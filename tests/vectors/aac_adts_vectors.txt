@@ -1,0 +1,23 @@
+# AAC ADTS 7-Byte Header (T1) Vectors
+
+- **Source file**: `artifacts/real_media/t1_sine.aac` (361 bytes)
+- **FFmpeg generation command**:
+  `ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=0.05" -c:a aac -b:a 64k -f adts artifacts/real_media/t1_sine.aac`
+- **Extraction command**:
+  `xxd -p -l 7 artifacts/real_media/t1_sine.aac`
+- **Positive Witness Hex (7 bytes)**:
+  `fff14c4016dffc`
+- **Decoded Fields**:
+  - `syncword = 0xFFF` (12 bits)
+  - `mpegVersion = 0` (MPEG-4)
+  - `layer = 0`
+  - `protectionAbs = true` (7-byte header, no CRC)
+  - `profileObject = 2` (AAC-LC, stored as `profile_Minus_1 = 1`)
+  - `sampleRateIdx = 3` (`sampleRateHz = 48000`)
+  - `privateBit = 0`
+  - `channelConfig = 1` (mono)
+  - `frameLength = 182` (`0x0B6` bytes)
+  - `bufferFullness = 0x7FF` (VBR)
+  - `numRawDataBlocksMinus1 = 0`
+- **Negative Witness Hex (broken syncword `0x00F` instead of `0xFFF`)**:
+  `00f14c4016dffc`

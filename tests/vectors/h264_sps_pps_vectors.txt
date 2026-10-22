@@ -1,0 +1,26 @@
+# H.264 SPS & PPS Exp-Golomb (T1) Vectors
+
+- **Source file**: `artifacts/real_media/test_720p.264` (27,484 bytes)
+- **FFmpeg extraction command**:
+  `ffmpeg -i artifacts/real_media/test_720p_h264.mp4 -c:v copy -bsf:v h264_mp4toannexb artifacts/real_media/test_720p.264`
+- **SPS NALU (`nal_unit_type = 7`, 24-byte payload after `00 00 01`)**:
+  `6742c01fda014016ec0440000003004000000f03c60ca800`
+  - `profileIdc = 66` (Baseline)
+  - `constraintFlags = 0xC0`
+  - `levelIdc = 31`
+  - `spsId = 0`
+  - `log2MaxFrameNum = 4`
+  - `picOrderCntType = 2`
+  - `maxNumRefFrames = 1`
+  - `picWidthInMbs = 80` (`widthPx = 1280`)
+  - `picHeightInMapU = 45` (`heightPx = 720`)
+  - `frameMbsOnly = true`
+- **PPS NALU (`nal_unit_type = 8`, 4-byte payload after `00 00 01`)**:
+  `68ce0fc8`
+  - `ppsId = 0`
+  - `spsId = 0`
+  - `entropyCodingCabac = false` (CAVLC)
+  - `bottomFieldPicOrder = false`
+  - `numSliceGroupsMinus1 = 0`
+- **Negative Witness Hex (invalid `nal_unit_type = 5` passed to `parseH264Sps`)**:
+  `6542c01fda014016ec0440000003004000000f03c60ca800`

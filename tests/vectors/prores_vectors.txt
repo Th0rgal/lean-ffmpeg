@@ -1,0 +1,29 @@
+# Apple ProRes Frame Header (T1) & 8x8 Integer IDCT (T2) Vectors
+
+## 1. T1: ProRes Frame Header (`icpf`, SMPTE RDD 36)
+- **Source file**: `artifacts/real_media/t1_64_prores.mov` (978 bytes)
+- **FFmpeg generation command**:
+  `ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=1" -frames:v 1 -c:v prores_ks -profile:v standard artifacts/real_media/t1_64_prores.mov`
+- **Extraction command**:
+  `dd if=artifacts/real_media/t1_64_prores.mov bs=1 skip=44 count=28 | xxd -p`
+- **Positive Witness Hex (first 28 bytes of `icpf` frame at offset 44)**:
+  `000000ec69637066009400004c617663004000408000020202000003`
+- **Decoded Fields**:
+  - `frameSize = 236` (`0x000000EC`)
+  - `magic = "icpf"` (`0x69637066`)
+  - `headerSize = 148` (`0x0094`)
+  - `version = 0`
+  - `creatorFourCC = 0x4C617663` (`"Lavc"`)
+  - `width = 64` (`0x0040`)
+  - `height = 64` (`0x0040`)
+  - `chromaFormat = 2` (4:2:2)
+  - `interlaceMode = 0` (progressive)
+  - `qmatFlags = 3` (`loadLumaQmat = true`, `loadChromaQmat = true` at byte 27)
+- **Negative Witness Hex (corrupted magic `"xxxx"` instead of `"icpf"`)**:
+  `000000ec78787878009400004c617663004000408000020202000003`
+
+## 2. T2: ProRes 8x8 Integer IDCT (`prores_idct_put_10`) vs FFmpeg
+- **FFmpeg Reference (`libavcodec/proresdsp.c` + `libavcodec/simple_idct_template.c`)**:
+  - Input 8x8 sparse DCT block (`coeffs[0]=64, coeffs[1]=-32, coeffs[2]=16, coeffs[8]=24, coeffs[9]=-12, coeffs[18]=8`, all others `0`) with uniform quantization matrix `qmat[i] = 4`.
+  - **FFmpeg Bit-Exact 10-bit Output (`[4, 1019]` clipped, 64 samples)**:
+    `[520, 519, 518, 518, 522, 527, 533, 537, 519, 518, 518, 519, 522, 527, 532, 535, 517, 517, 517, 519, 522, 526, 529, 531, 516, 516, 517, 519, 521, 524, 526, 528, 515, 515, 516, 517, 519, 522, 524, 525, 516, 515, 515, 515, 517, 519, 522, 523, 517, 515, 513, 513, 514, 517, 521, 523, 517, 515, 513, 511, 512, 516, 520, 523]`

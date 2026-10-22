@@ -1,0 +1,40 @@
+# FLAC STREAMINFO (T1) & Subframe Decode/Encode (T2) Vectors
+
+## 1. T1: FLAC `fLaC` + 34-byte `STREAMINFO`
+- **Source file**: `artifacts/real_media/t1_sine.flac` (9,208 bytes)
+- **FFmpeg generation command**:
+  `ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=0.2" -c:a flac -sample_fmt s16 artifacts/real_media/t1_sine.flac`
+- **Extraction command**:
+  `xxd -p -l 42 artifacts/real_media/t1_sine.flac`
+- **Positive Witness Hex (42 bytes)**:
+  `664c614300000022040004000000b60001820bb800f000000960058358ef753198a4674958a6d6b25406`
+- **Decoded Fields**:
+  - `minBlockSize = 1024` (`0x0400`)
+  - `maxBlockSize = 1024` (`0x0400`)
+  - `minFrameSize = 182` (`0x0000b6`)
+  - `maxFrameSize = 386` (`0x000182`)
+  - `sampleRate = 48000` (`0x0bb80`)
+  - `channels = 1`
+  - `bitsPerSample = 16`
+  - `totalSamples = 9600` (`0x000002580` -> `0x2580 = 9600`)
+  - `md5Hex = 058358ef753198a4674958a6d6b25406`
+- **Negative Witness Hex (corrupted magic byte 0x00 instead of 0x66)**:
+  `004c614300000022040004000000b60001820bb800f000000960058358ef753198a4674958a6d6b25406`
+
+## 2. T2: FLAC Subframe Fixed Order-2 (`stype = 10`) vs FFmpeg
+- **FFmpeg generation & decode commands**:
+  `ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=0.002" -c:a flac -sample_fmt s16 -blocksize 64 -lpc_type fixed flac_fixed.flac`
+  `ffmpeg -y -i flac_fixed.flac -c:a pcm_s16le flac_fixed.wav`
+- **Frame 0 Subframe Hex (offset 8295, 48 bytes)**:
+  `14000000eb08e277ed694bdaf25e6a2a8aebaecaadb6bb6cb6db2da32caedaacaaaa6bfd147bfc90a577abe68c842106`
+- **FFmpeg Bit-Exact Decoded 64 PCM16 Samples**:
+  `[0, 235, 470, 704, 935, 1162, 1387, 1606, 1820, 2029, 2230, 2424, 2610, 2787, 2956, 3114, 3261, 3399, 3525, 3639, 3741, 3830, 3908, 3972, 4022, 4060, 4084, 4095, 4092, 4075, 4045, 4001, 3944, 3874, 3792, 3696, 3589, 3469, 3338, 3196, 3044, 2880, 2708, 2527, 2337, 2140, 1935, 1725, 1508, 1286, 1060, 830, 599, 365, 129, -107, -342, -577, -809, -1039, -1265, -1487, -1705, -1916]`
+
+## 3. T2: FLAC Subframe LPC Order-8 (`stype = 39`, `qlpCoeffPrec = 12`, `qlpShift = 11`) vs FFmpeg
+- **FFmpeg generation & decode commands**:
+  `ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=0.002" -c:a flac -sample_fmt s16 -blocksize 64 -lpc_type levinson flac_lpc.flac`
+  `ffmpeg -y -i flac_lpc.flac -c:a pcm_s16le flac_lpc.wav`
+- **Frame 0 Subframe Hex (offset 8295, 75 bytes)**:
+  `4e000000eb01d602c003a7048a056b0646e62c9396d6acdeef3993bdee21ffbf1482851c7883c408384883841c7882cf34c3493092465388e2a9d08d47c6fdbf495b4d79a5892469634489`
+- **FFmpeg Bit-Exact Decoded 64 PCM16 Samples**:
+  Identical 64 samples (`maxErr = 0`).

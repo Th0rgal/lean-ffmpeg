@@ -1,0 +1,12 @@
+# FFV1 Lossless Video Plane R0 (Median Predictor + Rice-Golomb, T2) Vectors
+
+- **Source files**:
+  - `artifacts/real_media/t1_16_ffv1.avi` (5,814 bytes)
+  - `artifacts/real_media/t1_8x8.gray` (64 bytes)
+- **FFmpeg generation & decode commands**:
+  `ffmpeg -y -f lavfi -i "testsrc=size=16x16:rate=1" -frames:v 1 -pix_fmt gray -c:v ffv1 -level 1 -coder 0 artifacts/real_media/t1_16_ffv1.avi`
+  `ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=1" -vf "scale=8:8" -frames:v 1 -f rawvideo -pix_fmt gray artifacts/real_media/t1_8x8.gray`
+- **Real 8x8 Gray Plane Hex (`t1_8x8.gray`, 64 bytes)**:
+  `0154774db38ba7ff1ca1662ed19954d196c26532cd9a3f4ad2bb6532cd9a4a07d3ba6430ce9c4a05a4c16a3cc691443d7acfa09d8739556118687b4bbe7f9be1`
+- **FFV1 Median Predictor (`libavcodec/mathops.h` `mid_pred(left, left + top - topLeft, top)`)**:
+  - Bit-exact round-trip (`maxErr = 0`) over `t1_8x8.gray` and `t1_16_ffv1.avi` decoded gray plane.
