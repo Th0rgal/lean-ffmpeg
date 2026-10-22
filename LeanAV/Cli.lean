@@ -115,6 +115,13 @@ structure CliConfig where
   daemon         : Option String := none
   golden         : Option String := none
   output         : Option String := none
+  overwrite      : Bool := false
+  noVideo        : Bool := false
+  noAudio        : Bool := false
+  videoFrames    : Option Nat := none
+  audioRate      : Option Nat := none
+  audioChannels  : Option Nat := none
+  pixelFormat    : Option String := none
   errors         : List CliError := []
   deriving Repr, DecidableEq, Inhabited
 
@@ -130,12 +137,36 @@ def supportedFormat (s : String) : Bool :=
 
 /-- Flags that consume exactly one following argument. -/
 def flagTakesValue (s : String) : Bool :=
-  ["-i", "-c", "-c:v", "-c:a", "-vf", "-af", "-ss", "-t", "-f", "-daemon", "-golden"].contains s
+  ["-i", "-c", "-c:v", "-vcodec", "-c:a", "-acodec", "-vf", "-af",
+   "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes",
+   "-ar", "-ac", "-pix_fmt", "-loglevel", "-v", "-threads"].contains s
 
 /-- Recursive FFmpeg argv parser. -/
 def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
   match args with
   | [] => cfg
+  | "-y" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with overwrite := true }
+  | "-n" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with overwrite := false }
+  | "-hide_banner" :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-nostdin" :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-vn" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with noVideo := true }
+  | "-an" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with noAudio := true }
+  | "-sn" :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-dn" :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-loglevel" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-v" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-threads" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
   | "-i" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
       if value == "" then cfg.fail (.emptyValue "-i")
@@ -149,11 +180,45 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
       match parseCliCodec value with
       | some c => { cfg with videoCodec := some c }
       | none => cfg.fail (.unsupportedCodecOrFlag ("-c:v " ++ value))
+  | "-vcodec" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match parseCliCodec value with
+      | some c => { cfg with videoCodec := some c }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-vcodec " ++ value))
   | "-c:a" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
       match parseCliCodec value with
       | some c => { cfg with audioCodec := some c }
       | none => cfg.fail (.unsupportedCodecOrFlag ("-c:a " ++ value))
+  | "-acodec" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match parseCliCodec value with
+      | some c => { cfg with audioCodec := some c }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-acodec " ++ value))
+  | "-frames:v" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match value.toNat? with
+      | some n => { cfg with videoFrames := some n }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-frames:v " ++ value))
+  | "-vframes" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match value.toNat? with
+      | some n => { cfg with videoFrames := some n }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-vframes " ++ value))
+  | "-ar" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match value.toNat? with
+      | some n => { cfg with audioRate := some n }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-ar " ++ value))
+  | "-ac" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match value.toNat? with
+      | some n => { cfg with audioChannels := some n }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-ac " ++ value))
+  | "-pix_fmt" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      if value == "" then cfg.fail (.emptyValue "-pix_fmt")
+      else { cfg with pixelFormat := some value }
   | "-vf" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
       if value == "" then cfg.fail (.emptyValue "-vf")

@@ -2,8 +2,8 @@ import Lake
 open Lake DSL
 open System (FilePath)
 
-package «LeanAV» where
-  version := v!"0.1.0"
+package «lean-ffmpeg» where
+  version := v!"0.2.0"
 
 require «lean-sys» from "../lean-sys"
 
@@ -13,6 +13,6 @@ lean_lib «LeanAV» where
   precompileModules := false
 
 @[default_target]
-lean_exe «lean-av-core» where
+lean_exe «lffmpeg» where
   root := `LeanAV.Main
   supportInterpreter := false

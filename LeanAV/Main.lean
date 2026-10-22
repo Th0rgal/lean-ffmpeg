@@ -262,7 +262,7 @@ def runSelfTest : IO UInt32 := do
   let allOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lean-av-core\", \"waves\": 4, \"c_abi_gates\": 8, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 4, \"c_abi_gates\": 8, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -456,9 +456,37 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     IO.println (c0 ++ c1 ++ c2)
     return 0
 
+def printLffmpegVersion : IO UInt32 := do
+  IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
+  IO.println "  libavutil     LeanAV.Core      59. 39.100 (verified Law 1 rational rescale)"
+  IO.println "  libavcodec    LeanAV.Video/Audio 61. 19.100 (verified FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1)"
+  IO.println "  libavformat   LeanAV.Format    61.  7.100 (verified IVF, MP4, MKV, Ogg, MPEG-TS, WAV)"
+  IO.println "  libavfilter   LeanAV.Filter    10.  4.100 (verified Law 5 duration-conserving DAG)"
+  IO.println "  libswscale    LeanAV.Scale      8.  3.100 (verified Q10 BT.601/709/2020 + bilinear/bicubic)"
+  return 0
+
+def printLffmpegCodecs : IO UInt32 := do
+  IO.println "Codecs (lffmpeg / LeanAV):"
+  IO.println " D.V..S ffv1                 FFV1 lossless video (R0 Golomb-Rice + R1 Range Coder)"
+  IO.println " D.V.L. h264                 H.264 / AVC / MPEG-4 AVC (SPS/PPS + CABAC + DPB)"
+  IO.println " D.V.L. hevc                 HEVC / H.265 (NAL + SAO Band/Edge + CABAC)"
+  IO.println " D.V.L. prores               Apple ProRes (icpf + 10-bit 8x8 IDCT)"
+  IO.println " D.V.L. av1                  Alliance for Open Media AV1 (OBU + MSAC + CDEF + Wiener)"
+  IO.println " DEA.LS flac                 FLAC (Free Lossless Audio Codec: STREAMINFO + Fixed/LPC/Rice)"
+  IO.println " D.A.L. aac                  AAC (Advanced Audio Coding: ADTS + Huffman + IMDCT)"
+  IO.println " D.A.L. opus                 Opus (RFC 6716 Codes 0..3 + Range Coder + CELT/SILK)"
+  IO.println " DEA.S. pcm_s16le            PCM signed 16-bit little-endian"
+  return 0
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
+  | "-version" :: _ => printLffmpegVersion
+  | "--version" :: _ => printLffmpegVersion
+  | "-codecs" :: _ => printLffmpegCodecs
+  | "-formats" :: _ => printLffmpegCodecs
+  | "-h" :: _ => printLffmpegVersion
+  | "--help" :: _ => printLffmpegVersion
   | "bench" :: itStr :: _ => runBench (itStr.toNat?.getD 500)
   | "bench" :: [] => runBench 500
   | "bench-real" :: mediaDir :: itStr :: _ => runBenchRealFiles mediaDir (itStr.toNat?.getD 200)
@@ -471,9 +499,11 @@ def main (args : List String) : IO UInt32 := do
   | "emit-lnir" :: [] =>
     IO.println emitLeanAvLnirWire
     return 0
-  | "-i" :: _ => runFFmpegCli args
   | "ffmpeg" :: rest => runFFmpegCli rest
-  | _ => runSelfTest
+  | a :: _ =>
+    if a.startsWith "-" then runFFmpegCli args
+    else runSelfTest
+  | [] => runSelfTest
 
 /-! ## Axiom Verification (`#print axioms`) for Round-Trip Theorems and `AVGateSpec` Instances -/
 
