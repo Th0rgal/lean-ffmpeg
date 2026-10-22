@@ -527,6 +527,72 @@ def main (args : List String) : IO UInt32 := do
     let _ ← writeMediaFileAtomic s!"{outDir}/leanav_rgb24_filtered_640x360.raw" rgbFilt.data
     IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"ffv1_patch_64x64_compressed_bytes\": {ffv1Enc.size}, \"ffv1_max_err\": {ffv1MaxErr}, \"ffv1_sse\": {ffv1Sse} }"
     return 0
+  | "bench-e2e" :: mediaDir :: outDir :: _ =>
+    let yuvPath := s!"{mediaDir}/frame0_640x360.yuv"
+    let raw ← IO.FS.readBinFile yuvPath
+    let w := 640
+    let h := 360
+    let ySize := w * h
+    let uvW := w / 2
+    let uvH := h / 2
+    let uvSize := uvW * uvH
+    let pY : Plane2D := { data := raw.extract 0 ySize, width := w, height := h, stride := w }
+    let pU : Plane2D := { data := raw.extract ySize (ySize + uvSize), width := uvW, height := uvH, stride := uvW }
+    let pV : Plane2D := { data := raw.extract (ySize + uvSize) (ySize + 2 * uvSize), width := uvW, height := uvH, stride := uvW }
+    let vfBase := VideoFrame.allocYuv420p w h 0 AVRational.tb90kHz .bt709
+    let vf0 : VideoFrame := { vfBase with planes := #[pY, pU, pV] }
+    let iters := 3
+
+    -- Stage 1: Decode / Colorspace Conversion (YUV420p -> RGB24)
+    let t1s ← IO.monoNanosNow
+    let mut rgb := yuv420pToRgb24Plane vf0
+    for _ in [:iters] do
+      rgb := yuv420pToRgb24Plane vf0
+    let t1e ← IO.monoNanosNow
+
+    -- Stage 2: Fused Filter Graph (Contrast 1.25x + Brightness +12 + 3x3 BoxBlur on Luma)
+    let t2s ← IO.monoNanosNow
+    let mut pYFilt := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
+    for _ in [:iters] do
+      pYFilt := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
+    let t2e ← IO.monoNanosNow
+
+    -- Stage 3: FFV1 R0 Lossless Encode (64x64 Tile)
+    let pYTile := filterPlaneCrop pYFilt 160 90 64 64
+    let t3s ← IO.monoNanosNow
+    let mut encBs := encodePlaneFfv1RiceR0 pYTile 3
+    for _ in [:iters] do
+      encBs := encodePlaneFfv1RiceR0 pYTile 3
+    let t3e ← IO.monoNanosNow
+
+    -- Stage 4: FFV1 R0 Lossless Decode + Bit-Exact Verification (64x64 Tile)
+    let t4s ← IO.monoNanosNow
+    let mut pYDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray encBs)).getD pYTile
+    for _ in [:iters] do
+      pYDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray encBs)).getD pYTile
+    let t4e ← IO.monoNanosNow
+
+    let (maxErr, sse) := comparePlanesMetrics pYTile pYDec
+    let tDecUs := (t1e - t1s) / 1000 / (iters + 1)
+    let tFiltUs := (t2e - t2s) / 1000 / (iters + 1)
+    let tEncUs := (t3e - t3s) / 1000 / (iters + 1)
+    let tDec2Us := (t4e - t4s) / 1000 / (iters + 1)
+    let totalUs := tDecUs + tFiltUs + tEncUs + tDec2Us
+    let fps := if totalUs == 0 then 0 else 1000000 / totalUs
+
+    let vfFilt : VideoFrame := { vf0 with planes := #[pYFilt, pU, pV] }
+    let rgbFilt := yuv420pToRgb24Plane vfFilt
+    let _ ← writeMediaFileAtomic s!"{outDir}/e2e_filtered_rgb24_640x360.raw" rgbFilt.data
+
+    let r0 := s!"\{ \"ok\": true, \"resolution\": \"640x360\", \"tile\": \"64x64\", \"iters\": {iters + 1}, "
+    let r1 := s!"\"stage1_yuv_to_rgb24_us\": {tDecUs}, "
+    let r2 := s!"\"stage2_fused_filter_us\": {tFiltUs}, "
+    let r3 := s!"\"stage3_ffv1_tile_encode_us\": {tEncUs}, "
+    let r4 := s!"\"stage4_ffv1_tile_decode_us\": {tDec2Us}, "
+    let r5 := s!"\"total_pipeline_us\": {totalUs}, \"throughput_fps\": {fps}, "
+    let r6 := s!"\"ffv1_compressed_bytes\": {encBs.size}, \"ffv1_max_err\": {maxErr}, \"ffv1_sse\": {sse} }"
+    IO.println (r0 ++ r1 ++ r2 ++ r3 ++ r4 ++ r5 ++ r6)
+    return 0
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
     if a.startsWith "-" then runFFmpegCli args
