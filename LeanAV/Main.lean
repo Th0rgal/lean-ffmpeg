@@ -547,3 +547,13 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.ffv1PlaneRangeR0_encode_decode_roundtrip
 #print axioms LeanAV.Video.dpb_inter_frame_chain_verified
 
+#print axioms LeanAV.NativeKernels.evalLnir_swscale_gain_bias_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_opus_celt_saxpy_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_av1_cdef_fma_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_stencil3Tap_length_universal
+#print axioms LeanAV.NativeKernels.lnirKernelAst_wire_tokens_match
+#print axioms LeanAV.Audio.opusCeltPvqNormalizeBandQ15_length_universal
+#print axioms LeanAV.Audio.aacScaleFactorHuffman_roundtrip
+#print axioms LeanAV.Encoder.checkedPlaneFootprint_sound
+#print axioms LeanAV.Encoder.typedDmaSurface_bounds_safe
+

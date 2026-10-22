@@ -72,6 +72,71 @@ def HwDmaSurfaceView.verifyZeroCopy (surf : HwDmaSurfaceView) : Bool :=
     (if surf.noCpuCopyAttested then 1 else 0)
     (if surf.syncAttested then 1 else 0) == 1
 
+/-! ### T5: Phantom-Typed Host/Device DMA Buffers (`DmaMemorySpace`) & Checked `stride * height` Overflow Guards -/
+
+/--
+  Memory address space tag (`DmaMemorySpace`) preventing accidental CPU pointer dereference
+  of unmapped GPU/DMA device buffers (`CUdeviceptr` / `IOSurfaceRef` / `VASurfaceID`).
+-/
+inductive DmaMemorySpace where
+  | hostCpu
+  | deviceUnifiedIosurface
+  | deviceCudaBlackwell
+  | deviceVaapiDmabuf
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  Checked 2D plane byte-footprint guard (`checkedPlaneFootprint?`):
+  Ensures `width > 0`, `height > 0`, `stride ≥ width`, and `stride * height ≤ maxArenaBytes`
+  with explicit overflow and bounds checking before any DMA or software plane allocation.
+-/
+def checkedPlaneFootprint? (width height stride maxArenaBytes : Nat) : Option Nat :=
+  if width == 0 || height == 0 || stride < width || stride * height > maxArenaBytes then none
+  else some (stride * height)
+
+/--
+  Phantom-typed DMA Buffer (`TypedDmaSurface space`) parameterized by its compile-time `DmaMemorySpace`,
+  carrying a verified `stride * height ≤ allocBytes` proof obligation (`validFootprint`).
+-/
+structure TypedDmaSurface (space : DmaMemorySpace) where
+  handleId       : UInt64
+  deviceId       : UInt64
+  width          : Nat
+  height         : Nat
+  stride         : Nat
+  allocBytes     : Nat
+  validFootprint : width > 0 ∧ height > 0 ∧ stride ≥ width ∧ stride * height ≤ allocBytes
+
+/--
+  Zero-copy device-to-device DMA transfer (`dmaTransferDeviceToDevice`):
+  Requires source and destination `TypedDmaSurface` to reside in the exact same `DmaMemorySpace` (`space`)
+  on the same physical accelerator (`src.deviceId == dst.deviceId`) and share the underlying allocation (`src.handleId == dst.handleId`).
+-/
+def dmaTransferDeviceToDevice {space : DmaMemorySpace}
+    (src dst : TypedDmaSurface space) : Option (TypedDmaSurface space) :=
+  if src.deviceId == dst.deviceId && src.handleId == dst.handleId &&
+     src.width == dst.width && src.height == dst.height && src.stride == dst.stride then
+    some dst
+  else
+    none
+
+/-- Universal Theorem (T5): If `checkedPlaneFootprint? width height stride maxArenaBytes = some total`,
+    then `total = stride * height` holds universally (`∀`). -/
+theorem checkedPlaneFootprint_sound (width height stride maxArenaBytes total : Nat)
+    (h : checkedPlaneFootprint? width height stride maxArenaBytes = some total) :
+    total = stride * height := by
+  unfold checkedPlaneFootprint? at h
+  split at h
+  · contradiction
+  · injection h with hEq
+    exact hEq.symm
+
+/-- Universal Theorem (T5): Every `TypedDmaSurface space` satisfies `surf.width * surf.height ≤ surf.allocBytes`
+    universally (`∀`), eliminating `stride * height` buffer overflow. -/
+theorem typedDmaSurface_bounds_safe {space : DmaMemorySpace} (surf : TypedDmaSurface space) :
+    surf.stride * surf.height ≤ surf.allocBytes :=
+  surf.validFootprint.2.2.2
+
 /-! ## 2. Diamond Motion Estimation (`SAD` 8x8 / 16x16) & Rate-Distortion Optimization (`RDO`) -/
 
 /--

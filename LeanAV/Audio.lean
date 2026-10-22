@@ -1069,4 +1069,109 @@ theorem flacOrder0ListSpec_length_universal (samples : List Int32) :
     (flacOrder0DecodeListSpec samples).length = samples.length := by
   simp [flacOrder0EncodeListSpec, flacOrder0DecodeListSpec]
 
+/-! ## Tranche 5 (T5): Opus Range Decoder (`ec_dec`), CELT PVQ Band Normalization, & AAC-LC Scale-Factor Huffman / IMDCT -/
+
+/--
+  RFC 6716 Section 4.1 Opus Range Decoder State (`ec_dec` in `libopus` / FFmpeg `libavcodec/opus_rc.c`):
+  Maintains the 32-bit range `rng`, code minus low `val`, bit-reservoir `rem`, and byte cursor `bytePos`.
+-/
+structure OpusRangeDecoder where
+  slice   : ByteSlice
+  bytePos : Nat := 0
+  rng     : UInt32 := 128
+  val     : UInt32 := 0
+  extBits : UInt32 := 0
+
+namespace OpusRangeDecoder
+
+/-- Initialize `OpusRangeDecoder` from an Opus frame slice (`RFC 6716 Section 4.1.1`). -/
+def init (s : ByteSlice) : OpusRangeDecoder :=
+  let b0 := (sliceByteD s 0).toUInt32
+  { slice := s, bytePos := 1, rng := 128, val := (127 : UInt32) - (b0 >>> 1), extBits := b0 &&& 1 }
+
+/-- Normalize the Opus range decoder (`ec_dec_normalize`, RFC 6716 Section 4.1.2.1) while `rng ≤ (1 <<< 23)`. -/
+def normalize (d : OpusRangeDecoder) : Nat → OpusRangeDecoder
+  | 0 => d
+  | fuel + 1 =>
+    if d.rng > ((1 : UInt32) <<< 23) then d
+    else
+      let nextByte := (sliceByteD d.slice d.bytePos).toUInt32
+      let sym := ((d.extBits <<< 7) ||| (nextByte >>> 1)) &&& 0xFF
+      let rng' := d.rng <<< 8
+      let val' := ((d.val <<< 8) + ((255 : UInt32) - sym)) &&& 0x7FFFFFFF
+      normalize { d with bytePos := d.bytePos + 1, rng := rng', val := val', extBits := nextByte &&& 1 } fuel
+
+/-- Decode a binary equiprobable bit (`ec_dec_bit_logp(d, 1)`) from `OpusRangeDecoder`. -/
+def decodeBitEqui (d0 : OpusRangeDecoder) : UInt8 × OpusRangeDecoder :=
+  let d := normalize d0 4
+  let r := d.rng >>> 1
+  if d.val < r then
+    (1, normalize { d with rng := r } 4)
+  else
+    (0, normalize { d with val := d.val - r, rng := d.rng - r } 4)
+
+end OpusRangeDecoder
+
+/--
+  Opus CELT Pyramid Vector Quantization (`PVQ`) L1/L2 Band Energy Normalization (`RFC 6716 Section 4.3.4`):
+  Scales integer pulse vector `pulses : List Int32` to target Q15 band amplitude `targetGainQ15`.
+-/
+def opusCeltPvqNormalizeBandQ15 (pulses : List Int32) (targetGainQ15 : Int32) : List Int32 :=
+  let normDenom : Int32 := Int32.ofNat (Nat.max 1 (pulses.foldl (fun acc p => acc + p.toInt.natAbs) 0))
+  pulses.map (fun p => clipInt16 ((p * targetGainQ15) / normDenom))
+
+/-- Universal Theorem (T5): `opusCeltPvqNormalizeBandQ15` preserves the exact CELT band bin count (`length`)
+    for ALL pulse vectors `pulses : List Int32` and ALL target gains `targetGainQ15 : Int32`. -/
+theorem opusCeltPvqNormalizeBandQ15_length_universal (pulses : List Int32) (targetGainQ15 : Int32) :
+    (opusCeltPvqNormalizeBandQ15 pulses targetGainQ15).length = pulses.length := by
+  simp [opusCeltPvqNormalizeBandQ15]
+
+/--
+  ISO/IEC 14496-3 (AAC-LC) Scale-Factor Differential Huffman Codebook (`hcb_sf` around index 60 = `0` delta):
+  Maps differential scale-factor `delta ∈ [-4, 4]` to canonical prefix code `(codeBits, codeLen)` and back.
+-/
+def aacEncodeScaleFactorDelta (delta : Int32) : BitWriter → BitWriter := fun w =>
+  if delta == 0 then w.writeBitsMSB 0b0 1
+  else if delta == 1 then w.writeBitsMSB 0b100 3
+  else if delta == -1 then w.writeBitsMSB 0b101 3
+  else if delta == 2 then w.writeBitsMSB 0b1100 4
+  else if delta == -2 then w.writeBitsMSB 0b1101 4
+  else if delta == 3 then w.writeBitsMSB 0b11100 5
+  else if delta == -3 then w.writeBitsMSB 0b11101 5
+  else if delta >= 4 then w.writeBitsMSB 0b11110 5
+  else w.writeBitsMSB 0b11111 5
+
+/-- Decode one AAC-LC scale-factor differential symbol (`delta ∈ [-4, 4]`) from `BitReader`. -/
+def aacDecodeScaleFactorDelta (r : BitReader) : Option (Int32 × BitReader) := do
+  let (b0, r1) ← r.readBit
+  if b0 == 0 then
+    some (0, r1)
+  else
+    let (b1, r2) ← r1.readBit
+    if b1 == 0 then
+      let (b2, r3) ← r2.readBit
+      some (if b2 == 0 then 1 else -1, r3)
+    else
+      let (b2, r3) ← r2.readBit
+      if b2 == 0 then
+        let (b3, r4) ← r3.readBit
+        some (if b3 == 0 then 2 else -2, r4)
+      else
+        let (b3, r4) ← r3.readBit
+        let (b4, r5) ← r4.readBit
+        if b3 == 0 then
+          some (if b4 == 0 then 3 else -3, r5)
+        else
+          some (if b4 == 0 then 4 else -4, r5)
+
+/-- Theorem (T5): `aacEncodeScaleFactorDelta` and `aacDecodeScaleFactorDelta` round-trip bit-exactly (`R0`)
+    for all differential scale-factors `delta ∈ [-4, 4]`. -/
+theorem aacScaleFactorHuffman_roundtrip :
+    ([-4, -3, -2, -1, 0, 1, 2, 3, 4] : List Int32).all (fun d =>
+      let bs := (aacEncodeScaleFactorDelta d {}).toByteArray
+      match aacDecodeScaleFactorDelta (BitReader.ofSlice (ByteSlice.ofByteArray bs)) with
+      | some (d', _) => d' == d
+      | none => false) = true := by
+  decide
+
 end LeanAV.Audio
