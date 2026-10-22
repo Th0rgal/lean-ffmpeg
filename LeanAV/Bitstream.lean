@@ -440,4 +440,71 @@ theorem writeRiceSigned_readRiceSigned_bounded_all :
         roundtripRiceSigned k v == some v))) = true := by
   decide
 
+/-! ## Tranche 3 (T3): Compositional Prefix-Free `LawfulByteCodec` Algebra & Universal Injective Corollaries -/
+
+/--
+  Universal compositional byte-stream codec (`Law 2` algebra):
+  Encodes `α` into a `List UInt8` and decodes from any `List UInt8` with arbitrary trailing bytes `rest`,
+  recovering `(x, rest)` unambiguously (`roundtrip_prefix`).
+-/
+structure LawfulByteCodec (α : Type) where
+  encode : α → List UInt8
+  decode : List UInt8 → Option (α × List UInt8)
+  roundtrip_prefix : ∀ (x : α) (rest : List UInt8),
+    decode (encode x ++ rest) = some (x, rest)
+
+namespace LawfulByteCodec
+
+/-- Universal Theorem (Law 2): Every `LawfulByteCodec` has a strictly injective encoder (`encode x = encode y → x = y`). -/
+theorem encode_injective {α : Type} (C : LawfulByteCodec α) (x y : α)
+    (h : C.encode x = C.encode y) : x = y := by
+  have hx := C.roundtrip_prefix x []
+  have hy := C.roundtrip_prefix y []
+  rw [h] at hx
+  rw [hx] at hy
+  injection hy with hpair
+  injection hpair
+
+/-- Universal Theorem:Exact buffer decode (`rest = []`) recovers `some (x, [])` for all `x : α`. -/
+theorem decode_encode_exact {α : Type} (C : LawfulByteCodec α) (x : α) :
+    C.decode (C.encode x) = some (x, []) := by
+  have h := C.roundtrip_prefix x []
+  simpa [List.append_nil] using h
+
+/-- Sequential product combinator (`C1.seq C2`) for `LawfulByteCodec (α × β)` with universal prefix-roundtrip proof. -/
+def seq {α β : Type} (C1 : LawfulByteCodec α) (C2 : LawfulByteCodec β) : LawfulByteCodec (α × β) where
+  encode := fun (a, b) => C1.encode a ++ C2.encode b
+  decode := fun bytes =>
+    match C1.decode bytes with
+    | none => none
+    | some (a, rest1) =>
+      match C2.decode rest1 with
+      | none => none
+      | some (b, rest2) => some ((a, b), rest2)
+  roundtrip_prefix := by
+    intro ⟨a, b⟩ rest
+    simp [List.append_assoc, C1.roundtrip_prefix, C2.roundtrip_prefix]
+
+/-- Single-byte `LawfulByteCodec UInt8` with universal prefix-roundtrip proof (`0 native_decide`). -/
+def byteCodec : LawfulByteCodec UInt8 where
+  encode := fun b => [b]
+  decode := fun xs =>
+    match xs with
+    | [] => none
+    | b :: rest => some (b, rest)
+  roundtrip_prefix := by
+    intro b rest
+    rfl
+
+/-- Two-byte pair `LawfulByteCodec (UInt8 × UInt8)` derived compositionally via `byteCodec.seq byteCodec`. -/
+def bytePairCodec : LawfulByteCodec (UInt8 × UInt8) :=
+  byteCodec.seq byteCodec
+
+/-- Universal Theorem: `bytePairCodec` round-trips for ALL `b0 b1 : UInt8` and ALL trailing `rest : List UInt8`. -/
+theorem bytePairCodec_universal_roundtrip (b0 b1 : UInt8) (rest : List UInt8) :
+    bytePairCodec.decode (bytePairCodec.encode (b0, b1) ++ rest) = some ((b0, b1), rest) :=
+  bytePairCodec.roundtrip_prefix (b0, b1) rest
+
+end LawfulByteCodec
+
 end LeanAV.Bitstream

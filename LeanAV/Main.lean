@@ -534,3 +534,11 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Spec.h264SpsGateSpec
 #print axioms LeanAV.Spec.ffv1PlaneGateSpec
 
+#print axioms LeanAV.Bitstream.LawfulByteCodec.encode_injective
+#print axioms LeanAV.Bitstream.LawfulByteCodec.bytePairCodec_universal_roundtrip
+#print axioms LeanAV.Audio.flacOrder0ListSpec_roundtrip_universal
+#print axioms LeanAV.Video.ffv1MedianPredictor_idempotent_equal_neighbors
+#print axioms LeanAV.Video.uint8_xor_involution_universal
+#print axioms LeanAV.Video.hevcSaoBandFilter_list_array_refinement
+#print axioms LeanAV.Video.xorResidualsList_roundtrip_universal
+

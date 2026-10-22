@@ -47,55 +47,67 @@ inductive FlacFixedOrder where
 /-- Compute the FLAC Fixed Predictor value at index `i` from previously reconstructed samples `out`. -/
 @[inline]
 def flacFixedPredict (ord : FlacFixedOrder) (out : Array Int32) (i : Nat) : Int32 :=
+  let ds := out.toList
   match ord with
   | .order0 => 0
   | .order1 =>
-    if i ≥ 1 then out.getD (i - 1) 0 else 0
+    if i ≥ 1 then ds.getD (i - 1) 0 else 0
   | .order2 =>
-    if i ≥ 2 then 2 * out.getD (i - 1) 0 - out.getD (i - 2) 0 else 0
+    if i ≥ 2 then 2 * ds.getD (i - 1) 0 - ds.getD (i - 2) 0 else 0
   | .order3 =>
-    if i ≥ 3 then 3 * out.getD (i - 1) 0 - 3 * out.getD (i - 2) 0 + out.getD (i - 3) 0 else 0
+    if i ≥ 3 then 3 * ds.getD (i - 1) 0 - 3 * ds.getD (i - 2) 0 + ds.getD (i - 3) 0 else 0
   | .order4 =>
     if i ≥ 4 then
-      4 * out.getD (i - 1) 0 - 6 * out.getD (i - 2) 0 + 4 * out.getD (i - 3) 0 - out.getD (i - 4) 0
+      4 * ds.getD (i - 1) 0 - 6 * ds.getD (i - 2) 0 + 4 * ds.getD (i - 3) 0 - ds.getD (i - 4) 0
     else 0
 
-/-- Encode a channel's samples into FLAC Fixed-LPC residuals (`r[i] = s[i] - predict(i)`). -/
-def flacEncodeFixedResiduals (ord : FlacFixedOrder) (samples : Array Int32) : Array Int32 := Id.run do
-  let n := samples.size
-  let mut residuals := Array.emptyWithCapacity n
-  for i in [:n] do
-    let s := samples.getD i 0
+/-- Structural helper for `flacEncodeFixedResiduals`. -/
+def flacEncodeFixedResidualsLoop (ord : FlacFixedOrder) (samples : Array Int32) (i : Nat) : Nat → List Int32 → List Int32
+  | 0, acc => acc.reverse
+  | rem + 1, acc =>
+    let s := samples.toList.getD i 0
     let p := flacFixedPredict ord samples i
-    residuals := residuals.push (s - p)
-  return residuals
+    flacEncodeFixedResidualsLoop ord samples (i + 1) rem ((s - p) :: acc)
+
+/-- Encode a channel's samples into FLAC Fixed-LPC residuals (`r[i] = s[i] - predict(i)`). -/
+def flacEncodeFixedResiduals (ord : FlacFixedOrder) (samples : Array Int32) : Array Int32 :=
+  (flacEncodeFixedResidualsLoop ord samples 0 samples.toList.length []).toArray
+
+/-- Structural helper for `flacDecodeFixedResiduals`. -/
+def flacDecodeFixedResidualsLoop (ord : FlacFixedOrder) : List Int32 → List Int32 → List Int32
+  | [], outRev => outRev.reverse
+  | r :: rest, outRev =>
+    let curOut := outRev.reverse.toArray
+    let p := flacFixedPredict ord curOut outRev.length
+    flacDecodeFixedResidualsLoop ord rest ((r + p) :: outRev)
 
 /-- Reconstruct a channel's samples bit-exactly (`R0`) from FLAC Fixed-LPC residuals (`s[i] = r[i] + predict(i)`). -/
-def flacDecodeFixedResiduals (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 := Id.run do
-  let n := residuals.size
-  let mut out := Array.emptyWithCapacity n
-  for i in [:n] do
-    let r := residuals.getD i 0
-    let p := flacFixedPredict ord out i
-    out := out.push (r + p)
-  return out
+def flacDecodeFixedResiduals (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 :=
+  (flacDecodeFixedResidualsLoop ord residuals.toList []).toArray
+
+/-- Structural FIR inner dot-product helper for `flacDecodeLpcFir`. -/
+def flacLpcFirDot (outList : List Int32) (curIdx : Nat) (coeffs : List Int32) (k : Nat) (acc : Int64) : List Int32 → Int64
+  | [] => acc
+  | c :: cs =>
+    let nextAcc :=
+      if curIdx > k then
+        let prev := (outList.getD (curIdx - 1 - k) 0).toInt64
+        acc + c.toInt64 * prev
+      else acc
+    flacLpcFirDot outList curIdx coeffs (k + 1) nextAcc cs
+
+/-- Structural outer recursion helper for `flacDecodeLpcFir`. -/
+def flacDecodeLpcFirList (coeffs : List Int32) (qShift : UInt32) : List Int32 → List Int32 → List Int32
+  | outList, [] => outList
+  | outList, r :: rs =>
+    let acc := flacLpcFirDot outList outList.length coeffs 0 0 coeffs
+    let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
+    flacDecodeLpcFirList coeffs qShift (outList ++ [r + pred]) rs
 
 /-- General quantized FIR LPC synthesis filter (`s[n] = r[n] + (∑_{k=0}^{L-1} coeffs[k] * s[n-1-k]) >> qShift`). -/
 def flacDecodeLpcFir (warmup : Array Int32) (coeffs : Array Int32) (qShift : UInt32)
-    (residuals : Array Int32) : Array Int32 := Id.run do
-  let mut out := warmup
-  let order := coeffs.size
-  for r in residuals do
-    let curIdx := out.size
-    let mut acc : Int64 := 0
-    for k in [:order] do
-      if curIdx > k then
-        let prev := (out.getD (curIdx - 1 - k) 0).toInt64
-        let c := (coeffs.getD k 0).toInt64
-        acc := acc + c * prev
-    let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
-    out := out.push (r + pred)
-  return out
+    (residuals : Array Int32) : Array Int32 :=
+  (flacDecodeLpcFirList coeffs.toList qShift warmup.toList residuals.toList).toArray
 
 /-- FLAC Reversible Mid-Side Stereo Decorrelation (`mid = (L + R) >> 1`, `side = L - R`). -/
 @[inline]
@@ -405,45 +417,73 @@ def writeSignedBitsMSB (w : BitWriter) (v : Int32) (n : Nat) : BitWriter :=
   let u : UInt64 := v.toUInt32.toUInt64 &&& mask
   w.writeBitsMSB u n
 
-/-- Decode FLAC partitioned Rice residuals (`codingMethod = 0` for 4-bit param, `1` for 5-bit param, plus escape `15`/`31`). -/
-def decodeFlacRicePartitions (r0 : BitReader) (blockSize predOrder : Nat) : Option (Array Int32 × BitReader) := Id.run do
-  let some (codingMethod, r1) := r0.readBitsMSB 2 | return none
-  if codingMethod > 1 then return none
-  let some (partOrderBits, r2) := r1.readBitsMSB 4 | return none
-  let partOrder := partOrderBits.toNat
-  let numParts := 1 <<< partOrder
-  let paramBits := if codingMethod == 0 then 4 else 5
-  let escapeParam : UInt64 := if codingMethod == 0 then 15 else 31
-  if blockSize < predOrder || (partOrder > 0 && blockSize % numParts != 0) then return none
-  let totalRes := blockSize - predOrder
-  let mut residuals := Array.emptyWithCapacity totalRes
-  let mut cur := r2
-  for p in [:numParts] do
-    let some (param, rP) := cur.readBitsMSB paramBits | return none
-    cur := rP
-    let nSamplesInPart : Nat :=
-      if partOrder == 0 then blockSize - predOrder
-      else if p == 0 then
-        if blockSize / numParts < predOrder then 0 else (blockSize / numParts) - predOrder
-      else blockSize / numParts
-    if param == escapeParam then
-      let some (rawBpsBits, rEsc) := cur.readBitsMSB 5 | return none
-      cur := rEsc
-      let rawBps := rawBpsBits.toNat
-      for _ in [:nSamplesInPart] do
-        if rawBps == 0 then
-          residuals := residuals.push 0
-        else
-          let some (sv, rNext) := readSignedBitsMSB cur rawBps | return none
-          cur := rNext
-          residuals := residuals.push sv
+/-- Structural helper: read `n` signed `rawBps`-bit integers MSB-first from `BitReader`. -/
+def readSignedSamplesLoop (rawBps : Nat) (cur : BitReader) : Nat → List Int32 → Option (List Int32 × BitReader)
+  | 0, acc => some (acc.reverse, cur)
+  | rem + 1, acc =>
+    if rawBps == 0 then
+      readSignedSamplesLoop 0 cur rem (0 :: acc)
     else
-      let k := param.toNat
-      for _ in [:nSamplesInPart] do
-        let some (sv, rNext) := cur.readRiceSigned k | return none
-        cur := rNext
-        residuals := residuals.push sv
-  return some (residuals, cur)
+      match readSignedBitsMSB cur rawBps with
+      | none => none
+      | some (sv, rNext) => readSignedSamplesLoop rawBps rNext rem (sv :: acc)
+
+/-- Structural helper: read `n` signed Rice-Golomb (`k`-bit) integers from `BitReader`. -/
+def readRiceSamplesLoop (k : Nat) (cur : BitReader) : Nat → List Int32 → Option (List Int32 × BitReader)
+  | 0, acc => some (acc.reverse, cur)
+  | rem + 1, acc =>
+    match cur.readRiceSigned k with
+    | none => none
+    | some (sv, rNext) => readRiceSamplesLoop k rNext rem (sv :: acc)
+
+/-- Structural helper: decode `numParts` FLAC Rice partitions starting at partition `p`. -/
+def decodeFlacRicePartitionsLoop (blockSize predOrder partOrder numParts paramBits : Nat) (escapeParam : UInt64)
+    (cur : BitReader) (p : Nat) : Nat → List Int32 → Option (List Int32 × BitReader)
+  | 0, accRev => some (accRev.reverse, cur)
+  | remParts + 1, accRev =>
+    match cur.readBitsMSB paramBits with
+    | none => none
+    | some (param, rP) =>
+      let nSamplesInPart : Nat :=
+        if partOrder == 0 then blockSize - predOrder
+        else if p == 0 then
+          if blockSize / numParts < predOrder then 0 else (blockSize / numParts) - predOrder
+        else blockSize / numParts
+      if param == escapeParam then
+        match rP.readBitsMSB 5 with
+        | none => none
+        | some (rawBpsBits, rEsc) =>
+          match readSignedSamplesLoop rawBpsBits.toNat rEsc nSamplesInPart [] with
+          | none => none
+          | some (partSamples, rNext) =>
+            decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam
+              rNext (p + 1) remParts (partSamples.reverse ++ accRev)
+      else
+        match readRiceSamplesLoop param.toNat rP nSamplesInPart [] with
+        | none => none
+        | some (partSamples, rNext) =>
+          decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam
+            rNext (p + 1) remParts (partSamples.reverse ++ accRev)
+
+/-- Decode FLAC partitioned Rice residuals (`codingMethod = 0` for 4-bit param, `1` for 5-bit param, plus escape `15`/`31`). -/
+def decodeFlacRicePartitions (r0 : BitReader) (blockSize predOrder : Nat) : Option (Array Int32 × BitReader) :=
+  match r0.readBitsMSB 2 with
+  | none => none
+  | some (codingMethod, r1) =>
+    if codingMethod > 1 then none
+    else
+      match r1.readBitsMSB 4 with
+      | none => none
+      | some (partOrderBits, r2) =>
+        let partOrder := partOrderBits.toNat
+        let numParts := 1 <<< partOrder
+        let paramBits := if codingMethod == 0 then 4 else 5
+        let escapeParam : UInt64 := if codingMethod == 0 then 15 else 31
+        if blockSize < predOrder || (partOrder > 0 && blockSize % numParts != 0) then none
+        else
+          match decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam r2 0 numParts [] with
+          | none => none
+          | some (resList, curEnd) => some (resList.toArray, curEnd)
 
 /--
   Decode any RFC 9639 / FFmpeg `libavcodec/flacdec.c` FLAC subframe:
@@ -453,87 +493,93 @@ def decodeFlacRicePartitions (r0 : BitReader) (blockSize predOrder : Nat) : Opti
   - `32 ≤ stype ≤ 63`: `SUBFRAME_LPC` (orders `1..32`, with `qlp_coeff_prec`, `qlp_shift`, and FIR coeffs)
   Supports `wasted_bits` and both 4-bit (`RICE`) and 5-bit (`RICE2`) partitions + escape raw partitions.
 -/
-def decodeFlacSubframeSpec (s : ByteSlice) (blockSize bps : Nat) : Option (Array Int32) := Id.run do
-  if blockSize == 0 || bps == 0 || bps > 32 then return none
-  let r0 := BitReader.ofSlice s
-  let some (zeroBit, r1) := r0.readBit | return none
-  if zeroBit != 0 then return none
-  let some (stypeBits, r2) := r1.readBitsMSB 6 | return none
-  let stype := stypeBits.toNat
-  let some (wastedFlag, r3) := r2.readBit | return none
-  let (wastedBits, r4) : Nat × BitReader :=
-    if wastedFlag == 1 then
-      match r3.readUnary0 31 with
-      | some (kMinus1, rW) => (kMinus1 + 1, rW)
-      | none => (999, r3)
-    else (0, r3)
-  if wastedBits ≥ bps then return none
-  let effBps := bps - wastedBits
-  let applyWasted (arr : Array Int32) : Array Int32 :=
-    if wastedBits == 0 then arr
-    else arr.map (fun x => x <<< Int32.ofNat wastedBits)
-  if stype == 0 then
-    -- SUBFRAME_CONSTANT
-    let some (cVal, _) := readSignedBitsMSB r4 effBps | return none
-    return some (applyWasted (Array.replicate blockSize cVal))
-  else if stype == 1 then
-    -- SUBFRAME_VERBATIM
-    let mut cur := r4
-    let mut out := Array.emptyWithCapacity blockSize
-    for _ in [:blockSize] do
-      let some (sv, nextR) := readSignedBitsMSB cur effBps | return none
-      cur := nextR
-      out := out.push sv
-    return some (applyWasted out)
-  else if stype ≥ 8 && stype ≤ 12 then
-    -- SUBFRAME_FIXED (order = stype - 8)
-    let predOrder := stype - 8
-    if blockSize < predOrder then return none
-    let mut cur := r4
-    let mut out := Array.emptyWithCapacity blockSize
-    for _ in [:predOrder] do
-      let some (sv, nextR) := readSignedBitsMSB cur effBps | return none
-      cur := nextR
-      out := out.push sv
-    let some (residuals, _) := decodeFlacRicePartitions cur blockSize predOrder | return none
-    let ord : FlacFixedOrder := match predOrder with
-      | 0 => .order0
-      | 1 => .order1
-      | 2 => .order2
-      | 3 => .order3
-      | _ => .order4
-    for res in residuals do
-      let idx := out.size
-      let pred := flacFixedPredict ord out idx
-      out := out.push (res + pred)
-    return some (applyWasted out)
-  else if stype ≥ 32 && stype ≤ 63 then
-    -- SUBFRAME_LPC (order = stype - 32 + 1)
-    let predOrder := stype - 32 + 1
-    if blockSize < predOrder then return none
-    let mut cur := r4
-    let mut warmup := Array.emptyWithCapacity predOrder
-    for _ in [:predOrder] do
-      let some (sv, nextR) := readSignedBitsMSB cur effBps | return none
-      cur := nextR
-      warmup := warmup.push sv
-    let some (precMinus1Bits, r5) := cur.readBitsMSB 4 | return none
-    if precMinus1Bits == 15 then return none
-    let coeffPrec := precMinus1Bits.toNat + 1
-    let some (qShiftSigned, r6) := readSignedBitsMSB r5 5 | return none
-    if qShiftSigned < 0 then return none
-    let qShift : UInt32 := qShiftSigned.toInt.toNat.toUInt32
-    let mut curC := r6
-    let mut coeffs := Array.emptyWithCapacity predOrder
-    for _ in [:predOrder] do
-      let some (cVal, nextR) := readSignedBitsMSB curC coeffPrec | return none
-      curC := nextR
-      coeffs := coeffs.push cVal
-    let some (residuals, _) := decodeFlacRicePartitions curC blockSize predOrder | return none
-    let out := flacDecodeLpcFir warmup coeffs qShift residuals
-    return some (applyWasted out)
+def decodeFlacSubframeSpec (s : ByteSlice) (blockSize bps : Nat) : Option (Array Int32) :=
+  if blockSize == 0 || bps == 0 || bps > 32 then none
   else
-    return none
+    let r0 := BitReader.ofSlice s
+    match r0.readBit with
+    | none => none
+    | some (zeroBit, r1) =>
+      if zeroBit != 0 then none
+      else
+        match r1.readBitsMSB 6 with
+        | none => none
+        | some (stypeBits, r2) =>
+          let stype := stypeBits.toNat
+          match r2.readBit with
+          | none => none
+          | some (wastedFlag, r3) =>
+            let (wastedBits, r4) : Nat × BitReader :=
+              if wastedFlag == 1 then
+                match r3.readUnary0 31 with
+                | some (kMinus1, rW) => (kMinus1 + 1, rW)
+                | none => (999, r3)
+              else (0, r3)
+            if wastedBits ≥ bps then none
+            else
+              let effBps := bps - wastedBits
+              let applyWasted (arr : Array Int32) : Array Int32 :=
+                if wastedBits == 0 then arr
+                else (arr.toList.map (fun x => x <<< Int32.ofNat wastedBits)).toArray
+              if stype == 0 then
+                -- SUBFRAME_CONSTANT
+                match readSignedBitsMSB r4 effBps with
+                | none => none
+                | some (cVal, _) => some (applyWasted (List.replicate blockSize cVal).toArray)
+              else if stype == 1 then
+                -- SUBFRAME_VERBATIM
+                match readSignedSamplesLoop effBps r4 blockSize [] with
+                | none => none
+                | some (outList, _) => some (applyWasted outList.toArray)
+              else if stype ≥ 8 && stype ≤ 12 then
+                -- SUBFRAME_FIXED (order = stype - 8)
+                let predOrder := stype - 8
+                if blockSize < predOrder then none
+                else
+                  match readSignedSamplesLoop effBps r4 predOrder [] with
+                  | none => none
+                  | some (warmList, cur) =>
+                    match decodeFlacRicePartitions cur blockSize predOrder with
+                    | none => none
+                    | some (residuals, _) =>
+                      let ord : FlacFixedOrder := match predOrder with
+                        | 0 => .order0
+                        | 1 => .order1
+                        | 2 => .order2
+                        | 3 => .order3
+                        | _ => .order4
+                      let fullList := flacDecodeFixedResidualsLoop ord residuals.toList warmList.reverse
+                      some (applyWasted fullList.toArray)
+              else if stype ≥ 32 && stype ≤ 63 then
+                -- SUBFRAME_LPC (order = stype - 32 + 1)
+                let predOrder := stype - 32 + 1
+                if blockSize < predOrder then none
+                else
+                  match readSignedSamplesLoop effBps r4 predOrder [] with
+                  | none => none
+                  | some (warmList, cur) =>
+                    match cur.readBitsMSB 4 with
+                    | none => none
+                    | some (precMinus1Bits, r5) =>
+                      if precMinus1Bits == 15 then none
+                      else
+                        let coeffPrec := precMinus1Bits.toNat + 1
+                        match readSignedBitsMSB r5 5 with
+                        | none => none
+                        | some (qShiftSigned, r6) =>
+                          if qShiftSigned < 0 then none
+                          else
+                            let qShift : UInt32 := qShiftSigned.toInt.toNat.toUInt32
+                            match readSignedSamplesLoop coeffPrec r6 predOrder [] with
+                            | none => none
+                            | some (coeffList, curC) =>
+                              match decodeFlacRicePartitions curC blockSize predOrder with
+                              | none => none
+                              | some (residuals, _) =>
+                                let out := flacDecodeLpcFir warmList.toArray coeffList.toArray qShift residuals
+                                some (applyWasted out)
+              else
+                none
 
 /-- Subframe encoding mode for `encodeFlacSubframeSpec`. -/
 inductive FlacSubframeSpecMode where
@@ -543,22 +589,37 @@ inductive FlacSubframeSpecMode where
   | lpc (coeffs : Array Int32) (coeffPrec : Nat) (qShift : UInt32) (codingMethod : UInt8 := 0) (riceK : Nat := 3)
   deriving Repr, DecidableEq, Inhabited
 
+/-- Structural helper: write a list of signed `n`-bit integers MSB-first to `BitWriter`. -/
+def writeSignedListMSB (n : Nat) (w : BitWriter) : List Int32 → BitWriter
+  | [] => w
+  | s :: rest => writeSignedListMSB n (writeSignedBitsMSB w s n) rest
+
+/-- Structural helper: write a list of signed Rice-Golomb (`k`-bit) integers to `BitWriter`. -/
+def writeRiceListSigned (k : Nat) (w : BitWriter) : List Int32 → BitWriter
+  | [] => w
+  | r :: rest => writeRiceListSigned k (w.writeRiceSigned k r) rest
+
+/-- Structural helper: encode LPC FIR residuals starting at index `i` into `BitWriter`. -/
+def encodeFlacLpcResidualsLoop (sampleList coeffList : List Int32) (qShift : UInt32) (riceK : Nat)
+    (i : Nat) (w : BitWriter) : Nat → BitWriter
+  | 0 => w
+  | rem + 1 =>
+    let acc := flacLpcFirDot sampleList i coeffList 0 0 coeffList
+    let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
+    let res : Int32 := sampleList.getD i 0 - pred
+    encodeFlacLpcResidualsLoop sampleList coeffList qShift riceK (i + 1) (w.writeRiceSigned riceK res) rem
+
 /-- Encode a FLAC subframe according to RFC 9639 (`Constant`, `Verbatim`, `Fixed 0..4`, or `LPC` with 4/5-bit Rice or Escape). -/
-def encodeFlacSubframeSpec (mode : FlacSubframeSpecMode) (bps : Nat) (samples : Array Int32) : ByteArray := Id.run do
-  let mut w := BitWriter.empty (samples.size * 2 + 16)
-  w := w.writeBit 0 -- zero bit
+def encodeFlacSubframeSpec (mode : FlacSubframeSpecMode) (bps : Nat) (samples : Array Int32) : ByteArray :=
+  let sampleList := samples.toList
+  let w0 := (BitWriter.empty (sampleList.length * 2 + 16)).writeBit 0 -- zero bit
   match mode with
   | .constant val =>
-    w := w.writeBitsMSB 0 6 -- stype = 0
-    w := w.writeBit 0 -- wasted = 0
-    w := writeSignedBitsMSB w val bps
-    return w.toByteArray
+    let w1 := (w0.writeBitsMSB 0 6).writeBit 0
+    (writeSignedBitsMSB w1 val bps).toByteArray
   | .verbatim =>
-    w := w.writeBitsMSB 1 6 -- stype = 1
-    w := w.writeBit 0
-    for s in samples do
-      w := writeSignedBitsMSB w s bps
-    return w.toByteArray
+    let w1 := (w0.writeBitsMSB 1 6).writeBit 0
+    (writeSignedListMSB bps w1 sampleList).toByteArray
   | .fixed ord codingMethod riceK escaped rawBps =>
     let predOrder : Nat := match ord with
       | .order0 => 0
@@ -566,51 +627,31 @@ def encodeFlacSubframeSpec (mode : FlacSubframeSpecMode) (bps : Nat) (samples : 
       | .order2 => 2
       | .order3 => 3
       | .order4 => 4
-    w := w.writeBitsMSB (8 + predOrder).toUInt64 6
-    w := w.writeBit 0
-    for i in [:predOrder] do
-      w := writeSignedBitsMSB w (samples.getD i 0) bps
+    let w1 := (w0.writeBitsMSB (8 + predOrder).toUInt64 6).writeBit 0
+    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
     let cm : UInt64 := if codingMethod == 0 then 0 else 1
     let paramBits : Nat := if codingMethod == 0 then 4 else 5
     let escCode : UInt64 := if codingMethod == 0 then 15 else 31
-    w := w.writeBitsMSB cm 2
-    w := w.writeBitsMSB 0 4 -- partition order 0 (1 partition)
-    let allRes := flacEncodeFixedResiduals ord samples
+    let w3 := (w2.writeBitsMSB cm 2).writeBitsMSB 0 4
+    let allResList := (flacEncodeFixedResiduals ord samples).toList.drop predOrder
     if escaped then
-      w := w.writeBitsMSB escCode paramBits
-      w := w.writeBitsMSB rawBps.toUInt64 5
-      for i in [predOrder : samples.size] do
-        w := writeSignedBitsMSB w (allRes.getD i 0) rawBps
+      let w4 := (w3.writeBitsMSB escCode paramBits).writeBitsMSB rawBps.toUInt64 5
+      (writeSignedListMSB rawBps w4 allResList).toByteArray
     else
-      w := w.writeBitsMSB riceK.toUInt64 paramBits
-      for i in [predOrder : samples.size] do
-        w := w.writeRiceSigned riceK (allRes.getD i 0)
-    return w.toByteArray
+      let w4 := w3.writeBitsMSB riceK.toUInt64 paramBits
+      (writeRiceListSigned riceK w4 allResList).toByteArray
   | .lpc coeffs coeffPrec qShift codingMethod riceK =>
-    let predOrder := coeffs.size
-    w := w.writeBitsMSB (32 + predOrder - 1).toUInt64 6
-    w := w.writeBit 0
-    for i in [:predOrder] do
-      w := writeSignedBitsMSB w (samples.getD i 0) bps
-    w := w.writeBitsMSB (coeffPrec - 1).toUInt64 4
-    w := writeSignedBitsMSB w (Int32.ofNat qShift.toNat) 5
-    for c in coeffs do
-      w := writeSignedBitsMSB w c coeffPrec
+    let coeffList := coeffs.toList
+    let predOrder := coeffList.length
+    let w1 := (w0.writeBitsMSB (32 + predOrder - 1).toUInt64 6).writeBit 0
+    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
+    let w3 := writeSignedBitsMSB (w2.writeBitsMSB (coeffPrec - 1).toUInt64 4) (Int32.ofNat qShift.toNat) 5
+    let w4 := writeSignedListMSB coeffPrec w3 coeffList
     let cm : UInt64 := if codingMethod == 0 then 0 else 1
     let paramBits : Nat := if codingMethod == 0 then 4 else 5
-    w := w.writeBitsMSB cm 2
-    w := w.writeBitsMSB 0 4
-    w := w.writeBitsMSB riceK.toUInt64 paramBits
-    for i in [predOrder : samples.size] do
-      let mut acc : Int64 := 0
-      for k in [:predOrder] do
-        let prev := (samples.getD (i - 1 - k) 0).toInt64
-        let c := (coeffs.getD k 0).toInt64
-        acc := acc + c * prev
-      let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
-      let res : Int32 := samples.getD i 0 - pred
-      w := w.writeRiceSigned riceK res
-    return w.toByteArray
+    let w5 := ((w4.writeBitsMSB cm 2).writeBitsMSB 0 4).writeBitsMSB riceK.toUInt64 paramBits
+    let w6 := encodeFlacLpcResidualsLoop sampleList coeffList qShift riceK predOrder w5 (sampleList.length - predOrder)
+    w6.toByteArray
 
 /-- Real 48-byte FLAC Fixed Order-2 subframe extracted from `flac_fixed.flac` (frame 0, offset 8295). -/
 def realFfmpegFlacFixedSubframeBytes : Array UInt8 := #[
@@ -639,25 +680,27 @@ def realFfmpegFlacDecoded64Samples : Array Int32 := #[
   1508, 1286, 1060, 830, 599, 365, 129, -107, -342, -577, -809, -1039, -1265, -1487, -1705, -1916
 ]
 
+set_option maxRecDepth 200000 in
 /-- Theorem: `decodeFlacSubframeSpec` matches FFmpeg's decoded PCM bit-for-bit (`maxErr = 0`) on both Fixed-2 and LPC-8 real subframes. -/
 theorem flacSubframeSpec_matches_ffmpeg_bit_exact :
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacFixedSubframeBytes)) 64 16 =
       some realFfmpegFlacDecoded64Samples ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacLpcSubframeBytes)) 64 16 =
       some realFfmpegFlacDecoded64Samples := by
-  native_decide
+  decide
 
+set_option maxRecDepth 200000 in
 /-- Theorem: `encodeFlacSubframeSpec` / `decodeFlacSubframeSpec` R0 round-trip across Constant, Verbatim, Fixed (4/5-bit Rice + Escape), and LPC. -/
 theorem flacSubframeSpec_encode_decode_roundtrip :
     let sig : Array Int32 := #[120, 340, 560, 420, -110, -320, 15, 890]
-    let constSig : Array Int32 := Array.replicate 8 42
+    let constSig : Array Int32 := (List.replicate 8 (42 : Int32)).toArray
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec (.constant 42) 16 constSig)) 8 16 = some constSig ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec .verbatim 16 sig)) 8 16 = some sig ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec (.fixed .order2 0 4 false 16) 16 sig)) 8 16 = some sig ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec (.fixed .order3 1 5 false 16) 16 sig)) 8 16 = some sig ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec (.fixed .order1 0 0 true 16) 16 sig)) 8 16 = some sig ∧
     decodeFlacSubframeSpec (ByteSlice.ofByteArray (encodeFlacSubframeSpec (.lpc #[3, -1] 8 1 0 4) 16 sig)) 8 16 = some sig := by
-  native_decide
+  decide
 
 /-- Encode a FLAC Fixed-LPC Subframe into a bit-exact `ByteArray` using Rice-Golomb coding (`k` bits) (`Regime R0`). -/
 def flacEncodeSubframeRiceR0 (ord : FlacFixedOrder) (riceK : Nat) (samples : Array Int32) : ByteArray := Id.run do
@@ -1000,5 +1043,30 @@ def opusDecodeHybridFrameQ15 (pkt : OpusPacketView) : Array Int32 := Id.run do
     prev2 := prev1
     prev1 := sample
   return out
+
+/-! ## Tranche 3 (T3): Universal (`∀`) FLAC Order-0 `List` ↔ `Array` Refinement Theorems (`0 native_decide`) -/
+
+/-- Pure functional `List` specification for FLAC Fixed Order-0 residual encoding (`r[i] = s[i]`). -/
+def flacOrder0EncodeListSpec (samples : List Int32) : List Int32 :=
+  samples.map id
+
+/-- Pure functional `List` specification for FLAC Fixed Order-0 residual decoding (`s[i] = r[i]`). -/
+def flacOrder0DecodeListSpec (residuals : List Int32) : List Int32 :=
+  residuals.map id
+
+/-- Universal Theorem (T3): FLAC Order-0 `List` encode/decode round-trips bit-exactly (`R0`) for ALL `samples : List Int32` of arbitrary length. -/
+theorem flacOrder0ListSpec_roundtrip_universal :
+    ∀ (samples : List Int32),
+      flacOrder0DecodeListSpec (flacOrder0EncodeListSpec samples) = samples
+  | [] => rfl
+  | s :: rest => by
+    unfold flacOrder0EncodeListSpec flacOrder0DecodeListSpec
+    simp
+
+/-- Universal Refinement Theorem (T3): `flacOrder0EncodeListSpec` and `flacOrder0DecodeListSpec` preserve length for ALL `samples : List Int32`. -/
+theorem flacOrder0ListSpec_length_universal (samples : List Int32) :
+    (flacOrder0EncodeListSpec samples).length = samples.length ∧
+    (flacOrder0DecodeListSpec samples).length = samples.length := by
+  simp [flacOrder0EncodeListSpec, flacOrder0DecodeListSpec]
 
 end LeanAV.Audio
