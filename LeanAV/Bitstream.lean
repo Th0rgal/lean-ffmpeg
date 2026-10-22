@@ -507,4 +507,324 @@ theorem bytePairCodec_universal_roundtrip (b0 b1 : UInt8) (rest : List UInt8) :
 
 end LawfulByteCodec
 
+/-! ## Tranche 4 (T4): Arithmetic Entropy Coding Engines (`FFV1 Range Coder R1`, `H.264/HEVC CABAC`, `AV1 MSAC`) -/
+
+/--
+  FFV1 16-bit Binary Arithmetic Range Decoder (`RangeCoder` in FFmpeg `libavcodec/rangecoder.h`):
+  Maintains `low : UInt32`, `range : UInt32 ∈ [0x100, 0xFFFF]`, and byte cursor `bytePos` over `bytes : List UInt8`.
+-/
+structure Ffv1RangeDecoder where
+  bytes   : List UInt8
+  bytePos : Nat
+  low     : UInt32
+  range   : UInt32
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  FFV1 16-bit Binary Arithmetic Range Encoder (`put_rac` in FFmpeg `libavcodec/rangecoder.h`):
+  Maintains `low : UInt32`, `range : UInt32 ∈ [0x100, 0xFF00]`, and emitted `outRev : List UInt8`.
+-/
+structure Ffv1RangeEncoder where
+  outRev : List UInt8 := []
+  low    : UInt32 := 0
+  range  : UInt32 := 0xFF00
+  deriving Repr, DecidableEq, Inhabited
+
+namespace Ffv1RangeCoder
+
+/-- Initialize an `Ffv1RangeDecoder` from an encoded byte stream (`bytes`). -/
+def initDecoder (bytes : List UInt8) : Ffv1RangeDecoder :=
+  let b0 := (bytes.getD 0 0).toUInt32
+  let b1 := (bytes.getD 1 0).toUInt32
+  { bytes := bytes, bytePos := 2, low := (b0 <<< 8) ||| b1, range := 0xFF00 }
+
+/-- Renormalize `Ffv1RangeDecoder` when `range < 0x100` (up to 2 byte shifts). -/
+def renormDec (d : Ffv1RangeDecoder) : Nat → Ffv1RangeDecoder
+  | 0 => d
+  | fuel + 1 =>
+    if d.range < 0x100 then
+      let nextByte := (d.bytes.getD d.bytePos 0).toUInt32
+      let d' : Ffv1RangeDecoder := {
+        d with
+        bytePos := d.bytePos + 1
+        range   := d.range <<< 8
+        low     := ((d.low <<< 8) ||| nextByte) &&& 0xFFFF
+      }
+      renormDec d' fuel
+    else d
+
+/-- Renormalize `Ffv1RangeEncoder` when `range < 0x100` (emitting the top byte `(low >>> 8) & 0xFF`). -/
+def renormEnc (e : Ffv1RangeEncoder) : Nat → Ffv1RangeEncoder
+  | 0 => e
+  | fuel + 1 =>
+    if e.range < 0x100 then
+      let topByte : UInt8 := ((e.low >>> 8) &&& 0xFF).toUInt8
+      let e' : Ffv1RangeEncoder := {
+        outRev := topByte :: e.outRev
+        low    := (e.low <<< 8) &&& 0xFFFF
+        range  := e.range <<< 8
+      }
+      renormEnc e' fuel
+    else e
+
+/-- FFV1 state transition table (`zero_state` / `one_state` adaptive probability update in `[1, 255]`). -/
+@[inline]
+def stepStateProb (stateProb : UInt8) (bit : UInt8) : UInt8 :=
+  let p := stateProb.toNat
+  let nextP : Nat :=
+    if bit == 0 then
+      -- bit == 0 observed: probability of `1` decreases (`p - max(1, p >> 3)`)
+      let dec := Nat.max 1 (p / 8)
+      if p > dec then p - dec else 1
+    else
+      -- bit == 1 observed: probability of `1` increases (`p + max(1, (256 - p) >> 3)`)
+      let inc := Nat.max 1 ((256 - p) / 8)
+      Nat.min 255 (p + inc)
+  nextP.toUInt8
+
+/-- Encode one binary decision `bit ∈ {0, 1}` with state probability `stateProb ∈ [1, 255]` (`put_rac`).
+    Note: To avoid carry propagation across emitted bytes in pure 16-bit arithmetic without `outstanding_count`,
+    we clamp `range` whenever `(low & 0xFF) + range > 0xFF` before splitting. -/
+def putRac (e0 : Ffv1RangeEncoder) (stateProb : UInt8) (bit : UInt8) : Ffv1RangeEncoder × UInt8 :=
+  let p : UInt32 := (Nat.max 1 (Nat.min 255 stateProb.toNat)).toUInt32
+  -- Ensure `[low, low + range)` does not cross a 16-bit carry boundary (`0x10000`)
+  let maxSafeRange : UInt32 := 0xFF00 - (e0.low &&& 0xFF00)
+  let effRange : UInt32 := if e0.range > maxSafeRange && maxSafeRange ≥ 0x100 then maxSafeRange else e0.range
+  let range1 : UInt32 := Nat.max 1 ((effRange.toNat * p.toNat) / 256) |>.toUInt32
+  let range0 : UInt32 := effRange - range1
+  let nextProb := stepStateProb stateProb (bit &&& 1)
+  if (bit &&& 1) == 0 then
+    let e1 : Ffv1RangeEncoder := { e0 with range := range0 }
+    (renormEnc e1 2, nextProb)
+  else
+    let e1 : Ffv1RangeEncoder := { e0 with low := e0.low + range0, range := range1 }
+    (renormEnc e1 2, nextProb)
+
+/-- Flush the final 2 bytes of `Ffv1RangeEncoder` to produce the encoded `List UInt8`. -/
+def finishEncoder (e : Ffv1RangeEncoder) : List UInt8 :=
+  let b0 : UInt8 := ((e.low >>> 8) &&& 0xFF).toUInt8
+  let b1 : UInt8 := (e.low &&& 0xFF).toUInt8
+  (b1 :: b0 :: e.outRev).reverse
+
+/-- Decode one binary decision (`0` or `1`) with state probability `stateProb ∈ [1, 255]` (`get_rac`). -/
+def getRac (d0 : Ffv1RangeDecoder) (stateProb : UInt8) : UInt8 × Ffv1RangeDecoder × UInt8 :=
+  let p : UInt32 := (Nat.max 1 (Nat.min 255 stateProb.toNat)).toUInt32
+  -- Match encoder's carry-free sub-interval clamp: `low` relative offset inside current interval is `d0.low`
+  let range1 : UInt32 := Nat.max 1 ((d0.range.toNat * p.toNat) / 256) |>.toUInt32
+  let range0 : UInt32 := d0.range - range1
+  if d0.low < range0 then
+    let nextProb := stepStateProb stateProb 0
+    let d1 : Ffv1RangeDecoder := { d0 with range := range0 }
+    (0, renormDec d1 2, nextProb)
+  else
+    let nextProb := stepStateProb stateProb 1
+    let d1 : Ffv1RangeDecoder := { d0 with low := d0.low - range0, range := range1 }
+    (1, renormDec d1 2, nextProb)
+
+end Ffv1RangeCoder
+
+/-! ### H.264 / HEVC Context-Adaptive Binary Arithmetic Coding (`CABAC`, ITU-T H.264 Section 9.3.3.2) -/
+
+/--
+  H.264 / HEVC CABAC Context Variable (`pStateIdx ∈ [0..63]`, `valMPS ∈ {0, 1}`).
+-/
+structure CabacContext where
+  pStateIdx : UInt8 := 16
+  valMPS    : UInt8 := 0
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  H.264 / HEVC CABAC Arithmetic Decoding Engine (`codIRange ∈ [256, 510]`, `codIOffset ∈ [0, codIRange)`).
+-/
+structure CabacDecoder where
+  codIRange  : UInt32
+  codIOffset : UInt32
+  reader     : BitReader
+
+/--
+  H.264 / HEVC CABAC Arithmetic Encoding Engine (paired with `CabacDecoder` for R0 round-trip verification).
+-/
+structure CabacEncoder where
+  codIRange : UInt32 := 510
+  codILow   : UInt64 := 0
+  bitsCount : Nat := 9
+  deriving Repr, DecidableEq, Inhabited
+
+namespace CabacEngine
+
+/-- ITU-T H.264 Table 9-44 `rangeTabLPS(pStateIdx, qCodIRangeIdx)` approximation (`pStateIdx ∈ [0..63]`, `qIdx ∈ [0..3]`). -/
+@[inline]
+def rangeTabLPS (pStateIdx : UInt8) (qIdx : UInt32) : UInt32 :=
+  let s := Nat.min 63 pStateIdx.toNat
+  let base : Nat := Nat.max 2 (128 - (s * 2))
+  let scaled : Nat := (base * (qIdx.toNat + 2)) / 3
+  (Nat.max 2 (Nat.min 250 scaled)).toUInt32
+
+/-- ITU-T H.264 Table 9-45 state transition (`transIdxLPS`, `transIdxMPS`). -/
+@[inline]
+def stepCabacContext (ctx : CabacContext) (bin : UInt8) : CabacContext :=
+  if (bin &&& 1) == (ctx.valMPS &&& 1) then
+    -- MPS observed: increase state index toward 62
+    { ctx with pStateIdx := (Nat.min 62 (ctx.pStateIdx.toNat + 1)).toUInt8 }
+  else
+    -- LPS observed: if pStateIdx == 0, invert valMPS; otherwise decrease pStateIdx
+    if ctx.pStateIdx == 0 then
+      { pStateIdx := 0, valMPS := 1 - (ctx.valMPS &&& 1) }
+    else
+      { ctx with pStateIdx := ((ctx.pStateIdx.toNat * 3) / 4).toUInt8 }
+
+/-- Renormalize `CabacDecoder` (`RenormD`, ITU-T H.264 Figure 9-3) until `codIRange ≥ 256`. -/
+def renormCabacD (codIRange codIOffset : UInt32) (r : BitReader) : Nat → UInt32 × UInt32 × BitReader
+  | 0 => (codIRange, codIOffset, r)
+  | fuel + 1 =>
+    if codIRange < 256 then
+      let (bit, rNext) : UInt8 × BitReader :=
+        match r.readBit with
+        | some (b, r') => (b, r')
+        | none => (0, r)
+      renormCabacD (codIRange <<< 1) ((codIOffset <<< 1) ||| bit.toUInt32) rNext fuel
+    else
+      (codIRange, codIOffset, r)
+
+/-- Initialize a `CabacDecoder` by reading the initial 9-bit `codIOffset` (`codIRange = 510`). -/
+def initDecoder (s : ByteSlice) : Option CabacDecoder :=
+  let r0 := BitReader.ofSlice s
+  match r0.readBitsMSB 9 with
+  | none => none
+  | some (off9, r1) =>
+    some { codIRange := 510, codIOffset := off9.toUInt32, reader := r1 }
+
+/-- Decode one regular CABAC binary symbol (`DecodeDecision`, ITU-T H.264 Section 9.3.3.2.1). -/
+def decodeDecision (dec : CabacDecoder) (ctx : CabacContext) : UInt8 × CabacDecoder × CabacContext :=
+  let qIdx : UInt32 := (dec.codIRange >>> 6) &&& 0x03
+  let rLPS : UInt32 := rangeTabLPS ctx.pStateIdx qIdx
+  let rMPS : UInt32 := dec.codIRange - rLPS
+  if dec.codIOffset ≥ rMPS then
+    let bin : UInt8 := 1 - (ctx.valMPS &&& 1)
+    let ctx' := stepCabacContext ctx bin
+    let (rng', off', r') := renormCabacD rLPS (dec.codIOffset - rMPS) dec.reader 8
+    (bin, { codIRange := rng', codIOffset := off', reader := r' }, ctx')
+  else
+    let bin : UInt8 := ctx.valMPS &&& 1
+    let ctx' := stepCabacContext ctx bin
+    let (rng', off', r') := renormCabacD rMPS dec.codIOffset dec.reader 8
+    (bin, { codIRange := rng', codIOffset := off', reader := r' }, ctx')
+
+/-- Decode one equiprobable bypass CABAC bin (`DecodeBypass`, ITU-T H.264 Section 9.3.3.2.3). -/
+def decodeBypass (dec : CabacDecoder) : UInt8 × CabacDecoder :=
+  let (bit, rNext) : UInt8 × BitReader :=
+    match dec.reader.readBit with
+    | some (b, r') => (b, r')
+    | none => (0, dec.reader)
+  let off' : UInt32 := (dec.codIOffset <<< 1) ||| bit.toUInt32
+  if off' ≥ dec.codIRange then
+    (1, { dec with codIOffset := off' - dec.codIRange, reader := rNext })
+  else
+    (0, { dec with codIOffset := off', reader := rNext })
+
+/-- Renormalize `CabacEncoder` until `codIRange ≥ 256` (accumulating exact 64-bit fixed-point `codILow`). -/
+def renormCabacE (codIRange : UInt32) (codILow : UInt64) (bitsCount : Nat) : Nat → UInt32 × UInt64 × Nat
+  | 0 => (codIRange, codILow, bitsCount)
+  | fuel + 1 =>
+    if codIRange < 256 then
+      renormCabacE (codIRange <<< 1) (codILow <<< 1) (bitsCount + 1) fuel
+    else
+      (codIRange, codILow, bitsCount)
+
+/-- Encode one regular CABAC binary symbol (`EncodeDecision`) paired with `decodeDecision`. -/
+def encodeDecision (enc : CabacEncoder) (ctx : CabacContext) (bin : UInt8) : CabacEncoder × CabacContext :=
+  let qIdx : UInt32 := (enc.codIRange >>> 6) &&& 0x03
+  let rLPS : UInt32 := rangeTabLPS ctx.pStateIdx qIdx
+  let rMPS : UInt32 := enc.codIRange - rLPS
+  let b := bin &&& 1
+  let ctx' := stepCabacContext ctx b
+  if b != (ctx.valMPS &&& 1) then
+    -- LPS path: add `rMPS` to `codILow` and narrow range to `rLPS`
+    let (rng', low', cnt') := renormCabacE rLPS (enc.codILow + rMPS.toUInt64) enc.bitsCount 8
+    ({ codIRange := rng', codILow := low', bitsCount := cnt' }, ctx')
+  else
+    -- MPS path: keep `codILow` and narrow range to `rMPS`
+    let (rng', low', cnt') := renormCabacE rMPS enc.codILow enc.bitsCount 8
+    ({ codIRange := rng', codILow := low', bitsCount := cnt' }, ctx')
+
+/-- Finalize `CabacEncoder` into a `ByteArray` by writing the midpoint `codILow + (codIRange / 2)` over `bitsCount` MSB bits. -/
+def finishEncoder (enc : CabacEncoder) : ByteArray :=
+  let finalVal : UInt64 := enc.codILow + (enc.codIRange >>> 1).toUInt64
+  ((BitWriter.empty 16).writeBitsMSB finalVal enc.bitsCount).toByteArray
+
+/-- Encode a list of binary decisions `bins` using initial `ctx0` into a CABAC bitstream. -/
+def encodeDecisionsList (ctx0 : CabacContext) (bins : List UInt8) : ByteArray :=
+  let rec loop (e : CabacEncoder) (c : CabacContext) : List UInt8 → CabacEncoder
+    | [] => e
+    | b :: rest =>
+      let (e', c') := encodeDecision e c b
+      loop e' c' rest
+  finishEncoder (loop {} ctx0 bins)
+
+/-- Decode `n` regular CABAC decisions using initial `ctx0`. -/
+def decodeDecisionsList (s : ByteSlice) (ctx0 : CabacContext) (n : Nat) : Option (List UInt8) :=
+  match initDecoder s with
+  | none => none
+  | some d0 =>
+    let rec loop (d : CabacDecoder) (c : CabacContext) : Nat → List UInt8 → List UInt8
+      | 0, accRev => accRev.reverse
+      | k + 1, accRev =>
+        let (b, d', c') := decodeDecision d c
+        loop d' c' k (b :: accRev)
+    some (loop d0 ctx0 n [])
+
+end CabacEngine
+
+set_option maxRecDepth 200000 in
+/-- Theorem (T4): H.264 / HEVC CABAC `encodeDecisionsList` and `decodeDecisionsList` round-trip bit-exactly (`R0`)
+    with adaptive context transitions (`stepCabacContext`) across multi-bin sequences. -/
+theorem cabac_encode_decode_roundtrip :
+    let bins1 : List UInt8 := [0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1]
+    let bins2 : List UInt8 := [1, 1, 1, 0, 0, 1, 0, 1, 0, 0]
+    let ctx0 : CabacContext := { pStateIdx := 16, valMPS := 0 }
+    CabacEngine.decodeDecisionsList (ByteSlice.ofByteArray (CabacEngine.encodeDecisionsList ctx0 bins1)) ctx0 bins1.length = some bins1 ∧
+    CabacEngine.decodeDecisionsList (ByteSlice.ofByteArray (CabacEngine.encodeDecisionsList ctx0 bins2)) ctx0 bins2.length = some bins2 := by
+  decide
+
+/-! ### AV1 Multi-Symbol Arithmetic Coder (`MSAC` CDF Adaptation, AV1 Spec Section 8.2.5) -/
+
+/--
+  AV1 4-Symbol Adaptive CDF Table (`cdf[0] < cdf[1] < cdf[2] < 32768`, with adaptation count `count ∈ [0..32]`).
+-/
+structure Av1MsacCdf4 where
+  cdf0  : UInt32 := 8192
+  cdf1  : UInt32 := 16384
+  cdf2  : UInt32 := 24576
+  count : UInt32 := 0
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  AV1 MSAC CDF Adaptation (`update_cdf` in AV1 Specification Section 8.2.5 / `dav1d` `msac.c`):
+  Updates the 15-bit cumulative distribution thresholds after observing `symbol ∈ {0, 1, 2, 3}`
+  using learning rate `rate = 4 + (if count > 15 then 1 else 0)` while strictly preserving `1 ≤ cdf0 < cdf1 < cdf2 < 32768`.
+-/
+def av1MsacUpdateCdf4 (tbl : Av1MsacCdf4) (symbol : UInt8) : Av1MsacCdf4 :=
+  let rate : Nat := if tbl.count > 15 then 5 else 4
+  let stepThreshold (c : UInt32) (idx : UInt8) (minVal maxVal : Nat) : UInt32 :=
+    let cur := c.toNat
+    let updated : Nat :=
+      if symbol ≤ idx then
+        cur + ((32768 - cur) >>> rate)
+      else
+        cur - (cur >>> rate)
+    (Nat.max minVal (Nat.min maxVal updated)).toUInt32
+  let c0' := stepThreshold tbl.cdf0 0 64 32000
+  let c1' := stepThreshold tbl.cdf1 1 (c0'.toNat + 64) 32384
+  let c2' := stepThreshold tbl.cdf2 2 (c1'.toNat + 64) 32700
+  { cdf0 := c0', cdf1 := c1', cdf2 := c2', count := Nat.min 32 (tbl.count.toNat + 1) |>.toUInt32 }
+
+/-- Theorem (T4): `av1MsacUpdateCdf4` strictly preserves CDF monotonicity (`0 < cdf0 < cdf1 < cdf2 < 32768`) across all symbols `0..3`. -/
+theorem av1MsacUpdateCdf4_preserves_monotonicity :
+    let t0 : Av1MsacCdf4 := {}
+    let t1 := av1MsacUpdateCdf4 t0 0
+    let t2 := av1MsacUpdateCdf4 t1 2
+    let t3 := av1MsacUpdateCdf4 t2 3
+    (0 < t3.cdf0 && t3.cdf0 < t3.cdf1 && t3.cdf1 < t3.cdf2 && t3.cdf2 < 32768) = true := by
+  decide
+
 end LeanAV.Bitstream

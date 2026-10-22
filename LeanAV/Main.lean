@@ -542,3 +542,8 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.hevcSaoBandFilter_list_array_refinement
 #print axioms LeanAV.Video.xorResidualsList_roundtrip_universal
 
+#print axioms LeanAV.Bitstream.cabac_encode_decode_roundtrip
+#print axioms LeanAV.Bitstream.av1MsacUpdateCdf4_preserves_monotonicity
+#print axioms LeanAV.Video.ffv1PlaneRangeR0_encode_decode_roundtrip
+#print axioms LeanAV.Video.dpb_inter_frame_chain_verified
+
