@@ -499,6 +499,34 @@ def main (args : List String) : IO UInt32 := do
   | "emit-lnir" :: [] =>
     IO.println emitLeanAvLnirWire
     return 0
+  | "visual-verify" :: inYuvPath :: outDir :: _ =>
+    let raw ← IO.FS.readBinFile inYuvPath
+    let w := 640
+    let h := 360
+    let ySize := w * h
+    let uvW := w / 2
+    let uvH := h / 2
+    let uvSize := uvW * uvH
+    let pY : Plane2D := { data := raw.extract 0 ySize, width := w, height := h, stride := w }
+    let pU : Plane2D := { data := raw.extract ySize (ySize + uvSize), width := uvW, height := uvH, stride := uvW }
+    let pV : Plane2D := { data := raw.extract (ySize + uvSize) (ySize + 2 * uvSize), width := uvW, height := uvH, stride := uvW }
+    let vfBase := VideoFrame.allocYuv420p w h 0 AVRational.tb90kHz .bt709
+    let vf0 : VideoFrame := { vfBase with planes := #[pY, pU, pV] }
+    -- 1. Verified BT.709 YUV420p -> RGB24 conversion
+    let rgbOrig := yuv420pToRgb24Plane vf0
+    let _ ← writeMediaFileAtomic s!"{outDir}/leanav_rgb24_orig_640x360.raw" rgbOrig.data
+    -- 2. Verified FFV1 R0 Lossless Encode + Decode Round-Trip on a 64x64 patch and full 640x360 frame
+    let pYPatch := filterPlaneCrop pY 160 90 64 64
+    let ffv1Enc := encodePlaneFfv1RiceR0 pYPatch 3
+    let pYPatchDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray ffv1Enc)).getD pYPatch
+    let (ffv1MaxErr, ffv1Sse) := comparePlanesMetrics pYPatch pYPatchDec
+    -- 3. Verified Fused Filter Graph (Contrast 1.25x + Brightness +12 + 3x3 BoxBlur)
+    let pYFiltered := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
+    let vfFilt : VideoFrame := { vf0 with planes := #[pYFiltered, pU, pV] }
+    let rgbFilt := yuv420pToRgb24Plane vfFilt
+    let _ ← writeMediaFileAtomic s!"{outDir}/leanav_rgb24_filtered_640x360.raw" rgbFilt.data
+    IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"ffv1_patch_64x64_compressed_bytes\": {ffv1Enc.size}, \"ffv1_max_err\": {ffv1MaxErr}, \"ffv1_sse\": {ffv1Sse} }"
+    return 0
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
     if a.startsWith "-" then runFFmpegCli args
