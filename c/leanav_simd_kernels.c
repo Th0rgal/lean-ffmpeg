@@ -2856,7 +2856,7 @@ static int leanav_copy_plane_to_dst(
     return 0;
 }
 
-#define LEANAV_ENC_SLOTS 3
+#define LEANAV_ENC_SLOTS 8
 #define LEANAV_PKT_QUEUE 64
 
 typedef struct {
@@ -2921,15 +2921,15 @@ static void *leanav_enc_worker(void *arg) {
 
         AVFrame *f = q->pool[idx];
         int send = avcodec_send_frame(q->venc, f);
+        /* Hand the buffer back at once. x264 copies what it still needs, and
+           holding the slot here stalls the decoder for the whole encode. */
+        leanav_enc_return_slot(q, idx);
         for (;;) {
             int r = ep ? avcodec_receive_packet(q->venc, ep) : AVERROR(EAGAIN);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
             if (r < 0) { q->failed = 1; break; }
             leanav_enc_take_packet(q, ep);
         }
-        /* x264 reads the frame lazily, so the buffer must stay untouched until
-           receive_packet has drained everything that frame produced. */
-        leanav_enc_return_slot(q, idx);
         if (send < 0 && send != AVERROR(EAGAIN) && send != AVERROR_EOF) q->failed = 1;
     }
     avcodec_send_frame(q->venc, NULL);
