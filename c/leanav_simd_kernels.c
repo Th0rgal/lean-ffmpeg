@@ -3117,7 +3117,7 @@ static uint64_t leanav_libav_transcode_pixel(
     }
     AVDictionary *mux_opts = NULL;
     av_dict_set(&mux_opts, "movflags", "+faststart", 0);
-    av_dict_set(&mux_opts, "reserve_index_space", "4096", 0);
+    av_dict_set(&mux_opts, "reserve_index_space", "65536", 0);
     if (avformat_write_header(ofmt, &mux_opts) < 0) {
         av_dict_free(&mux_opts);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
@@ -3730,13 +3730,13 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s%s %s -movflags +faststart -reserve_index_space 4096 %s 2>/dev/null",
+            "%s %s%s %s -movflags +faststart -reserve_index_space 65536 %s 2>/dev/null",
             ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s %s%s -movflags +faststart -reserve_index_space 4096 %s 2>/dev/null",
+            "%s %s%s -movflags +faststart -reserve_index_space 65536 %s 2>/dev/null",
             ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
