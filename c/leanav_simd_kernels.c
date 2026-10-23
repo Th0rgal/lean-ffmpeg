@@ -3366,10 +3366,7 @@ static uint64_t leanav_libav_transcode_pixel(
 
         uint64_t f_mean = 0, f_var = 0;
         size_t dst_y_sz = dst_w * dst_h;
-        int sample_stats = ((frames_done & 7ULL) == 0ULL);
-        if (!sample_stats) {
-            /* luma stats only feed the return word, so one frame in eight is enough */
-        } else if (is_10bit) {
+        if (is_10bit) {
             uint64_t sum = 0, sum_sq = 0, cnt = 0;
             size_t step = (dst_y_sz > 65536) ? 16 : 1;
             for (size_t y = 0; y < dst_h; y += (step > 1 ? 4 : 1)) {
@@ -3823,11 +3820,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
             }
         }
 
-        /* 3. Luma statistics only fill the return word, so one frame in eight is enough */
+        /* 3. Compute pixel-domain luma statistics & sampled 16x16 macroblock SAD/PSNR on the scaled output frame */
         uint64_t f_mean = 0, f_var = 0;
-        int sample_stats = ((frames_done & 7ULL) == 0ULL);
-        if (!sample_stats) {
-        } else if (is_10bit) {
+        if (is_10bit) {
             const uint16_t *dst_y16 = (const uint16_t *)dst_y;
             uint64_t sum = 0, sum_sq = 0;
             size_t step = (dst_y_sz > 65536) ? 16 : 1;
