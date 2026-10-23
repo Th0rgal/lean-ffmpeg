@@ -629,7 +629,29 @@ static void leanav_scale_plane_3x3_raw(
         const uint8_t *row1 = row0 + src_w;
         const uint8_t *row2 = row1 + src_w;
         uint8_t *out_row = dst + dy * dst_w;
-        for (size_t dx = 0; dx < dst_w; dx++) {
+        size_t dx = 0;
+#if defined(__ARM_NEON)
+        const uint16x8_t bias4 = vdupq_n_u16(4);
+        const uint16x8_t recip7282 = vdupq_n_u16(7282);
+        for (; dx + 8 <= dst_w; dx += 8) {
+            size_t sx = dx * 3;
+            uint8x8x3_t t0 = vld3_u8(row0 + sx);
+            uint8x8x3_t t1 = vld3_u8(row1 + sx);
+            uint8x8x3_t t2 = vld3_u8(row2 + sx);
+            uint16x8_t s0 = vaddl_u8(t0.val[0], t0.val[1]);
+            s0 = vaddw_u8(s0, t0.val[2]);
+            uint16x8_t s1 = vaddl_u8(t1.val[0], t1.val[1]);
+            s1 = vaddw_u8(s1, t1.val[2]);
+            uint16x8_t s2 = vaddl_u8(t2.val[0], t2.val[1]);
+            s2 = vaddw_u8(s2, t2.val[2]);
+            uint16x8_t sum9 = vaddq_u16(vaddq_u16(s0, s1), vaddq_u16(s2, bias4));
+            uint32x4_t p_lo = vmull_u16(vget_low_u16(sum9), vget_low_u16(recip7282));
+            uint32x4_t p_hi = vmull_u16(vget_high_u16(sum9), vget_high_u16(recip7282));
+            uint16x8_t avg16 = vcombine_u16(vshrn_n_u32(p_lo, 16), vshrn_n_u32(p_hi, 16));
+            vst1_u8(out_row + dx, vmovn_u16(avg16));
+        }
+#endif
+        for (; dx < dst_w; dx++) {
             size_t sx = dx * 3;
             uint32_t sum9 =
                 (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] + (uint32_t)row0[sx + 2] +
@@ -641,8 +663,47 @@ static void leanav_scale_plane_3x3_raw(
 }
 
 /*
+ * Fast 3:2 Downscale (`src_w * 2 == dst_w * 3`, e.g. 1080p 1920x1080 -> 720p 1280x720):
+ * Maps every 3x3 source block to a 2x2 destination block without per-pixel division.
+ */
+static void leanav_scale_plane_3to2_raw(
+    const uint8_t *src,
+    size_t src_w,
+    size_t src_h,
+    uint8_t *dst,
+    size_t dst_w,
+    size_t dst_h
+) {
+    for (size_t by = 0; by + 1 < dst_h; by += 2) {
+        size_t sy = (by >> 1) * 3;
+        const uint8_t *r0 = src + sy * src_w;
+        const uint8_t *r1 = r0 + src_w;
+        const uint8_t *r2 = r1 + src_w;
+        uint8_t *d0 = dst + by * dst_w;
+        uint8_t *d1 = d0 + dst_w;
+        size_t bx = 0;
+        for (; bx + 1 < dst_w; bx += 2) {
+            size_t sx = (bx >> 1) * 3;
+            uint32_t a0 = ((uint32_t)r0[sx] * 2u + (uint32_t)r0[sx + 1]) * 2u +
+                          ((uint32_t)r1[sx] * 2u + (uint32_t)r1[sx + 1]);
+            uint32_t a1 = ((uint32_t)r0[sx + 2] * 2u + (uint32_t)r0[sx + 1]) * 2u +
+                          ((uint32_t)r1[sx + 2] * 2u + (uint32_t)r1[sx + 1]);
+            uint32_t b0 = ((uint32_t)r2[sx] * 2u + (uint32_t)r2[sx + 1]) * 2u +
+                          ((uint32_t)r1[sx] * 2u + (uint32_t)r1[sx + 1]);
+            uint32_t b1 = ((uint32_t)r2[sx + 2] * 2u + (uint32_t)r2[sx + 1]) * 2u +
+                          ((uint32_t)r1[sx + 2] * 2u + (uint32_t)r1[sx + 1]);
+            d0[bx]     = (uint8_t)(((a0 + 4u) * 7282u) >> 16);
+            d0[bx + 1] = (uint8_t)(((a1 + 4u) * 7282u) >> 16);
+            d1[bx]     = (uint8_t)(((b0 + 4u) * 7282u) >> 16);
+            d1[bx + 1] = (uint8_t)(((b1 + 4u) * 7282u) >> 16);
+        }
+    }
+}
+
+/*
  * Arbitrary Q8 Bilinear 2D plane scaler (`src_w x src_h -> dst_w x dst_h`):
- * Handles 1080p -> 720p (3:2), 4K -> 1440p, 720p -> 1080p, etc.
+ * Dispatches to specialized zero-division `2x2`, `3x3`, and `3:2` kernels, or precomputes
+ * `sx0[dx]` and `fx[dx]` tables outside the row loop to eliminate all inner-loop divisions.
  */
 static void leanav_scale_plane_bilinear_raw(
     const uint8_t *src,
@@ -664,6 +725,28 @@ static void leanav_scale_plane_bilinear_raw(
         leanav_scale_plane_3x3_raw(src, src_w, src_h, dst);
         return;
     }
+    if (src_w * 2 == dst_w * 3 && src_h * 2 == dst_h * 3 && (dst_w & 1) == 0 && (dst_h & 1) == 0) {
+        leanav_scale_plane_3to2_raw(src, src_w, src_h, dst, dst_w, dst_h);
+        return;
+    }
+    uint32_t *sx0_tab = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
+    uint32_t *sx1_tab = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
+    uint16_t *fx_tab  = (uint16_t *)malloc(dst_w * sizeof(uint16_t));
+    if (!sx0_tab || !sx1_tab || !fx_tab) {
+        free(sx0_tab);
+        free(sx1_tab);
+        free(fx_tab);
+        return;
+    }
+    for (size_t dx = 0; dx < dst_w; dx++) {
+        size_t sx_q8 = (dx * src_w * 256) / dst_w;
+        size_t s0 = sx_q8 >> 8;
+        if (s0 >= src_w) s0 = src_w - 1;
+        size_t s1 = (s0 + 1 < src_w) ? (s0 + 1) : s0;
+        sx0_tab[dx] = (uint32_t)s0;
+        sx1_tab[dx] = (uint32_t)s1;
+        fx_tab[dx]  = (uint16_t)(sx_q8 & 0xFF);
+    }
     for (size_t dy = 0; dy < dst_h; dy++) {
         size_t sy_q8 = (dy * src_h * 256) / dst_h;
         size_t sy0 = sy_q8 >> 8;
@@ -675,11 +758,9 @@ static void leanav_scale_plane_bilinear_raw(
         const uint8_t *row1 = src + sy1 * src_w;
         uint8_t *out_row = dst + dy * dst_w;
         for (size_t dx = 0; dx < dst_w; dx++) {
-            size_t sx_q8 = (dx * src_w * 256) / dst_w;
-            size_t sx0 = sx_q8 >> 8;
-            if (sx0 >= src_w) sx0 = src_w - 1;
-            size_t sx1 = (sx0 + 1 < src_w) ? (sx0 + 1) : sx0;
-            uint32_t fx = (uint32_t)(sx_q8 & 0xFF);
+            uint32_t sx0 = sx0_tab[dx];
+            uint32_t sx1 = sx1_tab[dx];
+            uint32_t fx  = fx_tab[dx];
             uint32_t ifx = 256u - fx;
             uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
             uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
@@ -687,12 +768,15 @@ static void leanav_scale_plane_bilinear_raw(
             out_row[dx] = (uint8_t)(val > 255u ? 255u : val);
         }
     }
+    free(sx0_tab);
+    free(sx1_tab);
+    free(fx_tab);
 }
 
 /*
  * BT.2020 -> BT.709 Q10 Chroma Re-matrixing + Optional Luma Contrast/Brightness LUT (`filter_flags`):
  * - bit 0 (1): apply BT.2020 -> BT.709 chroma cross-matrix on U/V planes
- * - bit 1 (2): apply Reinhard HDR-to-SDR highlight knee tonemap on Y plane
+ * - bit 1 (2): apply Reinhard HDR-to-SDR highlight knee tonemap on Y plane (via 256-byte LUT)
  * - bit 2 (4): apply 3x3 edge-preserving denoise on Y plane
  */
 static void leanav_apply_pixel_filters_raw(
@@ -706,12 +790,19 @@ static void leanav_apply_pixel_filters_raw(
     size_t y_sz = dst_w * dst_h;
     size_t uv_sz = (dst_w >> 1) * (dst_h >> 1);
     if (filter_flags & 2u) {
+        static int tm_init = 0;
+        static uint8_t tm_lut[256];
+        if (!tm_init) {
+            for (uint32_t yn = 0; yn < 256; yn++) {
+                uint32_t num = yn * 320u * 255u;
+                uint32_t den = 65280u + yn * 64u;
+                uint32_t out_y = num / den;
+                tm_lut[yn] = (uint8_t)(out_y > 255u ? 255u : out_y);
+            }
+            tm_init = 1;
+        }
         for (size_t i = 0; i < y_sz; i++) {
-            uint32_t yn = y_plane[i];
-            uint32_t num = yn * 320u * 255u;
-            uint32_t den = 65280u + yn * 64u;
-            uint32_t out_y = num / den;
-            y_plane[i] = (uint8_t)(out_y > 255u ? 255u : out_y);
+            y_plane[i] = tm_lut[y_plane[i]];
         }
     }
     if (filter_flags & 1u) {
