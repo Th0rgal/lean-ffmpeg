@@ -2568,7 +2568,7 @@ static int leanav_open_encoder(
     if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
         const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
         av_opt_set(ctx->priv_data, "preset", preset, 0);
-        av_opt_set_int(ctx->priv_data, "threads", 6, 0);
+        av_opt_set_int(ctx->priv_data, "threads", 4, 0);
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
         av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
