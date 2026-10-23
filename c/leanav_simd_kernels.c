@@ -2614,114 +2614,12 @@ static int leanav_open_audio_encoder(AVCodecContext **aenc_out, int sample_rate,
     return 0;
 }
 
-#define LEANAV_APKT_QUEUE 256
-
-typedef struct {
-    AVPacket *q[LEANAV_APKT_QUEUE];
-    int head, tail, count;
-    pthread_mutex_t mu;
-    pthread_cond_t has_room, has_pkt;
-    int closed;
-} leanav_apkt_queue_t;
-
-typedef struct {
-    leanav_apkt_queue_t in;
-    leanav_apkt_queue_t out;
-    AVCodecContext *adec;
-    AVCodecContext *aenc;
-    SwrContext *swr;
-    AVAudioFifo *afifo;
-    AVStream *oas;
-    int a_ch;
-    uint64_t audio_bytes;
-} leanav_audio_job_t;
-
-static void *leanav_audio_worker(void *arg) {
-    leanav_audio_job_t *j = (leanav_audio_job_t *)arg;
-    int64_t next_a_pts = 0;
-    for (;;) {
-        pthread_mutex_lock(&j->in.mu);
-        while (j->in.count == 0 && !j->in.closed) pthread_cond_wait(&j->in.has_pkt, &j->in.mu);
-        if (j->in.count == 0 && j->in.closed) { pthread_mutex_unlock(&j->in.mu); break; }
-        AVPacket *p = j->in.q[j->in.head];
-        j->in.q[j->in.head] = NULL;
-        j->in.head = (j->in.head + 1) % LEANAV_APKT_QUEUE;
-        j->in.count--;
-        pthread_cond_signal(&j->in.has_room);
-        pthread_mutex_unlock(&j->in.mu);
-        if (avcodec_send_packet(j->adec, p) >= 0) {
-            AVFrame *af = av_frame_alloc();
-            while (af && avcodec_receive_frame(j->adec, af) >= 0) {
-                int out_samples = (int)av_rescale_rnd(
-                    swr_get_delay(j->swr, j->adec->sample_rate) + af->nb_samples,
-                    j->aenc->sample_rate, j->adec->sample_rate, AV_ROUND_UP);
-                uint8_t **out_buf = NULL;
-                int linesize = 0;
-                if (av_samples_alloc_array_and_samples(&out_buf, &linesize, j->a_ch, out_samples, j->aenc->sample_fmt, 0) >= 0) {
-                    int converted = swr_convert(j->swr, out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
-                    if (converted > 0) {
-                        av_audio_fifo_write(j->afifo, (void **)out_buf, converted);
-                        leanav_drain_audio_fifo(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes);
-                    }
-                    av_freep(&out_buf[0]);
-                    av_freep(&out_buf);
-                }
-                av_frame_unref(af);
-            }
-            av_frame_free(&af);
-        }
-        av_packet_free(&p);
-    }
-    int delay = j->swr ? swr_get_delay(j->swr, j->aenc->sample_rate) : 0;
-    if (delay > 0) {
-        uint8_t **out_buf = NULL;
-        int linesize = 0;
-        if (av_samples_alloc_array_and_samples(&out_buf, &linesize, j->a_ch, delay + 32, j->aenc->sample_fmt, 0) >= 0) {
-            int converted = swr_convert(j->swr, out_buf, delay + 32, NULL, 0);
-            if (converted > 0) av_audio_fifo_write(j->afifo, (void **)out_buf, converted);
-            av_freep(&out_buf[0]);
-            av_freep(&out_buf);
-        }
-    }
-    leanav_drain_audio_fifo(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 1, &j->audio_bytes);
-    avcodec_send_frame(j->aenc, NULL);
-    AVPacket *ap = av_packet_alloc();
-    while (ap && avcodec_receive_packet(j->aenc, ap) >= 0) {
-        if (ap->size > 0) j->audio_bytes += (uint64_t)ap->size;
-        ap->stream_index = j->oas->index;
-        av_packet_rescale_ts(ap, j->aenc->time_base, j->oas->time_base);
-        leanav_apkt_push(&j->out, av_packet_clone(ap));
-        av_packet_unref(ap);
-    }
-    if (ap) av_packet_free(&ap);
-    pthread_mutex_lock(&j->out.mu);
-    j->out.closed = 1;
-    pthread_cond_signal(&j->out.has_pkt);
-    pthread_mutex_unlock(&j->out.mu);
-    return NULL;
-}
-
-static void leanav_apkt_push(leanav_apkt_queue_t *q, AVPacket *p) {
-    pthread_mutex_lock(&q->mu);
-    while (q->count == LEANAV_APKT_QUEUE && !q->closed) pthread_cond_wait(&q->has_room, &q->mu);
-    if (!q->closed) {
-        q->q[q->tail] = p;
-        q->tail = (q->tail + 1) % LEANAV_APKT_QUEUE;
-        q->count++;
-        pthread_cond_signal(&q->has_pkt);
-    } else {
-        av_packet_free(&p);
-    }
-    pthread_mutex_unlock(&q->mu);
-}
-
 static void leanav_drain_audio_fifo(
-    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, leanav_apkt_queue_t *out_q,
+    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, AVFormatContext *ofmt,
     int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes
 ) {
     (void)a_ch;
-    (void)oas;
-    if (!fifo || !aenc || !out_q) return;
+    if (!fifo || !aenc || !oas || !ofmt) return;
     int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
     while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
         int nb = av_audio_fifo_size(fifo);
@@ -2746,9 +2644,9 @@ static void leanav_drain_audio_fifo(
             AVPacket *ap = av_packet_alloc();
             while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
                 if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
-                ap->stream_index = oas ? oas->index : 1;
-                av_packet_rescale_ts(ap, aenc->time_base, oas ? oas->time_base : aenc->time_base);
-                leanav_apkt_push(out_q, av_packet_clone(ap));
+                ap->stream_index = oas->index;
+                av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
+                av_interleaved_write_frame(ofmt, ap);
                 av_packet_unref(ap);
             }
             if (ap) av_packet_free(&ap);
@@ -3363,23 +3261,9 @@ static uint64_t leanav_libav_transcode_pixel(
     uint64_t stats_t0 = leanav_mono_us();
     double frame_dur_s = (fps_num > 0 && fps_den > 0) ? ((double)fps_den / (double)fps_num) : (1001.0 / 24000.0);
     int64_t next_v_pts = 0;
+    int64_t next_a_pts = 0;
     int video_done = 0;
     int read_eof = 0;
-    leanav_audio_job_t ajob;
-    pthread_t athread;
-    int athread_on = 0;
-    memset(&ajob, 0, sizeof(ajob));
-    if (adec && swr && aenc && oas && afifo) {
-        ajob.adec = adec; ajob.aenc = aenc; ajob.swr = swr; ajob.afifo = afifo;
-        ajob.oas = oas; ajob.a_ch = a_ch;
-        pthread_mutex_init(&ajob.in.mu, NULL);
-        pthread_cond_init(&ajob.in.has_room, NULL);
-        pthread_cond_init(&ajob.in.has_pkt, NULL);
-        pthread_mutex_init(&ajob.out.mu, NULL);
-        pthread_cond_init(&ajob.out.has_room, NULL);
-        pthread_cond_init(&ajob.out.has_pkt, NULL);
-        athread_on = pthread_create(&athread, NULL, leanav_audio_worker, &ajob) == 0;
-    }
 
     while (!video_done) {
         if (!read_eof && av_read_frame(ifmt, pkt) >= 0) {
@@ -3393,8 +3277,30 @@ static uint64_t leanav_libav_transcode_pixel(
                     av_packet_unref(pkt);
                     continue;
                 }
-            } else if (athread_on && pkt->stream_index == a_idx) {
-                leanav_apkt_push(&ajob.in, av_packet_clone(pkt));
+            } else if (a_idx >= 0 && pkt->stream_index == a_idx && adec && swr && aenc && oas && afifo) {
+                if (avcodec_send_packet(adec, pkt) >= 0) {
+                    AVFrame *af = av_frame_alloc();
+                    while (af && avcodec_receive_frame(adec, af) >= 0) {
+                        int out_samples = (int)av_rescale_rnd(
+                            swr_get_delay(swr, adec->sample_rate) + af->nb_samples,
+                            aenc->sample_rate, adec->sample_rate, AV_ROUND_UP);
+                        uint8_t **out_buf = NULL;
+                        int linesize = 0;
+                        if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, out_samples, aenc->sample_fmt, 0) >= 0) {
+                            int converted = swr_convert(swr, out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
+                            if (converted > 0) {
+                                av_audio_fifo_write(afifo, (void **)out_buf, converted);
+                                leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes);
+                            }
+                            if (out_buf) {
+                                av_freep(&out_buf[0]);
+                                av_freep(&out_buf);
+                            }
+                        }
+                        av_frame_unref(af);
+                    }
+                    av_frame_free(&af);
+                }
             }
             av_packet_unref(pkt);
         } else {
@@ -3506,21 +3412,6 @@ static uint64_t leanav_libav_transcode_pixel(
         pthread_cond_signal(&enc_q.has_frame);
         pthread_mutex_unlock(&enc_q.mu);
         leanav_enc_flush_packets(&enc_q, ofmt);
-        if (athread_on) {
-            pthread_mutex_lock(&ajob.out.mu);
-            while (ajob.out.count > 0) {
-                AVPacket *ap = ajob.out.q[ajob.out.head];
-                ajob.out.q[ajob.out.head] = NULL;
-                ajob.out.head = (ajob.out.head + 1) % LEANAV_APKT_QUEUE;
-                ajob.out.count--;
-                pthread_cond_signal(&ajob.out.has_room);
-                pthread_mutex_unlock(&ajob.out.mu);
-                av_interleaved_write_frame(ofmt, ap);
-                av_packet_free(&ap);
-                pthread_mutex_lock(&ajob.out.mu);
-            }
-            pthread_mutex_unlock(&ajob.out.mu);
-        }
         frames_done++;
         if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
             uint64_t elapsed_us = leanav_mono_us() - stats_t0;
@@ -3546,31 +3437,29 @@ static uint64_t leanav_libav_transcode_pixel(
     pthread_cond_destroy(&enc_q.has_frame);
     pthread_cond_destroy(&enc_q.has_slot);
     for (int i = 0; i < LEANAV_ENC_SLOTS; i++) if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
-    if (athread_on) {
-        pthread_mutex_lock(&ajob.in.mu);
-        ajob.in.closed = 1;
-        pthread_cond_signal(&ajob.in.has_pkt);
-        pthread_mutex_unlock(&ajob.in.mu);
-        pthread_join(athread, NULL);
-        pthread_mutex_lock(&ajob.out.mu);
-        while (ajob.out.count > 0) {
-            AVPacket *ap = ajob.out.q[ajob.out.head];
-            ajob.out.q[ajob.out.head] = NULL;
-            ajob.out.head = (ajob.out.head + 1) % LEANAV_APKT_QUEUE;
-            ajob.out.count--;
-            pthread_mutex_unlock(&ajob.out.mu);
-            av_interleaved_write_frame(ofmt, ap);
-            av_packet_free(&ap);
-            pthread_mutex_lock(&ajob.out.mu);
+    if (aenc && oas && afifo) {
+        int delay = swr ? swr_get_delay(swr, aenc->sample_rate) : 0;
+        if (delay > 0) {
+            uint8_t **out_buf = NULL;
+            int linesize = 0;
+            if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, delay + 32, aenc->sample_fmt, 0) >= 0) {
+                int converted = swr_convert(swr, out_buf, delay + 32, NULL, 0);
+                if (converted > 0) av_audio_fifo_write(afifo, (void **)out_buf, converted);
+                av_freep(&out_buf[0]);
+                av_freep(&out_buf);
+            }
         }
-        pthread_mutex_unlock(&ajob.out.mu);
-        audio_bytes = ajob.audio_bytes;
-        pthread_mutex_destroy(&ajob.in.mu);
-        pthread_cond_destroy(&ajob.in.has_room);
-        pthread_cond_destroy(&ajob.in.has_pkt);
-        pthread_mutex_destroy(&ajob.out.mu);
-        pthread_cond_destroy(&ajob.out.has_room);
-        pthread_cond_destroy(&ajob.out.has_pkt);
+        leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 1, &audio_bytes);
+        avcodec_send_frame(aenc, NULL);
+        AVPacket *ap = av_packet_alloc();
+        while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
+            if (ap->size > 0) audio_bytes += (uint64_t)ap->size;
+            ap->stream_index = oas->index;
+            av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
+            av_interleaved_write_frame(ofmt, ap);
+            av_packet_unref(ap);
+        }
+        if (ap) av_packet_free(&ap);
     }
     int trailer_rc = av_write_trailer(ofmt);
     av_packet_free(&pkt);
