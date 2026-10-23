@@ -67,6 +67,10 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/audio_fifo.h>
+#if __has_include(<libavutil/hwcontext.h>)
+#define LEANAV_HAS_HWDEC 1
+#include <libavutil/hwcontext.h>
+#endif
 #endif
 #endif
 
@@ -2993,10 +2997,23 @@ static uint64_t leanav_libav_transcode_pixel(
        threading lets a frame split across the cores the encoder is not using. */
     vdec_ctx->thread_count = 0;
     vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+#if defined(LEANAV_HAS_HWDEC) && defined(__APPLE__)
+    /* Hardware decode returns frames as CVPixelBuffer; they are transferred to
+       software YUV before the scale. A refused stream falls back to software. */
+    AVBufferRef *hw_dev = NULL;
+    if (av_hwdevice_ctx_create(&hw_dev, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0) >= 0)
+        vdec_ctx->hw_device_ctx = av_buffer_ref(hw_dev);
+#endif
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
+#if defined(LEANAV_HAS_HWDEC) && defined(__APPLE__)
+        av_buffer_unref(&vdec_ctx->hw_device_ctx);
+        if (avcodec_open2(vdec_ctx, vdec, NULL) < 0)
+#endif
+        {
+            avcodec_free_context(&vdec_ctx);
+            avformat_close_input(&ifmt);
+            return 0;
+        }
     }
     int is_10bit = (strcmp(g_enc_pix_fmt, "yuv420p10le") == 0 || strcmp(g_enc_pix_fmt, "p010le") == 0) ? 1 : 0;
     uint32_t fps_num = 24000u, fps_den = 1001u;
@@ -3313,6 +3330,20 @@ static uint64_t leanav_libav_transcode_pixel(
         if (got == AVERROR_EOF) break;
         if (got < 0) break;
 
+#if defined(LEANAV_HAS_HWDEC)
+        if (frame->hw_frames_ctx) {
+            AVFrame *sw = av_frame_alloc();
+            if (!sw || av_hwframe_transfer_data(sw, frame, 0) < 0) {
+                if (sw) av_frame_free(&sw);
+                av_frame_unref(frame);
+                continue;
+            }
+            av_frame_copy_props(sw, frame);
+            av_frame_unref(frame);
+            av_frame_move_ref(frame, sw);
+            av_frame_free(&sw);
+        }
+#endif
         if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUV420P10LE && frame->format != AV_PIX_FMT_YUVJ420P) {
             av_frame_unref(frame);
             continue;
