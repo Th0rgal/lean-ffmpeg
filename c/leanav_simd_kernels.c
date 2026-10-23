@@ -485,6 +485,16 @@ static int leanav_shell_quote_safe(const char *s, char *dst, size_t dst_cap) {
  *   bits 24..47: average lumaVariance (24 bits)
  *   bits 0..23:  average lumaMean (24 bits)
  */
+static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_in);
+static const char *leanav_color_vui_args_for_cs(int hdr_cs) {
+    if (hdr_cs == 1) {
+        return "-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv";
+    } else if (hdr_cs == 2) {
+        return "-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv";
+    }
+    return "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
+}
+
 LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
     b_lean_obj_arg in_path_str,
     b_lean_obj_arg out_path_str,
@@ -509,6 +519,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
     if (leanav_shell_quote_safe(out_path, q_out, sizeof(q_out)) != 0) return 0;
 
     const char *ffmpeg_bin = "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
+    int hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
+    const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs);
 
     char dec_cmd[8192];
     snprintf(dec_cmd, sizeof(dec_cmd),
@@ -527,14 +539,14 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt yuv420p -s %zux%zu -r 24000/1001 -i - "
             "-i %s -map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s -c:a copy -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, dst_w, dst_h, q_in, v_enc_args, q_out);
+            "%s %s -c:a copy -movflags +faststart %s 2>/dev/null",
+            ffmpeg_bin, dst_w, dst_h, q_in, v_enc_args, color_vui_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt yuv420p -s %zux%zu -r 24000/1001 -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, dst_w, dst_h, v_enc_args, q_out);
+            "%s %s -movflags +faststart %s 2>/dev/null",
+            ffmpeg_bin, dst_w, dst_h, v_enc_args, color_vui_args, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");
