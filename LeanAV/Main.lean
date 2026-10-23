@@ -862,6 +862,13 @@ def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
     (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
+  let _ ← setEncoderCliOptionsC
+    (validCfg.preset.getD "")
+    (validCfg.crf.getD "")
+    (validCfg.videoBitrate.getD "")
+    (validCfg.audioBitrate.getD "")
+    (validCfg.frameRate.getD "")
+    (validCfg.pixelFormat.getD "")
   if validCfg.videoCodec == some .copy then
     let tDemux ← IO.monoNanosNow
     let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0
@@ -988,32 +995,9 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 demux startMs durMs withAudio
         if handledFull then
           return 0
-        else if validCfg.videoCodec != some .copy then
-          let targetCodec : CodecId := match validCfg.videoCodec with
-            | some .hevc => .hevc
-            | some .av1  => .av1
-            | _          => .h264
-          let codecName := match targetCodec with
-            | .hevc => "hevc"
-            | .av1  => "av1"
-            | _     => "h264"
-          let tDemux ← IO.monoNanosNow
-          let rep ← transcodeMp44kTo1080pIpbParallelCodec demux targetCodec 8 withAudio
-          let tTranscode ← IO.monoNanosNow
-          if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-            let _ ← writeMediaFileStreaming outPath rep.outputMp4Bytes
-          let tEnd ← IO.monoNanosNow
-          let demuxUs := (tDemux - t0) / 1000
-          let transcodeUs := (tTranscode - tDemux) / 1000
-          let totalUs := (tEnd - t0) / 1000
-          let fps := if totalUs == 0 then 0 else (rep.totalFrames * 1000000) / totalUs
-          let c0 := s!"\{ \"ok\": {rep.zeroCopyDmaOk && rep.dpbPocMonotone}, \"mode\": \"ffmpeg-cli-mp4-ipb-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{rep.srcWidth}x{rep.srcHeight}\", \"dst_res\": \"{rep.dstWidth}x{rep.dstHeight}\", "
-          let c2 := s!"\"frames\": {rep.totalFrames}, \"i_frames\": {rep.iFrames}, \"p_frames\": {rep.pFrames}, \"b_frames\": {rep.bFrames}, "
-          let c3 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
-          let c4 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep.dpbPocMonotone} }"
-          IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4)
-          return 0
+        else
+          IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{inPath}\", \"output\": \"{outPath}\" }"
+          return 1
       let crc := computeFrameCrc64 rawBytes
       let xxh := formatGoldenXxh64Line inSlice
       let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
@@ -1509,6 +1493,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Format.mp4MetadataBoxInject_preserves_mdat_relative_offsets
 #print axioms LeanAV.Format.elst_rescale_mvhd_mdhd_mismatch
 #print axioms LeanAV.Cli.resolveScaleDims_proportional_even_and_cli_flags_verified
+#print axioms LeanAV.Cli.cli_encoder_options_retained_and_invalid_rejected
 #print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
 
 

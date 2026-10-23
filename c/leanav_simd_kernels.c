@@ -1054,12 +1054,16 @@ static int leanav_locate_video_boxes(
         } else if (sz == 0) {
             sz = n - pos;
         }
-        if (sz < hdr || pos + sz > n) break;
+        if (sz < hdr) break;
         if (memcmp(buf + pos + 4, "moov", 4) == 0) {
+            if (pos + sz > n) break;
             *moov_pos = pos;
             *moov_sz = (size_t)sz;
         } else if (memcmp(buf + pos + 4, "mdat", 4) == 0 && *mdat_pos == 0) {
             *mdat_pos = pos;
+            if (pos + sz > n) break;
+        } else if (pos + sz > n) {
+            break;
         }
         pos += (size_t)sz;
     }
@@ -1145,8 +1149,11 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     if (!fo) return -1;
     if (fseek(fo, 0, SEEK_END) != 0) { fclose(fo); return -1; }
     long out_fsz_l = ftell(fo);
-    if (out_fsz_l <= 0 || out_fsz_l > 512 * 1024 * 1024) { fclose(fo); return -1; }
-    size_t out_n = (size_t)out_fsz_l;
+    if (out_fsz_l <= 0) { fclose(fo); return -1; }
+    /* Read at most the first 32 MiB to locate & patch `moov` (when `+faststart` places `moov` before `mdat`) */
+    size_t max_hdr = 32 * 1024 * 1024;
+    size_t read_n = ((size_t)out_fsz_l <= max_hdr) ? (size_t)out_fsz_l : max_hdr;
+    size_t out_n = read_n;
     if (fseek(fo, 0, SEEK_SET) != 0) { fclose(fo); return -1; }
     uint8_t *out_buf = (uint8_t *)malloc(out_n + 256);
     if (!out_buf) { fclose(fo); return -1; }
@@ -1157,6 +1164,15 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     if (!leanav_locate_video_boxes(out_buf, out_n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
         free(out_buf);
         return -1;
+    }
+
+    size_t free_p = 0, free_s = 0;
+    if (moov_p + moov_s + 8 <= out_n && memcmp(out_buf + moov_p + moov_s + 4, "free", 4) == 0) {
+        uint32_t fsz = leanav_rd_u32be(out_buf + moov_p + moov_s);
+        if (fsz >= 8 && moov_p + moov_s + fsz <= out_n) {
+            free_p = moov_p + moov_s;
+            free_s = fsz;
+        }
     }
 
     /* 1. Build payload of missing stsd child boxes (pasp, colr, clli, mdcv) */
@@ -1244,6 +1260,27 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     }
 
     int32_t total_delta = (int32_t)stsd_delta + edts_delta;
+    if (total_delta > 0 && free_p > 0 && free_s >= (size_t)total_delta + 8) {
+        /* Absorb moov expansion into the adjacent `free` padding box so `mdat` and `stco`/`co64` never move! */
+        size_t new_free_p = moov_p + moov_s;
+        size_t new_free_s = free_s - (size_t)total_delta;
+        leanav_wr_u32be(out_buf + new_free_p, (uint32_t)new_free_s);
+        memcpy(out_buf + new_free_p + 4, "free", 4);
+        FILE *fw = fopen(out_path, "r+b");
+        if (!fw) { free(out_buf); return -1; }
+        fseek(fw, 0, SEEK_SET);
+        fwrite(out_buf, 1, new_free_p + 8, fw);
+        fclose(fw);
+        free(out_buf);
+        return 0;
+    }
+
+    if (read_n < (size_t)out_fsz_l && moov_p < mdat_p && total_delta != 0) {
+        /* If file is > 32 MiB and had no `free` absorber box, bail cleanly rather than truncating `mdat` */
+        free(out_buf);
+        return -1;
+    }
+
     if (total_delta != 0 && moov_p < mdat_p) {
         /* Shift all stco and co64 chunk offsets inside moov by total_delta */
         size_t m_end = moov_p + moov_s;
@@ -1342,6 +1379,30 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
     if (strstr(out, "arib-std-b67") != NULL) return 2;
     if (strstr(out, "bt2020") != NULL || strstr(out, "smpte2084") != NULL) return 1;
     return 0;
+}
+
+static char g_enc_preset[64]  = "";
+static char g_enc_crf[64]     = "";
+static char g_enc_vb[64]      = "";
+static char g_enc_ab[64]      = "";
+static char g_enc_fps[64]     = "";
+static char g_enc_pix_fmt[64] = "";
+
+LEAN_EXPORT uint32_t leanav_c_set_encoder_cli_options(
+    b_lean_obj_arg preset_str,
+    b_lean_obj_arg crf_str,
+    b_lean_obj_arg vb_str,
+    b_lean_obj_arg ab_str,
+    b_lean_obj_arg fps_str,
+    b_lean_obj_arg pix_fmt_str
+) {
+    snprintf(g_enc_preset,  sizeof(g_enc_preset),  "%s", lean_string_cstr(preset_str));
+    snprintf(g_enc_crf,     sizeof(g_enc_crf),     "%s", lean_string_cstr(crf_str));
+    snprintf(g_enc_vb,      sizeof(g_enc_vb),      "%s", lean_string_cstr(vb_str));
+    snprintf(g_enc_ab,      sizeof(g_enc_ab),      "%s", lean_string_cstr(ab_str));
+    snprintf(g_enc_fps,     sizeof(g_enc_fps),     "%s", lean_string_cstr(fps_str));
+    snprintf(g_enc_pix_fmt, sizeof(g_enc_pix_fmt), "%s", lean_string_cstr(pix_fmt_str));
+    return 1u;
 }
 
 /*
@@ -1528,26 +1589,59 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     const char *raw_in_color_args = leanav_raw_in_color_args_for_cs(hdr_cs);
     const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
-    const char *v_enc_args = "-c:v libx264 -preset faster -crf 22.6 -tune ssim -threads 0 -pix_fmt yuv420p";
+    const char *eff_pix_fmt = (g_enc_pix_fmt[0] != '\0') ? g_enc_pix_fmt : "yuv420p";
+    const char *eff_preset_x264 = (g_enc_preset[0] != '\0') ? g_enc_preset : "faster";
+    const char *eff_preset_x265 = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
+    const char *eff_crf_x264 = (g_enc_crf[0] != '\0') ? g_enc_crf : "22.6";
+    const char *eff_crf_x265 = (g_enc_crf[0] != '\0') ? g_enc_crf : "24";
+
+    char v_rate_ctrl[128];
+    if (g_enc_vb[0] != '\0') {
+        snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-b:v %s", g_enc_vb);
+    } else if (codec_id_u32 == 2) {
+        snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-crf %s", eff_crf_x265);
+    } else {
+        snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-crf %s -tune ssim", eff_crf_x264);
+    }
+
+    char v_enc_args[512];
     const char *x264_subme_suffix = ":subme=3";
     if (codec_id_u32 == 1 && has_vt_h264) {
-        v_enc_args = "-c:v h264_videotoolbox -realtime 1 -b:v 6M -allow_sw 1 -pix_fmt yuv420p";
+        snprintf(v_enc_args, sizeof(v_enc_args),
+            "-c:v h264_videotoolbox -realtime 1 -b:v %s -allow_sw 1 -pix_fmt %s",
+            (g_enc_vb[0] != '\0') ? g_enc_vb : "6M", eff_pix_fmt);
         x264_subme_suffix = "";
     } else if (codec_id_u32 == 1 && has_nvenc_h264) {
-        v_enc_args = "-c:v h264_nvenc -preset p1 -cq 23 -pix_fmt yuv420p";
+        snprintf(v_enc_args, sizeof(v_enc_args),
+            "-c:v h264_nvenc -preset p1 -cq %s -pix_fmt %s",
+            (g_enc_crf[0] != '\0') ? g_enc_crf : "23", eff_pix_fmt);
         x264_subme_suffix = "";
     } else if (codec_id_u32 == 2) {
         x264_subme_suffix = "";
         if (has_vt_hevc) {
-            v_enc_args = "-c:v hevc_videotoolbox -realtime 1 -b:v 5M -allow_sw 1 -tag:v hvc1 -pix_fmt yuv420p";
+            snprintf(v_enc_args, sizeof(v_enc_args),
+                "-c:v hevc_videotoolbox -realtime 1 -b:v %s -allow_sw 1 -tag:v hvc1 -pix_fmt %s",
+                (g_enc_vb[0] != '\0') ? g_enc_vb : "5M", eff_pix_fmt);
         } else if (has_nvenc_hevc) {
-            v_enc_args = "-c:v hevc_nvenc -preset p1 -cq 24 -tag:v hvc1 -pix_fmt yuv420p";
+            snprintf(v_enc_args, sizeof(v_enc_args),
+                "-c:v hevc_nvenc -preset p1 -cq %s -tag:v hvc1 -pix_fmt %s",
+                (g_enc_crf[0] != '\0') ? g_enc_crf : "24", eff_pix_fmt);
         } else {
-            v_enc_args = "-c:v libx265 -preset veryfast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
+            snprintf(v_enc_args, sizeof(v_enc_args),
+                "-c:v libx265 -preset %s %s -tag:v hvc1 -pix_fmt %s",
+                eff_preset_x265, v_rate_ctrl, eff_pix_fmt);
         }
     } else if (codec_id_u32 == 3) {
-        v_enc_args = "-c:v libsvtav1 -preset 12 -crf 28 -pix_fmt yuv420p";
+        snprintf(v_enc_args, sizeof(v_enc_args),
+            "-c:v libsvtav1 -preset %s -crf %s -pix_fmt %s",
+            (g_enc_preset[0] != '\0') ? g_enc_preset : "12",
+            (g_enc_crf[0] != '\0') ? g_enc_crf : "28",
+            eff_pix_fmt);
         x264_subme_suffix = "";
+    } else {
+        snprintf(v_enc_args, sizeof(v_enc_args),
+            "-c:v libx264 -preset %s %s -threads 0 -pix_fmt %s",
+            eff_preset_x264, v_rate_ctrl, eff_pix_fmt);
     }
 
     char dec_cmd[8192];
@@ -1556,26 +1650,39 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         ffmpeg_bin, ss_arg, q_in, t_arg);
 
     /* Audio: if filter_flags bit 3 (8) requests 6ch->2ch stereo AAC downmix, encode `-ac 2 -c:a aac`, else `-c:a aac -b:a 128k` */
-    const char *a_enc_args = (filter_flags_u32 & 8u)
-        ? "-af \"pan=stereo|FL=FL+0.707*FC+0.707*BL|FR=FR+0.707*FC+0.707*BR\" -c:a aac -b:a 192k"
-        : "-c:a aac -b:a 128k";
+    char a_enc_args[256];
+    if (filter_flags_u32 & 8u) {
+        snprintf(a_enc_args, sizeof(a_enc_args),
+            "-af \"pan=stereo|FL=FL+0.707*FC+0.707*BL|FR=FR+0.707*FC+0.707*BR\" -c:a aac -b:a %s",
+            (g_enc_ab[0] != '\0') ? g_enc_ab : "192k");
+    } else {
+        snprintf(a_enc_args, sizeof(a_enc_args),
+            "-c:a aac -b:a %s",
+            (g_enc_ab[0] != '\0') ? g_enc_ab : "128k");
+    }
 
     uint32_t fps_num = 24000u, fps_den = 1001u;
     leanav_probe_input_fps_rational(in_path, q_in, &fps_num, &fps_den);
+    char fps_str[64];
+    if (g_enc_fps[0] != '\0') {
+        snprintf(fps_str, sizeof(fps_str), "%s", g_enc_fps);
+    } else {
+        snprintf(fps_str, sizeof(fps_str), "%u/%u", fps_num, fps_den);
+    }
 
     char enc_cmd[8192];
     if (with_audio_u32) {
         snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %u/%u -i - "
+            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %s -i - "
             "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s%s %s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_num, fps_den, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
+            "%s %s%s %s -movflags +faststart -reserve_index_space 4096 %s 2>/dev/null",
+            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %u/%u -i - "
+            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %s -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s %s%s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_num, fps_den, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
+            "%s %s%s -movflags +faststart -reserve_index_space 4096 %s 2>/dev/null",
+            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_str, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");

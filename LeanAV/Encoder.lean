@@ -1109,6 +1109,14 @@ opaque transcodeMp4GeneralVerifiedC
     (srcW srcH dstW dstH startMs durMs codecId withAudio filterFlags : UInt32) : BaseIO UInt64
 
 /--
+  Forward explicit CLI encoder options (`-preset`, `-crf`, `-b:v`, `-b:a`, `-r`, `-pix_fmt`)
+  into the C-ABI transcode pipeline (`leanav_c_set_encoder_cli_options`).
+-/
+@[extern "leanav_c_set_encoder_cli_options"]
+opaque setEncoderCliOptionsC
+    (preset crf videoBitrate audioBitrate frameRate pixFmt : @& String) : BaseIO UInt32
+
+/--
   Retrieve real NEON/scalar acceptance metrics measured during the latest transcode:
   `bit 40: distToRefLtBlack`, `bits 24..39: psnrDbX10`, `bits 0..23: maxBlockSad16x16`.
 -/
