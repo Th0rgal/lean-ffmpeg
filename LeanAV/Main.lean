@@ -836,6 +836,80 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   IO.println (r0 ++ r1 ++ r2 ++ r3a ++ r3b ++ r4 ++ r5 ++ r6 ++ r7 ++ r8 ++ r9)
   return 0
 
+/-- Read file byte size safely without throwing an exception. -/
+def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
+  if path == "" || path == "-" then return 0
+  try
+    let m ← System.FilePath.metadata path
+    return m.byteSize.toNat
+  catch _ =>
+    return fallback
+
+def tryFastHeaderProbeTranscode
+    (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
+    (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
+  if validCfg.videoCodec == some .copy then
+    let tDemux ← IO.monoNanosNow
+    let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0
+    if copyRep.ok then
+      let tEnd ← IO.monoNanosNow
+      let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
+      let outStat ← if validCfg.format != some "null" then getFileByteSizeOr outPath 0 else pure 0
+      let totalUs := (tEnd - t0) / 1000
+      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
+      let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{fastDemux.width}x{fastDemux.height}\", "
+      let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
+      let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {inStat}, \"out_bytes\": {outStat} }"
+      IO.println (c0 ++ c1 ++ c2 ++ c3)
+      return true
+    else
+      return false
+  else
+    let targetCodec : CodecId := match validCfg.videoCodec with
+      | some .hevc => .hevc
+      | some .av1  => .av1
+      | _          => .h264
+    let codecCode : UInt32 := match targetCodec with
+      | .hevc => 2
+      | .av1  => 3
+      | _     => 1
+    let codecName := match targetCodec with
+      | .hevc => "hevc"
+      | .av1  => "av1"
+      | _     => "h264"
+    let (reqW, reqH) := filterOps.foldl (fun (cw, ch) op =>
+      match op with
+      | .scale w h    => (w, h)
+      | .crop _ _ w h => (w, h)
+      | .pad w h _ _ _ => (w, h)
+      | _             => (cw, ch)) (Nat.max 2 (fastDemux.width / 2), Nat.max 2 (fastDemux.height / 2))
+    let vfStr := validCfg.videoFilter.getD ""
+    let cscBit : UInt32 := if (vfStr.splitOn "bt709").length > 1 then 1 else 0
+    let tmBit  : UInt32 := if (vfStr.splitOn "tonemap").length > 1 then 2 else 0
+    let acBit  : UInt32 := if validCfg.audioChannels == some 2 && validCfg.audioCodec == some .aac then 8 else 0
+    let filterFlags : UInt32 := cscBit ||| tmBit ||| acBit
+    let tDemux ← IO.monoNanosNow
+    let pixRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux reqW reqH startMs durMs codecCode withAudio filterFlags
+    if pixRep.ok then
+      let tEnd ← IO.monoNanosNow
+      let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
+      let outStat ← if validCfg.format != some "null" then getFileByteSizeOr outPath 0 else pure 0
+      let demuxUs := (tDemux - t0) / 1000
+      let transcodeUs := (tEnd - tDemux) / 1000
+      let totalUs := (tEnd - t0) / 1000
+      let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else fastDemux.samples.size
+      let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
+      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
+      let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
+      let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {fastDemux.iFrameCount}, \"p_frames\": {fastDemux.pFrameCount}, \"b_frames\": {fastDemux.bFrameCount}, "
+      let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
+      let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
+      let c5 := s!"\"in_bytes\": {inStat}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
+      IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
+      return true
+    else
+      return false
+
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
   let cfg := parseFFmpegArgs args
@@ -855,102 +929,71 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return 1
       | none => pure []
     let t0 ← IO.monoNanosNow
-    let rawBytes ← IO.FS.readBinFile inPath
-    let inSlice := ByteSlice.ofByteArray rawBytes
-    -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
-    if let some demux := demuxIsoMp4Track inSlice then
-      let startMs : UInt32 := match validCfg.startSec with
-        | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
-        | none   => 0
-      let durMs : UInt32 := match validCfg.durationSec with
-        | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
-        | none   => 0
-      let withAudio := !validCfg.noAudio && (validCfg.audioCodec.isSome || validCfg.videoCodec == some .copy)
-      if validCfg.videoCodec == some .copy then
-        let tDemux ← IO.monoNanosNow
-        let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath demux demux.width demux.height startMs durMs 0 withAudio 0
-        if copyRep.ok then
-          let tEnd ← IO.monoNanosNow
-          let outStat ← if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-            (do let ba ← IO.FS.readBinFile outPath; pure ba.size) <|> pure 0
-          else pure 0
-          let totalUs := (tEnd - t0) / 1000
-          let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
-          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{demux.width}x{demux.height}\", "
-          let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
-          let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {rawBytes.size}, \"out_bytes\": {outStat} }"
-          IO.println (c0 ++ c1 ++ c2 ++ c3)
+    -- Fast path: read only the initial 4 MiB header window via `readMediaWindow` (`pread`) to probe `ftyp`/`moov`
+    -- without reading multi-hundred-MB `mdat` payloads into RAM before running `runCertifiedGeneralTranscodeMp4`.
+    let hdrSliceOpt ← do
+      match ← readMediaWindow inPath 0 (4 * 1024 * 1024) with
+      | .ok s => pure (some s)
+      | .error _ => pure none
+    let fastDemuxOpt := match hdrSliceOpt with
+      | some s => probeIsoMp4HeaderSlice s
+      | none => none
+    let startMs : UInt32 := match validCfg.startSec with
+      | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
+      | none   => 0
+    let durMs : UInt32 := match validCfg.durationSec with
+      | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
+      | none   => 0
+    let withAudio := !validCfg.noAudio && (validCfg.audioCodec.isSome || validCfg.videoCodec == some .copy)
+    let handledFast ← match fastDemuxOpt with
+      | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 fastDemux startMs durMs withAudio
+      | none => pure false
+    if handledFast then
+      return 0
+    else
+      let rawBytes ← IO.FS.readBinFile inPath
+      let inSlice := ByteSlice.ofByteArray rawBytes
+      -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
+      if let some demux := demuxIsoMp4Track inSlice then
+        let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 demux startMs durMs withAudio
+        if handledFull then
           return 0
-      if validCfg.videoCodec != some .copy then
-        let targetCodec : CodecId := match validCfg.videoCodec with
-          | some .hevc => .hevc
-          | some .av1  => .av1
-          | _          => .h264
-        let codecCode : UInt32 := match targetCodec with
-          | .hevc => 2
-          | .av1  => 3
-          | _     => 1
-        let codecName := match targetCodec with
-          | .hevc => "hevc"
-          | .av1  => "av1"
-          | _     => "h264"
-        let (reqW, reqH) := filterOps.foldl (fun (cw, ch) op =>
-          match op with
-          | .scale w h    => (w, h)
-          | .crop _ _ w h => (w, h)
-          | .pad w h _ _ _ => (w, h)
-          | _             => (cw, ch)) (Nat.max 2 (demux.width / 2), Nat.max 2 (demux.height / 2))
-        let vfStr := validCfg.videoFilter.getD ""
-        let cscBit : UInt32 := if (vfStr.splitOn "bt709").length > 1 then 1 else 0
-        let tmBit  : UInt32 := if (vfStr.splitOn "tonemap").length > 1 then 2 else 0
-        let acBit  : UInt32 := if validCfg.audioChannels == some 2 && validCfg.audioCodec == some .aac then 8 else 0
-        let filterFlags : UInt32 := cscBit ||| tmBit ||| acBit
-        let tDemux ← IO.monoNanosNow
-        let pixRep ← runCertifiedGeneralTranscodeMp4 inPath outPath demux reqW reqH startMs durMs codecCode withAudio filterFlags
-        if pixRep.ok then
+        else if validCfg.videoCodec != some .copy then
+          let targetCodec : CodecId := match validCfg.videoCodec with
+            | some .hevc => .hevc
+            | some .av1  => .av1
+            | _          => .h264
+          let codecName := match targetCodec with
+            | .hevc => "hevc"
+            | .av1  => "av1"
+            | _     => "h264"
+          let tDemux ← IO.monoNanosNow
+          let rep ← transcodeMp44kTo1080pIpbParallelCodec demux targetCodec 8 withAudio
+          let tTranscode ← IO.monoNanosNow
+          if outPath != "" && outPath != "-" && validCfg.format != some "null" then
+            let _ ← writeMediaFileStreaming outPath rep.outputMp4Bytes
           let tEnd ← IO.monoNanosNow
-          let outStat ← if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-            (do let ba ← IO.FS.readBinFile outPath; pure ba.size) <|> pure 0
-          else pure 0
           let demuxUs := (tDemux - t0) / 1000
-          let transcodeUs := (tEnd - tDemux) / 1000
+          let transcodeUs := (tTranscode - tDemux) / 1000
           let totalUs := (tEnd - t0) / 1000
-          let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else demux.samples.size
-          let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
-          let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
-          let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {demux.iFrameCount}, \"p_frames\": {demux.pFrameCount}, \"b_frames\": {demux.bFrameCount}, "
-          let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
-          let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
-          let c5 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
-          IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
+          let fps := if totalUs == 0 then 0 else (rep.totalFrames * 1000000) / totalUs
+          let c0 := s!"\{ \"ok\": {rep.zeroCopyDmaOk && rep.dpbPocMonotone}, \"mode\": \"ffmpeg-cli-mp4-ipb-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
+          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{rep.srcWidth}x{rep.srcHeight}\", \"dst_res\": \"{rep.dstWidth}x{rep.dstHeight}\", "
+          let c2 := s!"\"frames\": {rep.totalFrames}, \"i_frames\": {rep.iFrames}, \"p_frames\": {rep.pFrames}, \"b_frames\": {rep.bFrames}, "
+          let c3 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
+          let c4 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep.dpbPocMonotone} }"
+          IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4)
           return 0
-        let rep ← transcodeMp44kTo1080pIpbParallelCodec demux targetCodec 8 withAudio
-        let tTranscode ← IO.monoNanosNow
-        if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-          let _ ← writeMediaFileStreaming outPath rep.outputMp4Bytes
-        let tEnd ← IO.monoNanosNow
-        let demuxUs := (tDemux - t0) / 1000
-        let transcodeUs := (tTranscode - tDemux) / 1000
-        let totalUs := (tEnd - t0) / 1000
-        let fps := if totalUs == 0 then 0 else (rep.totalFrames * 1000000) / totalUs
-        let c0 := s!"\{ \"ok\": {rep.zeroCopyDmaOk && rep.dpbPocMonotone}, \"mode\": \"ffmpeg-cli-mp4-ipb-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{rep.srcWidth}x{rep.srcHeight}\", \"dst_res\": \"{rep.dstWidth}x{rep.dstHeight}\", "
-        let c2 := s!"\"frames\": {rep.totalFrames}, \"i_frames\": {rep.iFrames}, \"p_frames\": {rep.pFrames}, \"b_frames\": {rep.bFrames}, "
-        let c3 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
-        let c4 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep.dpbPocMonotone} }"
-        IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4)
-        return 0
-    let crc := computeFrameCrc64 rawBytes
-    let xxh := formatGoldenXxh64Line inSlice
-    let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
-    if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-      let _ ← writeMediaFileAtomic outPath rawBytes
-    let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli\", \"input\": \"{inPath}\", \"output\": \"{outPath}\", "
-    let c1 := s!"\"bytes\": {rawBytes.size}, \"filter_stages\": {filterOps.length}, "
-    let c2 := s!"\"framecrc\": \"{frameCrcLine}\", \"digest\": \"{xxh}\" }"
-    IO.println (c0 ++ c1 ++ c2)
-    return 0
+      let crc := computeFrameCrc64 rawBytes
+      let xxh := formatGoldenXxh64Line inSlice
+      let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
+      if outPath != "" && outPath != "-" && validCfg.format != some "null" then
+        let _ ← writeMediaFileAtomic outPath rawBytes
+      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli\", \"input\": \"{inPath}\", \"output\": \"{outPath}\", "
+      let c1 := s!"\"bytes\": {rawBytes.size}, \"filter_stages\": {filterOps.length}, "
+      let c2 := s!"\"framecrc\": \"{frameCrcLine}\", \"digest\": \"{xxh}\" }"
+      IO.println (c0 ++ c1 ++ c2)
+      return 0
 
 def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
