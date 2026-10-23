@@ -2572,7 +2572,10 @@ static int leanav_open_encoder(
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
         av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
-        if (strcmp(enc_name, "libx264") == 0) av_opt_set(ctx->priv_data, "tune", "ssim", 0);
+        if (strcmp(enc_name, "libx264") == 0) {
+            av_opt_set(ctx->priv_data, "tune", "ssim", 0);
+            av_opt_set(ctx->priv_data, "rc-lookahead", "0", 0);
+        }
     } else if (strcmp(enc_name, "libsvtav1") == 0) {
         av_opt_set(ctx->priv_data, "preset", (g_enc_preset[0] != '\0') ? g_enc_preset : "12", 0);
         char crf_buf[32];
