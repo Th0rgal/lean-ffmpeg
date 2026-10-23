@@ -2991,12 +2991,9 @@ static uint64_t leanav_libav_transcode_pixel(
         avformat_close_input(&ifmt);
         return 0;
     }
-    /* The encoder takes half the cores, so the decoder must stay inside the
-       other half or the two pools fight and the wall time goes back up. */
-    long ncpu_dec = sysconf(_SC_NPROCESSORS_ONLN);
-    int dec_threads = (ncpu_dec > 2) ? (int)ncpu_dec / 2 - 1 : 1;
-    if (dec_threads < 1) dec_threads = 1;
-    vdec_ctx->thread_count = dec_threads;
+    /* Capping the decoder is what pushed the wall time to 64 s, so it keeps
+       the automatic frame-thread count. The encoder stays at half the cores. */
+    vdec_ctx->thread_count = 0;
     vdec_ctx->thread_type = FF_THREAD_FRAME;
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
         avcodec_free_context(&vdec_ctx);
