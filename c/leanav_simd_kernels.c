@@ -486,7 +486,15 @@ static int leanav_shell_quote_safe(const char *s, char *dst, size_t dst_cap) {
  *   bits 0..23:  average lumaMean (24 bits)
  */
 static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_in);
-static const char *leanav_color_vui_args_for_cs(int hdr_cs) {
+static const char *leanav_color_vui_args_for_cs(int hdr_cs, uint32_t codec_id_u32) {
+    if (codec_id_u32 == 1) {
+        if (hdr_cs == 1) {
+            return "-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv -x264-params colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc";
+        } else if (hdr_cs == 2) {
+            return "-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv -x264-params colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc";
+        }
+        return "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv -x264-params colorprim=bt709:transfer=bt709:colormatrix=bt709";
+    }
     if (hdr_cs == 1) {
         return "-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv";
     } else if (hdr_cs == 2) {
@@ -520,7 +528,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
 
     const char *ffmpeg_bin = "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
     int hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
-    const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs);
+    const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
     char dec_cmd[8192];
     snprintf(dec_cmd, sizeof(dec_cmd),
@@ -980,11 +988,18 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
                 if (n >= 15) {
                     for (size_t i = 0; i + 15 <= n; i++) {
                         if (buf[i] == 'c' && buf[i+1] == 'o' && buf[i+2] == 'l' && buf[i+3] == 'r' &&
-                            buf[i+4] == 'n' && buf[i+5] == 'c' && buf[i+6] == 'l' && buf[i+7] == 'x') {
+                            buf[i+4] == 'n' && buf[i+5] == 'c' && buf[i+6] == 'l' && (buf[i+7] == 'x' || buf[i+7] == 'c')) {
                             uint16_t prim = ((uint16_t)buf[i+8] << 8) | buf[i+9];
                             uint16_t trc  = ((uint16_t)buf[i+10] << 8) | buf[i+11];
                             if (prim == 9 && trc == 18) { free(buf); fclose(fp); return 2; }
                             if (prim == 9) { free(buf); fclose(fp); return 1; }
+                        }
+                        if (buf[i] == 'm' && buf[i+1] == 'd' && buf[i+2] == 'c' && buf[i+3] == 'v') {
+                            free(buf); fclose(fp); return 1;
+                        }
+                        if (buf[i] == 's' && buf[i+1] == 'm' && buf[i+2] == 'p' && buf[i+3] == 't' &&
+                            buf[i+4] == 'e' && buf[i+5] == '2' && buf[i+6] == '0' && buf[i+7] == '8' && buf[i+8] == '4') {
+                            free(buf); fclose(fp); return 1;
                         }
                     }
                 }
@@ -1120,12 +1135,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if ((filter_flags_u32 & 3u) == 0u) {
         hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
     }
-    const char *color_vui_args = "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
-    if (hdr_cs == 1) {
-        color_vui_args = "-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv";
-    } else if (hdr_cs == 2) {
-        color_vui_args = "-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv";
-    }
+    const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
     const char *v_enc_args = "-c:v libx264 -preset veryfast -crf 23 -threads 0 -pix_fmt yuv420p";
     if (codec_id_u32 == 1 && has_vt_h264) {
