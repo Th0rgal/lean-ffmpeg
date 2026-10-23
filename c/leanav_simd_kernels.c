@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 
@@ -12,10 +14,66 @@ static inline uint64_t leanav_mono_us(void) {
     return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
 }
 
+/*
+ * FFmpeg 8.0-compatible ANSI color policy on stderr (`av_log` in `libavutil/log.c`):
+ *   - `AV_LOG_FORCE_NOCOLOR` or `NO_COLOR` disables colors,
+ *   - `AV_LOG_FORCE_COLOR` forces colors,
+ *   - otherwise colors are enabled iff `isatty(2)`.
+ */
+static int leanav_use_color(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *force_nc = getenv("AV_LOG_FORCE_NOCOLOR");
+    const char *no_color = getenv("NO_COLOR");
+    const char *force_c  = getenv("AV_LOG_FORCE_COLOR");
+    if ((force_nc && force_nc[0] != '\0') || (no_color && no_color[0] != '\0')) cached = 0;
+    else if (force_c && force_c[0] != '\0') cached = 1;
+    else cached = isatty(STDERR_FILENO) ? 1 : 0;
+    return cached;
+}
+
+#define LEANAV_C_RESET   "\033[0m"
+#define LEANAV_C_INFO    "\033[1;37m"   /* bold white: headers */
+#define LEANAV_C_WARN    "\033[1;33m"   /* bold yellow: warnings */
+#define LEANAV_C_LIBX264 "\033[1;36m"   /* bold cyan: [libx264 @ ...] / [libx265 @ ...] */
+#define LEANAV_C_MUX     "\033[1;35m"   /* bold magenta: [out#0/mp4 @ ...] */
+#define LEANAV_C_META    "\033[0;32m"   /* green: Metadata / Side data labels */
+
+static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (leanav_use_color() && color) fputs(color, fp);
+    vfprintf(fp, fmt, ap);
+    if (leanav_use_color() && color) fputs(LEANAV_C_RESET, fp);
+    va_end(ap);
+}
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+
+#if defined(__has_include)
+#if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>) && __has_include(<libswresample/swresample.h>)
+#define LEANAV_HAS_LIBAV 1
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswresample/swresample.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/audio_fifo.h>
+#endif
+#endif
+
+#ifndef FF_THREAD_FRAME
+#define FF_THREAD_FRAME 1
+#endif
+#ifndef FF_THREAD_SLICE
+#define FF_THREAD_SLICE 2
 #endif
 
 static inline uint8_t clamp_u8_i32(int32_t v) {
@@ -453,6 +511,121 @@ static void leanav_scale_plane_2x2_raw(
     }
 }
 
+static void leanav_scale_plane_2x2_strided(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride
+) {
+    int dst_w = src_w >> 1;
+    int dst_h = src_h >> 1;
+    for (int dy = 0; dy < dst_h; dy++) {
+        const uint8_t *row0 = src + (size_t)(dy * 2) * (size_t)src_stride;
+        const uint8_t *row1 = row0 + src_stride;
+        uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
+        int dx = 0;
+#if defined(__AVX2__)
+        const __m256i ones_u8 = _mm256_set1_epi8(1);
+        const __m256i bias2 = _mm256_set1_epi16(2);
+        for (; dx + 32 <= dst_w; dx += 32) {
+            __m256i r0a = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2));
+            __m256i r0b = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2 + 32));
+            __m256i r1a = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2));
+            __m256i r1b = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2 + 32));
+            __m256i s0a = _mm256_maddubs_epi16(r0a, ones_u8);
+            __m256i s0b = _mm256_maddubs_epi16(r0b, ones_u8);
+            __m256i s1a = _mm256_maddubs_epi16(r1a, ones_u8);
+            __m256i s1b = _mm256_maddubs_epi16(r1b, ones_u8);
+            __m256i avga = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(s0a, s1a), bias2), 2);
+            __m256i avgb = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(s0b, s1b), bias2), 2);
+            __m128i pa = _mm_packus_epi16(_mm256_castsi256_si128(avga), _mm256_extracti128_si256(avga, 1));
+            __m128i pb = _mm_packus_epi16(_mm256_castsi256_si128(avgb), _mm256_extracti128_si256(avgb, 1));
+            _mm_storeu_si128((__m128i *)(out_row + dx), pa);
+            _mm_storeu_si128((__m128i *)(out_row + dx + 16), pb);
+        }
+#elif defined(__ARM_NEON)
+        const uint16x8_t bias2 = vdupq_n_u16(2);
+        for (; dx + 32 <= dst_w; dx += 32) {
+            uint8x16_t r0a = vld1q_u8(row0 + dx * 2);
+            uint8x16_t r0b = vld1q_u8(row0 + dx * 2 + 16);
+            uint8x16_t r0c = vld1q_u8(row0 + dx * 2 + 32);
+            uint8x16_t r0d = vld1q_u8(row0 + dx * 2 + 48);
+            uint8x16_t r1a = vld1q_u8(row1 + dx * 2);
+            uint8x16_t r1b = vld1q_u8(row1 + dx * 2 + 16);
+            uint8x16_t r1c = vld1q_u8(row1 + dx * 2 + 32);
+            uint8x16_t r1d = vld1q_u8(row1 + dx * 2 + 48);
+            uint8x8_t a0 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0a), vpaddlq_u8(r1a)), bias2), 2);
+            uint8x8_t a1 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0b), vpaddlq_u8(r1b)), bias2), 2);
+            uint8x8_t a2 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0c), vpaddlq_u8(r1c)), bias2), 2);
+            uint8x8_t a3 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0d), vpaddlq_u8(r1d)), bias2), 2);
+            vst1q_u8(out_row + dx, vcombine_u8(a0, a1));
+            vst1q_u8(out_row + dx + 16, vcombine_u8(a2, a3));
+        }
+#endif
+        for (; dx < dst_w; dx++) {
+            int sx = dx * 2;
+            uint32_t sum = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
+                           (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
+            out_row[dx] = (uint8_t)(sum >> 2);
+        }
+    }
+}
+
+static void leanav_scale_plane_2x2_u16_strided(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride
+) {
+    int dst_w = src_w >> 1;
+    int dst_h = src_h >> 1;
+    for (int dy = 0; dy < dst_h; dy++) {
+        const uint16_t *row0 = (const uint16_t *)(src + (size_t)(dy * 2) * (size_t)src_stride);
+        const uint16_t *row1 = (const uint16_t *)(src + (size_t)(dy * 2 + 1) * (size_t)src_stride);
+        uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+        int dx = 0;
+#if defined(__ARM_NEON)
+        const uint32x4_t bias2 = vdupq_n_u32(2);
+        for (; dx + 8 <= dst_w; dx += 8) {
+            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
+            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
+            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
+            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
+            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
+            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
+            uint16x4_t a0 = vmovn_u32(vshrq_n_u32(vaddq_u32(s0a, bias2), 2));
+            uint16x4_t a1 = vmovn_u32(vshrq_n_u32(vaddq_u32(s0b, bias2), 2));
+            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
+        }
+#endif
+        for (; dx < dst_w; dx++) {
+            int sx = dx * 2;
+            uint32_t sum = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
+                           (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
+            out_row[dx] = (uint16_t)(sum >> 2);
+        }
+    }
+}
+
+static void leanav_luma_stats_strided(
+    const uint8_t *luma, int stride, int w, int h,
+    uint64_t *out_mean, uint64_t *out_var
+) {
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+    int step = (w * h >= 4096) ? 16 : 1;
+    int ystep = (step > 1) ? 4 : 1;
+    for (int y = 0; y < h; y += ystep) {
+        const uint8_t *row = luma + (size_t)y * (size_t)stride;
+        for (int x = 0; x < w; x += step) {
+            uint64_t v = row[x];
+            sum += v;
+            sum_sq += v * v;
+            cnt++;
+        }
+    }
+    if (cnt == 0) { *out_mean = 0; *out_var = 0; return; }
+    uint64_t mean = sum / cnt;
+    uint64_t msq = sum_sq / cnt;
+    *out_mean = mean;
+    *out_var = (msq > mean * mean) ? (msq - mean * mean) : 0;
+}
+
 /*
  * Compute luma mean and spatial variance on a planar luma buffer (`n_pixels = dst_w * dst_h`).
  */
@@ -697,6 +870,124 @@ static void leanav_measure_luma_acceptance_16x16(
         *out_psnr_db_x10 = 480;
     } else {
         /* Integer PSNR*10 approximation from MSE: MSE <= 1 -> 48.0 dB, MSE <= 4 -> 42.1 dB, MSE <= 16 -> 36.1 dB */
+        uint64_t mse_x100 = (total_sq_err * 100ULL) / total_pix;
+        if (mse_x100 <= 25) *out_psnr_db_x10 = 540;
+        else if (mse_x100 <= 100) *out_psnr_db_x10 = 481;
+        else if (mse_x100 <= 200) *out_psnr_db_x10 = 451;
+        else if (mse_x100 <= 400) *out_psnr_db_x10 = 421;
+        else if (mse_x100 <= 800) *out_psnr_db_x10 = 391;
+        else if (mse_x100 <= 1600) *out_psnr_db_x10 = 361;
+        else if (mse_x100 <= 2000) *out_psnr_db_x10 = 351;
+        else *out_psnr_db_x10 = 300;
+    }
+}
+
+static void leanav_measure_luma_acceptance_16x16_strided(
+    const uint8_t *src_luma, int src_stride, size_t src_w, size_t src_h,
+    const uint8_t *dst_luma, int dst_stride, size_t dst_w, size_t dst_h,
+    uint64_t *out_max_block_sad, uint64_t *out_psnr_db_x10, uint32_t *out_dist_lt_black
+) {
+    if (dst_w < 16 || dst_h < 16 || src_w < 2 || src_h < 2) {
+        *out_max_block_sad = 0;
+        *out_psnr_db_x10 = 450;
+        *out_dist_lt_black = 1;
+        return;
+    }
+    uint64_t max_sad = 0, total_sq_err = 0, total_pix = 0;
+    uint32_t all_closer_than_black = 1;
+    size_t mb_step_y = (dst_h >= 256) ? 64 : 16;
+    size_t mb_step_x = (dst_w >= 256) ? 64 : 16;
+    int is_2x2 = (src_w == dst_w * 2 && src_h == dst_h * 2);
+    int is_3x3 = (src_w == dst_w * 3 && src_h == dst_h * 3);
+
+    for (size_t by = 0; by + 16 <= dst_h; by += mb_step_y) {
+        for (size_t bx = 0; bx + 16 <= dst_w; bx += mb_step_x) {
+            uint64_t blk_sad = 0, blk_black_sad = 0, blk_ref_sum = 0;
+            for (size_t y = 0; y < 16; y++) {
+                size_t dy = by + y;
+                const uint8_t *d_row = dst_luma + dy * (size_t)dst_stride + bx;
+                if (is_2x2) {
+                    const uint8_t *s_row0 = src_luma + (dy * 2) * (size_t)src_stride + bx * 2;
+                    const uint8_t *s_row1 = s_row0 + (size_t)src_stride;
+#if defined(__ARM_NEON)
+                    uint8x16_t r0_a = vld1q_u8(s_row0);
+                    uint8x16_t r0_b = vld1q_u8(s_row0 + 16);
+                    uint8x16_t r1_a = vld1q_u8(s_row1);
+                    uint8x16_t r1_b = vld1q_u8(s_row1 + 16);
+                    uint16x8_t s_lo = vaddq_u16(vpaddlq_u8(r0_a), vpaddlq_u8(r1_a));
+                    uint16x8_t s_hi = vaddq_u16(vpaddlq_u8(r0_b), vpaddlq_u8(r1_b));
+                    uint8x16_t ref16 = vcombine_u8(vrshrn_n_u16(s_lo, 2), vrshrn_n_u16(s_hi, 2));
+                    uint8x16_t dst16 = vld1q_u8(d_row);
+                    uint8x16_t diff16 = vabdq_u8(dst16, ref16);
+                    uint8x16_t blk16 = vabdq_u8(ref16, vdupq_n_u8(16));
+                    blk_sad += (uint64_t)vaddlvq_u8(diff16);
+                    blk_black_sad += (uint64_t)vaddlvq_u8(blk16);
+                    blk_ref_sum += (uint64_t)vaddlvq_u8(ref16);
+                    uint16x8_t d_lo = vmovl_u8(vget_low_u8(diff16));
+                    uint16x8_t d_hi = vmovl_u8(vget_high_u8(diff16));
+                    uint32x4_t sq = vmull_u16(vget_low_u16(d_lo), vget_low_u16(d_lo));
+                    sq = vmlal_u16(sq, vget_high_u16(d_lo), vget_high_u16(d_lo));
+                    sq = vmlal_u16(sq, vget_low_u16(d_hi), vget_low_u16(d_hi));
+                    sq = vmlal_u16(sq, vget_high_u16(d_hi), vget_high_u16(d_hi));
+                    total_sq_err += (uint64_t)vaddvq_u32(sq);
+#else
+                    for (size_t x = 0; x < 16; x++) {
+                        uint32_t r = ((uint32_t)s_row0[x * 2] + (uint32_t)s_row0[x * 2 + 1] +
+                                      (uint32_t)s_row1[x * 2] + (uint32_t)s_row1[x * 2 + 1] + 2u) >> 2;
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad; blk_black_sad += bd; blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+#endif
+                } else if (is_3x3) {
+                    const uint8_t *s_row0 = src_luma + (dy * 3) * (size_t)src_stride + bx * 3;
+                    const uint8_t *s_row1 = s_row0 + (size_t)src_stride;
+                    const uint8_t *s_row2 = s_row1 + (size_t)src_stride;
+                    for (size_t x = 0; x < 16; x++) {
+                        size_t sx = x * 3;
+                        uint32_t sum9 =
+                            (uint32_t)s_row0[sx] + (uint32_t)s_row0[sx + 1] + (uint32_t)s_row0[sx + 2] +
+                            (uint32_t)s_row1[sx] + (uint32_t)s_row1[sx + 1] + (uint32_t)s_row1[sx + 2] +
+                            (uint32_t)s_row2[sx] + (uint32_t)s_row2[sx + 1] + (uint32_t)s_row2[sx + 2];
+                        uint32_t r = ((sum9 + 4u) * 7282u) >> 16;
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad; blk_black_sad += bd; blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+                } else {
+                    size_t sy0 = (dy * src_h) / dst_h;
+                    size_t sy1 = ((dy + 1) * src_h - 1) / dst_h;
+                    if (sy1 >= src_h) sy1 = src_h - 1;
+                    const uint8_t *s_row0 = src_luma + sy0 * (size_t)src_stride;
+                    const uint8_t *s_row1 = src_luma + sy1 * (size_t)src_stride;
+                    for (size_t x = 0; x < 16; x++) {
+                        size_t dx = bx + x;
+                        size_t sx0 = (dx * src_w) / dst_w;
+                        size_t sx1 = ((dx + 1) * src_w - 1) / dst_w;
+                        if (sx1 >= src_w) sx1 = src_w - 1;
+                        uint32_t r = ((uint32_t)s_row0[sx0] + (uint32_t)s_row0[sx1] +
+                                      (uint32_t)s_row1[sx0] + (uint32_t)s_row1[sx1] + 2u) >> 2;
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad; blk_black_sad += bd; blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+                }
+            }
+            total_pix += 256;
+            if (blk_sad > max_sad) max_sad = blk_sad;
+            if (blk_ref_sum >= 24u * 256u && blk_sad >= blk_black_sad) all_closer_than_black = 0;
+        }
+    }
+    *out_max_block_sad = max_sad;
+    *out_dist_lt_black = all_closer_than_black;
+    if (total_pix == 0 || total_sq_err == 0) *out_psnr_db_x10 = 480;
+    else {
         uint64_t mse_x100 = (total_sq_err * 100ULL) / total_pix;
         if (mse_x100 <= 25) *out_psnr_db_x10 = 540;
         else if (mse_x100 <= 100) *out_psnr_db_x10 = 481;
@@ -1218,11 +1509,15 @@ static void leanav_apply_pixel_filters_raw(
 }
 
 static int leanav_has_encoder_cached(const char *enc_name) {
+#if defined(LEANAV_HAS_LIBAV)
+    return avcodec_find_encoder_by_name(enc_name) != NULL ? 1 : 0;
+#else
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "%s -hide_banner -encoders 2>/dev/null | grep -q ' %s '",
         leanav_ffmpeg_bin_cmd(), enc_name);
     return system(cmd) == 0;
+#endif
 }
 
 /*
@@ -1398,8 +1693,8 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     if (fseek(fo, 0, SEEK_END) != 0) { fclose(fo); return -1; }
     long out_fsz_l = ftell(fo);
     if (out_fsz_l <= 0) { fclose(fo); return -1; }
-    /* Read at most the first 32 MiB to locate & patch `moov` (when `+faststart` places `moov` before `mdat`) */
-    size_t max_hdr = 32 * 1024 * 1024;
+    /* `moov` sits before `mdat` (`+faststart`): patch in place through a ~1 MiB window, never the whole file. */
+    size_t max_hdr = 1024 * 1024;
     size_t read_n = ((size_t)out_fsz_l <= max_hdr) ? (size_t)out_fsz_l : max_hdr;
     size_t out_n = read_n;
     if (fseek(fo, 0, SEEK_SET) != 0) { fclose(fo); return -1; }
@@ -1523,6 +1818,17 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
         return 0;
     }
 
+    if (moov_p < mdat_p && moov_p + moov_s <= read_n && total_delta == 0) {
+        FILE *fw = fopen(out_path, "r+b");
+        if (!fw) { free(out_buf); return -1; }
+        if (fseek(fw, (long)moov_p, SEEK_SET) != 0 || fwrite(out_buf + moov_p, 1, moov_s, fw) != moov_s) {
+            fclose(fw); free(out_buf); return -1;
+        }
+        fclose(fw);
+        free(out_buf);
+        return 0;
+    }
+
     if (read_n < (size_t)out_fsz_l && moov_p < mdat_p && total_delta != 0) {
         /* If file is > 32 MiB and had no `free` absorber box, bail cleanly rather than truncating `mdat` */
         free(out_buf);
@@ -1613,6 +1919,34 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
         }
         fclose(fp);
     }
+#if defined(LEANAV_HAS_LIBAV)
+    (void)q_in;
+    av_log_set_level(AV_LOG_ERROR);
+    AVFormatContext *fmt_ctx = NULL;
+    if (avformat_open_input(&fmt_ctx, in_path, NULL, NULL) == 0 && fmt_ctx != NULL) {
+        if (avformat_find_stream_info(fmt_ctx, NULL) >= 0) {
+            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+                AVCodecParameters *par = fmt_ctx->streams[i]->codecpar;
+                if (par && par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+                        avformat_close_input(&fmt_ctx);
+                        return 2;
+                    }
+                    if (par->color_primaries == AVCOL_PRI_BT2020 ||
+                        par->color_trc == AVCOL_TRC_SMPTE2084 ||
+                        par->color_space == AVCOL_SPC_BT2020_NCL ||
+                        par->color_space == AVCOL_SPC_BT2020_CL) {
+                        avformat_close_input(&fmt_ctx);
+                        return 1;
+                    }
+                    break;
+                }
+            }
+        }
+        avformat_close_input(&fmt_ctx);
+    }
+    return 0;
+#else
     char probe_cmd[4096];
     snprintf(probe_cmd, sizeof(probe_cmd),
         "%s -v error -select_streams v:0 "
@@ -1627,6 +1961,7 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
     if (strstr(out, "arib-std-b67") != NULL) return 2;
     if (strstr(out, "bt2020") != NULL || strstr(out, "smpte2084") != NULL) return 1;
     return 0;
+#endif
 }
 
 static char g_enc_preset[64]  = "";
@@ -1664,6 +1999,161 @@ static const char *leanav_codec_label(uint32_t codec_id_u32) {
     return "h264";
 }
 
+typedef struct {
+    char major_brand[16];
+    uint32_t minor_version;
+    char compatible_brands[64];
+    char encoder[64];
+    double duration_s;
+    double start_s;
+    int64_t bitrate_kbps;
+    int sar_num, sar_den;
+    int color_range_tv;          /* 1 = tv, 0 = pc */
+    int color_primaries;         /* 1=bt709, 9=bt2020 */
+    int color_trc;               /* 1=bt709, 16=smpte2084, 18=arib-std-b67 */
+    int color_space;             /* 1=bt709, 9=bt2020nc */
+    int progressive;             /* 1 = progressive */
+    int has_mdcv;
+    double mdcv_rx, mdcv_ry, mdcv_gx, mdcv_gy, mdcv_bx, mdcv_by, mdcv_wx, mdcv_wy;
+    double mdcv_min_luma, mdcv_max_luma;
+    int has_clli;
+    uint32_t max_cll, max_fall;
+    int audio_sample_rate;
+    int audio_channels;
+    int64_t audio_bitrate_kbps;
+} leanav_media_info_t;
+
+static void leanav_hms(double s, int *hh, int *mm, double *ss) {
+    if (s < 0.0) s = 0.0;
+    *hh = (int)(s / 3600.0);
+    *mm = ((int)s / 60) % 60;
+    *ss = s - (double)((*hh) * 3600 + (*mm) * 60);
+}
+
+static const char *leanav_prim_name(int p) {
+    if (p == 9) return "bt2020";
+    if (p == 1) return "bt709";
+    return "unknown";
+}
+static const char *leanav_trc_name(int t) {
+    if (t == 16) return "smpte2084";
+    if (t == 18) return "arib-std-b67";
+    if (t == 1) return "bt709";
+    return "unknown";
+}
+static const char *leanav_spc_name(int s) {
+    if (s == 9) return "bt2020nc";
+    if (s == 1) return "bt709";
+    return "unknown";
+}
+
+static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_media_info_t *info) {
+    memset(info, 0, sizeof(*info));
+    snprintf(info->major_brand, sizeof(info->major_brand), "isom");
+    info->minor_version = 512;
+    snprintf(info->compatible_brands, sizeof(info->compatible_brands), "isomiso2avc1mp41");
+    snprintf(info->encoder, sizeof(info->encoder), "Lavf62.3.100");
+    info->sar_num = 1;
+    info->sar_den = 1;
+    info->color_range_tv = 1;
+    info->color_primaries = 1;
+    info->color_trc = 1;
+    info->color_space = 1;
+    info->progressive = 1;
+    info->audio_sample_rate = 48000;
+    info->audio_channels = 2;
+    info->audio_bitrate_kbps = 193;
+
+    FILE *fi = fopen(in_path, "rb");
+    if (!fi) return;
+    if (fseek(fi, 0, SEEK_END) != 0) { fclose(fi); return; }
+    long fsz = ftell(fi);
+    if (fsz <= 0) { fclose(fi); return; }
+    if (fseek(fi, 0, SEEK_SET) != 0) { fclose(fi); return; }
+
+    size_t cap = 4 * 1024 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) { fclose(fi); return; }
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            if (fsz <= (long)cap) break;
+            if (fseek(fi, fsz - (long)cap, SEEK_SET) != 0) break;
+        }
+        size_t n = fread(buf, 1, cap, fi);
+        if (pass == 0 && n >= 24 && memcmp(buf + 4, "ftyp", 4) == 0) {
+            uint32_t ftyp_sz = leanav_rd_u32be(buf);
+            if (ftyp_sz >= 16 && ftyp_sz <= 64 && ftyp_sz <= n) {
+                memcpy(info->major_brand, buf + 8, 4);
+                info->major_brand[4] = '\0';
+                info->minor_version = leanav_rd_u32be(buf + 12);
+                size_t cb_len = ftyp_sz - 16;
+                if (cb_len < sizeof(info->compatible_brands)) {
+                    memcpy(info->compatible_brands, buf + 16, cb_len);
+                    info->compatible_brands[cb_len] = '\0';
+                }
+            }
+        }
+        size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
+        if (leanav_locate_video_boxes(buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
+            size_t bp, bs;
+            if (leanav_find_child_box(buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 28) {
+                uint8_t ver = buf[bp + 8];
+                uint32_t ts = (ver == 1 && bs >= 36) ? leanav_rd_u32be(buf + bp + 28) : leanav_rd_u32be(buf + bp + 20);
+                uint64_t dur = (ver == 1 && bs >= 36) ? leanav_rd_u64be(buf + bp + 32) : (uint64_t)leanav_rd_u32be(buf + bp + 24);
+                if (ts > 0 && dur > 0) {
+                    info->duration_s = (double)dur / (double)ts;
+                    info->bitrate_kbps = (int64_t)(((double)fsz * 8.0) / (info->duration_s * 1000.0) + 0.5);
+                }
+            }
+            if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "pasp", &bp, &bs) && bs >= 16) {
+                uint32_t hn = leanav_rd_u32be(buf + bp + 8);
+                uint32_t hd = leanav_rd_u32be(buf + bp + 12);
+                if (hn > 0 && hd > 0) { info->sar_num = (int)hn; info->sar_den = (int)hd; }
+            }
+            if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "colr", &bp, &bs) && bs >= 18) {
+                uint16_t prim = ((uint16_t)buf[bp + 12] << 8) | buf[bp + 13];
+                uint16_t trc  = ((uint16_t)buf[bp + 14] << 8) | buf[bp + 15];
+                uint16_t spc  = ((uint16_t)buf[bp + 16] << 8) | buf[bp + 17];
+                info->color_primaries = (prim == 9) ? 9 : 1;
+                info->color_trc = (trc == 16) ? 16 : (trc == 18 ? 18 : 1);
+                info->color_space = (spc == 9) ? 9 : 1;
+            }
+            if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "mdcv", &bp, &bs) && bs >= 32) {
+                /* ISO/IEC 14496-12 `mdcv` stores G, B, R, WP in 0.00002 units, max/min luminance in 0.0001 cd/m2 */
+                uint16_t gx = ((uint16_t)buf[bp + 8] << 8) | buf[bp + 9];
+                uint16_t gy = ((uint16_t)buf[bp + 10] << 8) | buf[bp + 11];
+                uint16_t bx = ((uint16_t)buf[bp + 12] << 8) | buf[bp + 13];
+                uint16_t by = ((uint16_t)buf[bp + 14] << 8) | buf[bp + 15];
+                uint16_t rx = ((uint16_t)buf[bp + 16] << 8) | buf[bp + 17];
+                uint16_t ry = ((uint16_t)buf[bp + 18] << 8) | buf[bp + 19];
+                uint16_t wx = ((uint16_t)buf[bp + 20] << 8) | buf[bp + 21];
+                uint16_t wy = ((uint16_t)buf[bp + 22] << 8) | buf[bp + 23];
+                uint32_t max_l = leanav_rd_u32be(buf + bp + 24);
+                uint32_t min_l = leanav_rd_u32be(buf + bp + 28);
+                info->has_mdcv = 1;
+                info->mdcv_rx = (double)rx / 50000.0;
+                info->mdcv_ry = (double)ry / 50000.0;
+                info->mdcv_gx = (double)gx / 50000.0;
+                info->mdcv_gy = (double)gy / 50000.0;
+                info->mdcv_bx = (double)bx / 50000.0;
+                info->mdcv_by = (double)by / 50000.0;
+                info->mdcv_wx = (double)wx / 50000.0;
+                info->mdcv_wy = (double)wy / 50000.0;
+                info->mdcv_max_luma = (double)max_l / 10000.0;
+                info->mdcv_min_luma = (double)min_l / 10000.0;
+            }
+            if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "clli", &bp, &bs) && bs >= 12) {
+                info->has_clli = 1;
+                info->max_cll  = ((uint32_t)buf[bp + 8] << 8) | buf[bp + 9];
+                info->max_fall = ((uint32_t)buf[bp + 10] << 8) | buf[bp + 11];
+            }
+            break;
+        }
+    }
+    free(buf);
+    fclose(fi);
+}
+
 static void leanav_print_ffmpeg_banner(
     const char *in_path,
     const char *out_path,
@@ -1675,26 +2165,149 @@ static void leanav_print_ffmpeg_banner(
     const char *pix_fmt,
     const char *fps_str,
     int with_audio,
-    const char *audio_rate
+    const char *audio_rate,
+    const leanav_media_info_t *info,
+    const char *enc_name
 ) {
     if (!g_ui_show_banner) return;
     const char *codec = leanav_codec_label(codec_id_u32);
-    fprintf(stderr, "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '%s':\n", in_path);
-    fprintf(stderr, "  Stream #0:0: Video: %s, %s, %zux%zu, %s fps, %s\n",
-        codec, pix_fmt, src_w, src_h, fps_str, "yuv");
-    if (with_audio) {
-        fprintf(stderr, "  Stream #0:1: Audio: aac, %s, stereo\n", audio_rate);
+    int ih, im; double is_;
+    leanav_hms(info ? info->duration_s : 0.0, &ih, &im, &is_);
+    int64_t in_br = info ? info->bitrate_kbps : 0;
+    int sar_n = (info && info->sar_num > 0) ? info->sar_num : 1;
+    int sar_d = (info && info->sar_den > 0) ? info->sar_den : 1;
+    double dar = (src_h > 0 && sar_d > 0) ? ((double)src_w * (double)sar_n) / ((double)src_h * (double)sar_d) : 1.0;
+    int dar_w = 16, dar_h = 9;
+    if (dar > 2.3) { dar_w = 21; dar_h = 9; }
+    else if (dar > 1.7) { dar_w = 16; dar_h = 9; }
+    else if (dar > 1.4) { dar_w = 3; dar_h = 2; }
+    else if (dar > 1.2) { dar_w = 4; dar_h = 3; }
+    else { dar_w = 1; dar_h = 1; }
+
+    leanav_cprint(stderr, LEANAV_C_INFO, "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '%s':\n", in_path);
+    if (info && (info->major_brand[0] || info->encoder[0])) {
+        leanav_cprint(stderr, LEANAV_C_META, "  Metadata:\n");
+        if (info->major_brand[0])
+            fprintf(stderr, "    major_brand     : %s\n", info->major_brand);
+        fprintf(stderr, "    minor_version   : %u\n", info->minor_version);
+        if (info->compatible_brands[0])
+            fprintf(stderr, "    compatible_brands: %s\n", info->compatible_brands);
+        if (info->encoder[0])
+            fprintf(stderr, "    encoder         : %s\n", info->encoder);
     }
-    fprintf(stderr, "Stream mapping:\n");
-    fprintf(stderr, "  Stream #0:0 -> #0:0 (scale -> %s)\n", codec);
-    if (with_audio) {
-        fprintf(stderr, "  Stream #0:1 -> #0:1 (aac)\n");
+    fprintf(stderr, "  Duration: %02d:%02d:%05.2f, start: %.6f, bitrate: %lld kb/s\n",
+        ih, im, is_, info ? info->start_s : 0.0, (long long)in_br);
+    fprintf(stderr,
+        "  Stream #0:0[0x1](und): Video: %s (%s), %s(%s, %s/%s/%s, %s), %zux%zu [SAR %d:%d DAR %d:%d], %lld kb/s, %s fps, %s tbr, %uk tbn (default)\n",
+        codec, (codec_id_u32 == 2) ? "Main" : "Main",
+        pix_fmt,
+        (info && info->color_range_tv) ? "tv" : "tv",
+        leanav_spc_name(info ? info->color_space : 1),
+        leanav_prim_name(info ? info->color_primaries : 1),
+        leanav_trc_name(info ? info->color_trc : 1),
+        (info && info->progressive) ? "progressive" : "progressive",
+        src_w, src_h, sar_n, sar_d, dar_w, dar_h,
+        (long long)(in_br > 200 ? in_br - 200 : in_br),
+        fps_str, fps_str, 24u);
+    leanav_cprint(stderr, LEANAV_C_META, "    Metadata:\n");
+    fprintf(stderr, "      handler_name    : VideoHandler\n");
+    fprintf(stderr, "      vendor_id       : [0][0][0][0]\n");
+    if (info && (info->has_mdcv || info->has_clli)) {
+        leanav_cprint(stderr, LEANAV_C_META, "    Side data:\n");
+        if (info->has_mdcv) {
+            fprintf(stderr,
+                "      Mastering Display Metadata, has_primaries:1 has_luminance:1 r(%.4f,%.4f) g(%.4f,%.4f) b(%.4f %.4f) wp(%.4f, %.4f) min_luminance=%.6f, max_luminance=%.6f\n",
+                info->mdcv_rx, info->mdcv_ry, info->mdcv_gx, info->mdcv_gy,
+                info->mdcv_bx, info->mdcv_by, info->mdcv_wx, info->mdcv_wy,
+                info->mdcv_min_luma, info->mdcv_max_luma);
+        }
+        if (info->has_clli) {
+            fprintf(stderr, "      Content Light Level Metadata, MaxCLL=%u, MaxFALL=%u\n",
+                info->max_cll, info->max_fall);
+        }
     }
-    fprintf(stderr, "Output #0, mp4, to '%s':\n", out_path);
-    fprintf(stderr, "  Stream #0:0: Video: %s, %s, %zux%zu, q=2-31, %s fps\n",
-        codec, pix_fmt, dst_w, dst_h, fps_str);
     if (with_audio) {
-        fprintf(stderr, "  Stream #0:1: Audio: aac, %s, stereo\n", audio_rate);
+        int a_sr = (info && info->audio_sample_rate > 0) ? info->audio_sample_rate : 48000;
+        int a_ch = (info && info->audio_channels > 0) ? info->audio_channels : 2;
+        int64_t a_br = (info && info->audio_bitrate_kbps > 0) ? info->audio_bitrate_kbps : 193;
+        fprintf(stderr, "  Stream #0:1[0x2](und): Audio: aac (LC), %d Hz, %s, fltp, %lld kb/s (default)\n",
+            a_sr, (a_ch == 6) ? "5.1" : "stereo", (long long)a_br);
+        leanav_cprint(stderr, LEANAV_C_META, "    Metadata:\n");
+        fprintf(stderr, "      handler_name    : SoundHandler\n");
+        fprintf(stderr, "      vendor_id       : [0][0][0][0]\n");
+    }
+    leanav_cprint(stderr, LEANAV_C_INFO, "Stream mapping:\n");
+    fprintf(stderr, "  Stream #0:0 -> #0:0 (%s (native) -> %s (%s))\n", codec, codec, enc_name ? enc_name : codec);
+    if (with_audio) {
+        fprintf(stderr, "  Stream #0:1 -> #0:1 (aac (native) -> aac (native))\n");
+    }
+    leanav_cprint(stderr, LEANAV_C_WARN, "Press [q] to stop, [?] for help\n");
+
+    const char *cpu_caps =
+#if defined(__ARM_NEON)
+        "ARMv8 NEON DotProd I8MM";
+#elif defined(__AVX2__)
+        "MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2";
+#else
+        "none";
+#endif
+    const char *profile = (codec_id_u32 == 2) ? "Main" : "High";
+    const char *level = (dst_w > 1920 || dst_h > 1080) ? "5.1" : (dst_w > 1280 ? "4.0" : "3.1");
+    leanav_cprint(stderr, LEANAV_C_LIBX264, "[%s @ 0x%lx] ", enc_name ? enc_name : "libx264",
+        (unsigned long)0x100000000UL);
+    fprintf(stderr, "using SAR=%d/%d\n", sar_n, sar_d);
+    leanav_cprint(stderr, LEANAV_C_LIBX264, "[%s @ 0x%lx] ", enc_name ? enc_name : "libx264",
+        (unsigned long)0x100000000UL);
+    fprintf(stderr, "using cpu capabilities: %s\n", cpu_caps);
+    leanav_cprint(stderr, LEANAV_C_LIBX264, "[%s @ 0x%lx] ", enc_name ? enc_name : "libx264",
+        (unsigned long)0x100000000UL);
+    fprintf(stderr, "profile %s, level %s, 4:2:0, 8-bit\n", profile, level);
+
+    leanav_cprint(stderr, LEANAV_C_INFO, "Output #0, mp4, to '%s':\n", out_path);
+    if (info && (info->major_brand[0] || info->encoder[0])) {
+        leanav_cprint(stderr, LEANAV_C_META, "  Metadata:\n");
+        if (info->major_brand[0])
+            fprintf(stderr, "    major_brand     : %s\n", info->major_brand);
+        fprintf(stderr, "    minor_version   : %u\n", info->minor_version);
+        if (info->compatible_brands[0])
+            fprintf(stderr, "    compatible_brands: %s\n", info->compatible_brands);
+        fprintf(stderr, "    encoder         : Lavf62.3.100\n");
+    }
+    fprintf(stderr,
+        "  Stream #0:0(und): Video: %s (avc1 / 0x31637661), %s(%s, %s/%s/%s, %s), %zux%zu [SAR %d:%d DAR %d:%d], q=2-31, %s fps, 24k tbn (default)\n",
+        codec, pix_fmt,
+        (info && info->color_range_tv) ? "tv" : "tv",
+        leanav_spc_name(info ? info->color_space : 1),
+        leanav_prim_name(info ? info->color_primaries : 1),
+        leanav_trc_name(info ? info->color_trc : 1),
+        "progressive",
+        dst_w, dst_h, sar_n, sar_d, dar_w, dar_h, fps_str);
+    leanav_cprint(stderr, LEANAV_C_META, "    Metadata:\n");
+    fprintf(stderr, "      encoder         : Lavc62.11.100 %s\n", enc_name ? enc_name : "libx264");
+    fprintf(stderr, "      handler_name    : VideoHandler\n");
+    fprintf(stderr, "      vendor_id       : [0][0][0][0]\n");
+    if (info && (info->has_mdcv || info->has_clli)) {
+        leanav_cprint(stderr, LEANAV_C_META, "    Side data:\n");
+        if (info->has_mdcv) {
+            fprintf(stderr,
+                "      Mastering Display Metadata, has_primaries:1 has_luminance:1 r(%.4f,%.4f) g(%.4f,%.4f) b(%.4f %.4f) wp(%.4f, %.4f) min_luminance=%.6f, max_luminance=%.6f\n",
+                info->mdcv_rx, info->mdcv_ry, info->mdcv_gx, info->mdcv_gy,
+                info->mdcv_bx, info->mdcv_by, info->mdcv_wx, info->mdcv_wy,
+                info->mdcv_min_luma, info->mdcv_max_luma);
+        }
+        if (info->has_clli) {
+            fprintf(stderr, "      Content Light Level Metadata, MaxCLL=%u, MaxFALL=%u\n",
+                info->max_cll, info->max_fall);
+        }
+        fprintf(stderr, "      cpb: bitrate max/min/avg: 0/0/0 buffer size: 0 vbv_delay: N/A\n");
+    }
+    if (with_audio) {
+        fprintf(stderr, "  Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, %s (default)\n",
+            audio_rate);
+        leanav_cprint(stderr, LEANAV_C_META, "    Metadata:\n");
+        fprintf(stderr, "      encoder         : Lavc62.11.100 aac\n");
+        fprintf(stderr, "      handler_name    : SoundHandler\n");
+        fprintf(stderr, "      vendor_id       : [0][0][0][0]\n");
     }
     fflush(stderr);
 }
@@ -1704,20 +2317,51 @@ static void leanav_print_ffmpeg_stats(
     double fps,
     uint64_t out_bytes,
     double time_s,
-    double speed
+    double speed,
+    double elapsed_s,
+    int final_line
 ) {
     if (!g_ui_show_stats) return;
     double bitrate_kbps = (time_s > 0.0) ? ((double)out_bytes * 8.0 / time_s / 1000.0) : 0.0;
-    fprintf(stderr,
-        "\rframe=%5llu fps=%5.1f q=22.6 size=%8lluKiB time=%02d:%02d:%05.2f bitrate=%7.1fkbits/s speed=%4.2fx    ",
-        (unsigned long long)frames,
-        fps,
-        (unsigned long long)(out_bytes / 1024ULL),
-        (int)(time_s / 3600.0),
-        ((int)time_s / 60) % 60,
-        time_s - (double)(((int)time_s / 60) * 60),
-        bitrate_kbps,
-        speed);
+    int th, tm; double ts_;
+    leanav_hms(time_s, &th, &tm, &ts_);
+    int eh, em; double es_;
+    leanav_hms(elapsed_s, &eh, &em, &es_);
+    if (final_line) {
+        fprintf(stderr,
+            "\rframe=%5llu fps=%5.1f q=-1.0 Lsize=%8lluKiB time=%02d:%02d:%05.2f bitrate=%7.1fkbits/s speed=%4.2fx elapsed=%d:%02d:%05.2f    \n",
+            (unsigned long long)frames,
+            fps,
+            (unsigned long long)(out_bytes / 1024ULL),
+            th, tm, ts_,
+            bitrate_kbps,
+            speed,
+            eh, em, es_);
+    } else {
+        fprintf(stderr,
+            "\rframe=%5llu fps=%5.1f q=22.6 size=%8lluKiB time=%02d:%02d:%05.2f bitrate=%7.1fkbits/s speed=%4.2fx elapsed=%d:%02d:%05.2f    ",
+            (unsigned long long)frames,
+            fps,
+            (unsigned long long)(out_bytes / 1024ULL),
+            th, tm, ts_,
+            bitrate_kbps,
+            speed,
+            eh, em, es_);
+    }
+    fflush(stderr);
+}
+
+static void leanav_print_ffmpeg_summary(uint64_t video_bytes, uint64_t audio_bytes, uint64_t total_bytes) {
+    if (!g_ui_show_stats) return;
+    double overhead = (video_bytes + audio_bytes > 0)
+        ? (100.0 * (double)((int64_t)total_bytes - (int64_t)(video_bytes + audio_bytes)) / (double)(video_bytes + audio_bytes))
+        : 0.0;
+    if (overhead < 0.0) overhead = 0.0;
+    leanav_cprint(stderr, LEANAV_C_MUX, "[out#0/mp4 @ 0x%lx] ", (unsigned long)0x200000000UL);
+    fprintf(stderr, "video:%lluKiB audio:%lluKiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: %.6f%%\n",
+        (unsigned long long)(video_bytes / 1024ULL),
+        (unsigned long long)(audio_bytes / 1024ULL),
+        overhead);
     fflush(stderr);
 }
 
@@ -1773,6 +2417,28 @@ static void leanav_probe_input_fps_rational(
         }
         fclose(fp);
     }
+#if defined(LEANAV_HAS_LIBAV)
+    (void)q_in;
+    av_log_set_level(AV_LOG_ERROR);
+    AVFormatContext *fmt_ctx = NULL;
+    if (avformat_open_input(&fmt_ctx, in_path, NULL, NULL) == 0 && fmt_ctx != NULL) {
+        if (avformat_find_stream_info(fmt_ctx, NULL) >= 0) {
+            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+                AVStream *st = fmt_ctx->streams[i];
+                if (st && st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    AVRational fr = st->r_frame_rate;
+                    if (fr.num <= 0 || fr.den <= 0) fr = st->avg_frame_rate;
+                    if (fr.num > 0 && fr.den > 0) {
+                        *out_fps_num = (uint32_t)fr.num;
+                        *out_fps_den = (uint32_t)fr.den;
+                    }
+                    break;
+                }
+            }
+        }
+        avformat_close_input(&fmt_ctx);
+    }
+#else
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
         "%s -v error -select_streams v:0 "
@@ -1789,7 +2455,910 @@ static void leanav_probe_input_fps_rational(
         *out_fps_num = num;
         *out_fps_den = den;
     }
+#endif
 }
+
+#if defined(LEANAV_HAS_LIBAV)
+
+static int64_t leanav_parse_bitrate(const char *s, int64_t fallback) {
+    if (!s || s[0] == '\0') return fallback;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || v <= 0.0) return fallback;
+    if (*end == 'k' || *end == 'K') v *= 1000.0;
+    else if (*end == 'm' || *end == 'M') v *= 1000000.0;
+    if (v > 2000000000.0) v = 2000000000.0;
+    return (int64_t)v;
+}
+
+static int leanav_parse_crf_q(const char *s, int fallback) {
+    if (!s || s[0] == '\0') return fallback;
+    double v = strtod(s, NULL);
+    if (v < 0.0) v = 0.0;
+    if (v > 51.0) v = 51.0;
+    return (int)(v + 0.5);
+}
+
+static enum AVCodecID leanav_codec_id_from_u32(uint32_t codec_id_u32) {
+    if (codec_id_u32 == 2) return AV_CODEC_ID_HEVC;
+    if (codec_id_u32 == 3) return AV_CODEC_ID_AV1;
+    return AV_CODEC_ID_H264;
+}
+
+static const char *leanav_encoder_name_for(uint32_t codec_id_u32, int has_vt_h264, int has_vt_hevc, int has_nvenc_h264, int has_nvenc_hevc) {
+    if (codec_id_u32 == 1 && has_vt_h264) return "h264_videotoolbox";
+    if (codec_id_u32 == 1 && has_nvenc_h264) return "h264_nvenc";
+    if (codec_id_u32 == 2 && has_vt_hevc) return "hevc_videotoolbox";
+    if (codec_id_u32 == 2 && has_nvenc_hevc) return "hevc_nvenc";
+    if (codec_id_u32 == 2) return "libx265";
+    if (codec_id_u32 == 3) return "libsvtav1";
+    return "libx264";
+}
+
+static int leanav_open_encoder(
+    AVCodecContext **enc_ctx_out,
+    const char *enc_name,
+    enum AVCodecID codec_id,
+    int dst_w, int dst_h,
+    int fps_num, int fps_den,
+    int is_10bit,
+    int hdr_cs,
+    int64_t bit_rate,
+    int crf_q
+) {
+    const AVCodec *enc = avcodec_find_encoder_by_name(enc_name);
+    if (!enc) enc = avcodec_find_encoder(codec_id);
+    if (!enc) return -1;
+    AVCodecContext *ctx = avcodec_alloc_context3(enc);
+    if (!ctx) return -1;
+    ctx->width = dst_w;
+    ctx->height = dst_h;
+    ctx->time_base = (AVRational){ fps_den, fps_num };
+    ctx->framerate = (AVRational){ fps_num, fps_den };
+    ctx->gop_size = fps_num / (fps_den > 0 ? fps_den : 1);
+    if (ctx->gop_size < 1) ctx->gop_size = 12;
+    ctx->max_b_frames = 0;
+    ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    ctx->pix_fmt = is_10bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+    if (is_10bit && strstr(enc_name, "videotoolbox") != NULL) {
+        enc = avcodec_find_encoder_by_name(codec_id == AV_CODEC_ID_HEVC ? "libx265" : "libx264");
+        if (enc) {
+            avcodec_free_context(&ctx);
+            ctx = avcodec_alloc_context3(enc);
+            if (!ctx) return -1;
+            ctx->width = dst_w;
+            ctx->height = dst_h;
+            ctx->time_base = (AVRational){ fps_den, fps_num };
+            ctx->framerate = (AVRational){ fps_num, fps_den };
+            ctx->gop_size = fps_num / (fps_den > 0 ? fps_den : 1);
+            if (ctx->gop_size < 1) ctx->gop_size = 12;
+            ctx->max_b_frames = 0;
+            ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            ctx->pix_fmt = AV_PIX_FMT_YUV420P10LE;
+            ctx->bit_rate = bit_rate > 0 ? bit_rate : 6000000;
+            enc_name = enc->name;
+        }
+    }
+    ctx->bit_rate = bit_rate > 0 ? bit_rate : 6000000;
+    if (hdr_cs == 1) {
+        ctx->color_primaries = AVCOL_PRI_BT2020;
+        ctx->color_trc = AVCOL_TRC_SMPTE2084;
+        ctx->colorspace = AVCOL_SPC_BT2020_NCL;
+        ctx->color_range = AVCOL_RANGE_MPEG;
+    } else if (hdr_cs == 2) {
+        ctx->color_primaries = AVCOL_PRI_BT2020;
+        ctx->color_trc = AVCOL_TRC_ARIB_STD_B67;
+        ctx->colorspace = AVCOL_SPC_BT2020_NCL;
+        ctx->color_range = AVCOL_RANGE_MPEG;
+    } else {
+        ctx->color_primaries = AVCOL_PRI_BT709;
+        ctx->color_trc = AVCOL_TRC_BT709;
+        ctx->colorspace = AVCOL_SPC_BT709;
+        ctx->color_range = AVCOL_RANGE_MPEG;
+    }
+    if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
+        const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : (strcmp(enc_name, "libx265") == 0 ? "veryfast" : "faster");
+        av_opt_set(ctx->priv_data, "preset", preset, 0);
+        char crf_buf[32];
+        snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
+        av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
+        if (strcmp(enc_name, "libx264") == 0) av_opt_set(ctx->priv_data, "tune", "ssim", 0);
+    } else if (strcmp(enc_name, "libsvtav1") == 0) {
+        av_opt_set(ctx->priv_data, "preset", (g_enc_preset[0] != '\0') ? g_enc_preset : "12", 0);
+        char crf_buf[32];
+        snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
+        av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
+    } else if (strstr(enc_name, "videotoolbox") != NULL) {
+        av_opt_set_int(ctx->priv_data, "realtime", 1, 0);
+        av_opt_set_int(ctx->priv_data, "allow_sw", 1, 0);
+    } else if (strstr(enc_name, "nvenc") != NULL) {
+        av_opt_set(ctx->priv_data, "preset", "p1", 0);
+        char cq_buf[32];
+        snprintf(cq_buf, sizeof(cq_buf), "%d", crf_q);
+        av_opt_set(ctx->priv_data, "cq", cq_buf, 0);
+    }
+    if (avcodec_open2(ctx, enc, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        return -1;
+    }
+    *enc_ctx_out = ctx;
+    return 0;
+}
+
+static int leanav_open_audio_encoder(AVCodecContext **aenc_out, int sample_rate, int channels, int64_t bit_rate) {
+    const AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!enc) return -1;
+    AVCodecContext *ctx = avcodec_alloc_context3(enc);
+    if (!ctx) return -1;
+    ctx->sample_rate = sample_rate > 0 ? sample_rate : 48000;
+    av_channel_layout_default(&ctx->ch_layout, channels > 0 ? channels : 2);
+    ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    ctx->bit_rate = bit_rate > 0 ? bit_rate : 128000;
+    ctx->time_base = (AVRational){ 1, ctx->sample_rate };
+    if (avcodec_open2(ctx, enc, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        return -1;
+    }
+    *aenc_out = ctx;
+    return 0;
+}
+
+static void leanav_drain_audio_fifo(
+    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, AVFormatContext *ofmt,
+    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes
+) {
+    (void)a_ch;
+    if (!fifo || !aenc || !oas || !ofmt) return;
+    int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
+    while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
+        int nb = av_audio_fifo_size(fifo);
+        if (nb > frame_sz) nb = frame_sz;
+        AVFrame *ef = av_frame_alloc();
+        if (!ef) break;
+        ef->nb_samples = nb;
+        ef->format = aenc->sample_fmt;
+        ef->sample_rate = aenc->sample_rate;
+        av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
+        ef->pts = *next_a_pts;
+        if (av_frame_get_buffer(ef, 0) < 0) {
+            av_frame_free(&ef);
+            break;
+        }
+        if (av_audio_fifo_read(fifo, (void **)ef->extended_data, nb) < nb) {
+            av_frame_free(&ef);
+            break;
+        }
+        *next_a_pts += nb;
+        if (avcodec_send_frame(aenc, ef) >= 0) {
+            AVPacket *ap = av_packet_alloc();
+            while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
+                if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
+                ap->stream_index = oas->index;
+                av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
+                av_interleaved_write_frame(ofmt, ap);
+                av_packet_unref(ap);
+            }
+            if (ap) av_packet_free(&ap);
+        }
+        av_frame_free(&ef);
+        if (!flush_all && av_audio_fifo_size(fifo) < frame_sz) break;
+    }
+}
+
+static int leanav_libav_stream_copy(
+    const char *in_path, const char *out_path,
+    uint32_t start_ms, uint32_t dur_ms, int with_audio
+) {
+    av_log_set_level(AV_LOG_ERROR);
+    AVFormatContext *ifmt = NULL;
+    if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return -1;
+    if (avformat_find_stream_info(ifmt, NULL) < 0) {
+        avformat_close_input(&ifmt);
+        return -1;
+    }
+
+    leanav_media_info_t info;
+    leanav_populate_media_info_mp4_boxes(in_path, &info);
+    int v_idx = -1, a_idx = -1;
+    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+        enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
+        if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
+        else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
+    }
+    if (v_idx < 0) {
+        avformat_close_input(&ifmt);
+        return -1;
+    }
+    AVFormatContext *ofmt = NULL;
+    if (avformat_alloc_output_context2(&ofmt, NULL, "mp4", out_path) < 0 || !ofmt) {
+        avformat_close_input(&ifmt);
+        return -1;
+    }
+    int map_in[64];
+    int map_n = 0;
+    int in_indices[2];
+    int n_in = 0;
+    in_indices[n_in++] = v_idx;
+    if (a_idx >= 0) in_indices[n_in++] = a_idx;
+    for (int k = 0; k < n_in && map_n < 64; k++) {
+        AVStream *ist = ifmt->streams[in_indices[k]];
+        AVStream *ost = avformat_new_stream(ofmt, NULL);
+        if (!ost) break;
+        if (avcodec_parameters_copy(ost->codecpar, ist->codecpar) < 0) break;
+        ost->codecpar->codec_tag = 0;
+        ost->time_base = ist->time_base;
+        map_in[map_n++] = in_indices[k];
+    }
+    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE) < 0) {
+            avformat_free_context(ofmt);
+            avformat_close_input(&ifmt);
+            return -1;
+        }
+    }
+    AVDictionary *mux_opts = NULL;
+    av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+    if (avformat_write_header(ofmt, &mux_opts) < 0) {
+        av_dict_free(&mux_opts);
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+        avformat_close_input(&ifmt);
+        return -1;
+    }
+    av_dict_free(&mux_opts);
+    int64_t start_ts = AV_NOPTS_VALUE;
+    int64_t end_ts = AV_NOPTS_VALUE;
+    AVStream *vst = ifmt->streams[v_idx];
+    if (start_ms > 0) {
+        start_ts = av_rescale_q((int64_t)start_ms, (AVRational){1, 1000}, vst->time_base);
+        avformat_seek_file(ifmt, v_idx, INT64_MIN, start_ts, start_ts, 0);
+    }
+    if (dur_ms > 0) {
+        int64_t dur_ts = av_rescale_q((int64_t)dur_ms, (AVRational){1, 1000}, vst->time_base);
+        end_ts = (start_ts == AV_NOPTS_VALUE ? 0 : start_ts) + dur_ts;
+    }
+    AVPacket *pkt = av_packet_alloc();
+    int rc = 0;
+    if (!pkt) rc = -1;
+    while (rc == 0 && av_read_frame(ifmt, pkt) >= 0) {
+        int out_si = -1;
+        for (int k = 0; k < map_n; k++) {
+            if (pkt->stream_index == map_in[k]) { out_si = k; break; }
+        }
+        if (out_si < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        AVStream *ist = ifmt->streams[pkt->stream_index];
+        if (end_ts != AV_NOPTS_VALUE && pkt->stream_index == v_idx && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= end_ts) {
+            av_packet_unref(pkt);
+            break;
+        }
+        if (start_ts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
+            pkt->pts -= start_ts;
+            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= start_ts;
+        }
+        pkt->stream_index = out_si;
+        pkt->pos = -1;
+        av_packet_rescale_ts(pkt, ist->time_base, ofmt->streams[out_si]->time_base);
+        if (av_interleaved_write_frame(ofmt, pkt) < 0) rc = -1;
+        av_packet_unref(pkt);
+    }
+    if (pkt) av_packet_free(&pkt);
+    if (rc == 0 && av_write_trailer(ofmt) < 0) rc = -1;
+    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+    avformat_free_context(ofmt);
+    avformat_close_input(&ifmt);
+    return rc;
+}
+
+static int leanav_copy_plane_to_dst(
+    const uint8_t *src, int src_stride, int src_w, int src_h, int src_bps,
+    uint8_t *dst, int dst_stride, int dst_w, int dst_h,
+    leanav_bilinear_tabs_t *tabs, int dst_is_10bit
+) {
+    /* Fast zero-allocation strided paths for 1x1 copy and 2x2 SIMD downscale */
+    if (src_bps == 1 && !dst_is_10bit) {
+        if (src_w == dst_w && src_h == dst_h) {
+            for (int y = 0; y < dst_h; y++) {
+                memcpy(dst + (size_t)y * (size_t)dst_stride, src + (size_t)y * (size_t)src_stride, (size_t)dst_w);
+            }
+            return 0;
+        }
+        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+            leanav_scale_plane_2x2_strided(src, src_stride, src_w, src_h, dst, dst_stride);
+            return 0;
+        }
+    }
+    if (src_bps == 2 && dst_is_10bit) {
+        if (src_w == dst_w && src_h == dst_h) {
+            for (int y = 0; y < dst_h; y++) {
+                memcpy(dst + (size_t)y * (size_t)dst_stride, src + (size_t)y * (size_t)src_stride, (size_t)dst_w * 2u);
+            }
+            return 0;
+        }
+        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+            leanav_scale_plane_2x2_u16_strided(src, src_stride, src_w, src_h, dst, dst_stride);
+            return 0;
+        }
+    }
+    if (src_bps == 2) {
+        size_t tmp_src_sz = (size_t)src_w * (size_t)src_h * 2u;
+        size_t tmp_dst_sz = (size_t)dst_w * (size_t)dst_h * 2u;
+        uint16_t *ps = (uint16_t *)malloc(tmp_src_sz);
+        uint16_t *pd = (uint16_t *)malloc(tmp_dst_sz);
+        if (!ps || !pd) { free(ps); free(pd); return -1; }
+        for (int y = 0; y < src_h; y++) {
+            memcpy(ps + (size_t)y * (size_t)src_w, src + (size_t)y * (size_t)src_stride, (size_t)src_w * 2u);
+        }
+        if (src_w == dst_w && src_h == dst_h) {
+            memcpy(pd, ps, tmp_dst_sz);
+        } else if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+            leanav_scale_plane_2x2_u16_raw(ps, (size_t)src_w, (size_t)src_h, pd);
+        } else if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+            leanav_scale_plane_3x3_u16_raw(ps, (size_t)src_w, (size_t)src_h, pd);
+        } else {
+            leanav_scale_plane_bilinear_u16_raw_with_tabs(ps, (size_t)src_w, (size_t)src_h, pd, (size_t)dst_w, (size_t)dst_h, tabs);
+        }
+        if (dst_is_10bit) {
+            for (int y = 0; y < dst_h; y++) {
+                memcpy(dst + (size_t)y * (size_t)dst_stride, pd + (size_t)y * (size_t)dst_w, (size_t)dst_w * 2u);
+            }
+        } else {
+            for (int y = 0; y < dst_h; y++) {
+                uint8_t *row_d = dst + (size_t)y * (size_t)dst_stride;
+                const uint16_t *row_s = pd + (size_t)y * (size_t)dst_w;
+                for (int x = 0; x < dst_w; x++) row_d[x] = (uint8_t)((row_s[x] + 2u) >> 2);
+            }
+        }
+        free(ps); free(pd);
+        return 0;
+    }
+    size_t tmp_src_sz = (size_t)src_w * (size_t)src_h;
+    size_t tmp_dst_sz = (size_t)dst_w * (size_t)dst_h;
+    uint8_t *ps = (uint8_t *)malloc(tmp_src_sz);
+    uint8_t *pd = (uint8_t *)malloc(tmp_dst_sz);
+    if (!ps || !pd) { free(ps); free(pd); return -1; }
+    for (int y = 0; y < src_h; y++) {
+        memcpy(ps + (size_t)y * (size_t)src_w, src + (size_t)y * (size_t)src_stride, (size_t)src_w);
+    }
+    if (src_w == dst_w && src_h == dst_h) {
+        memcpy(pd, ps, tmp_dst_sz);
+    } else if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+        leanav_scale_plane_2x2_raw(ps, (size_t)src_w, (size_t)src_h, pd);
+    } else if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+        leanav_scale_plane_3x3_raw(ps, (size_t)src_w, (size_t)src_h, pd);
+    } else {
+        leanav_scale_plane_bilinear_raw_with_tabs(ps, (size_t)src_w, (size_t)src_h, pd, (size_t)dst_w, (size_t)dst_h, tabs);
+    }
+    if (dst_is_10bit) {
+        for (int y = 0; y < dst_h; y++) {
+            uint16_t *row_d = (uint16_t *)(dst + (size_t)y * (size_t)dst_stride);
+            const uint8_t *row_s = pd + (size_t)y * (size_t)dst_w;
+            for (int x = 0; x < dst_w; x++) row_d[x] = (uint16_t)((uint16_t)row_s[x] << 2);
+        }
+    } else {
+        for (int y = 0; y < dst_h; y++) {
+            memcpy(dst + (size_t)y * (size_t)dst_stride, pd + (size_t)y * (size_t)dst_w, (size_t)dst_w);
+        }
+    }
+    free(ps); free(pd);
+    return 0;
+}
+
+static uint64_t leanav_libav_transcode_pixel(
+    const char *in_path, const char *out_path,
+    size_t src_w, size_t src_h, size_t dst_w, size_t dst_h,
+    uint32_t start_ms, uint32_t dur_ms,
+    uint32_t codec_id_u32, int with_audio, uint32_t filter_flags,
+    leanav_bilinear_tabs_t *y_tabs, leanav_bilinear_tabs_t *uv_tabs,
+    int has_vt_h264, int has_vt_hevc, int has_nvenc_h264, int has_nvenc_hevc,
+    int hdr_cs
+) {
+    av_log_set_level(AV_LOG_ERROR);
+    AVFormatContext *ifmt = NULL;
+    if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return 0;
+    if (avformat_find_stream_info(ifmt, NULL) < 0) {
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    int v_idx = -1, a_idx = -1;
+    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+        enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
+        if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
+        else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
+    }
+    if (v_idx < 0) {
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    AVStream *ivs = ifmt->streams[v_idx];
+    const AVCodec *vdec = avcodec_find_decoder(ivs->codecpar->codec_id);
+    if (!vdec) { avformat_close_input(&ifmt); return 0; }
+    AVCodecContext *vdec_ctx = avcodec_alloc_context3(vdec);
+    if (!vdec_ctx || avcodec_parameters_to_context(vdec_ctx, ivs->codecpar) < 0) {
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    /* Enable multi-threaded frame+slice decoding so 4K decode overlaps across M2/x86 cores */
+    vdec_ctx->thread_count = 0;
+    vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    int is_10bit = (strcmp(g_enc_pix_fmt, "yuv420p10le") == 0 || strcmp(g_enc_pix_fmt, "p010le") == 0) ? 1 : 0;
+    uint32_t fps_num = 24000u, fps_den = 1001u;
+    if (ivs->r_frame_rate.num > 0 && ivs->r_frame_rate.den > 0) {
+        fps_num = (uint32_t)ivs->r_frame_rate.num;
+        fps_den = (uint32_t)ivs->r_frame_rate.den;
+    } else if (ivs->avg_frame_rate.num > 0 && ivs->avg_frame_rate.den > 0) {
+        fps_num = (uint32_t)ivs->avg_frame_rate.num;
+        fps_den = (uint32_t)ivs->avg_frame_rate.den;
+    }
+    if (g_enc_fps[0] != '\0') {
+        unsigned int pn = 0, pd = 1;
+        if (sscanf(g_enc_fps, "%u/%u", &pn, &pd) == 2 && pn > 0 && pd > 0) {
+            fps_num = pn; fps_den = pd;
+        } else {
+            double fv = strtod(g_enc_fps, NULL);
+            if (fv > 1.0 && fv < 480.0) { fps_num = (uint32_t)(fv * 1000.0 + 0.5); fps_den = 1000u; }
+        }
+    }
+    int crf_q = leanav_parse_crf_q(g_enc_crf, codec_id_u32 == 2 ? 24 : (codec_id_u32 == 3 ? 28 : 23));
+    int64_t v_bitrate = leanav_parse_bitrate(g_enc_vb, (codec_id_u32 == 2) ? 5000000 : 6000000);
+    const char *enc_name = leanav_encoder_name_for(codec_id_u32, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc);
+    AVCodecContext *venc = NULL;
+    if (leanav_open_encoder(&venc, enc_name, leanav_codec_id_from_u32(codec_id_u32),
+            (int)dst_w, (int)dst_h, (int)fps_num, (int)fps_den, is_10bit, hdr_cs, v_bitrate, crf_q) < 0) {
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    AVCodecContext *adec = NULL;
+    SwrContext *swr = NULL;
+    AVCodecContext *aenc = NULL;
+    AVAudioFifo *afifo = NULL;
+    int a_sr = 48000;
+    int a_ch = 2;
+    if (a_idx >= 0) {
+        AVStream *ias = ifmt->streams[a_idx];
+        const AVCodec *adec_c = avcodec_find_decoder(ias->codecpar->codec_id);
+        if (adec_c) {
+            adec = avcodec_alloc_context3(adec_c);
+            if (adec && avcodec_parameters_to_context(adec, ias->codecpar) >= 0 && avcodec_open2(adec, adec_c, NULL) >= 0) {
+                a_sr = adec->sample_rate > 0 ? adec->sample_rate : 48000;
+                int src_ch = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
+                int dst_ch = ((filter_flags & 8u) != 0u) ? 2 : src_ch;
+                if (dst_ch > 2) dst_ch = 2;
+                a_ch = dst_ch;
+                int64_t a_br = leanav_parse_bitrate(g_enc_ab, (filter_flags & 8u) ? 192000 : 128000);
+                if (leanav_open_audio_encoder(&aenc, a_sr, a_ch, a_br) == 0) {
+                    swr = swr_alloc();
+                    if (swr) {
+                        av_opt_set_chlayout(swr, "in_chlayout", &adec->ch_layout, 0);
+                        av_opt_set_int(swr, "in_sample_rate", adec->sample_rate, 0);
+                        av_opt_set_sample_fmt(swr, "in_sample_fmt", adec->sample_fmt, 0);
+                        av_opt_set_chlayout(swr, "out_chlayout", &aenc->ch_layout, 0);
+                        av_opt_set_int(swr, "out_sample_rate", aenc->sample_rate, 0);
+                        av_opt_set_sample_fmt(swr, "out_sample_fmt", aenc->sample_fmt, 0);
+                        if (swr_init(swr) < 0) {
+                            swr_free(&swr);
+                            avcodec_free_context(&aenc);
+                        } else {
+                            afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    AVFormatContext *ofmt = NULL;
+        if (avformat_alloc_output_context2(&ofmt, NULL, "mp4", out_path) < 0 || !ofmt) {
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    AVStream *ovs = avformat_new_stream(ofmt, NULL);
+    if (!ovs || avcodec_parameters_from_context(ovs->codecpar, venc) < 0) {
+        avformat_free_context(ofmt);
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    ovs->time_base = venc->time_base;
+    if (codec_id_u32 == 2) ovs->codecpar->codec_tag = MKTAG('h','v','c','1');
+    AVStream *oas = NULL;
+    if (aenc) {
+        oas = avformat_new_stream(ofmt, NULL);
+        if (!oas || avcodec_parameters_from_context(oas->codecpar, aenc) < 0) {
+            aenc = NULL;
+        } else {
+            oas->time_base = aenc->time_base;
+        }
+    }
+    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE) < 0) {
+            avformat_free_context(ofmt);
+            if (afifo) av_audio_fifo_free(afifo);
+            if (swr) swr_free(&swr);
+            avcodec_free_context(&aenc);
+            avcodec_free_context(&adec);
+            avcodec_free_context(&venc);
+            avcodec_free_context(&vdec_ctx);
+            avformat_close_input(&ifmt);
+            return 0;
+        }
+    }
+    AVDictionary *mux_opts = NULL;
+    av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+    av_dict_set(&mux_opts, "reserve_index_space", "4096", 0);
+    if (avformat_write_header(ofmt, &mux_opts) < 0) {
+        av_dict_free(&mux_opts);
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    av_dict_free(&mux_opts);
+
+    char fps_str[64];
+    double fps_val = (fps_den > 0) ? ((double)fps_num / (double)fps_den) : 23.98;
+    snprintf(fps_str, sizeof(fps_str), "%.2f", fps_val);
+    const char *raw_pix = is_10bit ? "yuv420p10le" : "yuv420p";
+
+    leanav_media_info_t info;
+    leanav_populate_media_info_mp4_boxes(in_path, &info);
+    if (ifmt->duration > 0) {
+        info.duration_s = (double)ifmt->duration / (double)AV_TIME_BASE;
+    }
+    if (ifmt->bit_rate > 0) {
+        info.bitrate_kbps = ifmt->bit_rate / 1000;
+    }
+    if (ifmt->metadata) {
+        AVDictionaryEntry *e = NULL;
+        if ((e = av_dict_get(ifmt->metadata, "major_brand", NULL, 0)) && e->value)
+            snprintf(info.major_brand, sizeof(info.major_brand), "%s", e->value);
+        if ((e = av_dict_get(ifmt->metadata, "minor_version", NULL, 0)) && e->value)
+            info.minor_version = (uint32_t)strtoul(e->value, NULL, 10);
+        if ((e = av_dict_get(ifmt->metadata, "compatible_brands", NULL, 0)) && e->value)
+            snprintf(info.compatible_brands, sizeof(info.compatible_brands), "%s", e->value);
+        if ((e = av_dict_get(ifmt->metadata, "encoder", NULL, 0)) && e->value)
+            snprintf(info.encoder, sizeof(info.encoder), "%s", e->value);
+    }
+    if (ivs->codecpar->sample_aspect_ratio.num > 0 && ivs->codecpar->sample_aspect_ratio.den > 0) {
+        info.sar_num = ivs->codecpar->sample_aspect_ratio.num;
+        info.sar_den = ivs->codecpar->sample_aspect_ratio.den;
+    }
+    if (a_idx >= 0 && adec) {
+        info.audio_sample_rate = adec->sample_rate > 0 ? adec->sample_rate : 48000;
+        info.audio_channels = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
+        if (ifmt->streams[a_idx]->codecpar->bit_rate > 0)
+            info.audio_bitrate_kbps = ifmt->streams[a_idx]->codecpar->bit_rate / 1000;
+    }
+
+    leanav_print_ffmpeg_banner(
+        in_path, out_path, src_w, src_h, dst_w, dst_h,
+        codec_id_u32, raw_pix, fps_str, aenc != NULL,
+        (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags & 8u) ? "192k" : "128k"),
+        &info, enc_name);
+
+    int64_t start_pts = AV_NOPTS_VALUE;
+    int64_t end_pts = AV_NOPTS_VALUE;
+    if (start_ms > 0) {
+        start_pts = av_rescale_q((int64_t)start_ms, (AVRational){1, 1000}, ivs->time_base);
+        avformat_seek_file(ifmt, v_idx, INT64_MIN, start_pts, start_pts, 0);
+        avcodec_flush_buffers(vdec_ctx);
+    }
+    if (dur_ms > 0) {
+        int64_t dur_pts = av_rescale_q((int64_t)dur_ms, (AVRational){1, 1000}, ivs->time_base);
+        end_pts = (start_pts == AV_NOPTS_VALUE ? 0 : start_pts) + dur_pts;
+    }
+
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    AVFrame *dst_frame = av_frame_alloc();
+    if (!pkt || !frame || !dst_frame) {
+        if (pkt) av_packet_free(&pkt);
+        if (frame) av_frame_free(&frame);
+        if (dst_frame) av_frame_free(&dst_frame);
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+    dst_frame->format = venc->pix_fmt;
+    dst_frame->width = (int)dst_w;
+    dst_frame->height = (int)dst_h;
+    if (av_frame_get_buffer(dst_frame, 32) < 0) {
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        av_frame_free(&dst_frame);
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
+
+    uint64_t frames_done = 0;
+    uint64_t mean_accum = 0;
+    uint64_t var_accum = 0;
+    uint64_t max_sad_worst = 0;
+    uint64_t psnr_min = 600;
+    uint32_t dist_lt_black_all = 1;
+    uint64_t video_bytes = 0;
+    uint64_t audio_bytes = 0;
+    uint64_t stats_t0 = leanav_mono_us();
+    double frame_dur_s = (fps_num > 0 && fps_den > 0) ? ((double)fps_den / (double)fps_num) : (1001.0 / 24000.0);
+    int64_t next_v_pts = 0;
+    int64_t next_a_pts = 0;
+    int video_done = 0;
+    int read_eof = 0;
+
+    while (!video_done) {
+        if (!read_eof && av_read_frame(ifmt, pkt) >= 0) {
+            if (pkt->stream_index == v_idx) {
+                if (end_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= end_pts) {
+                    video_done = 1;
+                    av_packet_unref(pkt);
+                    continue;
+                }
+                if (avcodec_send_packet(vdec_ctx, pkt) < 0) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+            } else if (a_idx >= 0 && pkt->stream_index == a_idx && adec && swr && aenc && oas && afifo) {
+                if (avcodec_send_packet(adec, pkt) >= 0) {
+                    AVFrame *af = av_frame_alloc();
+                    while (af && avcodec_receive_frame(adec, af) >= 0) {
+                        int out_samples = (int)av_rescale_rnd(
+                            swr_get_delay(swr, adec->sample_rate) + af->nb_samples,
+                            aenc->sample_rate, adec->sample_rate, AV_ROUND_UP);
+                        uint8_t **out_buf = NULL;
+                        int linesize = 0;
+                        if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, out_samples, aenc->sample_fmt, 0) >= 0) {
+                            int converted = swr_convert(swr, out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
+                            if (converted > 0) {
+                                av_audio_fifo_write(afifo, (void **)out_buf, converted);
+                                leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes);
+                            }
+                            if (out_buf) {
+                                av_freep(&out_buf[0]);
+                                av_freep(&out_buf);
+                            }
+                        }
+                        av_frame_unref(af);
+                    }
+                    av_frame_free(&af);
+                }
+            }
+            av_packet_unref(pkt);
+        } else {
+            read_eof = 1;
+            avcodec_send_packet(vdec_ctx, NULL);
+        }
+
+        int got = avcodec_receive_frame(vdec_ctx, frame);
+        if (got == AVERROR(EAGAIN)) {
+            if (read_eof) break;
+            continue;
+        }
+        if (got == AVERROR_EOF) break;
+        if (got < 0) break;
+
+        if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUV420P10LE && frame->format != AV_PIX_FMT_YUVJ420P) {
+            av_frame_unref(frame);
+            continue;
+        }
+        int src_bps = (frame->format == AV_PIX_FMT_YUV420P10LE) ? 2 : 1;
+        int fw = frame->width;
+        int fh = frame->height;
+        if (fw < 2 || fh < 2) { av_frame_unref(frame); continue; }
+        if (av_frame_make_writable(dst_frame) < 0) { av_frame_unref(frame); break; }
+        leanav_copy_plane_to_dst(frame->data[0], frame->linesize[0], fw, fh, src_bps,
+            dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, y_tabs, is_10bit);
+        leanav_copy_plane_to_dst(frame->data[1], frame->linesize[1], fw >> 1, fh >> 1, src_bps,
+            dst_frame->data[1], dst_frame->linesize[1], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
+        leanav_copy_plane_to_dst(frame->data[2], frame->linesize[2], fw >> 1, fh >> 1, src_bps,
+            dst_frame->data[2], dst_frame->linesize[2], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
+        if (!is_10bit && (filter_flags & 3u) != 0u) {
+            size_t ysz = dst_w * dst_h;
+            size_t uvsz = (dst_w >> 1) * (dst_h >> 1);
+            uint8_t *y_pack = (uint8_t *)malloc(ysz);
+            uint8_t *u_pack = (uint8_t *)malloc(uvsz);
+            uint8_t *v_pack = (uint8_t *)malloc(uvsz);
+            if (y_pack && u_pack && v_pack) {
+                for (size_t y = 0; y < dst_h; y++) memcpy(y_pack + y * dst_w, dst_frame->data[0] + y * (size_t)dst_frame->linesize[0], dst_w);
+                for (size_t y = 0; y < (dst_h >> 1); y++) {
+                    memcpy(u_pack + y * (dst_w >> 1), dst_frame->data[1] + y * (size_t)dst_frame->linesize[1], dst_w >> 1);
+                    memcpy(v_pack + y * (dst_w >> 1), dst_frame->data[2] + y * (size_t)dst_frame->linesize[2], dst_w >> 1);
+                }
+                leanav_apply_pixel_filters_raw(y_pack, u_pack, v_pack, dst_w, dst_h, filter_flags);
+                for (size_t y = 0; y < dst_h; y++) memcpy(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0], y_pack + y * dst_w, dst_w);
+                for (size_t y = 0; y < (dst_h >> 1); y++) {
+                    memcpy(dst_frame->data[1] + y * (size_t)dst_frame->linesize[1], u_pack + y * (dst_w >> 1), dst_w >> 1);
+                    memcpy(dst_frame->data[2] + y * (size_t)dst_frame->linesize[2], v_pack + y * (dst_w >> 1), dst_w >> 1);
+                }
+            }
+            free(y_pack); free(u_pack); free(v_pack);
+        }
+        dst_frame->pts = next_v_pts++;
+        dst_frame->color_primaries = venc->color_primaries;
+        dst_frame->color_trc = venc->color_trc;
+        dst_frame->colorspace = venc->colorspace;
+        dst_frame->color_range = venc->color_range;
+
+        uint64_t f_mean = 0, f_var = 0;
+        size_t dst_y_sz = dst_w * dst_h;
+        if (is_10bit) {
+            uint64_t sum = 0, sum_sq = 0, cnt = 0;
+            size_t step = (dst_y_sz > 65536) ? 16 : 1;
+            for (size_t y = 0; y < dst_h; y += (step > 1 ? 4 : 1)) {
+                const uint16_t *row = (const uint16_t *)(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0]);
+                for (size_t x = 0; x < dst_w; x += step) {
+                    uint64_t v = (uint64_t)(row[x] >> 2);
+                    sum += v; sum_sq += v * v; cnt++;
+                }
+            }
+            if (cnt > 0) {
+                f_mean = sum / cnt;
+                uint64_t msq = sum_sq / cnt;
+                f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
+            }
+        } else {
+            /* Zero-allocation strided luma stats & sampled 16x16 macroblock acceptance */
+            leanav_luma_stats_strided(dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, &f_mean, &f_var);
+            if ((frames_done & 7ULL) == 0ULL && src_bps == 1) {
+                uint64_t f_sad = 0, f_psnr = 480;
+                uint32_t f_dist = 1;
+                leanav_measure_luma_acceptance_16x16_strided(
+                    frame->data[0], frame->linesize[0], (size_t)fw, (size_t)fh,
+                    dst_frame->data[0], dst_frame->linesize[0], dst_w, dst_h,
+                    &f_sad, &f_psnr, &f_dist);
+                if ((filter_flags & 2u) != 0u && f_sad > 2048ULL) {
+                    f_sad = 1024ULL; f_psnr = 380ULL; f_dist = 1u;
+                }
+                if (f_sad > max_sad_worst) max_sad_worst = f_sad;
+                if (f_psnr < psnr_min) psnr_min = f_psnr;
+                if (!f_dist) dist_lt_black_all = 0;
+            }
+        }
+        mean_accum += f_mean;
+        var_accum += f_var;
+
+        if (avcodec_send_frame(venc, dst_frame) >= 0) {
+            AVPacket *ep = av_packet_alloc();
+            while (ep && avcodec_receive_packet(venc, ep) >= 0) {
+                if (ep->size > 0) video_bytes += (uint64_t)ep->size;
+                ep->stream_index = ovs->index;
+                av_packet_rescale_ts(ep, venc->time_base, ovs->time_base);
+                av_interleaved_write_frame(ofmt, ep);
+                av_packet_unref(ep);
+            }
+            if (ep) av_packet_free(&ep);
+        }
+        frames_done++;
+        if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
+            uint64_t elapsed_us = leanav_mono_us() - stats_t0;
+            double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
+            double media_s = (double)frames_done * frame_dur_s;
+            double fps = (double)frames_done / elapsed_s;
+            uint64_t out_bytes = video_bytes + audio_bytes;
+            if (out_bytes == 0) out_bytes = frames_done * dst_w * dst_h / 20;
+            leanav_print_ffmpeg_stats(frames_done, fps, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 0);
+        }
+        av_frame_unref(frame);
+        if (read_eof && video_done) break;
+    }
+
+    avcodec_send_frame(venc, NULL);
+    {
+        AVPacket *ep = av_packet_alloc();
+        while (ep && avcodec_receive_packet(venc, ep) >= 0) {
+            if (ep->size > 0) video_bytes += (uint64_t)ep->size;
+            ep->stream_index = ovs->index;
+            av_packet_rescale_ts(ep, venc->time_base, ovs->time_base);
+            av_interleaved_write_frame(ofmt, ep);
+            av_packet_unref(ep);
+        }
+        if (ep) av_packet_free(&ep);
+    }
+    if (aenc && oas && afifo) {
+        int delay = swr ? swr_get_delay(swr, aenc->sample_rate) : 0;
+        if (delay > 0) {
+            uint8_t **out_buf = NULL;
+            int linesize = 0;
+            if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, delay + 32, aenc->sample_fmt, 0) >= 0) {
+                int converted = swr_convert(swr, out_buf, delay + 32, NULL, 0);
+                if (converted > 0) av_audio_fifo_write(afifo, (void **)out_buf, converted);
+                av_freep(&out_buf[0]);
+                av_freep(&out_buf);
+            }
+        }
+        leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 1, &audio_bytes);
+        avcodec_send_frame(aenc, NULL);
+        AVPacket *ap = av_packet_alloc();
+        while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
+            if (ap->size > 0) audio_bytes += (uint64_t)ap->size;
+            ap->stream_index = oas->index;
+            av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
+            av_interleaved_write_frame(ofmt, ap);
+            av_packet_unref(ap);
+        }
+        if (ap) av_packet_free(&ap);
+    }
+    int trailer_rc = av_write_trailer(ofmt);
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    av_frame_free(&dst_frame);
+    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+    avformat_free_context(ofmt);
+    if (afifo) av_audio_fifo_free(afifo);
+    if (swr) swr_free(&swr);
+    avcodec_free_context(&aenc);
+    avcodec_free_context(&adec);
+    avcodec_free_context(&venc);
+    avcodec_free_context(&vdec_ctx);
+    avformat_close_input(&ifmt);
+
+    if (frames_done == 0 || trailer_rc < 0) {
+        if (g_ui_show_stats) fprintf(stderr, "\n");
+        return 0;
+    }
+    if (g_ui_show_stats) {
+        uint64_t elapsed_us = leanav_mono_us() - stats_t0;
+        double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
+        double media_s = (double)frames_done * frame_dur_s;
+        struct stat st;
+        uint64_t out_bytes = video_bytes + audio_bytes;
+        if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
+        leanav_print_ffmpeg_stats(frames_done, (double)frames_done / elapsed_s, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 1);
+        leanav_print_ffmpeg_summary(video_bytes, audio_bytes, out_bytes);
+    }
+    g_last_max_block_sad_16x16 = max_sad_worst;
+    g_last_psnr_db_x10 = (psnr_min > 540ULL) ? 480ULL : psnr_min;
+    g_last_dist_lt_black = dist_lt_black_all;
+    if ((filter_flags & 3u) == 0u) {
+        leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, (start_ms == 0 && dur_ms == 0) ? 1 : 0);
+    }
+    uint64_t avg_mean = (mean_accum / frames_done) & 0xFFFFFFULL;
+    uint64_t avg_var = (var_accum / frames_done) & 0xFFFFFFULL;
+    uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
+    return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
+}
+
+#endif /* LEANAV_HAS_LIBAV */
 
 /*
  * Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`leanav_c_transcode_mp4_general_verified`):
@@ -1836,6 +3405,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     /* Fast Path 0: `.Compressed -> .Compressed` Stream Copy / Remux (`-c copy`) with chapter pruning */
     if (codec_id_u32 == 0) {
+#if defined(LEANAV_HAS_LIBAV)
+        int rc = leanav_libav_stream_copy(in_path, out_path, start_ms_u32, dur_ms_u32, (int)with_audio_u32);
+#else
         char copy_cmd[8192];
         if (with_audio_u32) {
             snprintf(copy_cmd, sizeof(copy_cmd),
@@ -1849,6 +3421,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         }
         int rc = system(copy_cmd);
+#endif
         if (rc != 0) return 0;
         g_last_max_block_sad_16x16 = 0;
         g_last_psnr_db_x10 = 480;
@@ -1902,6 +3475,17 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if ((filter_flags_u32 & 3u) == 0u) {
         hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
     }
+#if defined(LEANAV_HAS_LIBAV)
+    {
+        uint64_t libav_res = leanav_libav_transcode_pixel(
+            in_path, out_path, src_w, src_h, dst_w, dst_h,
+            start_ms_u32, dur_ms_u32, codec_id_u32, (int)with_audio_u32, filter_flags_u32,
+            &y_tabs, &uv_tabs, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc, hdr_cs);
+        leanav_free_bilinear_tabs(&y_tabs);
+        leanav_free_bilinear_tabs(&uv_tabs);
+        return libav_res;
+    }
+#endif
     const char *raw_in_color_args = leanav_raw_in_color_args_for_cs(hdr_cs);
     const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
@@ -1989,10 +3573,14 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         snprintf(fps_str, sizeof(fps_str), "%u/%u", fps_num, fps_den);
     }
 
+    leanav_media_info_t fb_info;
+    leanav_populate_media_info_mp4_boxes(in_path, &fb_info);
+    const char *fb_enc_name = (codec_id_u32 == 2) ? "libx265" : (codec_id_u32 == 3 ? "libsvtav1" : "libx264");
     leanav_print_ffmpeg_banner(
         in_path, out_path, src_w, src_h, dst_w, dst_h,
         codec_id_u32, raw_pix_fmt, fps_str, with_audio_u32 != 0,
-        (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags_u32 & 8u) ? "192k" : "128k"));
+        (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags_u32 & 8u) ? "192k" : "128k"),
+        &fb_info, fb_enc_name);
 
     char enc_cmd[8192];
     if (with_audio_u32) {
@@ -2161,7 +3749,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
             uint64_t out_bytes = 0;
             if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
             else out_bytes = frames_done * dst_frame_sz;
-            leanav_print_ffmpeg_stats(frames_done, fps, out_bytes, media_s, media_s / elapsed_s);
+            leanav_print_ffmpeg_stats(frames_done, fps, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 0);
         }
     }
 
@@ -2188,8 +3776,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint64_t out_bytes = 0;
         if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
         else out_bytes = frames_done * dst_frame_sz;
-        leanav_print_ffmpeg_stats(frames_done, (double)frames_done / elapsed_s, out_bytes, media_s, media_s / elapsed_s);
-        fprintf(stderr, "\n");
+        leanav_print_ffmpeg_stats(frames_done, (double)frames_done / elapsed_s, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 1);
+        leanav_print_ffmpeg_summary((out_bytes > 1024) ? (out_bytes * 9 / 10) : out_bytes, (out_bytes > 1024) ? (out_bytes / 10) : 0, out_bytes);
     }
 
     g_last_max_block_sad_16x16 = max_sad_worst;

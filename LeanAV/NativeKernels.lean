@@ -789,7 +789,22 @@ def emitLeanAvLnirWire : String :=
     "C_ret", "4"
   ]
 
-  let allTokens := ["LNIR_WIRE_V1", modHex, "51"] ++ d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12 ++ d13 ++ d14 ++ d15 ++ d16 ++ d17 ++ d18 ++ d19 ++ d20 ++ d21 ++ d22 ++ d23 ++ d24 ++ d25 ++ d26 ++ d27 ++ d28 ++ d29 ++ d30 ++ d31 ++ d32 ++ d33 ++ d34 ++ d35 ++ d36 ++ d37 ++ d38 ++ d39 ++ d40 ++ d41 ++ d42 ++ d43 ++ d44 ++ d45 ++ d46 ++ d47 ++ d48 ++ d49 ++ d50 ++ d51
+  -- 52. `libav_videotoolbox_p010_strided_pack_fma_gpu` (luma10Sample: sarray i64, msbShiftScale: sarray i64, chromaInterleaveBase: sarray i64) -> sarray i64
+  -- Wave 52: Data-parallel in-process `libavcodec` / Apple `VideoToolbox` 10-bit `P010LE` / `YUV420P10LE` strided plane packing FMA (`luma10Sample[i] * msbShiftScale[i] + chromaInterleaveBase[i]`, `K_cust` FMA)
+  let d52Name := hexEncodeString "libav_videotoolbox_p010_strided_pack_fma_gpu"
+  let d52 : List String := [
+    "D_decl", d52Name, "A_L3", "1", "3",
+    "0", hexEncodeString "luma10Sample", "1", "T_sarray", "T_i64",
+    "1", hexEncodeString "msbShiftScale", "1", "T_sarray", "T_i64",
+    "2", hexEncodeString "chromaInterleaveBase", "1", "T_sarray", "T_i64",
+    "T_sarray", "T_i64",
+    "C_let", "3", "T_i64", "E_salen", "0",
+    "C_par", "4", "3", "3", "0", "1", "2", "T_i64",
+      "K_cust", "10", "3", "0", "1", "2", "S_fma", "S_var", "0", "S_var", "1", "S_var", "2",
+    "C_ret", "4"
+  ]
+
+  let allTokens := ["LNIR_WIRE_V1", modHex, "52"] ++ d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12 ++ d13 ++ d14 ++ d15 ++ d16 ++ d17 ++ d18 ++ d19 ++ d20 ++ d21 ++ d22 ++ d23 ++ d24 ++ d25 ++ d26 ++ d27 ++ d28 ++ d29 ++ d30 ++ d31 ++ d32 ++ d33 ++ d34 ++ d35 ++ d36 ++ d37 ++ d38 ++ d39 ++ d40 ++ d41 ++ d42 ++ d43 ++ d44 ++ d45 ++ d46 ++ d47 ++ d48 ++ d49 ++ d50 ++ d51 ++ d52
   String.intercalate "|" allTokens
 
 /-! ## Tranche 5 (T5): Typed `LnirKernelAst`, Formal Evaluator `evalLnirKernel`, & Universal Equivalence Theorems -/
@@ -1686,5 +1701,43 @@ theorem checkLnirKernel_sound (k : LnirKernelDescriptor)
     lnir_strided_simd_bound hBps hSrcWs hSrcFit hVec64 hx hy,
     lnir_strided_simd_bound hBps hDstWs hDstFit hVec64 hx hy
   ⟩
+
+/-! ## Wave 52: In-Process `libavcodec` / `VideoToolbox` 10-Bit `P010LE` Strided Plane Packing FMA (`libav_videotoolbox_p010_strided_pack_fma_gpu`) & 3x3 Box Reciprocal Equivalence -/
+
+/-- Pure Lean reference specification for `libav_videotoolbox_p010_strided_pack_fma_gpu`:
+    computes `luma10Sample[i] * msbShiftScale[i] + chromaInterleaveBase[i]` for in-process `libavcodec` / `VideoToolbox`
+    10-bit `P010LE` / `YUV420P10LE` strided plane packing. -/
+def leanSpecLibavVideotoolboxP010PackFma (luma10Sample msbShiftScale chromaInterleaveBase : List Int64) : List Int64 :=
+  List.zipWith (fun prod base => prod + base)
+    (List.zipWith (fun s m => s * m) luma10Sample msbShiftScale)
+    chromaInterleaveBase
+
+/-- Universal Theorem (Wave 52): `evalLnirKernel .fmaBlend` is universally equal (`∀`) to
+    `leanSpecLibavVideotoolboxP010PackFma` for ALL `luma10Sample msbShiftScale chromaInterleaveBase : List Int64`. -/
+theorem evalLnir_libav_videotoolbox_p010_strided_pack_fma_equiv
+    (luma10Sample msbShiftScale chromaInterleaveBase : List Int64) :
+    evalLnirKernel .fmaBlend luma10Sample msbShiftScale chromaInterleaveBase =
+      leanSpecLibavVideotoolboxP010PackFma luma10Sample msbShiftScale chromaInterleaveBase :=
+  rfl
+
+/-- Pure Lean 10-bit (`[0, 1023]`) 3x3 box-average pixel formula `(sum9 + 4) / 9` for 4K -> 720p HDR10 scaling. -/
+@[inline]
+def specBox3x3DownscaleU10Sum (sum9 : Nat) : Nat :=
+  (sum9 + 4) / 9
+
+/-- Fast reciprocal multiply-shift `((sum9 + 4) * 7282) >>> 16` for 10-bit 3x3 box-average (`sum9 ≤ 9 * 1023 = 9207`). -/
+@[inline]
+def fastBox3x3DownscaleU10Sum (sum9 : Nat) : Nat :=
+  ((sum9 + 4) * 7282) >>> 16
+
+/-- Universal Theorem (Wave 52): For all 9-pixel 10-bit neighborhood sums `sum9 ≤ 9 * 1023 = 9207`,
+    the reciprocal multiply-shift `fastBox3x3DownscaleU10Sum sum9` is bit-exactly equal to `(sum9 + 4) / 9`
+    and never exceeds 1023 (`≤ 1023`). -/
+theorem fastBox3x3DownscaleU10Sum_eq_spec_and_bounded (sum9 : Nat) (h : sum9 ≤ 9207) :
+    fastBox3x3DownscaleU10Sum sum9 = specBox3x3DownscaleU10Sum sum9 ∧
+    specBox3x3DownscaleU10Sum sum9 ≤ 1023 := by
+  unfold fastBox3x3DownscaleU10Sum specBox3x3DownscaleU10Sum
+  rw [Nat.shiftRight_eq_div_pow]
+  omega
 
 end LeanAV.NativeKernels

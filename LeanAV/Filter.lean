@@ -280,6 +280,8 @@ def parseVideoFilterGraph (spec : String) : Except String (List VideoFilterOp) :
         | [cQ8, b] => ops := ops ++ [.eq (Int32.ofNat cQ8) (Int32.ofNat b) false]
         | [cQ8]    => ops := ops ++ [.eq (Int32.ofNat cQ8) 0 false]
         | _ => return .error s!"Invalid eq syntax: {st}"
+      | ["boxblur", _] | ["boxblur3x3", _] =>
+        ops := ops ++ [.boxblur3x3]
       | _ => return .error s!"UnsupportedFilterStage: {st}"
   return .ok (optimizeAndFuseVideoFilterGraph ops)
 

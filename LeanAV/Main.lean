@@ -369,7 +369,7 @@ def runSelfTest : IO UInt32 := do
   let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
     evalLnirKernel .fmaBlend [360, 200] [9, 9] [-360, -200] == [2880, 1600]
   let w14Tokens := emitLeanAvLnirWire.splitOn "|"
-  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "51"
+  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "52"
 
   -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
   let w15ShI : HevcSliceSegmentHeaderView := {
@@ -771,15 +771,21 @@ def runSelfTest : IO UInt32 := do
   let w51LnirOk := checkLnirKernel w51LnirDesc && !(checkLnirKernel w51LnirBadAlias) && !(checkLnirKernel w51LnirBadTail)
   let w51Ok := w51PlaneOk && w51BombRejected && w51SliceOk && w51SliceOverflowRejected && w51TimeOk && w51DpbAndCtxOk && w51LnirOk
 
+  -- 60. Wave 52: In-Process `libavcodec`/`VideoToolbox` 10-Bit `P010LE` Strided Pack FMA & 10-Bit 3x3 Reciprocal Scaling Gate
+  let w52P010Out := evalLnirKernel .fmaBlend [512, 1023] [64, 64] [0, 32768]
+  let w52BoxU10Ok := fastBox3x3DownscaleU10Sum 9207 == specBox3x3DownscaleU10Sum 9207 &&
+                     specBox3x3DownscaleU10Sum 9207 == 1023
+  let w52Ok := w52P010Out == leanSpecLibavVideotoolboxP010PackFma [512, 1023] [64, 64] [0, 32768] && w52BoxU10Ok
+
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
-  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok
+  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 51, \"c_abi_gates\": 12, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 52, \"c_abi_gates\": 12, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -788,7 +794,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -1621,6 +1627,8 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.activateCtx_coherent
 #print axioms LeanAV.Video.DpbState.step_preserves_inv
 #print axioms LeanAV.NativeKernels.checkLnirKernel_sound
+#print axioms LeanAV.NativeKernels.evalLnir_libav_videotoolbox_p010_strided_pack_fma_equiv
+#print axioms LeanAV.NativeKernels.fastBox3x3DownscaleU10Sum_eq_spec_and_bounded
 
 
 
