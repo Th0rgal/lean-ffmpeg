@@ -262,27 +262,6 @@ def scalePlaneDown2x2TilePatch (src : Plane2D) (tileX tileY dstW dstH : Nat)
         outArr := outArr.push (clipUInt8 scaled)
   return { data := ByteArray.mk outArr, width := dstW, height := dstH, stride := dstW }
 
-/--
-  Fast `YUV420P` `VideoFrame` scaler (`scaleVideoFrameYuv420pFast`):
-  Automatically dispatches to the zero-division 2x2 box fast-path when `vf.width == dstW * 2 && vf.height == dstH * 2`
-  (such as 4K `3840×2160` -> 1080p `1920×1080` or 1080p -> 540p), and falls back to `scaleVideoFrameYuv420p` otherwise.
--/
-def scaleVideoFrameYuv420pFast (vf : VideoFrame) (dstW dstH : Nat) : VideoFrame := Id.run do
-  if vf.planes.size < 3 then
-    return VideoFrame.allocYuv420p dstW dstH vf.pts vf.timeBase vf.colorMatrix
-  if vf.width == dstW * 2 && vf.height == dstH * 2 && dstW > 0 && dstH > 0 then
-    let yScaled := scalePlaneDown2x2Fast vf.planes[0]!
-    let uScaled := scalePlaneDown2x2Fast vf.planes[1]!
-    let vScaled := scalePlaneDown2x2Fast vf.planes[2]!
-    return {
-      vf with
-      width := dstW
-      height := dstH
-      planes := #[yScaled, uScaled, vScaled]
-    }
-  else
-    return scaleVideoFrameYuv420p vf dstW dstH
-
 /-- Compute maximum absolute pixel error (`L_∞`) and mean squared error (`MSE * 1000`) between two `Plane2D`s. -/
 def comparePlanesMetrics (refPlane implPlane : Plane2D) : Nat × Nat := Id.run do
   let w := Nat.min refPlane.width implPlane.width
@@ -443,12 +422,30 @@ def scalePlaneDown2x2FusedEqBytesSimd (src : ByteArray) (srcW srcH srcStride : N
       out := out.push (clipUInt8 scaled)
   return out
 
+/--
+  Fast C-ABI SIMD 2x2 Box Downscale (`leanav_c_scale_plane_down_2x2`):
+  Uses 256-bit AVX2 (`_mm256_maddubs_epi16`) or 128-bit ARM64 NEON (`vpaddlq_u8` + `vshrn_n_u16`)
+  and falls back to pure Lean `scalePlaneDown2x2BytesSimd` in the kernel interpreter.
+-/
+@[extern "leanav_c_scale_plane_down_2x2"]
+def scalePlaneDown2x2CSimd (src : @& ByteArray) (srcW srcH srcStride : USize) : ByteArray :=
+  scalePlaneDown2x2BytesSimd src srcW.toNat srcH.toNat srcStride.toNat
+
+/--
+  Fast C-ABI SIMD Fused 2x2 Box Downscale + Q8 Contrast/Brightness (`leanav_c_scale_plane_down_2x2_fused_eq`).
+-/
+@[extern "leanav_c_scale_plane_down_2x2_fused_eq"]
+def scalePlaneDown2x2FusedEqCSimd (src : @& ByteArray) (srcW srcH srcStride : USize)
+    (contrastQ8 brightness : UInt32) : ByteArray :=
+  scalePlaneDown2x2FusedEqBytesSimd src srcW.toNat srcH.toNat srcStride.toNat
+    (Int32.ofNat contrastQ8.toNat) (Int32.ofNat brightness.toNat)
+
 /-- Fast zero-boxing 2D plane 2x2 box downscaler (`scalePlaneDown2x2Simd`). -/
 @[inline]
 def scalePlaneDown2x2Simd (src : Plane2D) : Plane2D :=
   let dstW := Nat.max 1 (src.width / 2)
   let dstH := Nat.max 1 (src.height / 2)
-  let outBa := scalePlaneDown2x2BytesSimd src.data src.width src.height src.stride
+  let outBa := scalePlaneDown2x2CSimd src.data src.width.toUSize src.height.toUSize src.stride.toUSize
   { data := outBa, width := dstW, height := dstH, stride := dstW }
 
 /-- Fast zero-boxing fused 2x2 box downscaler + Q8 contrast/brightness (`scalePlaneDown2x2FusedEqSimd`). -/
@@ -456,7 +453,8 @@ def scalePlaneDown2x2Simd (src : Plane2D) : Plane2D :=
 def scalePlaneDown2x2FusedEqSimd (src : Plane2D) (contrastQ8 : Int32 := 256) (brightness : Int32 := 0) : Plane2D :=
   let dstW := Nat.max 1 (src.width / 2)
   let dstH := Nat.max 1 (src.height / 2)
-  let outBa := scalePlaneDown2x2FusedEqBytesSimd src.data src.width src.height src.stride contrastQ8 brightness
+  let outBa := scalePlaneDown2x2FusedEqCSimd src.data src.width.toUSize src.height.toUSize src.stride.toUSize
+    contrastQ8.toUInt32 brightness.toUInt32
   { data := outBa, width := dstW, height := dstH, stride := dstW }
 
 /-- Fast SIMD-backed full YUV420p `VideoFrame` 2x2 downscaler (`scaleVideoFrameYuv420pSimd`):
@@ -487,31 +485,87 @@ theorem scalePlaneDown2x2Simd_eq_fast_and_dims :
 /-! ## 6. Wave B: Pure Fixed-Point Arbitrary Bilinear (`Q8`), 3x3 Box Downscale (`4K -> 720p`),
     BT.2020 -> BT.709 Color-Space & HDR-to-SDR Tonemap LUT, and `LawfulTranscodeStage` Instances -/
 
-/--
-  Fast exact 3x3 box-average downscaler (`scalePlaneDown3x3Fast`) for 4K (`3840×2160`) -> 720p (`1280×720`):
-  Computes `((sum9 + 4) * 7282) >>> 16` (exact division by 9 for `sum9 ≤ 2295`).
--/
-def scalePlaneDown3x3Fast (src : Plane2D) : Plane2D := Id.run do
-  let dstW := Nat.max 1 (src.width / 3)
-  let dstH := Nat.max 1 (src.height / 3)
+/-- Pure Lean byte-array body for `scalePlaneDown3x3Fast`. -/
+def scalePlaneDown3x3Bytes (src : ByteArray) (srcW srcH st : Nat) : ByteArray := Id.run do
+  let dstW := Nat.max 1 (srcW / 3)
+  let dstH := Nat.max 1 (srcH / 3)
   let total := dstW * dstH
   let mut out := ByteArray.emptyWithCapacity total
-  let data := src.data
-  let cap := data.size
-  let st := src.stride
+  let cap := src.size
   for dy in [:dstH] do
     let r0 := (dy * 3) * st
     let r1 := r0 + st
     let r2 := r1 + st
     for dx in [:dstW] do
       let c0 := dx * 3
-      let getB (idx : Nat) : Nat := if idx < cap then (data.get! idx).toNat else 0
+      let getB (idx : Nat) : Nat := if idx < cap then (src.get! idx).toNat else 0
       let sum9 :=
         getB (r0 + c0) + getB (r0 + c0 + 1) + getB (r0 + c0 + 2) +
         getB (r1 + c0) + getB (r1 + c0 + 1) + getB (r1 + c0 + 2) +
         getB (r2 + c0) + getB (r2 + c0 + 1) + getB (r2 + c0 + 2)
       out := out.push ((((sum9 + 4) * 7282) >>> 16).toUInt8)
-  return { data := out, width := dstW, height := dstH, stride := dstW }
+  return out
+
+/-- Fast C-ABI SIMD 3x3 Box Downscale (`leanav_c_scale_plane_down_3x3`, e.g. 4K `3840x2160` -> 720p `1280x720`). -/
+@[extern "leanav_c_scale_plane_down_3x3"]
+def scalePlaneDown3x3CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
+  scalePlaneDown3x3Bytes src srcW.toNat srcH.toNat srcW.toNat
+
+/--
+  Fast exact 3x3 box-average downscaler (`scalePlaneDown3x3Fast`) for 4K (`3840×2160`) -> 720p (`1280×720`):
+  Computes `((sum9 + 4) * 7282) >>> 16` (exact division by 9 for `sum9 ≤ 2295`).
+-/
+def scalePlaneDown3x3Fast (src : Plane2D) : Plane2D :=
+  let dstW := Nat.max 1 (src.width / 3)
+  let dstH := Nat.max 1 (src.height / 3)
+  let out :=
+    if src.stride == src.width then
+      scalePlaneDown3x3CSimd src.data src.width.toUSize src.height.toUSize
+    else
+      scalePlaneDown3x3Bytes src.data src.width src.height src.stride
+  { data := out, width := dstW, height := dstH, stride := dstW }
+
+/-- Pure Lean byte-array body for 3:2 block downscaling (`1080p 1920x1080 -> 720p 1280x720`). -/
+def scalePlaneDown3to2Bytes (src : ByteArray) (srcW srcH : Nat) : ByteArray := Id.run do
+  let dstW := Nat.max 1 ((srcW * 2) / 3)
+  let dstH := Nat.max 1 ((srcH * 2) / 3)
+  let mut out := ByteArray.mk (Array.replicate (dstW * dstH) (0 : UInt8))
+  let cap := src.size
+  let getB (idx : Nat) : Nat := if idx < cap then (src.get! idx).toNat else 0
+  let mut byIdx : Nat := 0
+  while byIdx + 1 < dstH do
+    let sy := (byIdx / 2) * 3
+    let r0 := sy * srcW
+    let r1 := r0 + srcW
+    let r2 := r1 + srcW
+    let d0 := byIdx * dstW
+    let d1 := d0 + dstW
+    let mut bxIdx : Nat := 0
+    while bxIdx + 1 < dstW do
+      let sx := (bxIdx / 2) * 3
+      let a0 := (getB (r0 + sx) * 2 + getB (r0 + sx + 1)) * 2 + (getB (r1 + sx) * 2 + getB (r1 + sx + 1))
+      let a1 := (getB (r0 + sx + 2) * 2 + getB (r0 + sx + 1)) * 2 + (getB (r1 + sx + 2) * 2 + getB (r1 + sx + 1))
+      let b0 := (getB (r2 + sx) * 2 + getB (r2 + sx + 1)) * 2 + (getB (r1 + sx) * 2 + getB (r1 + sx + 1))
+      let b1 := (getB (r2 + sx + 2) * 2 + getB (r2 + sx + 1)) * 2 + (getB (r1 + sx + 2) * 2 + getB (r1 + sx + 1))
+      out := out.set! (d0 + bxIdx) ((((a0 + 4) * 7282) >>> 16).toUInt8)
+      out := out.set! (d0 + bxIdx + 1) ((((a1 + 4) * 7282) >>> 16).toUInt8)
+      out := out.set! (d1 + bxIdx) ((((b0 + 4) * 7282) >>> 16).toUInt8)
+      out := out.set! (d1 + bxIdx + 1) ((((b1 + 4) * 7282) >>> 16).toUInt8)
+      bxIdx := bxIdx + 2
+    byIdx := byIdx + 2
+  return out
+
+/-- Fast C-ABI SIMD 3:2 Block Downscale (`leanav_c_scale_plane_down_3to2`, e.g. 1080p `1920x1080` -> 720p `1280x720`). -/
+@[extern "leanav_c_scale_plane_down_3to2"]
+def scalePlaneDown3to2CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
+  scalePlaneDown3to2Bytes src srcW.toNat srcH.toNat
+
+/-- Fast 3:2 block-average downscaler (`scalePlaneDown3to2Fast`, e.g. 1080p `1920×1080` -> 720p `1280×720`). -/
+def scalePlaneDown3to2Fast (src : Plane2D) : Plane2D :=
+  let dstW := Nat.max 1 ((src.width * 2) / 3)
+  let dstH := Nat.max 1 ((src.height * 2) / 3)
+  let out := scalePlaneDown3to2CSimd src.data src.width.toUSize src.height.toUSize
+  { data := out, width := dstW, height := dstH, stride := dstW }
 
 /-- Universal Arithmetic Lemma (Wave B1): Reciprocal multiply `((sum9 + 4) * 7282) >>> 16` equals
     exact rounded division `(sum9 + 4) / 9` for all 9-pixel 8-bit sums `sum9 ≤ 2295`. -/
@@ -549,6 +603,47 @@ theorem cscBt2020ToBt709_and_tonemap_invariants :
     tonemapLumaReinhardQ8 0 = 0 ∧
     tonemapLumaReinhardQ8 255 = 255 := by
   decide
+
+/--
+  Fast `YUV420P` `VideoFrame` scaler (`scaleVideoFrameYuv420pFast`):
+  Automatically dispatches to the C-ABI SIMD `2x2` (`4K -> 1080p`), `3x3` (`4K -> 720p`), or `3:2` (`1080p -> 720p`)
+  fast-paths and falls back to `scaleVideoFrameYuv420p` otherwise.
+-/
+def scaleVideoFrameYuv420pFast (vf : VideoFrame) (dstW dstH : Nat) : VideoFrame := Id.run do
+  if vf.planes.size < 3 then
+    return VideoFrame.allocYuv420p dstW dstH vf.pts vf.timeBase vf.colorMatrix
+  if vf.width == dstW * 2 && vf.height == dstH * 2 && dstW > 0 && dstH > 0 then
+    let yScaled := scalePlaneDown2x2Simd vf.planes[0]!
+    let uScaled := scalePlaneDown2x2Simd vf.planes[1]!
+    let vScaled := scalePlaneDown2x2Simd vf.planes[2]!
+    return {
+      vf with
+      width := dstW
+      height := dstH
+      planes := #[yScaled, uScaled, vScaled]
+    }
+  else if vf.width == dstW * 3 && vf.height == dstH * 3 && dstW > 0 && dstH > 0 then
+    let yScaled := scalePlaneDown3x3Fast vf.planes[0]!
+    let uScaled := scalePlaneDown3x3Fast vf.planes[1]!
+    let vScaled := scalePlaneDown3x3Fast vf.planes[2]!
+    return {
+      vf with
+      width := dstW
+      height := dstH
+      planes := #[yScaled, uScaled, vScaled]
+    }
+  else if vf.width * 2 == dstW * 3 && vf.height * 2 == dstH * 3 && dstW > 0 && dstH > 0 then
+    let yScaled := scalePlaneDown3to2Fast vf.planes[0]!
+    let uScaled := scalePlaneDown3to2Fast vf.planes[1]!
+    let vScaled := scalePlaneDown3to2Fast vf.planes[2]!
+    return {
+      vf with
+      width := dstW
+      height := dstH
+      planes := #[yScaled, uScaled, vScaled]
+    }
+  else
+    return scaleVideoFrameYuv420p vf dstW dstH
 
 /-- Phase-indexed `LawfulTranscodeStage` instance for 2x2 SIMD plane downscaling (`.Decoded -> .Decoded`). -/
 def lawfulStageScale2x2 (pf : PixelFormat) (srcW srcH : Nat) :

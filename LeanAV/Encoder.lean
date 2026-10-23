@@ -1140,10 +1140,11 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
   let lMean := packed &&& 0xFFFFFF
   let pixCnt := (dstW * dstH).toUInt64
   let vfOk := cOk && verifyVisualFidelity pixCnt lMean lVar 0 (pixCnt * 2) 0 == 1
+  let totalFrames := if frames > 0 then frames else if demux.samples.size > 0 then demux.samples.size else 24
   let expectedDurMs : UInt64 :=
     if durMs > 0 then durMs.toUInt64
     else if demux.timescale == 0 then 1000
-    else ((demux.samples.size * 1001 * 1000) / 24000).toUInt64
+    else Nat.max 1 ((totalFrames * 1001 * 1000) / 24000) |>.toUInt64
   let syncOk := cOk &&
     verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 expectedDurMs expectedDurMs 0 == 1
   let acceptOk := cOk &&

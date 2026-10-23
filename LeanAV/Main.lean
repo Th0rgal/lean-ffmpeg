@@ -930,14 +930,25 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       | none => pure []
     let t0 ← IO.monoNanosNow
     -- Fast path: read only the initial 4 MiB header window via `readMediaWindow` (`pread`) to probe `ftyp`/`moov`
-    -- without reading multi-hundred-MB `mdat` payloads into RAM before running `runCertifiedGeneralTranscodeMp4`.
+    -- (and the trailing 4 MiB window if `moov` is at the tail after `mdat`) without reading multi-hundred-MB `mdat` payloads into RAM.
     let hdrSliceOpt ← do
       match ← readMediaWindow inPath 0 (4 * 1024 * 1024) with
       | .ok s => pure (some s)
       | .error _ => pure none
-    let fastDemuxOpt := match hdrSliceOpt with
-      | some s => probeIsoMp4HeaderSlice s
-      | none => none
+    let fastDemuxOpt ← match hdrSliceOpt with
+      | some s =>
+        match probeIsoMp4HeaderSlice s with
+        | some d => pure (some d)
+        | none =>
+          let fileSz ← getFileByteSizeOr inPath 0
+          if fileSz > 4 * 1024 * 1024 then
+            let tailOff : UInt64 := (fileSz - 4 * 1024 * 1024).toUInt64
+            match ← readMediaWindow inPath tailOff (4 * 1024 * 1024) with
+            | .ok tailSlice => pure (probeIsoMp4HeaderSlice tailSlice)
+            | .error _ => pure none
+          else
+            pure none
+      | none => pure none
     let startMs : UInt32 := match validCfg.startSec with
       | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
       | none   => 0
@@ -1147,11 +1158,44 @@ def main (args : List String) : IO UInt32 := do
     let (us4, fps4) ← measureWorkers 4
     let (us8, fps8) ← measureWorkers 8
     let (us16, fps16) ← measureWorkers 16
+    -- Also benchmark full-frame C-ABI SIMD scaling kernels: 4K->1080p (2x2), 4K->720p (3x3), and 1080p->720p (3:2)
+    let vf4k := VideoFrame.allocYuv420p 3840 2160 0
+    if vf4k.planes.isEmpty then IO.println ""
+    let t2x2_0 ← IO.monoNanosNow
+    let mut sum2x2 : Nat := 0
+    let mut vf1080 := scaleVideoFrameYuv420pSimd vf4k
+    for i in [:numFrames] do
+      let vfIn : VideoFrame := { vf4k with pts := i.toUInt64 }
+      vf1080 := scaleVideoFrameYuv420pSimd vfIn
+      sum2x2 := sum2x2 + vf1080.planes[0]!.data.size
+    let t2x2_1 ← IO.monoNanosNow
+    let mut sum3x3 : Nat := 0
+    for i in [:numFrames] do
+      let vfIn : VideoFrame := { vf4k with pts := i.toUInt64 }
+      let vf720 := scaleVideoFrameYuv420pFast vfIn 1280 720
+      sum3x3 := sum3x3 + vf720.planes[0]!.data.size
+    let t3x3_1 ← IO.monoNanosNow
+    let mut sum3to2 : Nat := 0
+    for i in [:numFrames] do
+      let vfIn : VideoFrame := { vf1080 with pts := i.toUInt64 }
+      let vf720 := scaleVideoFrameYuv420pFast vfIn 1280 720
+      sum3to2 := sum3to2 + vf720.planes[0]!.data.size
+    let t3to2_1 ← IO.monoNanosNow
+    if sum2x2 == 0 || sum3x3 == 0 || sum3to2 == 0 then IO.println ""
+    let us2x2 := (t2x2_1 - t2x2_0) / 1000
+    let us3x3 := (t3x3_1 - t2x2_1) / 1000
+    let us3to2 := (t3to2_1 - t3x3_1) / 1000
+    let fps2x2 := if us2x2 == 0 then 0 else (numFrames * 1000000) / us2x2
+    let fps3x3 := if us3x3 == 0 then 0 else (numFrames * 1000000) / us3x3
+    let fps3to2 := if us3to2 == 0 then 0 else (numFrames * 1000000) / us3to2
     let s0 := s!"\{ \"ok\": true, \"pipeline\": \"D_4K_to_1080p_parallel_IO_asTask\", \"frames\": {numFrames}, "
     let s1 := s!"\"w1_us\": {us1}, \"w1_fps\": {fps1}, \"w2_us\": {us2}, \"w2_fps\": {fps2}, "
     let s2 := s!"\"w4_us\": {us4}, \"w4_fps\": {fps4}, \"w8_us\": {us8}, \"w8_fps\": {fps8}, "
-    let s3 := s!"\"w16_us\": {us16}, \"w16_fps\": {fps16} }"
-    IO.println (s0 ++ s1 ++ s2 ++ s3)
+    let s3 := s!"\"w16_us\": {us16}, \"w16_fps\": {fps16}, "
+    let s4 := s!"\"simd_4k_to_1080p_2x2_us\": {us2x2}, \"simd_4k_to_1080p_2x2_fps\": {fps2x2}, "
+    let s5 := s!"\"simd_4k_to_720p_3x3_us\": {us3x3}, \"simd_4k_to_720p_3x3_fps\": {fps3x3}, "
+    let s6 := s!"\"simd_1080p_to_720p_3to2_us\": {us3to2}, \"simd_1080p_to_720p_3to2_fps\": {fps3to2} }"
+    IO.println (s0 ++ s1 ++ s2 ++ s3 ++ s4 ++ s5 ++ s6)
     return 0
   | "bench-pipeline-d" :: framesStr :: outMp4Path :: _ =>
     let numFrames := Nat.max 1 (framesStr.toNat?.getD 8)

@@ -742,6 +742,58 @@ static void leanav_scale_plane_3to2_raw(
 }
 
 /*
+ * Fast zero-copy C-ABI 3x3 Box Downscale (`scalePlaneDown3x3Fast` compatible, e.g. 4K 3840x2160 -> 720p 1280x720):
+ * Computes dst[y, x] = ((sum9 + 4) * 7282) >> 16 using ARM64 NEON (`vld3_u8`) / scalar.
+ */
+LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_3x3(
+    b_lean_obj_arg src_ba,
+    size_t src_w,
+    size_t src_h
+) {
+    size_t dst_w = src_w / 3;
+    size_t dst_h = src_h / 3;
+    if (dst_w == 0) dst_w = 1;
+    if (dst_h == 0) dst_h = 1;
+    size_t dst_size = dst_w * dst_h;
+    lean_obj_res dst_ba = lean_alloc_sarray(1, dst_size, dst_size);
+    uint8_t *dst = lean_sarray_cptr(dst_ba);
+    const uint8_t *src = lean_sarray_cptr(src_ba);
+    size_t src_cap = lean_sarray_size(src_ba);
+    if (src_w >= 3 && src_h >= 3 && src_cap >= src_w * src_h) {
+        leanav_scale_plane_3x3_raw(src, src_w, src_h, dst);
+    } else {
+        memset(dst, 0, dst_size);
+    }
+    return dst_ba;
+}
+
+/*
+ * Fast zero-copy C-ABI 3:2 Block Downscale (`1080p 1920x1080 -> 720p 1280x720`):
+ * Maps every 3x3 source block to a 2x2 destination block using ARM64 NEON (`vld3_u8` + `vst2_u8`) / scalar.
+ */
+LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_3to2(
+    b_lean_obj_arg src_ba,
+    size_t src_w,
+    size_t src_h
+) {
+    size_t dst_w = (src_w * 2) / 3;
+    size_t dst_h = (src_h * 2) / 3;
+    if (dst_w == 0) dst_w = 1;
+    if (dst_h == 0) dst_h = 1;
+    size_t dst_size = dst_w * dst_h;
+    lean_obj_res dst_ba = lean_alloc_sarray(1, dst_size, dst_size);
+    uint8_t *dst = lean_sarray_cptr(dst_ba);
+    const uint8_t *src = lean_sarray_cptr(src_ba);
+    size_t src_cap = lean_sarray_size(src_ba);
+    if (src_w >= 3 && src_h >= 3 && src_cap >= src_w * src_h) {
+        leanav_scale_plane_3to2_raw(src, src_w, src_h, dst, dst_w, dst_h);
+    } else {
+        memset(dst, 0, dst_size);
+    }
+    return dst_ba;
+}
+
+/*
  * Arbitrary Q8 Bilinear 2D plane scaler (`src_w x src_h -> dst_w x dst_h`):
  * Dispatches to specialized zero-division `2x2`, `3x3`, and `3:2` kernels, or uses
  * preallocated `sx0[dx]` and `fx[dx]` tables outside the row loop to eliminate all inner-loop divisions.

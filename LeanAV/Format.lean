@@ -1020,14 +1020,36 @@ def parseStssBox (body : ByteSlice) : Array Nat := Id.run do
   Fast header-only ISO/IEC 14496-12 MP4 (`ftyp`/`moov`) metadata scanner (`probeIsoMp4HeaderFast`):
   Scans only the initial prefix (up to 4 MiB) or tail of an MP4 file via positional `pread` (`readMediaWindow`)
   to extract `(width, height, timescale, totalSampleCount)` without reading the multi-hundred-MB `mdat` box into RAM.
+  Also supports truncated top-level `moov` boxes when `moov` spans slightly beyond the window or is preceded by `ftyp`.
 -/
 partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := Id.run do
-  let topBoxes := parseMp4Boxes s
+  let mut topBoxes : Array Mp4BoxView := #[]
+  let mut pos : Nat := 0
+  let mut fuel : Nat := 128
   let mut hasFtypOrMoov : Bool := false
-  for b in topBoxes do
-    if b.fourcc == "ftyp" || b.fourcc == "moov" then
+  while pos + 8 ≤ s.len && fuel > 0 do
+    fuel := fuel - 1
+    let sz32 := (readU32BE s pos).toNat
+    let fcc := readFourCCString s (pos + 4)
+    if fcc == "ftyp" || fcc == "moov" then
       hasFtypOrMoov := true
-  if !hasFtypOrMoov then return none
+    let (rawBoxLen, hdrLen) : Nat × Nat :=
+      if sz32 == 1 && pos + 16 ≤ s.len then
+        ((readU64BE s (pos + 8)).toNat, 16)
+      else if sz32 == 0 then
+        (s.len - pos, 8)
+      else
+        (sz32, 8)
+    if rawBoxLen < hdrLen then
+      break
+    -- Clamp box length to available slice if `moov` or `mdat` extends past the 4 MiB header window
+    let clampedBoxLen := Nat.min rawBoxLen (s.len - pos)
+    if clampedBoxLen >= hdrLen then
+      if let (some bSlice, some bodySlice) := (s.subSlice? pos clampedBoxLen, s.subSlice? (pos + hdrLen) (clampedBoxLen - hdrLen)) then
+        topBoxes := topBoxes.push { fourcc := fcc, headerBytes := hdrLen, boxSlice := bSlice, bodySlice := bodySlice }
+    if pos + rawBoxLen > s.len then
+      break
+    pos := pos + rawBoxLen
 
   let rec walkMeta (boxes : Array Mp4BoxView) (depth : Nat) :
       Nat × Nat × UInt32 × Nat := Id.run do
@@ -1074,7 +1096,30 @@ partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := 
           nSamplesFound := sampleCount
     return (wFound, hFound, tsFound, nSamplesFound)
 
-  let (w0, h0, ts0, n0) := walkMeta topBoxes 8
+  -- Fallback: if `moov` was placed after `mdat` (or not in the top-level walk), scan `s` for a raw `"moov"` atom header
+  let (w0, h0, ts0, n0) := Id.run do
+    let (wa, ha, tsa, na) := if hasFtypOrMoov then walkMeta topBoxes 8 else (0, 0, 0, 0)
+    if wa > 0 && ha > 0 then
+      return (wa, ha, tsa, na)
+    else
+      let mut wScan : Nat := 0
+      let mut hScan : Nat := 0
+      let mut tsScan : UInt32 := 0
+      let mut nScan : Nat := 0
+      let mut k : Nat := 0
+      let limit := if s.len > 16 then s.len - 16 else 0
+      while k < limit && wScan == 0 do
+        if s.getByteD (k + 4) 0 == 0x6D && s.getByteD (k + 5) 0 == 0x6F &&
+           s.getByteD (k + 6) 0 == 0x6F && s.getByteD (k + 7) 0 == 0x76 then
+          let sz32 := (readU32BE s k).toNat
+          if sz32 >= 16 then
+            let clampLen := Nat.min (sz32 - 8) (s.len - (k + 8))
+            if let some bodySlice := s.subSlice? (k + 8) clampLen then
+              let (wb, hb, tsb, nb) := walkMeta (parseMp4Boxes bodySlice) 7
+              if wb > 0 && hb > 0 then
+                wScan := wb; hScan := hb; tsScan := tsb; nScan := nb
+        k := k + 1
+      return (wScan, hScan, tsScan, nScan)
   if w0 == 0 || h0 == 0 then return none
   let nFrames := if n0 > 0 then n0 else 240
   return some {
