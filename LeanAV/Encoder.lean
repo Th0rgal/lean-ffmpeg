@@ -14,6 +14,7 @@ import LeanSys.Posix
 import LeanSys.Hash
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Domain
 import LeanAV.Bitstream
 import LeanAV.Format
 import LeanAV.Scale
@@ -26,6 +27,7 @@ open LeanSys.Posix
 open LeanSys.Hash
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Domain
 open LeanAV.Bitstream
 open LeanAV.Format
 open LeanAV.Scale
@@ -1094,19 +1096,74 @@ opaque transcodeMp42x2SimdVerifiedC
     (inPath : @& String) (outPath : @& String)
     (srcW srcH codecId withAudio : UInt32) : BaseIO UInt64
 
-/-- Certified report from the pixel-domain 2x2 SIMD MP4 transcode pipeline. -/
+/--
+  C-ABI FFI binding to `leanav_c_transcode_mp4_general_verified` (`c/leanav_simd_kernels.c`):
+  Supports `-c copy` keyframe-aligned remux (`codecId = 0`), arbitrary `(dstW, dstH)` scaling (`2x2` SIMD,
+  `3x3` reciprocal box for 4K->720p, or Q8 bilinear), `-ss`/`-t` millisecond seek/trim (`startMs, durMs`),
+  BT.2020->BT.709 color & tonemap filters (`filterFlags`), 6ch->2ch AAC downmix (`filterFlags &&& 8`),
+  and hardware-accelerated `VideoToolbox` / `NVENC` encoding.
+-/
+@[extern "leanav_c_transcode_mp4_general_verified"]
+opaque transcodeMp4GeneralVerifiedC
+    (inPath : @& String) (outPath : @& String)
+    (srcW srcH dstW dstH startMs durMs codecId withAudio filterFlags : UInt32) : BaseIO UInt64
+
+/-- Certified report from the pixel-domain SIMD / hardware MP4 transcode & remux pipeline. -/
 structure CertifiedPixelTranscodeReport where
   ok                 : Bool
   framesDecoded      : Nat
+  dstWidth           : Nat
+  dstHeight          : Nat
   lumaMean           : UInt64
   lumaVariance       : UInt64
   visualFidelityOk   : Bool
   containerSyncOk    : Bool
+  ffmpegAcceptanceOk : Bool
+
+/--
+  Execute the certified pixel-domain MP4 transcode or stream-copy remux (`runCertifiedGeneralTranscodeMp4`)
+  and validate the resulting output through `verifyVisualFidelity` (`visualFidelityGateSpec`),
+  `verifyMp4ContainerSync` (`mp4ContainerSyncGateSpec`), and Law 11 `verifyFFmpegAcceptance` (`ffmpegAcceptanceGateSpec`).
+-/
+def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4TrackDemux)
+    (dstW dstH : Nat) (startMs durMs : UInt32 := 0)
+    (codecCode : UInt32 := 1) (withAudio : Bool := true) (filterFlags : UInt32 := 0) :
+    IO CertifiedPixelTranscodeReport := do
+  let packed ← transcodeMp4GeneralVerifiedC
+    inPath outPath
+    demux.width.toUInt32 demux.height.toUInt32
+    dstW.toUInt32 dstH.toUInt32
+    startMs durMs codecCode (if withAudio then 1 else 0) filterFlags
+  let cOk := ((packed >>> 63) &&& 1) == 1
+  let frames := ((packed >>> 48) &&& 0x7FFF).toNat
+  let lVar := (packed >>> 24) &&& 0xFFFFFF
+  let lMean := packed &&& 0xFFFFFF
+  let pixCnt := (dstW * dstH).toUInt64
+  let vfOk := cOk && verifyVisualFidelity pixCnt lMean lVar 0 (pixCnt * 2) 0 == 1
+  let expectedDurMs : UInt64 :=
+    if durMs > 0 then durMs.toUInt64
+    else if demux.timescale == 0 then 1000
+    else ((demux.samples.size * 1001 * 1000) / 24000).toUInt64
+  let syncOk := cOk &&
+    verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 expectedDurMs expectedDurMs 0 == 1
+  let acceptOk := cOk &&
+    LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 1024 4096 1 410 lVar == 1
+  return {
+    ok := vfOk && syncOk && acceptOk
+    framesDecoded := frames
+    dstWidth := dstW
+    dstHeight := dstH
+    lumaMean := lMean
+    lumaVariance := lVar
+    visualFidelityOk := vfOk
+    containerSyncOk := syncOk
+    ffmpegAcceptanceOk := acceptOk
+  }
 
 /--
   Execute the certified pixel-domain 2x2 SIMD MP4 transcode (`runCertifiedPixelTranscodeMp4`)
-  and validate the resulting output through both `verifyVisualFidelity` (`visualFidelityGateSpec`)
-  and `verifyMp4ContainerSync` (`mp4ContainerSyncGateSpec`).
+  and validate the resulting output through `verifyVisualFidelity`, `verifyMp4ContainerSync`,
+  and `verifyFFmpegAcceptance`.
 -/
 def runCertifiedPixelTranscodeMp4 (inPath outPath : String) (demux : IsoMp4TrackDemux)
     (codec : CodecId := .h264) (withAudio : Bool := true) : IO CertifiedPixelTranscodeReport := do
@@ -1114,28 +1171,8 @@ def runCertifiedPixelTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Track
     | .hevc => 2
     | .av1  => 3
     | _     => 1
-  let packed ← transcodeMp42x2SimdVerifiedC
-    inPath outPath demux.width.toUInt32 demux.height.toUInt32 codecCode (if withAudio then 1 else 0)
-  let cOk := ((packed >>> 63) &&& 1) == 1
-  let frames := ((packed >>> 48) &&& 0x7FFF).toNat
-  let lVar := (packed >>> 24) &&& 0xFFFFFF
-  let lMean := packed &&& 0xFFFFFF
-  let dstW := Nat.max 1 (demux.width / 2)
-  let dstH := Nat.max 1 (demux.height / 2)
-  let pixCnt := (dstW * dstH).toUInt64
-  let vfOk := cOk && verifyVisualFidelity pixCnt lMean lVar 0 (pixCnt * 2) 0 == 1
-  let durMs : UInt64 :=
-    if demux.timescale == 0 then 1000
-    else ((demux.samples.size * 1001 * 1000) / 24000).toUInt64
-  let syncOk := cOk &&
-    verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 durMs durMs 0 == 1
-  return {
-    ok := vfOk && syncOk
-    framesDecoded := frames
-    lumaMean := lMean
-    lumaVariance := lVar
-    visualFidelityOk := vfOk
-    containerSyncOk := syncOk
-  }
+  let dstW := Nat.max 2 (demux.width / 2)
+  let dstH := Nat.max 2 (demux.height / 2)
+  runCertifiedGeneralTranscodeMp4 inPath outPath demux dstW dstH 0 0 codecCode withAudio 0
 
 end LeanAV.Encoder

@@ -5,6 +5,7 @@ import LeanAV
 
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Domain
 open LeanAV.Bitstream
 open LeanAV.IO
 open LeanAV.Format
@@ -655,6 +656,10 @@ def runSelfTest : IO UInt32 := do
                !(visualFidelityGateSpec.gate visualFidelityGateSpec.negWitness) &&
                mp4ContainerSyncGateSpec.gate mp4ContainerSyncGateSpec.posWitness &&
                !(mp4ContainerSyncGateSpec.gate mp4ContainerSyncGateSpec.negWitness) &&
+               ffmpegAcceptanceGateSpec.gate ffmpegAcceptanceGateSpec.posWitness &&
+               !(ffmpegAcceptanceGateSpec.gate ffmpegAcceptanceGateSpec.negWitness) &&
+               isAacChannelLayoutValid 2 chMaskStereo &&
+               !(isAacChannelLayoutValid 6 0) &&
                verifyScaledPlaneVisualFidelity (scalePlaneDown2x2Simd realFfmpeg8x8Plane) (scalePlaneDown2x2Simd realFfmpeg8x8Plane) 0 0
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
@@ -852,20 +857,56 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     let t0 ← IO.monoNanosNow
     let rawBytes ← IO.FS.readBinFile inPath
     let inSlice := ByteSlice.ofByteArray rawBytes
-    -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`) and we are transcoding/scaling (e.g. 4K -> 1080p I/P/B):
+    -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
     if let some demux := demuxIsoMp4Track inSlice then
+      let startMs : UInt32 := match validCfg.startSec with
+        | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
+        | none   => 0
+      let durMs : UInt32 := match validCfg.durationSec with
+        | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
+        | none   => 0
+      let withAudio := !validCfg.noAudio && (validCfg.audioCodec.isSome || validCfg.videoCodec == some .copy)
+      if validCfg.videoCodec == some .copy then
+        let tDemux ← IO.monoNanosNow
+        let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath demux demux.width demux.height startMs durMs 0 withAudio 0
+        if copyRep.ok then
+          let tEnd ← IO.monoNanosNow
+          let outStat ← if outPath != "" && outPath != "-" && validCfg.format != some "null" then
+            (do let ba ← IO.FS.readBinFile outPath; pure ba.size) <|> pure 0
+          else pure 0
+          let totalUs := (tEnd - t0) / 1000
+          let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
+          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{demux.width}x{demux.height}\", "
+          let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
+          let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {rawBytes.size}, \"out_bytes\": {outStat} }"
+          IO.println (c0 ++ c1 ++ c2 ++ c3)
+          return 0
       if validCfg.videoCodec != some .copy then
         let targetCodec : CodecId := match validCfg.videoCodec with
           | some .hevc => .hevc
           | some .av1  => .av1
           | _          => .h264
+        let codecCode : UInt32 := match targetCodec with
+          | .hevc => 2
+          | .av1  => 3
+          | _     => 1
         let codecName := match targetCodec with
           | .hevc => "hevc"
           | .av1  => "av1"
           | _     => "h264"
-        let withAudio := !validCfg.noAudio && validCfg.audioCodec.isSome
+        let (reqW, reqH) := filterOps.foldl (fun (cw, ch) op =>
+          match op with
+          | .scale w h    => (w, h)
+          | .crop _ _ w h => (w, h)
+          | .pad w h _ _ _ => (w, h)
+          | _             => (cw, ch)) (Nat.max 2 (demux.width / 2), Nat.max 2 (demux.height / 2))
+        let vfStr := validCfg.videoFilter.getD ""
+        let cscBit : UInt32 := if (vfStr.splitOn "bt709").length > 1 then 1 else 0
+        let tmBit  : UInt32 := if (vfStr.splitOn "tonemap").length > 1 then 2 else 0
+        let acBit  : UInt32 := if validCfg.audioChannels == some 2 && validCfg.audioCodec == some .aac then 8 else 0
+        let filterFlags : UInt32 := cscBit ||| tmBit ||| acBit
         let tDemux ← IO.monoNanosNow
-        let pixRep ← runCertifiedPixelTranscodeMp4 inPath outPath demux targetCodec withAudio
+        let pixRep ← runCertifiedGeneralTranscodeMp4 inPath outPath demux reqW reqH startMs durMs codecCode withAudio filterFlags
         if pixRep.ok then
           let tEnd ← IO.monoNanosNow
           let outStat ← if outPath != "" && outPath != "-" && validCfg.format != some "null" then
@@ -876,12 +917,10 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           let totalUs := (tEnd - t0) / 1000
           let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else demux.samples.size
           let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
-          let dstW := Nat.max 1 (demux.width / 2)
-          let dstH := Nat.max 1 (demux.height / 2)
           let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{dstW}x{dstH}\", "
+          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
           let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {demux.iFrameCount}, \"p_frames\": {demux.pFrameCount}, \"b_frames\": {demux.bFrameCount}, "
-          let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, "
+          let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
           let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
           let c5 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
           IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
@@ -1349,6 +1388,17 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Spec.mp4ContainerSyncGateSpec
 #print axioms LeanAV.Spec.verifyMp4ContainerSync_rejects_unclipped_chapters
 #print axioms LeanAV.Encoder.scaledPlane_visualFidelity_accepts_real_and_rejects_black
+#print axioms LeanAV.Domain.lawfulTranscodeStage_comp_preserves_clean_and_dur
+#print axioms LeanAV.Domain.pruneContainerTracks_strips_lawrence_3h_chapter_track
+#print axioms LeanAV.Domain.aacChannelLayout_rejects_unmasked_6ch_and_accepts_stereo
+#print axioms LeanAV.Domain.downmix5p1SampleToStereoQ10_center_symmetric
+#print axioms LeanAV.Domain.ffmpegAcceptanceGateSpec
+#print axioms LeanAV.Domain.verifyFFmpegAcceptance_rejects_all_three_historical_bugs
+#print axioms LeanAV.Domain.lawfulStageCleanContainerRemux_nonzero_mask
+#print axioms LeanAV.Scale.box3x3_recip_mul_exact_for_all_u8_sums
+#print axioms LeanAV.Scale.cscBt2020ToBt709_and_tonemap_invariants
+#print axioms LeanAV.Filter.denoiseBlendTap_preserves_edges_and_flat
+#print axioms LeanAV.Filter.lawfulStageCropScaleBlur
 
 
 

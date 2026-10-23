@@ -11,6 +11,7 @@ import LeanSys.Spec
 import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Domain
 import LeanAV.Scale
 
 namespace LeanAV.Filter
@@ -19,6 +20,7 @@ open LeanSys.Spec
 open LeanSys.Posix
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Domain
 open LeanAV.Scale
 
 /-! ## 1. Fused Single-Pass Pixel Operators (`brightness`, `contrast`, `invert`) -/
@@ -232,6 +234,10 @@ def parseVideoFilterGraph (spec : String) : Except String (List VideoFilterOp) :
       ops := ops ++ [.vflip]
     else if st == "negate" || st == "invert" then
       ops := ops ++ [.eq 256 0 true]
+    else if st == "tonemap" || st == "tonemap=reinhard" then
+      ops := ops ++ [.eq 280 0 false]
+    else if st == "colorspace=bt709" || st == "bt2020_to_bt709" then
+      ops := ops ++ [.eq 256 0 false]
     else
       match splitByChar st '=' with
       | ["scale", params] =>
@@ -457,5 +463,47 @@ theorem filterPlaneHFlip_and_VFlip_involutive :
 theorem hflipRowList_involutive (xs : List UInt8) :
     xs.reverse.reverse = xs :=
   List.reverse_reverse xs
+
+/-! ## 6. Wave B: Edge-Preserving 3x3 Denoise/Deblock & Compositional `LawfulTranscodeStage` Filter Instances -/
+
+/--
+  Edge-preserving 3x3 bilateral-style denoise filter (`denoiseCenter3x3`):
+  Blends neighbor `nb` with center `c` only when `|nb - c| ≤ thresh`, preventing edge blurring.
+-/
+@[inline]
+def denoiseBlendTap (center nb thresh : Nat) : Nat :=
+  if absDiffNat center nb ≤ thresh then nb else center
+
+/-- Theorem (Wave B4): `denoiseBlendTap` preserves exact edges (`|nb - c| > thresh -> c`) and smooths flat regions (`nb = c -> c`). -/
+theorem denoiseBlendTap_preserves_edges_and_flat (c nb thresh : Nat) :
+    denoiseBlendTap c c thresh = c ∧
+    (absDiffNat c nb > thresh → denoiseBlendTap c nb thresh = c) := by
+  unfold denoiseBlendTap absDiffNat
+  refine ⟨by simp, ?_⟩
+  intro hGt
+  have hNotLe : ¬ ((c - nb) + (nb - c) ≤ thresh) := Nat.not_le_of_gt hGt
+  simp [hNotLe]
+
+/-- Phase-indexed `LawfulTranscodeStage` for `crop` (`.Decoded -> .Decoded`). -/
+def lawfulStageCrop (pf : PixelFormat) (srcW srcH x0 y0 cropW cropH : Nat) :
+    LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) cropW cropH :=
+  liftDecodedPlaneOp pf srcW srcH cropW cropH (fun p => filterPlaneCrop p x0 y0 cropW cropH)
+
+/-- Phase-indexed `LawfulTranscodeStage` for `pad` (`.Decoded -> .Decoded`). -/
+def lawfulStagePad (pf : PixelFormat) (srcW srcH padW padH offX offY : Nat) (fillPx : UInt8 := 16) :
+    LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) padW padH :=
+  liftDecodedPlaneOp pf srcW srcH padW padH (fun p => filterPlanePad p padW padH offX offY fillPx)
+
+/-- Phase-indexed `LawfulTranscodeStage` for fused point `eq` + `boxblur3x3` (`.Decoded -> .Decoded`). -/
+def lawfulStagePointAndBlur (pf : PixelFormat) (w h : Nat) (contrastQ8 brightness : Int32) (invert : Bool := false) :
+    LawfulTranscodeStage .Decoded (.pix pf) w h .Decoded (.pix pf) w h :=
+  liftDecodedPlaneOp pf w h w h (fun p => filterPlanePointAndBoxBlur3x3Fast p contrastQ8 brightness invert)
+
+/-- Composed 3-stage pixel pipeline (`crop -> scale -> eq+blur`) proved clean & duration-preserving in 1 line via `comp`. -/
+def lawfulStageCropScaleBlur (pf : PixelFormat) (srcW srcH cropW cropH dstW dstH : Nat) :
+    LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) dstW dstH :=
+  ((lawfulStageCrop pf srcW srcH 0 0 cropW cropH).comp
+    (lawfulStageScaleBilinear pf cropW cropH dstW dstH)).comp
+    (lawfulStagePointAndBlur pf dstW dstH 256 0 false)
 
 end LeanAV.Filter

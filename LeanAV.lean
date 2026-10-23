@@ -5,6 +5,7 @@
 -/
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Domain
 import LeanAV.Bitstream
 import LeanAV.IO
 import LeanAV.Format

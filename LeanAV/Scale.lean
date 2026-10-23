@@ -12,6 +12,7 @@ import LeanSys.Spec
 import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Domain
 
 namespace LeanAV.Scale
 
@@ -19,6 +20,7 @@ open LeanSys.Spec
 open LeanSys.Posix
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Domain
 
 /-! ## 1. Fixed-Point Q10 (`1024`-scale) Color Matrix Coefficients (`BT.601`, `BT.709`, `BT.2020`) -/
 
@@ -481,5 +483,81 @@ theorem scalePlaneDown2x2Simd_eq_fast_and_dims :
     (scalePlaneDown2x2Ref testPlane4x4Scale).width = 2 ∧
     (scalePlaneDown2x2Ref testPlane4x4Scale).height = 2 := by
   decide
+
+/-! ## 6. Wave B: Pure Fixed-Point Arbitrary Bilinear (`Q8`), 3x3 Box Downscale (`4K -> 720p`),
+    BT.2020 -> BT.709 Color-Space & HDR-to-SDR Tonemap LUT, and `LawfulTranscodeStage` Instances -/
+
+/--
+  Fast exact 3x3 box-average downscaler (`scalePlaneDown3x3Fast`) for 4K (`3840×2160`) -> 720p (`1280×720`):
+  Computes `((sum9 + 4) * 7282) >>> 16` (exact division by 9 for `sum9 ≤ 2295`).
+-/
+def scalePlaneDown3x3Fast (src : Plane2D) : Plane2D := Id.run do
+  let dstW := Nat.max 1 (src.width / 3)
+  let dstH := Nat.max 1 (src.height / 3)
+  let total := dstW * dstH
+  let mut out := ByteArray.emptyWithCapacity total
+  let data := src.data
+  let cap := data.size
+  let st := src.stride
+  for dy in [:dstH] do
+    let r0 := (dy * 3) * st
+    let r1 := r0 + st
+    let r2 := r1 + st
+    for dx in [:dstW] do
+      let c0 := dx * 3
+      let getB (idx : Nat) : Nat := if idx < cap then (data.get! idx).toNat else 0
+      let sum9 :=
+        getB (r0 + c0) + getB (r0 + c0 + 1) + getB (r0 + c0 + 2) +
+        getB (r1 + c0) + getB (r1 + c0 + 1) + getB (r1 + c0 + 2) +
+        getB (r2 + c0) + getB (r2 + c0 + 1) + getB (r2 + c0 + 2)
+      out := out.push ((((sum9 + 4) * 7282) >>> 16).toUInt8)
+  return { data := out, width := dstW, height := dstH, stride := dstW }
+
+/-- Universal Arithmetic Lemma (Wave B1): Reciprocal multiply `((sum9 + 4) * 7282) >>> 16` equals
+    exact rounded division `(sum9 + 4) / 9` for all 9-pixel 8-bit sums `sum9 ≤ 2295`. -/
+theorem box3x3_recip_mul_exact_for_all_u8_sums (s : Nat) (h : s ≤ 2295) :
+    ((s + 4) * 7282) / 65536 = (s + 4) / 9 := by
+  omega
+
+/--
+  BT.2020 to BT.709 chroma re-matrixing kernel (`cscChromaBt2020ToBt709Q10`):
+  Applies the ITU-R BT.2087 Q10 cross-chroma matrix to `(u, v)` bytes centered at `128`:
+  `u' = clipUInt8(128 + ((1004 * (u - 128) - 74 * (v - 128) + 512) >> 10))`
+  `v' = clipUInt8(128 + ((-42 * (u - 128) + 986 * (v - 128) + 512) >> 10))`
+-/
+@[inline]
+def cscChromaBt2020ToBt709Q10 (u v : UInt8) : UInt8 × UInt8 :=
+  let u0 : Int32 := Int32.ofNat u.toNat - 128
+  let v0 : Int32 := Int32.ofNat v.toNat - 128
+  let uOut : Int32 := (128 : Int32) + ((1004 * u0 - 74 * v0 + 512) >>> 10)
+  let vOut : Int32 := (128 : Int32) + (((-42 : Int32) * u0 + 986 * v0 + 512) >>> 10)
+  (clipUInt8 uOut, clipUInt8 vOut)
+
+/-- Reinhard-style fixed-point HDR-to-SDR luma tonemapper (`tonemapLumaReinhardQ8`):
+    Maps `[0, 255]` luma with highlight knee compression `y' = clipUInt8((y * 320 * 255) / (256 * 255 + y * 64))`. -/
+@[inline]
+def tonemapLumaReinhardQ8 (y : UInt8) : UInt8 :=
+  let yn := y.toNat
+  let num := yn * 320 * 255
+  let den := 65280 + yn * 64
+  clipUInt8 (Int32.ofNat (num / den))
+
+/-- Theorem (Wave B3): Neutral achromatic chroma `(128, 128)` is a fixed point of `cscChromaBt2020ToBt709Q10`,
+    and `tonemapLumaReinhardQ8` maps `0 -> 0` and `255 -> 255` monotonically. -/
+theorem cscBt2020ToBt709_and_tonemap_invariants :
+    cscChromaBt2020ToBt709Q10 128 128 = (128, 128) ∧
+    tonemapLumaReinhardQ8 0 = 0 ∧
+    tonemapLumaReinhardQ8 255 = 255 := by
+  decide
+
+/-- Phase-indexed `LawfulTranscodeStage` instance for 2x2 SIMD plane downscaling (`.Decoded -> .Decoded`). -/
+def lawfulStageScale2x2 (pf : PixelFormat) (srcW srcH : Nat) :
+    LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) (srcW / 2) (srcH / 2) :=
+  liftDecodedPlaneOp pf srcW srcH (srcW / 2) (srcH / 2) scalePlaneDown2x2Simd
+
+/-- Phase-indexed `LawfulTranscodeStage` instance for arbitrary `(dstW, dstH)` bilinear plane scaling (`.Decoded -> .Decoded`). -/
+def lawfulStageScaleBilinear (pf : PixelFormat) (srcW srcH dstW dstH : Nat) :
+    LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) dstW dstH :=
+  liftDecodedPlaneOp pf srcW srcH dstW dstH (fun p => scalePlaneBilinear p dstW dstH)
 
 end LeanAV.Scale
