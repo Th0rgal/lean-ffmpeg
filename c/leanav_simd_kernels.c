@@ -895,6 +895,19 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         return 0;
     }
 
+    uint32_t *sx0_tab = NULL;
+    uint32_t *sx1_tab = NULL;
+    uint16_t *fx_tab  = NULL;
+    size_t tab_cap = (dst_w > (dst_w >> 1)) ? dst_w : 1;
+    if (!(src_w == dst_w && src_h == dst_h) &&
+        !(src_w == dst_w * 2 && src_h == dst_h * 2) &&
+        !(src_w == dst_w * 3 && src_h == dst_h * 3) &&
+        !(src_w * 2 == dst_w * 3 && src_h * 2 == dst_h * 3 && (dst_w & 1) == 0 && (dst_h & 1) == 0)) {
+        sx0_tab = (uint32_t *)malloc(tab_cap * sizeof(uint32_t));
+        sx1_tab = (uint32_t *)malloc(tab_cap * sizeof(uint32_t));
+        fx_tab  = (uint16_t *)malloc(tab_cap * sizeof(uint16_t));
+    }
+
     static int hw_checked = 0;
     static int has_vt_h264 = 0;
     static int has_vt_hevc = 0;
@@ -902,8 +915,10 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     static int has_nvenc_hevc = 0;
     if (!hw_checked) {
 #if defined(__APPLE__)
-        has_vt_h264 = leanav_has_encoder_cached("h264_videotoolbox");
-        has_vt_hevc = leanav_has_encoder_cached("hevc_videotoolbox");
+        if (getenv("LEANAV_USE_VIDEOTOOLBOX") != NULL) {
+            has_vt_h264 = leanav_has_encoder_cached("h264_videotoolbox");
+            has_vt_hevc = leanav_has_encoder_cached("hevc_videotoolbox");
+        }
 #else
         if (getenv("LEANAV_USE_NVENC") != NULL) {
             has_nvenc_h264 = leanav_has_encoder_cached("h264_nvenc");
@@ -915,12 +930,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     const char *v_enc_args = "-c:v libx264 -preset ultrafast -crf 23 -threads 0 -pix_fmt yuv420p";
     if (codec_id_u32 == 1 && has_vt_h264) {
-        v_enc_args = "-c:v h264_videotoolbox -b:v 6M -allow_sw 1 -pix_fmt yuv420p";
+        v_enc_args = "-c:v h264_videotoolbox -realtime 1 -b:v 6M -allow_sw 1 -pix_fmt yuv420p";
     } else if (codec_id_u32 == 1 && has_nvenc_h264) {
         v_enc_args = "-c:v h264_nvenc -preset p1 -cq 23 -pix_fmt yuv420p";
     } else if (codec_id_u32 == 2) {
         if (has_vt_hevc) {
-            v_enc_args = "-c:v hevc_videotoolbox -b:v 5M -allow_sw 1 -tag:v hvc1 -pix_fmt yuv420p";
+            v_enc_args = "-c:v hevc_videotoolbox -realtime 1 -b:v 5M -allow_sw 1 -tag:v hvc1 -pix_fmt yuv420p";
         } else if (has_nvenc_hevc) {
             v_enc_args = "-c:v hevc_nvenc -preset p1 -cq 24 -tag:v hvc1 -pix_fmt yuv420p";
         } else {
@@ -956,7 +971,13 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");
-    if (!dec_fp) return 0;
+    if (!dec_fp) {
+        free(sx0_tab);
+        free(sx1_tab);
+        free(fx_tab);
+        return 0;
+    }
+    setvbuf(dec_fp, NULL, _IOFBF, 4 * 1024 * 1024);
 
     size_t src_y_sz = src_w * src_h;
     size_t src_uv_sz = (src_w >> 1) * (src_h >> 1);
@@ -969,6 +990,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint8_t *src_buf = (uint8_t *)malloc(src_frame_sz);
     uint8_t *dst_buf = (uint8_t *)malloc(dst_frame_sz);
     if (!src_buf || !dst_buf) {
+        free(sx0_tab);
+        free(sx1_tab);
+        free(fx_tab);
         free(src_buf);
         free(dst_buf);
         pclose(dec_fp);
@@ -992,6 +1016,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         if (!enc_fp) {
             enc_fp = popen(enc_cmd, "w");
             if (!enc_fp) break;
+            setvbuf(enc_fp, NULL, _IOFBF, 4 * 1024 * 1024);
         }
 
         uint8_t *dst_y = dst_buf;
@@ -1021,6 +1046,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         frames_done++;
     }
 
+    free(sx0_tab);
+    free(sx1_tab);
+    free(fx_tab);
     free(src_buf);
     free(dst_buf);
     pclose(dec_fp);
