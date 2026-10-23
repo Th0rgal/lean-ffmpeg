@@ -3369,7 +3369,10 @@ static uint64_t leanav_libav_transcode_pixel(
 
         uint64_t f_mean = 0, f_var = 0;
         size_t dst_y_sz = dst_w * dst_h;
-        if (is_10bit) {
+        int sample_stats = ((frames_done & 7ULL) == 0ULL);
+        if (!sample_stats) {
+            /* luma stats only feed the return word, so one frame in eight is enough */
+        } else if (is_10bit) {
             uint64_t sum = 0, sum_sq = 0, cnt = 0;
             size_t step = (dst_y_sz > 65536) ? 16 : 1;
             for (size_t y = 0; y < dst_h; y += (step > 1 ? 4 : 1)) {
