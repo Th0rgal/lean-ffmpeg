@@ -655,4 +655,30 @@ def lawfulStageScaleBilinear (pf : PixelFormat) (srcW srcH dstW dstH : Nat) :
     LawfulTranscodeStage .Decoded (.pix pf) srcW srcH .Decoded (.pix pf) dstW dstH :=
   liftDecodedPlaneOp pf srcW srcH dstW dstH (fun p => scalePlaneBilinear p dstW dstH)
 
+/-! ## 7. Wave 51: 4-Tap Bicubic `[-1, 9, 9, -1] / 16` Downscale Kernel & Partition-of-Unity Invariant -/
+
+/--
+  Evaluate one 4-tap symmetric bicubic downscale tap `((-p0 + 9*p1 + 9*p2 - p3 + 8) >> 4)`
+  with `[0, 255]` clamping (partition of unity `-1 + 9 + 9 - 1 = 16`).
+-/
+@[inline]
+def evalBicubic4TapMidpoint (p0 p1 p2 p3 : Nat) : Nat :=
+  let raw := (p1 * 9 + p2 * 9 + 8 - p0 - p3) / 16
+  if raw > 255 then 255 else raw
+
+/--
+  Theorem (Wave 51): The 4-tap bicubic kernel `[-1, 9, 9, -1] / 16` satisfies exact partition of unity
+  (`-1 + 9 + 9 - 1 = 16`) and preserves every constant 8-bit plane value `c ∈ [0, 255]` bit-for-bit
+  (`evalBicubic4TapMidpoint c c c c = c`), hence stays strictly bounded in `[0, 255]`.
+-/
+theorem bicubic4TapMidpoint_partition_of_unity_and_const_exact (c : Nat) (h : c ≤ 255) :
+    (-1 : Int) + 9 + 9 - 1 = 16 ∧
+    evalBicubic4TapMidpoint c c c c = c := by
+  unfold evalBicubic4TapMidpoint
+  refine ⟨rfl, ?_⟩
+  have hNum : c * 9 + c * 9 + 8 - c - c = c * 16 + 8 := by omega
+  have hDiv : (c * 16 + 8) / 16 = c := by omega
+  have hNotGt : ¬ (c > 255) := by omega
+  simp [hNum, hDiv, hNotGt]
+
 end LeanAV.Scale

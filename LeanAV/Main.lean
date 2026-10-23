@@ -879,12 +879,15 @@ def tryFastHeaderProbeTranscode
       | .hevc => "hevc"
       | .av1  => "av1"
       | _     => "h264"
+    let initDims : Nat × Nat := match validCfg.videoSize with
+      | some (sw, sh) => (sw, sh)
+      | none          => (Nat.max 2 fastDemux.width, Nat.max 2 fastDemux.height)
     let (reqW, reqH) := filterOps.foldl (fun (cw, ch) op =>
       match op with
-      | .scale w h    => (w, h)
+      | .scale w h    => resolveScaleDims fastDemux.width fastDemux.height w h
       | .crop _ _ w h => (w, h)
       | .pad w h _ _ _ => (w, h)
-      | _             => (cw, ch)) (Nat.max 2 (fastDemux.width / 2), Nat.max 2 (fastDemux.height / 2))
+      | _             => (cw, ch)) initDims
     let vfStr := validCfg.videoFilter.getD ""
     let cscBit : UInt32 := if (vfStr.splitOn "bt709").length > 1 then 1 else 0
     let tmBit  : UInt32 := if (vfStr.splitOn "tonemap").length > 1 then 2 else 0
@@ -901,6 +904,8 @@ def tryFastHeaderProbeTranscode
       let totalUs := (tEnd - t0) / 1000
       let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else fastDemux.samples.size
       let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
+      let audioSummary := if withAudio then "aac" else "disabled (-an)"
+      IO.eprintln s!"[lffmpeg] {inPath} ({fastDemux.width}x{fastDemux.height}) -> {outPath} ({pixRep.dstWidth}x{pixRep.dstHeight}, {codecName}, audio={audioSummary}): {nFrames} frames in {totalUs / 1000} ms ({fps} fps, {outStat / 1024} KiB)"
       let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
       let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
       let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {fastDemux.iFrameCount}, \"p_frames\": {fastDemux.pFrameCount}, \"b_frames\": {fastDemux.bFrameCount}, "
@@ -957,7 +962,7 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     let durMs : UInt32 := match validCfg.durationSec with
       | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
       | none   => 0
-    let withAudio := !validCfg.noAudio && (validCfg.audioCodec.isSome || validCfg.videoCodec == some .copy)
+    let withAudio := !validCfg.noAudio
     let handledFast ← match fastDemuxOpt with
       | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 fastDemux startMs durMs withAudio
       | none => pure false
@@ -1489,6 +1494,9 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Filter.denoiseBlendTap_preserves_edges_and_flat
 #print axioms LeanAV.Filter.lawfulStageCropScaleBlur
 #print axioms LeanAV.Domain.liftDecodedPlaneOp_preserves_colorSpace_and_explicit_convert
+#print axioms LeanAV.Format.mp4MetadataBoxInject_preserves_mdat_relative_offsets
+#print axioms LeanAV.Cli.resolveScaleDims_proportional_even_and_cli_flags_verified
+#print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
 
 
 

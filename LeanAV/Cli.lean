@@ -123,12 +123,57 @@ structure CliConfig where
   overwrite      : Bool := false
   noVideo        : Bool := false
   noAudio        : Bool := false
+  jsonOutput     : Bool := false
+  videoSize      : Option (Nat × Nat) := none
   videoFrames    : Option Nat := none
   audioRate      : Option Nat := none
   audioChannels  : Option Nat := none
   pixelFormat    : Option String := none
   errors         : List CliError := []
   deriving Repr, DecidableEq, Inhabited
+
+/-- Parse a positive decimal `Nat` from a `List Char` using pure structural recursion (kernel-reducible). -/
+def parseNatCharsLoop : List Char → Nat → Bool → Option Nat
+  | [], acc, true => if acc > 0 then some acc else none
+  | [], _, false => none
+  | c :: cs, acc, _ =>
+    let d := c.toNat
+    if 48 ≤ d && d ≤ 57 then
+      parseNatCharsLoop cs (acc * 10 + (d - 48)) true
+    else
+      none
+
+/-- Split a `List Char` around the first `'x'` or `':'` separator into `(wChars, hChars)`. -/
+def splitVideoSizeChars : List Char → List Char → Option (List Char × List Char)
+  | [], _ => none
+  | c :: cs, acc =>
+    if c == 'x' || c == ':' then some (acc.reverse, cs)
+    else splitVideoSizeChars cs (c :: acc)
+
+/-- Parse an FFmpeg `-s WxH` or `-s W:H` video size string (`"1920x1080"` -> `some (1920, 1080)`). -/
+def parseVideoSizeSpec (s : String) : Option (Nat × Nat) :=
+  match splitVideoSizeChars s.toList [] with
+  | some (wChars, hChars) =>
+    match parseNatCharsLoop wChars 0 false, parseNatCharsLoop hChars 0 false with
+    | some w, some h => some (w, h)
+    | _, _ => none
+  | none => none
+
+/--
+  Resolve proportional scale dimensions (`scale=W:-1` / `scale=W:-2` represented as `(w, 0)`,
+  or `scale=-1:H` / `scale=-2:H` represented as `(0, h)`) against source resolution `(srcW, srcH)`,
+  rounding the derived dimension to the nearest even integer `≥ 2` for YUV420p compatibility.
+-/
+def resolveScaleDims (srcW srcH reqW reqH : Nat) : Nat × Nat :=
+  let evenRound (n : Nat) : Nat := Nat.max 2 (((n + 1) / 2) * 2)
+  if reqW > 0 && reqH == 0 && srcW > 0 then
+    (evenRound reqW, evenRound ((reqW * srcH) / srcW))
+  else if reqW == 0 && reqH > 0 && srcH > 0 then
+    (evenRound ((reqH * srcW) / srcH), evenRound reqH)
+  else if reqW > 0 && reqH > 0 then
+    (reqW, reqH)
+  else
+    (srcW, srcH)
 
 /-- Accumulate a parse error (fail-closed, never silently dropped). -/
 @[inline]
@@ -142,7 +187,7 @@ def supportedFormat (s : String) : Bool :=
 
 /-- Flags that consume exactly one following argument. -/
 def flagTakesValue (s : String) : Bool :=
-  ["-i", "-c", "-c:v", "-vcodec", "-c:a", "-acodec", "-vf", "-af",
+  ["-i", "-c", "-c:v", "-vcodec", "-c:a", "-acodec", "-vf", "-af", "-s",
    "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes",
    "-ar", "-ac", "-pix_fmt", "-loglevel", "-v", "-threads",
    "-preset", "-crf", "-bf", "-g", "-r", "-b:v", "-b:a", "-movflags"].contains s
@@ -155,6 +200,10 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
     parseFFmpegArgsLoop rest { cfg with overwrite := true }
   | "-n" :: rest =>
     parseFFmpegArgsLoop rest { cfg with overwrite := false }
+  | "--json" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with jsonOutput := true }
+  | "-json" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with jsonOutput := true }
   | "-hide_banner" :: rest =>
     parseFFmpegArgsLoop rest cfg
   | "-nostdin" :: rest =>
@@ -167,6 +216,11 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
     parseFFmpegArgsLoop rest cfg
   | "-dn" :: rest =>
     parseFFmpegArgsLoop rest cfg
+  | "-s" :: value :: rest =>
+    parseFFmpegArgsLoop rest <|
+      match parseVideoSizeSpec value with
+      | some sz => { cfg with videoSize := some sz }
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-s " ++ value))
   | "-loglevel" :: _ :: rest =>
     parseFFmpegArgsLoop rest cfg
   | "-v" :: _ :: rest =>
@@ -366,6 +420,21 @@ theorem parseCliSeconds_exact_and_rejects_malformed :
     parseCliSeconds "1.2.3" = none ∧
     parseCliSeconds "" = none ∧
     parseCliSeconds "abc" = none := by
+  decide
+
+/--
+  Theorem (Wave 51): `resolveScaleDims` preserves exact 16:9 aspect ratio with even YUV420p alignment
+  on `scale=1920:-1` / `scale=1920:-2` (`3840x2160 -> 1920x1080`) and `scale=-2:720` (`3840x2160 -> 1280x720`),
+  and `parseFFmpegArgs` parses `-s 1920x1080`, `-an`, and `--json` without error.
+-/
+theorem resolveScaleDims_proportional_even_and_cli_flags_verified :
+    resolveScaleDims 3840 2160 1920 0 = (1920, 1080) ∧
+    resolveScaleDims 3840 2160 0 720 = (1280, 720) ∧
+    resolveScaleDims 3840 2160 0 0 = (3840, 2160) ∧
+    (parseFFmpegArgs ["-y", "-i", "in.mp4", "-s", "1920x1080", "-an", "--json", "out.mp4"]).videoSize = some (1920, 1080) ∧
+    (parseFFmpegArgs ["-y", "-i", "in.mp4", "-s", "1920x1080", "-an", "--json", "out.mp4"]).noAudio = true ∧
+    (parseFFmpegArgs ["-y", "-i", "in.mp4", "-s", "1920x1080", "-an", "--json", "out.mp4"]).jsonOutput = true ∧
+    (parseFFmpegArgs ["-y", "-i", "in.mp4", "-s", "1920x1080", "-an", "--json", "out.mp4"]).errors = [] := by
   decide
 
 end LeanAV.Cli

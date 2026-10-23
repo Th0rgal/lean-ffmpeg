@@ -1079,7 +1079,7 @@ partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := 
       else if b.fourcc == "mdhd" && b.bodySlice.len >= 20 then
         let ver := b.bodySlice.getByteD 0 0
         let ts := if ver == 1 && b.bodySlice.len >= 24 then readU32BE b.bodySlice 20 else readU32BE b.bodySlice 12
-        if tsFound == 0 && ts > 0 then tsFound := ts
+        if tsFound == 0 && ts > 0 && ts < 40000 then tsFound := ts
       else if b.fourcc == "stsd" && b.bodySlice.len >= 40 then
         if let some entrySlice := b.bodySlice.subSlice? 8 (b.bodySlice.len - 8) then
           let entries := parseMp4Boxes entrySlice
@@ -1182,7 +1182,7 @@ partial def demuxIsoMp4Track (s : ByteSlice) : Option IsoMp4TrackDemux := Id.run
       else if b.fourcc == "mdhd" && b.bodySlice.len >= 20 then
         let ver := b.bodySlice.getByteD 0 0
         let ts := if ver == 1 && b.bodySlice.len >= 24 then readU32BE b.bodySlice 20 else readU32BE b.bodySlice 12
-        if tsFound == 0 && ts > 0 then tsFound := ts
+        if tsFound == 0 && ts > 0 && ts < 40000 then tsFound := ts
       else if b.fourcc == "stsd" && b.bodySlice.len >= 40 then
         -- stsd FullBox (8B: version/flags + entry_count) -> SampleEntry (e.g. avc1)
         if let some entrySlice := b.bodySlice.subSlice? 8 (b.bodySlice.len - 8) then
@@ -5222,5 +5222,32 @@ theorem udta_meta_ilst_container_metadata_roundtrip :
     decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec { udtaLffm with itemKey4CC := 0xA974006F }) = none ∧
     decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec { udtaLffm with encoderTag4CC := 0x4C464600 }) = none := by
   decide
+
+/-! ## Wave 51: ISO BMFF Ancestor Box Size Propagation & `stco` Chunk Offset Shift Invariant (`colr`/`clli`/`mdcv`/`pasp`/`edts`) -/
+
+/-- Adjust an ISO BMFF ancestor box byte size after injecting `delta` bytes of HDR/color/timeline metadata (`colr`, `clli`, `mdcv`, `pasp`, `edts`). -/
+@[inline]
+def shiftMp4AncestorSize (origSize delta : Nat) : Nat :=
+  origSize + delta
+
+/-- Shift an `stco` / `co64` chunk offset when `moov` precedes `mdat` (`moovBeforeMdat = true`) by `delta` injected metadata bytes. -/
+@[inline]
+def shiftMp4ChunkOffset (origOffset delta : Nat) (moovBeforeMdat : Bool) : Nat :=
+  if moovBeforeMdat then origOffset + delta else origOffset
+
+/--
+  Theorem (Wave 51): Injecting `delta` bytes of ISO BMFF HDR/timeline boxes (`colr`, `clli`, `mdcv`, `pasp`, `edts`) inside `moov`
+  preserves exact relative sample distance inside `mdat` (`chunkOffset' - mdatOffset' = chunkOffset - mdatOffset`)
+  whether `moov` precedes `mdat` (`faststart`) or follows `mdat`, and strictly increases ancestor box sizes by `delta`.
+-/
+theorem mp4MetadataBoxInject_preserves_mdat_relative_offsets
+    (moovSize trakSize mdatOff chunkOff delta : Nat) (moovBeforeMdat : Bool)
+    (hOrder : mdatOff ≤ chunkOff) :
+    shiftMp4AncestorSize moovSize delta - moovSize = delta ∧
+    shiftMp4AncestorSize trakSize delta - trakSize = delta ∧
+    shiftMp4ChunkOffset chunkOff delta moovBeforeMdat -
+      shiftMp4ChunkOffset mdatOff delta moovBeforeMdat = chunkOff - mdatOff := by
+  unfold shiftMp4AncestorSize shiftMp4ChunkOffset
+  cases moovBeforeMdat <;> simp <;> omega
 
 end LeanAV.Format

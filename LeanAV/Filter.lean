@@ -241,10 +241,25 @@ def parseVideoFilterGraph (spec : String) : Except String (List VideoFilterOp) :
     else
       match splitByChar st '=' with
       | ["scale", params] =>
-        match parseColonNats params with
-        | [w, h] =>
-          if w > 0 && h > 0 then ops := ops ++ [.scale w h]
-          else return .error s!"Invalid scale dimensions: {st}"
+        match splitByChar params ':' with
+        | [wStr, "-1"] | [wStr, "-2"] =>
+          match wStr.toNat? with
+          | some w =>
+            if w > 0 then ops := ops ++ [.scale w 0]
+            else return .error s!"Invalid scale dimensions: {st}"
+          | none => return .error s!"Invalid scale syntax: {st}"
+        | ["-1", hStr] | ["-2", hStr] =>
+          match hStr.toNat? with
+          | some h =>
+            if h > 0 then ops := ops ++ [.scale 0 h]
+            else return .error s!"Invalid scale dimensions: {st}"
+          | none => return .error s!"Invalid scale syntax: {st}"
+        | [wStr, hStr] =>
+          match wStr.toNat?, hStr.toNat? with
+          | some w, some h =>
+            if w > 0 && h > 0 then ops := ops ++ [.scale w h]
+            else return .error s!"Invalid scale dimensions: {st}"
+          | _, _ => return .error s!"Invalid scale syntax: {st}"
         | _ => return .error s!"Invalid scale syntax: {st}"
       | ["crop", params] =>
         match parseColonNats params with
