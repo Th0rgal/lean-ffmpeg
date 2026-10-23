@@ -1183,6 +1183,7 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
     verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 expectedDurMs expectedDurMs 0 == 1
   let acceptOk := cOk &&
     LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 realMaxSad maxAllowedSad realDistLtBlack realPsnrX10 lVar == 1
+  IO.eprintln s!"GATE mean={lMean} var={lVar} sad={realMaxSad} psnr_x10={realPsnrX10} dist={realDistLtBlack} frames={frames} vf={vfOk} sync={syncOk} accept={acceptOk}"
   return {
     ok := vfOk && syncOk && acceptOk
     framesDecoded := frames
