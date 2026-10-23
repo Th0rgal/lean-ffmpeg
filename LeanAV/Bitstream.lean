@@ -909,4 +909,341 @@ theorem rangeCoder15_encode_decode_roundtrip :
     decodeBits15List (ByteSlice.ofByteArray (encodeBits15List pairs1)) probs1 = some bits1 := by
   decide
 
+/-! ## Wave 51 (P1): Non-Indexed `BitCursor`, Total `BitM` Parser Monad, Bounded `readUEM`, & Confined `withSliceBits` Combinator -/
+
+/-- Structured parsing errors for `BitM` (eliminating silent truncation and unbounded loops). -/
+inductive BitErr where
+  | truncated (requestedBits remainingBits : Nat)
+  | invalidBitWidth (requestedBits : Nat)
+  | unalignedSlice (bitPos : Nat)
+  | expGolombLeadingZeroBudgetExceeded (maxLz : Nat)
+  | expGolombValueExceeded (value maxVal : UInt64)
+  | invalidBoxSize (boxSize remainingBytes : Nat)
+  | boxNestingDepthExceeded (depth maxDepth : Nat)
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  Non-indexed bitstream cursor (`BitCursor`) with bundled propositional bounds invariant:
+  - Avoids `BitReader (n : Nat)` index churn where variable-width codes (`readUE`) break `do`-notation.
+  - Carries a lower window bound `baseBits`, a current read position `bitPos`, an upper logical bit limit `limitBits`
+    (narrowed by `withSliceBits` for ISOBMFF/MP4 boxes), and the physical buffer bit capacity `8 * buf.size`,
+    with `baseBits ≤ bitPos ∧ bitPos ≤ limitBits ∧ limitBits ≤ 8 * buf.size`.
+-/
+structure BitCursor where
+  buf       : ByteArray
+  baseBits  : Nat := 0
+  bitPos    : Nat
+  limitBits : Nat
+  h_base    : baseBits ≤ bitPos
+  h_pos     : bitPos ≤ limitBits
+  h_lim     : limitBits ≤ 8 * buf.size
+
+namespace BitCursor
+
+/-- Initialize a `BitCursor` over the entire `ByteArray`. -/
+def ofByteArray (buf : ByteArray) : BitCursor :=
+  { buf := buf
+    baseBits := 0
+    bitPos := 0
+    limitBits := 8 * buf.size
+    h_base := Nat.le_refl 0
+    h_pos := Nat.zero_le _
+    h_lim := Nat.le_refl _ }
+
+/-- Remaining readable bits in the current slice window (`limitBits - bitPos`). -/
+@[inline]
+def remainingBits (c : BitCursor) : Nat :=
+  c.limitBits - c.bitPos
+
+/--
+  Universal Theorem (P1 Byte Index In-Bounds):
+  Whenever `c.bitPos < c.limitBits`, the underlying byte index `c.bitPos / 8` is strictly less than `c.buf.size`
+  and `c.bitPos` lies within `[c.baseBits, c.limitBits)`.
+-/
+theorem byteIdx_lt_size (c : BitCursor) (hLt : c.bitPos < c.limitBits) :
+    c.bitPos / 8 < c.buf.size ∧ c.baseBits ≤ c.bitPos := by
+  have hLim := c.h_lim
+  have hBase := c.h_base
+  omega
+
+/--
+  Primitive 1 (`readBit?`): Read a single bit from `c : BitCursor`, returning `Except BitErr (UInt8 × BitCursor)`
+  with bundled proof that the cursor advances by 1 (`c'.bitPos = c.bitPos + 1`) and stays within `[c.baseBits, c.limitBits]`.
+-/
+@[inline]
+def readBit? (c : BitCursor) : Except BitErr (UInt8 × BitCursor) :=
+  if hLt : c.bitPos < c.limitBits then
+    have hByte : c.bitPos / 8 < c.buf.size := (c.byteIdx_lt_size hLt).1
+    let b : UInt8 := c.buf[c.bitPos / 8]'hByte
+    let shift : UInt8 := (7 - (c.bitPos % 8)).toUInt8
+    let bit : UInt8 := (b >>> shift) &&& 1
+    let c' : BitCursor := {
+      buf := c.buf
+      baseBits := c.baseBits
+      bitPos := c.bitPos + 1
+      limitBits := c.limitBits
+      h_base := by have := c.h_base; omega
+      h_pos := by omega
+      h_lim := c.h_lim
+    }
+    .ok (bit, c')
+  else
+    .error (.truncated 1 (c.limitBits - c.bitPos))
+
+/--
+  Universal Theorem (P1 Local Progression & Confinement of `readBit?`):
+  Whenever `c.readBit? = .ok (b, c')`, `c'.bitPos = c.bitPos + 1`, `c'.baseBits = c.baseBits`,
+  `c'.limitBits = c.limitBits`, and `c'.buf = c.buf`.
+-/
+theorem readBit_progress (c c' : BitCursor) (b : UInt8)
+    (hOk : c.readBit? = .ok (b, c')) :
+    c'.bitPos = c.bitPos + 1 ∧ c'.baseBits = c.baseBits ∧ c'.limitBits = c.limitBits ∧ c'.buf = c.buf := by
+  unfold readBit? at hOk
+  split at hOk
+  · injection hOk with hPair
+    injection hPair with _ hC
+    subst hC
+    exact ⟨rfl, rfl, rfl, rfl⟩
+  · contradiction
+
+end BitCursor
+
+/--
+  Cursor-Window Endpoint Preservation Predicate (`CursorWindowPreserved c c'`):
+  States that transitioning from cursor `c` to `c'` preserves the underlying buffer `buf`,
+  the lower window bound `baseBits`, and the upper window bound `limitBits`, while advancing
+  monotonically within `[c.bitPos, c.limitBits]`.
+-/
+def CursorWindowPreserved (c c' : BitCursor) : Prop :=
+  c'.buf = c.buf ∧
+  c'.baseBits = c.baseBits ∧
+  c'.limitBits = c.limitBits ∧
+  c.bitPos ≤ c'.bitPos ∧
+  c'.bitPos ≤ c.limitBits
+
+/--
+  Lawful Bitstream Parser Monad (`BitM α`):
+  Wraps `run : BitCursor → Except BitErr (α × BitCursor)` together with the inductive proof `h_wf`
+  that every successful execution preserves the active slice window endpoints (`CursorWindowPreserved c c'`).
+  For parsers built from the supplied `BitM` primitives/combinators (`pure`, `bind`, `fail`, `readBit`, `readBits`,
+  `peekBits`, `readUEM`, `withSliceBits`), all byte accesses go through `BitCursor.readBit?` (which checks `c.bitPos < c.limitBits`
+  before reading `c.buf[c.bitPos / 8]`). The universal `BitM.h_wf` field constrains successful returned cursor endpoints
+  (`c'.bitPos ∈ [c.bitPos, c.limitBits]`, `c'.buf = c.buf`, `c'.baseBits = c.baseBits`, `c'.limitBits = c.limitBits`)
+  rather than intermediate trace observations of an arbitrary raw `run` function.
+-/
+structure BitM (α : Type) where
+  run  : BitCursor → Except BitErr (α × BitCursor)
+  h_wf : ∀ (c c' : BitCursor) (a : α), run c = .ok (a, c') → CursorWindowPreserved c c'
+
+namespace BitM
+
+@[inline]
+def pure (a : α) : BitM α where
+  run := fun c => .ok (a, c)
+  h_wf := by
+    intro c c' _ hOk
+    injection hOk with hPair
+    injection hPair with _ hC
+    subst hC
+    exact ⟨rfl, rfl, rfl, Nat.le_refl _, c.h_pos⟩
+
+@[inline]
+def bind (m : BitM α) (f : α → BitM β) : BitM β where
+  run := fun c =>
+    match m.run c with
+    | .ok (a, c₁) => (f a).run c₁
+    | .error e    => .error e
+  h_wf := by
+    intro c c' b hOk
+    split at hOk
+    · rename_i a c₁ hM
+      have h1 := m.h_wf c c₁ a hM
+      have h2 := (f a).h_wf c₁ c' b hOk
+      rcases h1 with ⟨hBuf1, hBase1, hLim1, hPos1, _⟩
+      rcases h2 with ⟨hBuf2, hBase2, hLim2, hPos2, hEnd2⟩
+      refine ⟨by rw [hBuf2, hBuf1], by omega, by omega, Nat.le_trans hPos1 hPos2, ?_⟩
+      omega
+    · contradiction
+
+instance : Monad BitM where
+  pure := BitM.pure
+  bind := BitM.bind
+
+@[inline]
+def fail (e : BitErr) : BitM α where
+  run := fun _ => .error e
+  h_wf := by
+    intro _ _ _ hOk
+    contradiction
+
+/-- Primitive 1 in `BitM`: read 1 MSB bit within `[c.bitPos, c.limitBits)`. -/
+@[inline]
+def readBit : BitM UInt8 where
+  run := fun c => c.readBit?
+  h_wf := by
+    intro c c' b hOk
+    have hProg := BitCursor.readBit_progress c c' b hOk
+    rcases hProg with ⟨hPos, hBase, hLim, hBuf⟩
+    refine ⟨hBuf, hBase, hLim, by omega, ?_⟩
+    have hPosC' := c'.h_pos
+    omega
+
+/-- Internal structural helper for reading `k` bits after `k ≤ 64` has been checked. -/
+def readBitsLoop (k : Nat) (acc : UInt64 := 0) : BitM UInt64 :=
+  match k with
+  | 0 => pure acc
+  | k' + 1 => do
+    let b ← readBit
+    readBitsLoop k' ((acc <<< 1) ||| b.toUInt64)
+
+/--
+  Primitive 2 in `BitM`: read `k` MSB bits (`0 ≤ k ≤ 64`) structurally without `partial` or `Fin` indices.
+  Explicitly rejects `k > 64` with `.error (.invalidBitWidth k)`. With the default seed `acc = 0` the newly read
+  field fits in `UInt64`; a nonzero seed `acc` is shifted modularly (`<<<` on `UInt64`) and may drop its high bits.
+-/
+def readBits (k : Nat) (acc : UInt64 := 0) : BitM UInt64 :=
+  if k > 64 then
+    fail (.invalidBitWidth k)
+  else
+    readBitsLoop k acc
+
+/-- Primitive 3 in `BitM`: peek `k` bits (`k ≤ 64`) without advancing the cursor. -/
+@[inline]
+def peekBits (k : Nat) : BitM UInt64 where
+  run := fun c =>
+    match (readBits k 0).run c with
+    | .ok (v, _) => .ok (v, c)
+    | .error e   => .error e
+  h_wf := by
+    intro c c' v hOk
+    split at hOk
+    · injection hOk with hPair
+      injection hPair with _ hC
+      subst hC
+      exact ⟨rfl, rfl, rfl, Nat.le_refl _, c.h_pos⟩
+    · contradiction
+
+/-- Structural leading-zero counter for Exp-Golomb with explicit `maxLz` resource budget. -/
+def countLeadingZerosBounded (fuel maxLz acc : Nat) : BitM Nat :=
+  match fuel with
+  | 0 => fail (.expGolombLeadingZeroBudgetExceeded maxLz)
+  | fuel' + 1 => do
+    let b ← readBit
+    if b == 0 then
+      countLeadingZerosBounded fuel' maxLz (acc + 1)
+    else
+      pure acc
+
+/--
+  Total Unsigned Exp-Golomb reader (`readUEM`) in `BitM`:
+  Enforces both a structural leading-zero budget (`maxLz ≤ 31`, rejecting `maxLz > 31` upfront so `1 <<< lz` cannot wrap)
+  and an explicit semantic value ceiling `maxVal`.
+-/
+def readUEM (maxLz : Nat := 31) (maxVal : UInt64 := 0xFFFFFFFF) : BitM UInt64 := do
+  if maxLz > 31 then
+    fail (.expGolombLeadingZeroBudgetExceeded maxLz)
+  else
+    let lz ← countLeadingZerosBounded (maxLz + 1) maxLz 0
+    if lz == 0 then
+      pure 0
+    else
+      let suffix ← readBits lz 0
+      let val : UInt64 := (((1 : UInt64) <<< lz.toUInt64) - 1) + suffix
+      if val > maxVal then
+        fail (.expGolombValueExceeded val maxVal)
+      else
+        pure val
+
+/--
+  Combinator (`withSliceBits`): runs a nested parser `m : BitM α` on a sub-cursor whose window endpoints are narrowed to
+  `[c.bitPos, c.bitPos + sliceBits]` (`c.bitPos + sliceBits ≤ c.limitBits`), establishes via `m.h_wf` that any successful
+  returned cursor `subEnd` of `m` satisfies `c.bitPos ≤ subEnd.bitPos ≤ c.bitPos + sliceBits` with `subEnd.limitBits = c.bitPos + sliceBits`,
+  and advances the outer cursor to `c.bitPos + sliceBits`.
+-/
+def withSliceBits (sliceBits : Nat) (m : BitM α) : BitM α where
+  run := fun c =>
+    if hSlice : c.bitPos + sliceBits ≤ c.limitBits then
+      match m.run {
+        buf := c.buf
+        baseBits := c.bitPos
+        bitPos := c.bitPos
+        limitBits := c.bitPos + sliceBits
+        h_base := Nat.le_refl c.bitPos
+        h_pos := Nat.le_add_right c.bitPos sliceBits
+        h_lim := Nat.le_trans hSlice c.h_lim
+      } with
+      | .error e => .error e
+      | .ok (res, _) =>
+        .ok (res, {
+          buf := c.buf
+          baseBits := c.baseBits
+          bitPos := c.bitPos + sliceBits
+          limitBits := c.limitBits
+          h_base := by have := c.h_base; omega
+          h_pos := hSlice
+          h_lim := c.h_lim
+        })
+    else
+      .error (.truncated sliceBits (c.limitBits - c.bitPos))
+  h_wf := by
+    intro c c' a hOk
+    split at hOk
+    · rename_i hSlice
+      split at hOk
+      · contradiction
+      · injection hOk with hPair
+        injection hPair with _ hC
+        subst hC
+        exact ⟨rfl, rfl, rfl, Nat.le_add_right c.bitPos sliceBits, hSlice⟩
+    · contradiction
+
+/--
+  Universal Theorem (P1 Box/Slice Window Preservation of `withSliceBits`):
+  For ANY lawful parser `m : BitM α`, if `(withSliceBits sliceBits m).run c = .ok (res, c')`,
+  then there exists `hSlice : c.bitPos + sliceBits ≤ c.limitBits` and an intermediate cursor `subEnd : BitCursor`
+  such that:
+  1. `m.run { buf := c.buf, baseBits := c.bitPos, bitPos := c.bitPos, limitBits := c.bitPos + sliceBits, ... } = .ok (res, subEnd)`
+  2. `c.bitPos ≤ subEnd.bitPos ∧ subEnd.bitPos ≤ c.bitPos + sliceBits ∧ subEnd.baseBits = c.bitPos ∧ subEnd.limitBits = c.bitPos + sliceBits ∧ subEnd.buf = c.buf`
+  3. The outer cursor advances to `c'.bitPos = c.bitPos + sliceBits ≤ c.limitBits` with `c'.limitBits = c.limitBits` and `c'.buf = c.buf`.
+-/
+theorem withSliceBits_confined {α : Type} (sliceBits : Nat) (m : BitM α)
+    (c c' : BitCursor) (res : α)
+    (hOk : (withSliceBits sliceBits m).run c = .ok (res, c')) :
+    (∃ (hSlice : c.bitPos + sliceBits ≤ c.limitBits) (subEnd : BitCursor),
+      m.run {
+        buf := c.buf
+        baseBits := c.bitPos
+        bitPos := c.bitPos
+        limitBits := c.bitPos + sliceBits
+        h_base := Nat.le_refl c.bitPos
+        h_pos := Nat.le_add_right c.bitPos sliceBits
+        h_lim := Nat.le_trans hSlice c.h_lim
+      } = .ok (res, subEnd) ∧
+      c.bitPos ≤ subEnd.bitPos ∧
+      subEnd.bitPos ≤ c.bitPos + sliceBits ∧
+      subEnd.baseBits = c.bitPos ∧
+      subEnd.limitBits = c.bitPos + sliceBits ∧
+      subEnd.buf = c.buf) ∧
+    c'.bitPos = c.bitPos + sliceBits ∧
+    c'.bitPos ≤ c.limitBits ∧
+    c'.limitBits = c.limitBits ∧
+    c'.buf = c.buf := by
+  unfold withSliceBits at hOk
+  dsimp at hOk
+  split at hOk
+  · rename_i hSlice
+    split at hOk
+    · contradiction
+    · rename_i resSub subEnd hSub
+      injection hOk with hPair
+      injection hPair with hRes hC
+      subst hRes
+      subst hC
+      have hWf := m.h_wf _ subEnd resSub hSub
+      rcases hWf with ⟨hBuf, hBase, hLim, hGe, hLe⟩
+      refine ⟨⟨hSlice, subEnd, hSub, hGe, hLe, hBase, hLim, hBuf⟩, rfl, hSlice, rfl, rfl⟩
+  · contradiction
+
+end BitM
+
 end LeanAV.Bitstream

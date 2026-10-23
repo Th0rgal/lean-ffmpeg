@@ -2281,4 +2281,351 @@ theorem av1FrameHeader_encode_decode_roundtrip :
     decodeAv1FrameHeaderSpec (encodeAv1FrameHeaderSpec fhBadKey) = none := by
   decide
 
+/-! ## Wave 51 (P2): Sealed `ActiveCtx` ("Parse, Don't Validate"), Codec Resolution Policy (AV1 Ref-Scaling + WebRTC), & `DpbState` Refinement -/
+
+/--
+  Codec-aware resolution transition policy (`CodecResolutionPolicy`):
+  Avoids over-restricting legitimate streams:
+  - `.av1ReferenceScaling`: AV1 §6.8.6 allows inter prediction across different reference resolutions
+    provided `refW ≤ 2 * curW ∧ curW ≤ 16 * refW` and `refH ≤ 2 * curH ∧ curH ≤ 16 * refH`
+    (in rational arithmetic, `(curW : ℚ) / 16 ≤ refW ≤ 2 * curW` and `(curH : ℚ) / 16 ≤ refH ≤ 2 * curH`, or in integers `⌈curW / 16⌉ ≤ refW ≤ 2 * curW`).
+  - `.webrtcNonIdrSpsSwitch`: WebRTC / RTC simulcast policy checking that any referenced slot across an SPS resolution
+    switch satisfies `ref ≤ 2 * cur ∧ cur ≤ 16 * ref`.
+  - `.strictIdrOnResChange`: Strict profile requiring every referenced slot to match the current `sps.width`,
+    `sps.height`, and `sps.generation`.
+-/
+inductive CodecResolutionPolicy where
+  | av1ReferenceScaling
+  | webrtcNonIdrSpsSwitch
+  | strictIdrOnResChange
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  Check AV1 §6.8.6 Reference Frame Scaling ratio bounds:
+  `refW ≤ 2 * curW ∧ curW ≤ 16 * refW` and `refH ≤ 2 * curH ∧ curH ≤ 16 * refH`
+  (in rational arithmetic, `(curW : ℚ) / 16 ≤ refW ≤ 2 * curW` and `(curH : ℚ) / 16 ≤ refH ≤ 2 * curH`).
+-/
+@[inline]
+def av1RefScaleRatioValid (refW refH curW curH : Nat) : Bool :=
+  0 < refW && 0 < refH && 0 < curW && 0 < curH &&
+  refW ≤ 2 * curW && curW ≤ 16 * refW &&
+  refH ≤ 2 * curH && curH ≤ 16 * refH
+
+/-- Sequence Parameter Set (`SpsEntry`) stored in the decoder's `ParamSetTable`. -/
+structure SpsEntry where
+  spsId        : UInt8
+  generation   : Nat
+  width        : Nat
+  height       : Nat
+  bitDepth     : Nat := 8
+  maxDpbFrames : Nat := 8
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Picture Parameter Set (`PpsEntry`) linking `ppsId` to `spsId`. -/
+structure PpsEntry where
+  ppsId      : UInt8
+  spsId      : UInt8
+  generation : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Slice / Frame header requesting activation of `ppsId` at `frameW × frameH`. -/
+structure SliceActivationReq where
+  ppsId      : UInt8
+  isIdr      : Bool
+  isInter    : Bool := !isIdr
+  poc        : Int
+  frameW     : Nat
+  frameH     : Nat
+  policy     : CodecResolutionPolicy := .av1ReferenceScaling
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Parameter set repository (`ParamSetTable`) holding validated SPS (`0..31`) and PPS (`0..255`) entries. -/
+structure ParamSetTable where
+  spsList : List SpsEntry := []
+  ppsList : List PpsEntry := []
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Explicit error taxonomy for SPS/PPS/Slice activation and DPB transitions. -/
+inductive CodecStateErr where
+  | missingPps (ppsId : UInt8)
+  | missingSps (spsId : UInt8)
+  | invalidDimensions (w h : Nat)
+  | resolutionMismatch (spsW spsH frameW frameH : Nat)
+  | referenceScalingOutOfBounds (refW refH curW curH : Nat)
+  | missingReferenceList
+  | uninitializedReferenceSlot (slotIdx : Nat)
+  | dpbCapacityExceeded (count maxSlots : Nat)
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  Proof-Carrying Activated Decoding Context (`ActiveCtx`):
+  Follows the Fable/Astra "Parse, Don't Validate" pattern:
+  - Bundles `sps`, `pps`, and `req` together with propositional coherence proof fields `h_link`, `h_bounds`, and `h_dim`.
+  - Downstream `decodeSlice` takes `ActiveCtx` directly—no `(h : nal.spsId = sps.id)` hypotheses pollute call signatures,
+    and mid-frame SPS/PPS ID/dimension mismatches are rejected at construction by `activateCtx`.
+-/
+structure ActiveCtx where
+  sps      : SpsEntry
+  pps      : PpsEntry
+  req      : SliceActivationReq
+  h_link   : req.ppsId = pps.ppsId ∧ pps.spsId = sps.spsId
+  h_bounds : sps.spsId < 32 ∧ 0 < sps.width ∧ 0 < sps.height ∧ 0 < sps.maxDpbFrames ∧ sps.maxDpbFrames ≤ 16
+  h_dim    : req.frameW = sps.width ∧ req.frameH = sps.height
+
+/--
+  Activate a sealed `ActiveCtx` at the slice boundary (`activateCtx`):
+  Resolves `req.ppsId → pps` and `pps.spsId → sps` once and discharges `h_link`, `h_bounds`, and `h_dim`.
+-/
+def activateCtx (tbl : ParamSetTable) (req : SliceActivationReq) : Except CodecStateErr ActiveCtx :=
+  match tbl.ppsList.find? (fun p => p.ppsId == req.ppsId) with
+  | none => .error (.missingPps req.ppsId)
+  | some pps =>
+    match tbl.spsList.find? (fun s => s.spsId == pps.spsId) with
+    | none => .error (.missingSps pps.spsId)
+    | some sps =>
+      if hLink : req.ppsId = pps.ppsId ∧ pps.spsId = sps.spsId then
+        if hBounds : sps.spsId < 32 ∧ 0 < sps.width ∧ 0 < sps.height ∧ 0 < sps.maxDpbFrames ∧ sps.maxDpbFrames ≤ 16 then
+          if hDim : req.frameW = sps.width ∧ req.frameH = sps.height then
+            .ok {
+              sps := sps
+              pps := pps
+              req := req
+              h_link := hLink
+              h_bounds := hBounds
+              h_dim := hDim
+            }
+          else
+            .error (.resolutionMismatch sps.width sps.height req.frameW req.frameH)
+        else
+          .error (.invalidDimensions sps.width sps.height)
+      else
+        .error (.missingSps pps.spsId)
+
+/--
+  Universal Theorem (P2 Sealed Context Coherence):
+  Every `ctx : ActiveCtx` produced by `activateCtx` guarantees `ctx.req.ppsId = ctx.pps.ppsId`,
+  `ctx.pps.spsId = ctx.sps.spsId`, `ctx.req.frameW = ctx.sps.width`, and `0 < ctx.sps.width`.
+-/
+theorem activateCtx_coherent (tbl : ParamSetTable) (req : SliceActivationReq) (ctx : ActiveCtx)
+    (_hOk : activateCtx tbl req = .ok ctx) :
+    ctx.req.ppsId = ctx.pps.ppsId ∧
+    ctx.pps.spsId = ctx.sps.spsId ∧
+    ctx.req.frameW = ctx.sps.width ∧
+    ctx.req.frameH = ctx.sps.height ∧
+    0 < ctx.sps.width ∧ 0 < ctx.sps.height := by
+  exact ⟨ctx.h_link.1, ctx.h_link.2, ctx.h_dim.1, ctx.h_dim.2, ctx.h_bounds.2.1, ctx.h_bounds.2.2.1⟩
+
+/-! ### Non-Indexed Decoded Picture Buffer (`DpbState`) with State-Machine Invariant Preservation (`DpbState.Inv`) -/
+
+/-- Validated reference frame slot in the DPB (`DpbRefSlot`). -/
+structure DpbRefSlot where
+  slotId        : Nat
+  poc           : Int
+  spsGeneration : Nat
+  width         : Nat
+  height        : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Ordinary (non-indexed) Decoded Picture Buffer state (`DpbState`). -/
+structure DpbState where
+  maxSlots  : Nat := 8
+  nextPicId : Nat := 0
+  slots     : List DpbRefSlot := []
+  deriving Repr, DecidableEq, Inhabited
+
+namespace DpbState
+
+/-- Boolean check that a `DpbRefSlot` has positive dimensions and `slotId < nextPicId`. -/
+@[inline]
+def slotValidBelow (nextPicId : Nat) (s : DpbRefSlot) : Bool :=
+  decide (0 < s.width ∧ 0 < s.height ∧ s.slotId < nextPicId)
+
+/--
+  State-machine invariant predicate (`DpbState.Inv`) as a `Prop` (not a dependent type index):
+  1. `0 < d.maxSlots ∧ d.maxSlots ≤ 16`
+  2. `d.slots.length ≤ d.maxSlots`
+  3. Every resident reference frame has strictly positive dimensions and `s.slotId < d.nextPicId`
+     (`d.slots.all (slotValidBelow d.nextPicId) = true`), guaranteeing that the next assigned `d.nextPicId`
+     is strictly greater than every resident `slotId` (new-ID freshness; pairwise uniqueness of arbitrary
+     historical states is not required to guarantee freshness of `d.nextPicId`).
+-/
+def Inv (d : DpbState) : Prop :=
+  0 < d.maxSlots ∧
+  d.maxSlots ≤ 16 ∧
+  d.slots.length ≤ d.maxSlots ∧
+  d.slots.all (slotValidBelow d.nextPicId) = true
+
+/-- Verify whether a reference slot `refSlot` can be used to predict `ctx : ActiveCtx` under `ctx.req.policy`. -/
+def canPredictFromSlot (ctx : ActiveCtx) (refSlot : DpbRefSlot) : Bool :=
+  match ctx.req.policy with
+  | .av1ReferenceScaling =>
+    av1RefScaleRatioValid refSlot.width refSlot.height ctx.sps.width ctx.sps.height
+  | .webrtcNonIdrSpsSwitch =>
+    av1RefScaleRatioValid refSlot.width refSlot.height ctx.sps.width ctx.sps.height
+  | .strictIdrOnResChange =>
+    refSlot.width == ctx.sps.width && refSlot.height == ctx.sps.height && refSlot.spsGeneration == ctx.sps.generation
+
+/--
+  Execute one verified DPB state transition (`DpbState.step`) for an activated frame `ctx : ActiveCtx`:
+  - Synchronizes `maxSlots := ctx.sps.maxDpbFrames` (`1 ≤ maxDpbFrames ≤ 16` via `ctx.h_bounds`) and assigns a fresh monotonic `slotId := d.nextPicId`.
+  - If `ctx.req.isIdr = true`, flushes prior references and inserts the new IDR reference frame.
+  - If `ctx.req.isIdr = false` and `ctx.req.isInter = false` (non-IDR intra / clean random access / recovery intra picture),
+    inserts the intra frame into the DPB without requiring inter reference slots.
+  - If `ctx.req.isIdr = false` and `ctx.req.isInter = true` (inter-predicted P/B frame), requires a non-empty reference list (`refIndices ≠ []`),
+    verifies that all referenced slots `refIndices` exist in `d.slots` and satisfy `canPredictFromSlot ctx`
+    (supporting AV1 reference scaling and WebRTC non-IDR switches, while allowing repeated reference list entries L0/L1),
+    then inserts the reconstructed frame (evicting the oldest slot when `slots.length == maxSlots`).
+-/
+def step (d : DpbState) (ctx : ActiveCtx) (refIndices : List Nat) : Except CodecStateErr DpbState :=
+  let effMax := ctx.sps.maxDpbFrames
+  let newSlot : DpbRefSlot := {
+    slotId := d.nextPicId
+    poc := ctx.req.poc
+    spsGeneration := ctx.sps.generation
+    width := ctx.sps.width
+    height := ctx.sps.height
+  }
+  if ctx.req.isIdr then
+    let nextSlots := [newSlot].take effMax
+    .ok { maxSlots := effMax, nextPicId := d.nextPicId + 1, slots := nextSlots }
+  else if !ctx.req.isInter then
+    let nextSlots := (newSlot :: d.slots).take effMax
+    .ok { maxSlots := effMax, nextPicId := d.nextPicId + 1, slots := nextSlots }
+  else
+    if refIndices.isEmpty then
+      .error .missingReferenceList
+    else
+      let refsExistAndValid := refIndices.all (fun idx =>
+        match d.slots[idx]? with
+        | none => false
+        | some refSlot => canPredictFromSlot ctx refSlot)
+      if !refsExistAndValid then
+        .error (.uninitializedReferenceSlot (refIndices.headD 0))
+      else
+        let nextSlots := (newSlot :: d.slots).take effMax
+        .ok { maxSlots := effMax, nextPicId := d.nextPicId + 1, slots := nextSlots }
+
+/-- Helper lemma: `List.take n xs` has length `≤ n`. -/
+theorem length_take_le (n : Nat) (xs : List α) : (xs.take n).length ≤ n := by
+  simp [List.length_take]
+  omega
+
+/-- Helper lemma: if `xs.all p = true`, then `(xs.take n).all p = true`. -/
+theorem all_take_of_all {α : Type} (p : α → Bool) (n : Nat) (xs : List α)
+    (hAll : xs.all p = true) : (xs.take n).all p = true := by
+  induction xs generalizing n with
+  | nil => simp
+  | cons x rest ih =>
+    cases n with
+    | zero => simp
+    | succ n' =>
+      simp only [List.take, List.all_cons, Bool.and_eq_true] at hAll ⊢
+      exact ⟨hAll.1, ih n' hAll.2⟩
+
+/-- Helper lemma: monotonicity of `slotValidBelow` when `nextPicId` increases to `nextPicId + 1`. -/
+theorem all_slotValidBelow_succ (nextPicId : Nat) (xs : List DpbRefSlot)
+    (hAll : xs.all (slotValidBelow nextPicId) = true) :
+    xs.all (slotValidBelow (nextPicId + 1)) = true := by
+  induction xs with
+  | nil => simp
+  | cons s rest ih =>
+    simp only [List.all_cons, Bool.and_eq_true] at hAll ⊢
+    refine ⟨?_, ih hAll.2⟩
+    have hS := hAll.1
+    unfold slotValidBelow at hS ⊢
+    rw [decide_eq_true_iff] at hS ⊢
+    omega
+
+/--
+  Universal Theorem (P2 DPB State-Machine Invariant Preservation, Fresh `slotId`, & Reference Validation):
+  For any `d : DpbState` satisfying `DpbState.Inv d`, any sealed `ctx : ActiveCtx`, and any reference list `refIndices`,
+  if `d.step ctx refIndices = .ok d'`, then:
+  1. `DpbState.Inv d'` holds (`0 < d'.maxSlots ≤ 16`, `d'.slots.length ≤ d'.maxSlots`, and every resident slot has positive dimensions and `slotId < d'.nextPicId`).
+  2. Every preexisting slot in `d.slots` had `slotId < d.nextPicId` (`d.slots.all (slotValidBelow d.nextPicId) = true`),
+     so the newly assigned `slotId := d.nextPicId` is guaranteed fresh relative to all resident slots in `d.slots`.
+  3. `d'.maxSlots = ctx.sps.maxDpbFrames` and `d'.nextPicId = d.nextPicId + 1`.
+  4. On any non-IDR inter-predicted frame (`ctx.req.isIdr = false ∧ ctx.req.isInter = true`), `refIndices` is non-empty
+     and every index in `refIndices` resolves to an initialized slot in `d.slots` satisfying `canPredictFromSlot ctx`.
+-/
+theorem step_preserves_inv (d d' : DpbState) (ctx : ActiveCtx) (refIndices : List Nat)
+    (hInv : d.Inv) (hStep : d.step ctx refIndices = .ok d') :
+    d'.Inv ∧
+    d.slots.all (slotValidBelow d.nextPicId) = true ∧
+    d'.maxSlots = ctx.sps.maxDpbFrames ∧
+    d'.nextPicId = d.nextPicId + 1 ∧
+    (ctx.req.isIdr = false → ctx.req.isInter = true →
+      refIndices.isEmpty = false ∧
+      refIndices.all (fun idx =>
+        match d.slots[idx]? with
+        | none => false
+        | some refSlot => canPredictFromSlot ctx refSlot) = true) := by
+  unfold Inv at hInv ⊢
+  rcases hInv with ⟨_, _, _, hAllValid⟩
+  have hSpsMaxPos : 0 < ctx.sps.maxDpbFrames := ctx.h_bounds.2.2.2.1
+  have hSpsMax16  : ctx.sps.maxDpbFrames ≤ 16 := ctx.h_bounds.2.2.2.2
+  have hNewValid : slotValidBelow (d.nextPicId + 1) {
+      slotId := d.nextPicId
+      poc := ctx.req.poc
+      spsGeneration := ctx.sps.generation
+      width := ctx.sps.width
+      height := ctx.sps.height } = true := by
+    unfold slotValidBelow
+    rw [decide_eq_true_iff]
+    exact ⟨ctx.h_bounds.2.1, ctx.h_bounds.2.2.1, Nat.lt_succ_self d.nextPicId⟩
+  have hOldValidSucc : d.slots.all (slotValidBelow (d.nextPicId + 1)) = true :=
+    all_slotValidBelow_succ d.nextPicId d.slots hAllValid
+  unfold step at hStep
+  dsimp at hStep
+  split at hStep
+  · rename_i hIdr
+    injection hStep with hEq
+    subst hEq
+    refine ⟨⟨hSpsMaxPos, hSpsMax16, length_take_le ctx.sps.maxDpbFrames _, ?_⟩, hAllValid, rfl, rfl, ?_⟩
+    · apply all_take_of_all
+      simp [hNewValid]
+    · intro hFalse _
+      rw [hIdr] at hFalse
+      contradiction
+  · rename_i hNotIdr
+    split at hStep
+    · rename_i hNotInter
+      injection hStep with hEq
+      subst hEq
+      refine ⟨⟨hSpsMaxPos, hSpsMax16, length_take_le ctx.sps.maxDpbFrames _, ?_⟩, hAllValid, rfl, rfl, ?_⟩
+      · apply all_take_of_all
+        simp [hNewValid, hOldValidSucc]
+      · intro _ hInterTrue
+        rw [hInterTrue] at hNotInter
+        simp at hNotInter
+    · rename_i hInter
+      split at hStep
+      · contradiction
+      · rename_i hNotEmpty
+        split at hStep
+        · contradiction
+        · rename_i hRefsNotFalse
+          injection hStep with hEq
+          subst hEq
+          have hRefsTrue : (refIndices.all fun idx =>
+              match d.slots[idx]? with
+              | none => false
+              | some refSlot => canPredictFromSlot ctx refSlot) = true := by
+            cases hB : (refIndices.all fun idx =>
+              match d.slots[idx]? with
+              | none => false
+              | some refSlot => canPredictFromSlot ctx refSlot)
+            · simp [hB] at hRefsNotFalse
+            · rfl
+          have hEmptyFalse : refIndices.isEmpty = false := by
+            cases hE : refIndices.isEmpty
+            · rfl
+            · exfalso; exact hNotEmpty hE
+          refine ⟨⟨hSpsMaxPos, hSpsMax16, length_take_le ctx.sps.maxDpbFrames _, ?_⟩, hAllValid, rfl, rfl, ?_⟩
+          · apply all_take_of_all
+            simp [hNewValid, hOldValidSucc]
+          · intro _ _
+            exact ⟨hEmptyFalse, hRefsTrue⟩
+
+end DpbState
+
 end LeanAV.Video

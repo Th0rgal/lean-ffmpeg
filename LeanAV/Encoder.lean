@@ -19,6 +19,7 @@ import LeanAV.Bitstream
 import LeanAV.Format
 import LeanAV.Scale
 import LeanAV.Video
+import LeanAV.NativeKernels
 
 namespace LeanAV.Encoder
 
@@ -1210,5 +1211,99 @@ def runCertifiedPixelTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Track
   let dstW := Nat.max 2 (demux.width / 2)
   let dstH := Nat.max 2 (demux.height / 2)
   runCertifiedGeneralTranscodeMp4 inPath outPath demux dstW dstH 0 0 codecCode withAudio 0
+
+/-! ## 9. Wave 51 (P4): Certified C-ABI / FFI Plane Contract Guard (`verifyPlaneFfiContractC`) -/
+
+@[extern "leanav_c_verify_plane_ffi_contract"]
+opaque verifyPlaneFfiContractC
+    (ba : @& ByteArray) (w h stride bytesPerSample simdVecBytes : USize) (requireExclusive : UInt32) : UInt32
+
+/--
+  Verify that a validated `p : Plane` satisfies the runtime C-ABI / SIMD FFI boundary contract
+  (`leanav_c_verify_plane_ffi_contract`: 64-byte stride alignment, `stride * h + 64 ≤ ByteArray.size`
+  SIMD tail-padding, and optional `lean_is_exclusive` check).
+-/
+@[inline]
+def verifyPlaneFfiContract (p : Plane) (simdVecBytes : Nat := 32) (requireExclusive : Bool := false) : Bool :=
+  verifyPlaneFfiContractC
+    p.data
+    p.w.toUSize p.h.toUSize p.stride.toUSize
+    p.bytesPerSample.toUSize simdVecBytes.toUSize
+    (if requireExclusive then 1 else 0) == 1
+
+/--
+  Boundary-guarded 8-bit (`bytesPerSample = 1`) SIMD 2x2 plane downscaler (`scalePlaneDown2x2Checked?`):
+  Provides the guarded P4/P3 entry point (whereas raw `LeanAV.Scale.scalePlaneDown2x2BicubicCSimd` is the internal
+  preconditioned binding). Memory safety is established by the combination of:
+  1. Explicit `src.bytesPerSample = 1` requirement (returning `.error (.unsupportedSampleWidth src.bytesPerSample 1)` otherwise).
+  2. Source descriptor check `checkLnirKernel srcDesc` over the actual source geometry (`src.w × src.h`, `src.stride`,
+     `src.data.size`, `simdVecBytes := 32`) plus the runtime C-ABI guard `verifyPlaneFfiContract src 32 false`
+     (the native C kernel reads a clamped 4-tap neighborhood of `src` within `[0, src.w) × [0, src.h)` and writes to a
+     freshly allocated tightly-packed buffer `lean_alloc_sarray(1, dst_w * dst_h, dst_w * dst_h)` whose bounds are checked
+     by the audited C implementation).
+  3. Exact post-call length check `rawOut.size = dstW * dstH` (returning `.error (.unexpectedKernelOutputSize ...)` on mismatch).
+  4. Destination descriptor check `checkLnirKernel paddedDesc` over the final 64-byte-stride-aligned `Plane` layout
+     (`dstW × dstH`, `dstStride := alignStride64 dstW`, `dstCap := dstStride * dstH + 64`, `simdVecBytes := 32`) before
+     constructing the output `Plane` via `Plane.mk?`.
+  The constant buffer IDs and `dstExclusiveRc1 := true` in `srcDesc`/`paddedDesc` are descriptor declarations backed by the
+  audited correspondence that the output buffers are freshly allocated (`m_rc == 1`) and distinct from `src.data`.
+-/
+def scalePlaneDown2x2Checked? (src : Plane) : Except PlaneError Plane :=
+  if src.bytesPerSample != 1 then
+    .error (.unsupportedSampleWidth src.bytesPerSample 1)
+  else
+    let dstW := Nat.max 1 (src.w / 2)
+    let dstH := Nat.max 1 (src.h / 2)
+    let dstStride := alignStride64 dstW
+    let reqBytes := dstStride * dstH + 64
+    let srcDesc : LeanAV.NativeKernels.LnirKernelDescriptor := {
+      name := "scalePlaneDown2x2BicubicCSimd_src"
+      width := src.w
+      height := src.h
+      bytesPerSample := 1
+      srcStride := src.stride
+      dstStride := src.stride
+      srcCap := src.data.size
+      dstCap := src.data.size
+      simdVecBytes := 32
+      srcBufId := 0
+      dstBufId := 1
+      inPlaceAllowed := false
+      dstExclusiveRc1 := true
+    }
+    let paddedDesc : LeanAV.NativeKernels.LnirKernelDescriptor := {
+      name := "scalePlaneDown2x2BicubicCSimd_padded_dst"
+      width := dstW
+      height := dstH
+      bytesPerSample := 1
+      srcStride := dstStride
+      dstStride := dstStride
+      srcCap := reqBytes
+      dstCap := reqBytes
+      simdVecBytes := 32
+      srcBufId := 0
+      dstBufId := 1
+      inPlaceAllowed := false
+      dstExclusiveRc1 := true
+    }
+    if !(LeanAV.NativeKernels.checkLnirKernel srcDesc && LeanAV.NativeKernels.checkLnirKernel paddedDesc) then
+      .error .lnirDescriptorRejected
+    else if !(verifyPlaneFfiContract src 32 false) then
+      .error (.insufficientBufferWithSimdPadding (src.stride * src.h + 64) src.data.size)
+    else
+      let expectedRawBytes := dstW * dstH
+      let rawOut := LeanAV.Scale.scalePlaneDown2x2BicubicCSimd src.data src.w.toUSize src.h.toUSize src.stride.toUSize
+      if rawOut.size != expectedRawBytes then
+        .error (.unexpectedKernelOutputSize expectedRawBytes rawOut.size)
+      else
+        let paddedOut := Id.run do
+          let mut arr := ByteArray.mk (Array.replicate reqBytes 0)
+          for dy in [:dstH] do
+            for dx in [:dstW] do
+              let srcIdx := dy * dstW + dx
+              let dstIdx := dy * dstStride + dx
+              arr := arr.set! dstIdx (rawOut.get! srcIdx)
+          return arr
+        Plane.mk? paddedOut dstW dstH dstStride 1 src.maxDim src.maxArenaBytes
 
 end LeanAV.Encoder

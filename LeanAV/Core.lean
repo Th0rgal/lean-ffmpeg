@@ -435,4 +435,350 @@ theorem alignStride64_ge_and_mod64 (w : Nat) :
   unfold alignStride64
   omega
 
+/-! ## 7. Wave 51 (P0): Non-Indexed `Plane` with Propositional Invariants, SIMD Tail-Padding, & Exact Signed `Timestamp` Rescaling -/
+
+/-- Explicit error taxonomy for plane allocation and geometry validation (`Parse, Don't Validate`). -/
+inductive PlaneError where
+  | zeroDimension
+  | invalidBytesPerSample (bps : Nat)
+  | unsupportedSampleWidth (bps expectedBps : Nat)
+  | exceedsMaxDimension (w h maxDim : Nat)
+  | strideSmallerThanRowBytes (rowBytes stride : Nat)
+  | unalignedStride64 (stride : Nat)
+  | exceedsArenaBudget (requiredBytes maxArenaBytes : Nat)
+  | insufficientBufferWithSimdPadding (requiredBytes actualBytes : Nat)
+  | unexpectedKernelOutputSize (expectedBytes actualBytes : Nat)
+  | lnirDescriptorRejected
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Supported sample byte widths (`1` for 8-bit, `2` for 10/12/16-bit, `4` for 32-bit float/int, `8` for 64-bit). -/
+@[inline]
+def validBytesPerSample (bps : Nat) : Prop :=
+  bps = 1 ∨ bps = 2 ∨ bps = 4 ∨ bps = 8
+
+instance (bps : Nat) : Decidable (validBytesPerSample bps) := by
+  unfold validBytesPerSample
+  infer_instance
+
+/--
+  Non-indexed validated 2D media plane (`Plane`):
+  Follows the Fable/Astra boundary-validation architecture ("Parse, Don't Validate"):
+  - Dimensions (`w`, `h`), sample byte width (`bytesPerSample ∈ {1, 2, 4, 8}`), and `stride` are ordinary fields
+    (avoiding dependent-type index explosion across dynamic resolution changes, cropping, and 4:2:0 subsampling).
+  - Carries propositional invariants (`h_pos`, `h_bps`, `h_dim`, `h_ws`, `h_al`, `h_fit`, `h_cap`) checked **once**
+    at the boundary by `Plane.mk?` / `Plane.alloc?`, including a mandatory **64-byte SIMD tail-padding**
+    (`stride * h + 64 ≤ data.size`) so 16/32/64-byte unaligned vector loads (`vld1q_u8` / `_mm256_loadu_si256`)
+    starting at any valid pixel coordinate never read past `data.size`.
+  - Enforces an explicit single-plane logical byte-length cap (`data.size ≤ maxArenaBytes`); aggregate multi-plane
+    decoder memory budgets and allocator capacity reservations remain tracked at the caller/runtime level.
+-/
+structure Plane where
+  data           : ByteArray
+  w              : Nat
+  h              : Nat
+  bytesPerSample : Nat := 1
+  stride         : Nat
+  maxDim         : Nat := 16384
+  maxArenaBytes  : Nat := 134217728 -- 128 MiB default decompression-bomb cap
+  h_pos          : 0 < w ∧ 0 < h ∧ 0 < bytesPerSample
+  h_bps          : validBytesPerSample bytesPerSample
+  h_dim          : w ≤ maxDim ∧ h ≤ maxDim
+  h_ws           : w * bytesPerSample ≤ stride
+  h_al           : stride % 64 = 0
+  h_fit          : stride * h + 64 ≤ data.size
+  h_cap          : data.size ≤ maxArenaBytes
+
+namespace Plane
+
+/-- Universal helper lemma: if `y < h`, then `y * stride + stride ≤ stride * h`. -/
+theorem row_end_le_total (stride y h : Nat) (hy : y < h) :
+    y * stride + stride ≤ stride * h := by
+  have hy1 : y + 1 ≤ h := hy
+  have hmul : (y + 1) * stride ≤ h * stride := Nat.mul_le_mul_right stride hy1
+  have hcomm : h * stride = stride * h := Nat.mul_comm h stride
+  have hdist : (y + 1) * stride = y * stride + stride := by
+    rw [Nat.add_mul, Nat.one_mul]
+  omega
+
+/--
+  Universal Theorem (P0 Scalar & Multi-Byte Sample Bounds):
+  For any validated `p : Plane` and coordinates `x < p.w`, `y < p.h`, the byte offset
+  `y * p.stride + x * p.bytesPerSample` and its entire sample footprint (`+ p.bytesPerSample`)
+  are strictly within `p.data.size` (`0 cast`, `0 Fin` churn).
+-/
+theorem addr_lt (p : Plane) {x y : Nat} (hx : x < p.w) (hy : y < p.h) :
+    y * p.stride + x * p.bytesPerSample < p.data.size ∧
+    y * p.stride + x * p.bytesPerSample + p.bytesPerSample ≤ p.data.size := by
+  have hx1 : x + 1 ≤ p.w := hx
+  have hmulX : (x + 1) * p.bytesPerSample ≤ p.w * p.bytesPerSample :=
+    Nat.mul_le_mul_right p.bytesPerSample hx1
+  have hdistX : (x + 1) * p.bytesPerSample = x * p.bytesPerSample + p.bytesPerSample := by
+    rw [Nat.add_mul, Nat.one_mul]
+  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total p.stride y p.h hy
+  have hWs := p.h_ws
+  have hFit := p.h_fit
+  have hBps := p.h_pos.2.2
+  omega
+
+/--
+  Universal Theorem (P0/P4 SIMD Vector Tail-Safety):
+  For any validated `p : Plane`, any coordinate `x < p.w`, `y < p.h`, and any SIMD vector width
+  `vecBytes ≤ 64` (covering 128-bit NEON `16`, 256-bit AVX2 `32`, and 512-bit AVX-512 `64`),
+  an unaligned vector load starting at `y * p.stride + x * p.bytesPerSample` stays strictly within `p.data.size`:
+  `y * p.stride + x * p.bytesPerSample + vecBytes ≤ p.data.size`.
+-/
+theorem simd_load_safe (p : Plane) {x y vecBytes : Nat}
+    (hx : x < p.w) (hy : y < p.h) (hVec : vecBytes ≤ 64) :
+    y * p.stride + x * p.bytesPerSample + vecBytes ≤ p.data.size := by
+  have hAddr := p.addr_lt hx hy
+  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total p.stride y p.h hy
+  have hx1 : x + 1 ≤ p.w := hx
+  have hmulX : (x + 1) * p.bytesPerSample ≤ p.w * p.bytesPerSample :=
+    Nat.mul_le_mul_right p.bytesPerSample hx1
+  have hdistX : (x + 1) * p.bytesPerSample = x * p.bytesPerSample + p.bytesPerSample := by
+    rw [Nat.add_mul, Nat.one_mul]
+  have hWs := p.h_ws
+  have hFit := p.h_fit
+  have hBps := p.h_pos.2.2
+  omega
+
+/--
+  Smart constructor (`Plane.mk?`): validates dimensions, `bytesPerSample ∈ {1, 2, 4, 8}`, 64-byte stride alignment,
+  backing-allocation arena cap (`data.size ≤ maxArenaBytes`), and 64-byte SIMD tail padding at the boundary once,
+  returning a `Plane` with bundled proof fields.
+-/
+def mk? (data : ByteArray) (w h stride : Nat) (bytesPerSample : Nat := 1)
+    (maxDim : Nat := 16384) (maxArenaBytes : Nat := 134217728) : Except PlaneError Plane :=
+  if hPos : 0 < w ∧ 0 < h ∧ 0 < bytesPerSample then
+    if hBps : validBytesPerSample bytesPerSample then
+      if hDim : w ≤ maxDim ∧ h ≤ maxDim then
+        if hWs : w * bytesPerSample ≤ stride then
+          if hAl : stride % 64 = 0 then
+            if hFit : stride * h + 64 ≤ data.size then
+              if hCap : data.size ≤ maxArenaBytes then
+                .ok {
+                  data := data
+                  w := w
+                  h := h
+                  bytesPerSample := bytesPerSample
+                  stride := stride
+                  maxDim := maxDim
+                  maxArenaBytes := maxArenaBytes
+                  h_pos := hPos
+                  h_bps := hBps
+                  h_dim := hDim
+                  h_ws := hWs
+                  h_al := hAl
+                  h_fit := hFit
+                  h_cap := hCap
+                }
+              else
+                .error (.exceedsArenaBudget data.size maxArenaBytes)
+            else
+              .error (.insufficientBufferWithSimdPadding (stride * h + 64) data.size)
+          else
+            .error (.unalignedStride64 stride)
+        else
+          .error (.strideSmallerThanRowBytes (w * bytesPerSample) stride)
+      else
+        .error (.exceedsMaxDimension w h maxDim)
+    else
+      .error (.invalidBytesPerSample bytesPerSample)
+  else
+    .error .zeroDimension
+
+/--
+  Allocate a fresh 64-byte-stride-aligned `Plane` with mandatory 64-byte SIMD tail padding,
+  gated by `maxDim` and `maxArenaBytes` decompression-bomb limits.
+-/
+def alloc? (w h : Nat) (bytesPerSample : Nat := 1) (fill : UInt8 := 0)
+    (maxDim : Nat := 16384) (maxArenaBytes : Nat := 134217728) : Except PlaneError Plane :=
+  let stride := alignStride64 (w * bytesPerSample)
+  let reqBytes := stride * h + 64
+  if !(decide (validBytesPerSample bytesPerSample)) then
+    .error (.invalidBytesPerSample bytesPerSample)
+  else if w == 0 || h == 0 then
+    .error .zeroDimension
+  else if w > maxDim || h > maxDim then
+    .error (.exceedsMaxDimension w h maxDim)
+  else if reqBytes > maxArenaBytes then
+    .error (.exceedsArenaBudget reqBytes maxArenaBytes)
+  else
+    let ba := ByteArray.mk (Array.replicate reqBytes fill)
+    mk? ba w h stride bytesPerSample maxDim maxArenaBytes
+
+/--
+  Total proof-discharged byte read of the first byte of the sample at `(x, y)`
+  (`y * p.stride + x * p.bytesPerSample < p.data.size` for any valid `bytesPerSample ∈ {1, 2, 4, 8}`).
+-/
+@[inline]
+def getByte (p : Plane) (x y : Nat) (hx : x < p.w) (hy : y < p.h) : UInt8 :=
+  let idx := y * p.stride + x * p.bytesPerSample
+  have hLt : idx < p.data.size := (p.addr_lt hx hy).1
+  p.data[idx]'hLt
+
+/-- Chroma subsampled dimension helper `⌈d / 2⌉ = (d + 1) / 2` for odd/even YUV420/YUV422 planes. -/
+@[inline]
+def chromaSubsampleDim2 (d : Nat) : Nat :=
+  (d + 1) / 2
+
+/-- Theorem: `chromaSubsampleDim2 d > 0` whenever `d > 0` (handles odd dimensions without underflow to 0). -/
+theorem chromaSubsampleDim2_pos {d : Nat} (hd : 0 < d) : 0 < chromaSubsampleDim2 d := by
+  unfold chromaSubsampleDim2
+  omega
+
+end Plane
+
+/-! ### Exact Signed `Rational`, Rounding Modes (`AVRounding`), and Overflow-Checked `Timestamp` Rescaling -/
+
+/-- Exact rational timebase `num / den` with positive numerator and denominator (`den > 0` and `num > 0` by construction). -/
+structure PosRational where
+  num   : Nat
+  den   : Nat
+  h_num : 0 < num
+  h_den : 0 < den
+  deriving Repr, DecidableEq
+
+namespace PosRational
+
+/-- Smart constructor for `PosRational`: rejects `num = 0` or `den = 0` explicitly instead of silently clamping. -/
+def mk? (num den : Nat) : Option PosRational :=
+  if h : 0 < num ∧ 0 < den then
+    some { num := num, den := den, h_num := h.1, h_den := h.2 }
+  else
+    none
+
+end PosRational
+
+/-- Explicit rounding modes matching FFmpeg `enum AVRounding` (`libavutil/mathematics.h`). -/
+inductive AVRounding where
+  | zero     -- Round toward zero (`AV_ROUND_ZERO`)
+  | inf      -- Round away from zero (`AV_ROUND_INF`)
+  | down     -- Round toward -infinity (`AV_ROUND_DOWN`)
+  | up       -- Round toward +infinity (`AV_ROUND_UP`)
+  | nearInf  -- Round to nearest and halfway cases away from zero (`AV_ROUND_NEAR_INF`, FFmpeg default)
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Explicit error taxonomy for timestamp arithmetic (`No Silent Saturation`). -/
+inductive TimeError where
+  | invalidTimebase
+  | noptsValue
+  | int64Overflow (exactValue : Int)
+  | discontinuity (prevDts curDts : Int)
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Signed timestamp with explicit `none` sentinel for `AV_NOPTS_VALUE` (`0x8000000000000000`). -/
+abbrev Timestamp := Option Int
+
+/-- Minimum and maximum representable signed 64-bit timestamps (reserving `Int64.minValue` for `AV_NOPTS_VALUE`). -/
+def minValidPtsInt64 : Int := -9223372036854775807
+def maxValidPtsInt64 : Int :=  9223372036854775807
+
+/-- Non-negative exact integer division with explicit `AVRounding` mode (`c > 0`). -/
+def divRoundNat (n c : Nat) (rnd : AVRounding) : Nat :=
+  match rnd with
+  | .zero | .down => n / c
+  | .inf  | .up   => (n + c - 1) / c
+  | .nearInf      => (n + c / 2) / c
+
+/--
+  Exact arbitrary-precision signed rescaling (`av_rescale_rnd` mathematical model over `Int`):
+  Computes `round(pts * b / c)` according to `rnd : AVRounding`, preserving negative `ctts` v1 offsets
+  and never overflowing intermediate products.
+-/
+def rescaleIntExact (pts : Int) (b c : Nat) (rnd : AVRounding := .nearInf) : Int :=
+  if pts ≥ 0 then
+    Int.ofNat (divRoundNat (pts.toNat * b) c rnd)
+  else
+    let mag := (-pts).toNat * b
+    let magRnd : AVRounding :=
+      match rnd with
+      | .zero    => .zero
+      | .inf     => .inf
+      | .down    => .up
+      | .up      => .down
+      | .nearInf => .nearInf
+    0 - Int.ofNat (divRoundNat mag c magRnd)
+
+/--
+  Checked 64-bit timestamp rescaling (`rescaleTimestampChecked`):
+  - Preserves `none` (`AV_NOPTS_VALUE`) explicitly when `allowNopts = true`, or returns `.error .noptsValue`.
+  - Computes the exact mathematical rescaled value in `Int` via `rescaleIntExact`.
+  - Checks `[minValidPtsInt64, maxValidPtsInt64]` bounds and returns `.error (.int64Overflow q)` instead of silently saturating.
+-/
+def rescaleTimestampChecked (ts : Timestamp) (bq cq : PosRational)
+    (rnd : AVRounding := .nearInf) (allowNopts : Bool := true) : Except TimeError Timestamp :=
+  match ts with
+  | none =>
+    if allowNopts then .ok none else .error .noptsValue
+  | some pts =>
+    let b := bq.num * cq.den
+    let c := bq.den * cq.num
+    let q := rescaleIntExact pts b c rnd
+    if minValidPtsInt64 ≤ q ∧ q ≤ maxValidPtsInt64 then
+      .ok (some q)
+    else
+      .error (.int64Overflow q)
+
+/--
+  Universal Theorem (P0 Exact Rescale Error Bound):
+  For any non-negative `pts : Nat` and positive timebase product `c > 0`, the floor-rounded
+  rescaled timestamp `q = divRoundNat (pts * b) c .zero` satisfies the exact inequality:
+  `q * c ≤ pts * b ∧ pts * b < (q + 1) * c` (error strictly less than `1` destination tick, with zero silent saturation).
+-/
+theorem divRoundNat_zero_error_lt_one_tick (pts b c : Nat) (hc : 0 < c) :
+    let q := divRoundNat (pts * b) c .zero
+    q * c ≤ pts * b ∧ pts * b < (q + 1) * c := by
+  dsimp [divRoundNat]
+  have hMod : (pts * b) % c < c := Nat.mod_lt (pts * b) hc
+  have hDivMod : c * ((pts * b) / c) + (pts * b) % c = pts * b := Nat.div_add_mod (pts * b) c
+  have hComm1 : ((pts * b) / c) * c = c * ((pts * b) / c) := Nat.mul_comm _ _
+  have hDist : ((pts * b) / c + 1) * c = ((pts * b) / c) * c + c := by
+    rw [Nat.add_mul, Nat.one_mul]
+  omega
+
+/--
+  Universal Theorem (P0 Nearest-Tie-Away-From-Zero Error Bound — `AV_ROUND_NEAR_INF`):
+  For any non-negative `pts : Nat` and positive denominator `c > 0`, `q = divRoundNat (pts * b) c .nearInf`
+  satisfies both the shifted quotient bracket `q * c ≤ pts * b + c / 2 ∧ pts * b + c / 2 < (q + 1) * c`
+  and the explicit two-sided half-tick absolute-error bound:
+  `2 * (q * c) ≤ 2 * (pts * b) + c ∧ 2 * (pts * b) < 2 * (q * c) + c` (i.e., `2 * |q * c - pts * b| ≤ c`).
+-/
+theorem divRoundNat_nearInf_error_bound (pts b c : Nat) (hc : 0 < c) :
+    let q := divRoundNat (pts * b) c .nearInf
+    q * c ≤ pts * b + c / 2 ∧
+    pts * b + c / 2 < (q + 1) * c ∧
+    2 * (q * c) ≤ 2 * (pts * b) + c ∧
+    2 * (pts * b) < 2 * (q * c) + c := by
+  dsimp [divRoundNat]
+  have hMod : (pts * b + c / 2) % c < c := Nat.mod_lt (pts * b + c / 2) hc
+  have hDivMod : c * ((pts * b + c / 2) / c) + (pts * b + c / 2) % c = pts * b + c / 2 :=
+    Nat.div_add_mod (pts * b + c / 2) c
+  have hComm1 : ((pts * b + c / 2) / c) * c = c * ((pts * b + c / 2) / c) := Nat.mul_comm _ _
+  have hDist : ((pts * b + c / 2) / c + 1) * c = ((pts * b + c / 2) / c) * c + c := by
+    rw [Nat.add_mul, Nat.one_mul]
+  have hHalf : 2 * (c / 2) ≤ c ∧ c ≤ 2 * (c / 2) + 1 := by omega
+  omega
+
+/--
+  Universal Theorem (P0 No Silent Saturation):
+  Whenever `rescaleTimestampChecked (some pts) bq cq rnd` succeeds with `.ok (some q)`,
+  `q` equals the exact mathematical value `rescaleIntExact pts (bq.num * cq.den) (bq.den * cq.num) rnd`
+  and lies within `[minValidPtsInt64, maxValidPtsInt64]` inclusively.
+-/
+theorem rescaleTimestampChecked_exact_and_bounded (pts q : Int) (bq cq : PosRational)
+    (rnd : AVRounding) (allowNopts : Bool)
+    (hOk : rescaleTimestampChecked (some pts) bq cq rnd allowNopts = .ok (some q)) :
+    q = rescaleIntExact pts (bq.num * cq.den) (bq.den * cq.num) rnd ∧
+    minValidPtsInt64 ≤ q ∧ q ≤ maxValidPtsInt64 := by
+  unfold rescaleTimestampChecked at hOk
+  dsimp at hOk
+  split at hOk
+  · rename_i hBounds
+    injection hOk with hSome
+    injection hSome with hEq
+    subst hEq
+    exact ⟨rfl, hBounds⟩
+  · contradiction
+
 end LeanAV.Core

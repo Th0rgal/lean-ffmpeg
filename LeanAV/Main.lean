@@ -689,15 +689,97 @@ def runSelfTest : IO UInt32 := do
                ((lawfulStageScale2x2 .yuv420p 8 8).run (DecodedPlaneBuf.ofPlane2D .yuv420p realFfmpeg8x8Plane 40 .bt2020Pq)).colorSpace == .bt2020Pq &&
                ((lawfulStageColorConvert .yuv420p 8 8 .bt709 id).run (DecodedPlaneBuf.ofPlane2D .yuv420p realFfmpeg8x8Plane 40 .bt2020Pq)).colorSpace == .bt709
 
+  -- 59. Wave 51 (P0-P5): Fable & Astra Anti-OSS-Fuzz Architecture Gate
+  -- Non-indexed `Plane` with 64B SIMD tail padding + C-ABI FFI guard, `BitM`/`withSliceBits` confinement,
+  -- exact signed `Timestamp` rescale without silent saturation, sealed `ActiveCtx` + AV1 reference scaling DPB,
+  -- and decidable LNIR Translation Validation (`checkLnirKernel`).
+  let w51PlaneOk :=
+    match Plane.alloc? 1920 1080 1 16, Plane.alloc? 64 64 1 128 with
+    | .ok p1080, .ok p64 =>
+      verifyPlaneFfiContract p1080 32 false &&
+      p1080.stride == 1920 &&
+      p1080.data.size == 1920 * 1080 + 64 &&
+      (match scalePlaneDown2x2Checked? p64 with
+       | .ok p32 => p32.w == 32 && p32.h == 32 && p32.stride == 64 && p32.data.size == 64 * 32 + 64
+       | .error _ => false)
+    | _, _ => false
+  let w51BombRejected :=
+    match Plane.alloc? 65535 65535 1 0 with
+    | .error _ => true
+    | .ok _    => false
+  let w51Cursor := BitCursor.ofByteArray (ByteArray.mk #[0xA5, 0x5A, 0xF0, 0x0F])
+  let w51SliceOk :=
+    match (BitM.withSliceBits 16 (BitM.readBits 8 0)).run w51Cursor with
+    | .ok (v, cNext) => v == 0xA5 && cNext.bitPos == 16 && cNext.limitBits == 32
+    | .error _ => false
+  let w51SliceOverflowRejected :=
+    match (BitM.withSliceBits 8 (BitM.readBits 16 0)).run w51Cursor with
+    | .error _ => true
+    | .ok _    => false
+  let w51TimeOk :=
+    match PosRational.mk? 1 90000, PosRational.mk? 1 1000 with
+    | some tb90k, some tb1k =>
+      (match rescaleTimestampChecked (some (-90000)) tb90k tb1k .nearInf with
+       | .ok (some q) => q == -1000
+       | _ => false) &&
+      (match rescaleTimestampChecked none tb90k tb1k .nearInf true with
+       | .ok none => true
+       | _ => false) &&
+      (match rescaleTimestampChecked (some maxValidPtsInt64) tb1k tb90k .nearInf with
+       | .error (.int64Overflow _) => true
+       | _ => false)
+    | _, _ => false
+  let w51ParamTbl : ParamSetTable := {
+    spsList := [
+      { spsId := 0, generation := 1, width := 1920, height := 1080, maxDpbFrames := 8 },
+      { spsId := 1, generation := 2, width := 1280, height := 720,  maxDpbFrames := 8 }
+    ]
+    ppsList := [
+      { ppsId := 0, spsId := 0, generation := 1 },
+      { ppsId := 1, spsId := 1, generation := 2 }
+    ]
+  }
+  let w51DpbAndCtxOk :=
+    match activateCtx w51ParamTbl { ppsId := 0, isIdr := true, poc := 0, frameW := 1920, frameH := 1080, policy := .av1ReferenceScaling },
+          activateCtx w51ParamTbl { ppsId := 1, isIdr := false, poc := 2, frameW := 1280, frameH := 720, policy := .av1ReferenceScaling } with
+    | .ok ctx0, .ok ctx1 =>
+      let d0 : DpbState := { maxSlots := 8, slots := [] }
+      match d0.step ctx0 [] with
+      | .ok d1 =>
+        match d1.step ctx1 [0, 0] with -- Tests both AV1 reference scaling (1920x1080 -> 1280x720) and repeated reference indices
+        | .ok d2 => d2.slots.length == 2 && (d1.step ctx1 [5]).isOk == false
+        | .error _ => false
+      | .error _ => false
+    | _, _ => false
+  let w51LnirDesc : LnirKernelDescriptor := {
+    name := "scalePlaneDown2x2Simd_checked"
+    width := 1920
+    height := 1080
+    bytesPerSample := 1
+    srcStride := 1920
+    dstStride := 1920
+    srcCap := 1920 * 1080 + 64
+    dstCap := 1920 * 1080 + 64
+    simdVecBytes := 32
+    srcBufId := 0
+    dstBufId := 1
+    inPlaceAllowed := false
+    dstExclusiveRc1 := true
+  }
+  let w51LnirBadAlias : LnirKernelDescriptor := { w51LnirDesc with dstBufId := 0, inPlaceAllowed := false }
+  let w51LnirBadTail : LnirKernelDescriptor := { w51LnirDesc with srcCap := 1920 * 1080 }
+  let w51LnirOk := checkLnirKernel w51LnirDesc && !(checkLnirKernel w51LnirBadAlias) && !(checkLnirKernel w51LnirBadTail)
+  let w51Ok := w51PlaneOk && w51BombRejected && w51SliceOk && w51SliceOverflowRejected && w51TimeOk && w51DpbAndCtxOk && w51LnirOk
+
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
-  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok
+  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 50, \"c_abi_gates\": 11, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 51, \"c_abi_gates\": 12, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -706,7 +788,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -1527,6 +1609,18 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Cli.cli_encoder_options_retained_and_invalid_rejected
 #print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
 #print axioms LeanAV.Scale.pq10Tonemap_and_bicubic2x2_verified
+#print axioms LeanAV.Core.Plane.addr_lt
+#print axioms LeanAV.Core.Plane.simd_load_safe
+#print axioms LeanAV.Core.Plane.chromaSubsampleDim2_pos
+#print axioms LeanAV.Core.divRoundNat_zero_error_lt_one_tick
+#print axioms LeanAV.Core.divRoundNat_nearInf_error_bound
+#print axioms LeanAV.Core.rescaleTimestampChecked_exact_and_bounded
+#print axioms LeanAV.Bitstream.BitCursor.byteIdx_lt_size
+#print axioms LeanAV.Bitstream.BitCursor.readBit_progress
+#print axioms LeanAV.Bitstream.BitM.withSliceBits_confined
+#print axioms LeanAV.Video.activateCtx_coherent
+#print axioms LeanAV.Video.DpbState.step_preserves_inv
+#print axioms LeanAV.NativeKernels.checkLnirKernel_sound
 
 
 

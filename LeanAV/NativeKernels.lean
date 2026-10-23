@@ -1584,4 +1584,107 @@ theorem evalLnir_hevc_cabac_bypass_bin_accum_fma_equiv (bypassBinBit codIRangeSt
       leanSpecHevcCabacBypassBinAccumFma bypassBinBit codIRangeStep bypassOffsetAccum :=
   rfl
 
+/-! ## Wave 51 (P3): Certified LNIR Kernel Descriptor Bounds & Aliasing Checker (`checkLnirKernel`, `checkLnirKernel_sound`) -/
+
+/--
+  Flat (non-dependent) LNIR 2D/SIMD Kernel Contract Descriptor (`LnirKernelDescriptor`):
+  Follows the CompCert / Fable / Astra *Translation Validation* descriptor-checking architecture:
+  - Instead of embedding dependent proof terms inside IR nodes (which breaks IR serialization and optimization passes),
+    the IR carries explicit numeric bounds (`width`, `height`, `bytesPerSample`, `srcStride`, `dstStride`,
+    `srcCap`, `dstCap`, `simdVecBytes`, `srcBufId`, `dstBufId`, `inPlaceAllowed`, `dstExclusiveRc1`).
+  - A certified decidable descriptor checker `checkLnirKernel : LnirKernelDescriptor → Bool` validates every lowered kernel
+    descriptor before code emission (while C/SIMD codegen and runtime `lean_is_exclusive` checks remain in the audited TCB),
+    and `checkLnirKernel_sound` proves that `checkLnirKernel k = true → LnirKernelMemSafe k`.
+-/
+structure LnirKernelDescriptor where
+  name            : String
+  width           : Nat
+  height          : Nat
+  bytesPerSample  : Nat := 1
+  srcStride       : Nat
+  dstStride       : Nat
+  srcCap          : Nat
+  dstCap          : Nat
+  simdVecBytes    : Nat := 32  -- 16 (NEON), 32 (AVX2), or 64 (AVX-512)
+  srcBufId        : Nat := 0
+  dstBufId        : Nat := 1
+  inPlaceAllowed  : Bool := false
+  dstExclusiveRc1 : Bool := true
+  deriving Repr, DecidableEq, Inhabited
+
+/--
+  Semantic memory-safety specification (`LnirKernelMemSafe`) for a lowered LNIR SIMD/GPU kernel:
+  1. Positive dimensions, sample width, and SIMD vector width (`1 ≤ simdVecBytes ≤ 64`).
+  2. Row byte footprints fit within 64-byte-aligned strides (`width * bytesPerSample ≤ stride` and `stride % 64 = 0`).
+  3. Source and destination capacities include at least 64 bytes of SIMD tail padding (`stride * height + 64 ≤ cap`).
+  4. Destination buffer has exclusive ownership (`dstExclusiveRc1 = true`) and never aliases `srcBufId` unless `inPlaceAllowed = true`.
+  5. Every pixel coordinate `(x < width, y < height)` and any vector load/store of `simdVecBytes` bytes starting at
+     `y * stride + x * bytesPerSample` stays strictly within `srcCap` and `dstCap`.
+-/
+def LnirKernelMemSafe (k : LnirKernelDescriptor) : Prop :=
+  0 < k.width ∧ 0 < k.height ∧ 0 < k.bytesPerSample ∧
+  0 < k.simdVecBytes ∧ k.simdVecBytes ≤ 64 ∧
+  k.width * k.bytesPerSample ≤ k.srcStride ∧ k.srcStride % 64 = 0 ∧
+  k.width * k.bytesPerSample ≤ k.dstStride ∧ k.dstStride % 64 = 0 ∧
+  k.srcStride * k.height + 64 ≤ k.srcCap ∧
+  k.dstStride * k.height + 64 ≤ k.dstCap ∧
+  k.dstExclusiveRc1 = true ∧
+  (k.srcBufId ≠ k.dstBufId ∨ k.inPlaceAllowed = true) ∧
+  (∀ x y : Nat, x < k.width → y < k.height →
+    y * k.srcStride + x * k.bytesPerSample + k.simdVecBytes ≤ k.srcCap ∧
+    y * k.dstStride + x * k.bytesPerSample + k.simdVecBytes ≤ k.dstCap)
+
+/--
+  Decidable LNIR Translation Validation Checker (`checkLnirKernel`):
+  Placed in the small TCB to validate lowered LNIR kernel descriptors before C/SIMD/PTX emission.
+-/
+def checkLnirKernel (k : LnirKernelDescriptor) : Bool :=
+  decide (
+    0 < k.width ∧ 0 < k.height ∧ 0 < k.bytesPerSample ∧
+    0 < k.simdVecBytes ∧ k.simdVecBytes ≤ 64 ∧
+    k.width * k.bytesPerSample ≤ k.srcStride ∧ k.srcStride % 64 = 0 ∧
+    k.width * k.bytesPerSample ≤ k.dstStride ∧ k.dstStride % 64 = 0 ∧
+    k.srcStride * k.height + 64 ≤ k.srcCap ∧
+    k.dstStride * k.height + 64 ≤ k.dstCap ∧
+    k.dstExclusiveRc1 = true ∧
+    (k.srcBufId ≠ k.dstBufId ∨ k.inPlaceAllowed = true)
+  )
+
+/-- Helper arithmetic lemma for LNIR 2D strided SIMD bounds. -/
+private theorem lnir_strided_simd_bound {w h bps stride cap vecBytes x y : Nat}
+    (hBps : 0 < bps)
+    (hWs : w * bps ≤ stride)
+    (hFit : stride * h + 64 ≤ cap)
+    (hVec : vecBytes ≤ 64)
+    (hx : x < w) (hy : y < h) :
+    y * stride + x * bps + vecBytes ≤ cap := by
+  have hx1 : x + 1 ≤ w := hx
+  have hmulX : (x + 1) * bps ≤ w * bps := Nat.mul_le_mul_right bps hx1
+  have hdistX : (x + 1) * bps = x * bps + bps := by
+    rw [Nat.add_mul, Nat.one_mul]
+  have hy1 : y + 1 ≤ h := hy
+  have hmulY : (y + 1) * stride ≤ h * stride := Nat.mul_le_mul_right stride hy1
+  have hcommY : h * stride = stride * h := Nat.mul_comm h stride
+  have hdistY : (y + 1) * stride = y * stride + stride := by
+    rw [Nat.add_mul, Nat.one_mul]
+  omega
+
+/--
+  Universal Theorem (P3 Translation Validation Soundness — `checkLnirKernel_sound`):
+  If `checkLnirKernel k = true`, then `LnirKernelMemSafe k` holds universally (`∀ x < k.width, ∀ y < k.height`,
+  including full SIMD vector loads/stores of width `k.simdVecBytes ≤ 64` and no-aliasing/exclusivity invariants).
+-/
+theorem checkLnirKernel_sound (k : LnirKernelDescriptor)
+    (hCheck : checkLnirKernel k = true) :
+    LnirKernelMemSafe k := by
+  unfold checkLnirKernel at hCheck
+  rw [decide_eq_true_iff] at hCheck
+  rcases hCheck with ⟨hW, hH, hBps, hVecPos, hVec64, hSrcWs, hSrcAl, hDstWs, hDstAl, hSrcFit, hDstFit, hExcl, hAlias⟩
+  refine ⟨hW, hH, hBps, hVecPos, hVec64, hSrcWs, hSrcAl, hDstWs, hDstAl, hSrcFit, hDstFit, hExcl, hAlias, ?_⟩
+  intro x y hx hy
+  exact ⟨
+    lnir_strided_simd_bound hBps hSrcWs hSrcFit hVec64 hx hy,
+    lnir_strided_simd_bound hBps hDstWs hDstFit hVec64 hx hy
+  ⟩
+
 end LeanAV.NativeKernels

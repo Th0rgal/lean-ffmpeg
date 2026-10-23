@@ -58,6 +58,9 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2_bicubic(
     size_t dst_h = src_h >> 1;
     if (dst_w == 0) dst_w = 1;
     if (dst_h == 0) dst_h = 1;
+    if (dst_h > SIZE_MAX / dst_w) {
+        return lean_alloc_sarray(1, 0, 0);
+    }
     size_t dst_size = dst_w * dst_h;
     lean_obj_res dst_ba = lean_alloc_sarray(1, dst_size, dst_size);
     uint8_t *dst = lean_sarray_cptr(dst_ba);
@@ -83,7 +86,7 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2_bicubic(
             size_t cx2 = (src_w == 0) ? 0 : (x2 < src_w ? x2 : src_w - 1);
             size_t cx3 = (src_w == 0) ? 0 : (x3 < src_w ? x3 : src_w - 1);
 
-            #define GET_PX(cy, cx) (((cy) * src_stride + (cx) < src_cap) ? src[(cy) * src_stride + (cx)] : (uint8_t)0)
+            #define GET_PX(cy, cx) ((src_stride == 0 || (cy) <= (SIZE_MAX - (cx)) / src_stride) && ((cy) * src_stride + (cx) < src_cap) ? src[(cy) * src_stride + (cx)] : (uint8_t)0)
             uint8_t h0 = leanav_eval_bicubic_4tap_u8(GET_PX(cy0, cx0), GET_PX(cy0, cx1), GET_PX(cy0, cx2), GET_PX(cy0, cx3));
             uint8_t h1 = leanav_eval_bicubic_4tap_u8(GET_PX(cy1, cx0), GET_PX(cy1, cx1), GET_PX(cy1, cx2), GET_PX(cy1, cx3));
             uint8_t h2 = leanav_eval_bicubic_4tap_u8(GET_PX(cy2, cx0), GET_PX(cy2, cx1), GET_PX(cy2, cx2), GET_PX(cy2, cx3));
@@ -2202,3 +2205,36 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
     return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
 }
+
+/*
+ * Wave 51 (P4): Certified C-ABI / FFI Plane Contract Guard (`leanav_c_verify_plane_ffi_contract`):
+ * Checks at the C boundary before any SIMD/DMA kernel execution:
+ * 1. Non-zero dimensions (`w > 0 && h > 0 && bytes_per_sample > 0`) and `simd_vec_bytes <= 64`.
+ * 2. Overflow-safe `w * bytes_per_sample <= stride` and 64-byte stride alignment (`(stride & 63) == 0`).
+ * 3. Overflow-safe `stride * h + 64 <= lean_sarray_size(ba)` (guarantees 64-byte SIMD tail padding on `ByteArray`
+ *    so 16/32/64-byte vector loads at the end of the last row never read out-of-bounds).
+ * 4. If `require_exclusive != 0`, verifies `lean_is_exclusive(ba)` (`m_rc == 1`) before any in-place mutation.
+ */
+LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
+    b_lean_obj_arg ba,
+    size_t w,
+    size_t h,
+    size_t stride,
+    size_t bytes_per_sample,
+    size_t simd_vec_bytes,
+    uint32_t require_exclusive
+) {
+    if (w == 0 || h == 0 || (bytes_per_sample != 1 && bytes_per_sample != 2 && bytes_per_sample != 4 && bytes_per_sample != 8)) return 0u;
+    if (simd_vec_bytes == 0 || simd_vec_bytes > 64) return 0u;
+    if ((stride & 63u) != 0u) return 0u;
+    if (w > SIZE_MAX / bytes_per_sample) return 0u;
+    size_t row_bytes = w * bytes_per_sample;
+    if (row_bytes > stride) return 0u;
+    if (h > (SIZE_MAX - 64u) / stride) return 0u;
+    size_t req_cap = stride * h + 64u;
+    size_t actual_cap = lean_sarray_size(ba);
+    if (actual_cap < req_cap) return 0u;
+    if (require_exclusive != 0u && !lean_is_exclusive((lean_object *)ba)) return 0u;
+    return 1u;
+}
+
