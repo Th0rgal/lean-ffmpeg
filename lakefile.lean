@@ -36,6 +36,6 @@ lean_exe «lffmpeg» where
   supportInterpreter := false
   moreLinkArgs :=
     if System.Platform.isOSX then
-      #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"]
+      #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil", "-lpthread"]
     else
-      #[]
+      #["-lpthread"]
