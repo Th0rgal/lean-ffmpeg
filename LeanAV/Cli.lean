@@ -42,25 +42,30 @@ inductive CliCodec where
 /-- Parse a codec token string into `CliCodec` (`none` = unsupported → fail-closed). -/
 def parseCliCodec (s : String) : Option CliCodec :=
   match s with
-  | "copy"      => some .copy
-  | "h264"      => some .h264
-  | "libx264"   => some .h264
-  | "hevc"      => some .hevc
-  | "libx265"   => some .hevc
-  | "av1"       => some .av1
-  | "libaom-av1" => some .av1
-  | "vp9"       => some .vp9
-  | "libvpx-vp9" => some .vp9
-  | "prores"    => some .prores
-  | "prores_ks" => some .prores
-  | "ffv1"      => some .ffv1
-  | "aac"       => some .aac
-  | "opus"      => some .opus
-  | "libopus"   => some .opus
-  | "flac"      => some .flac
-  | "pcm_s16le" => some .pcmS16le
-  | "rawvideo"  => some .rawvideo
-  | _           => none
+  | "copy"        => some .copy
+  | "h264"        => some .h264
+  | "libx264"     => some .h264
+  | "h264_nvenc"  => some .h264
+  | "hevc"        => some .hevc
+  | "h265"        => some .hevc
+  | "libx265"     => some .hevc
+  | "hevc_nvenc"  => some .hevc
+  | "av1"         => some .av1
+  | "libaom-av1"  => some .av1
+  | "libsvtav1"   => some .av1
+  | "av1_nvenc"   => some .av1
+  | "vp9"         => some .vp9
+  | "libvpx-vp9"  => some .vp9
+  | "prores"      => some .prores
+  | "prores_ks"   => some .prores
+  | "ffv1"        => some .ffv1
+  | "aac"         => some .aac
+  | "opus"        => some .opus
+  | "libopus"     => some .opus
+  | "flac"        => some .flac
+  | "pcm_s16le"   => some .pcmS16le
+  | "rawvideo"    => some .rawvideo
+  | _             => none
 
 /-- Exact rational seconds (`-ss`, `-t`) avoiding floating-point drift. -/
 structure CliSeconds where
@@ -139,7 +144,8 @@ def supportedFormat (s : String) : Bool :=
 def flagTakesValue (s : String) : Bool :=
   ["-i", "-c", "-c:v", "-vcodec", "-c:a", "-acodec", "-vf", "-af",
    "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes",
-   "-ar", "-ac", "-pix_fmt", "-loglevel", "-v", "-threads"].contains s
+   "-ar", "-ac", "-pix_fmt", "-loglevel", "-v", "-threads",
+   "-preset", "-crf", "-bf", "-g", "-r", "-b:v", "-b:a", "-movflags"].contains s
 
 /-- Recursive FFmpeg argv parser. -/
 def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
@@ -166,6 +172,22 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
   | "-v" :: _ :: rest =>
     parseFFmpegArgsLoop rest cfg
   | "-threads" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-preset" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-crf" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-bf" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-g" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-r" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-b:v" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-b:a" :: _ :: rest =>
+    parseFFmpegArgsLoop rest cfg
+  | "-movflags" :: _ :: rest =>
     parseFFmpegArgsLoop rest cfg
   | "-i" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
@@ -252,7 +274,7 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
   | arg :: rest =>
     parseFFmpegArgsLoop rest <|
       if flagTakesValue arg then cfg.fail (.missingValue arg)
-      else if arg.startsWith "-" && arg != "-" then cfg.fail (.unsupportedCodecOrFlag arg)
+      else if arg.toList.head? == some '-' && arg != "-" then cfg.fail (.unsupportedCodecOrFlag arg)
       else
         match cfg.output with
         | none => if arg == "" then cfg.fail (.emptyValue "output") else { cfg with output := some arg }
@@ -314,5 +336,36 @@ def formatGoldenFrameCrcLine (streamIdx : Nat) (dts pts duration : UInt64) (size
 def formatGoldenXxh64Line (s : ByteSlice) : String :=
   let d := xxh64Slice s 0
   s!"XXH64={uint64ToHex16 d}"
+
+/-! ## 3. Wave 6 (C5): Formal CLI Option Parser & Fail-Closed Gate Soundness Theorems -/
+
+/--
+  Theorem (Wave 6 C5): `validateCliConfig` enforces the fail-closed stream-copy vs filter exclusion law
+  (`-c copy` combined with `-vf` or `-af` is rejected with `CliError.copyWithFilter`), while a valid
+  transcode invocation (`-i in.mp4 -c:v ffv1 -vf eq=128:0 -af volume=256 out.mp4`) is accepted with zero errors.
+-/
+theorem cliValidate_copyWithFilter_rejected_and_transcode_accepted :
+    let badCfg := parseFFmpegArgs ["-i", "in.mp4", "-c", "copy", "-vf", "hflip", "out.mp4"]
+    let goodCfg := parseFFmpegArgs ["-i", "in.mp4", "-c:v", "ffv1", "-vf", "eq=256:0", "-af", "volume=256", "out.mp4"]
+    let badRes := match validateCliConfig badCfg with | .error errs => errs == [.copyWithFilter] | .ok _ => false
+    let goodRes := match validateCliConfig goodCfg with | .ok c => c == goodCfg | .error _ => false
+    badRes = true ∧
+    goodRes = true ∧
+    goodCfg.videoCodec = some .ffv1 ∧
+    goodCfg.videoFilter = some "eq=256:0" ∧
+    goodCfg.audioFilter = some "volume=256" := by
+  decide
+
+/--
+  Theorem (Wave 6 C5): `parseCliSeconds` parses exact decimal rational timestamps (`"1.5"` -> `15/10`, `"24"` -> `24/1`)
+  without floating-point representation drift and rejects malformed strings (`"1.2.3"`, `""`, `"abc"`).
+-/
+theorem parseCliSeconds_exact_and_rejects_malformed :
+    parseCliSeconds "1.5" = some { num := 15, den := 10 } ∧
+    parseCliSeconds "24" = some { num := 24, den := 1 } ∧
+    parseCliSeconds "1.2.3" = none ∧
+    parseCliSeconds "" = none ∧
+    parseCliSeconds "abc" = none := by
+  decide
 
 end LeanAV.Cli

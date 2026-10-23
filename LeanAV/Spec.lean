@@ -673,7 +673,7 @@ def isProResHeaderBytesValid (bs : Array UInt8) : Bool :=
 def ProResHeaderBytesSafe (bs : Array UInt8) : Prop :=
   isProResHeaderBytesValid bs = true
 
-/-- `AVGateSpec` for Apple ProRes Frame Header using real 28B `icpf` header extracted by `ffmpeg` from `artifacts/real_media/t1_64_prores.mov`. -/
+/-- `AVGateSpec` for Apple ProRes Frame Header using real 28B `icpf` header (`t1_64_prores.mov`). -/
 def proResHeaderGateSpec : AVGateSpec (Array UInt8) ProResHeaderBytesSafe where
   gate := isProResHeaderBytesValid
   sound _ h := h
@@ -746,6 +746,41 @@ def ffv1PlaneGateSpec : AVGateSpec (Array UInt8) Ffv1PlaneBytesSafe where
   complete _ h := h
   posWitness := #[0x00, 0x08, 0x00, 0x08, 0x03, 0x81, 0x54, 0x77, 0x4D, 0xB3]
   negWitness := #[0x00, 0x00, 0x00, 0x08, 0x03, 0x81, 0x54, 0x77, 0x4D, 0xB3]
+  nonVacuous := rfl
+  tight := rfl
+
+/--
+  9. Wave 7 4K -> 1080p AVCC I/P/B Packet Header gate:
+  Verifies 4B big-endian AVCC length prefix `len ≥ 9`, valid H.264 NAL type `∈ {1, 5}`,
+  and embedded 1080p (`1920x1080`) macroblock dimensions `120x68` (`0x07 0x80 0x38`).
+-/
+def isAvcc1080pIpbPacketBytesValid (bs : Array UInt8) : Bool :=
+  if bs.size < 13 then false
+  else
+    let nalLen :=
+      (((bs.getD 0 0).toUInt32 <<< 24) |||
+       ((bs.getD 1 0).toUInt32 <<< 16) |||
+       ((bs.getD 2 0).toUInt32 <<< 8) |||
+       (bs.getD 3 0).toUInt32).toNat
+    let nalHdr := bs.getD 4 0x80
+    let nalType := nalHdr &&& 0x1F
+    nalLen ≥ 9 &&
+    (nalHdr &&& 0x80) == 0 &&
+    (nalType == 1 || nalType == 5) &&
+    bs.getD 10 0 == 0x07 &&
+    bs.getD 11 0 == 0x80 &&
+    bs.getD 12 0 == 0x38
+
+def Avcc1080pIpbPacketBytesSafe (bs : Array UInt8) : Prop :=
+  isAvcc1080pIpbPacketBytesValid bs = true
+
+/-- `AVGateSpec` for Wave 7 4K -> 1080p AVCC I/P/B packet header (`1920x1080` IDR/P/B slice). -/
+def avcc1080pIpbPacketGateSpec : AVGateSpec (Array UInt8) Avcc1080pIpbPacketBytesSafe where
+  gate := isAvcc1080pIpbPacketBytesValid
+  sound _ h := h
+  complete _ h := h
+  posWitness := #[0x00, 0x00, 0x00, 0x19, 0x65, 0x88, 0x04, 0x00, 0x00, 0x00, 0x07, 0x80, 0x38]
+  negWitness := #[0x00, 0x00, 0x00, 0x04, 0x85, 0x88, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
   nonVacuous := rfl
   tight := rfl
 

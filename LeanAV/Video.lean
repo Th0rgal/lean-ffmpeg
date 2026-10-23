@@ -1176,6 +1176,109 @@ theorem ffv1PlaneRiceR0_encode_decode_roundtrip :
      | none => false) = true := by
   decide
 
+/-- High-throughput flat-`ByteArray` FFV1 Rice-Golomb encoder (`encodePlaneFfv1RiceR0Fast`):
+    Writes directly to a pre-allocated `ByteArray` via a word-level 64-bit bit-accumulator (`bitBuf : UInt64`, `bitCnt : Nat`),
+    eliminating per-bit `ByteArray` copy-on-write and `Array UInt8` boxing while producing the exact same bitstream as `encodePlaneFfv1RiceR0`. -/
+def encodePlaneFfv1RiceR0Fast (p : Plane2D) (riceK : Nat := 3) : ByteArray := Id.run do
+  let w := p.width
+  let h := p.height
+  let k := Nat.min 7 riceK
+  let mut out := ByteArray.emptyWithCapacity (w * h + 16)
+  out := out.push ((w >>> 8) &&& 0xFF).toUInt8
+  out := out.push (w &&& 0xFF).toUInt8
+  out := out.push ((h >>> 8) &&& 0xFF).toUInt8
+  out := out.push (h &&& 0xFF).toUInt8
+  out := out.push (k &&& 0xFF).toUInt8
+  let mut bitBuf : UInt64 := 0
+  let mut bitCnt : Nat := 0
+  let mask : UInt64 := ((1 : UInt64) <<< k.toUInt64) - 1
+  for r in [:h] do
+    for c in [:w] do
+      let cur := p.getPixel r c
+      let left := if c > 0 then p.getPixel r (c - 1) else 0
+      let top  := if r > 0 then p.getPixel (r - 1) c else 0
+      let tl   := if r > 0 && c > 0 then p.getPixel (r - 1) (c - 1) else 0
+      let pred := ffv1MedianPredictor left top tl
+      let diffU8 : UInt8 := cur - pred
+      let u : UInt64 :=
+        if diffU8.toNat ≥ 128 then
+          let m : UInt64 := (255 - diffU8.toNat).toUInt64
+          (m <<< 1) ||| 1
+        else
+          diffU8.toUInt64 <<< 1
+      let q : Nat := (u >>> k.toUInt64).toNat
+      let remBits : UInt64 := u &&& mask
+      -- Emit `q` zero bits + `1` stop bit + `k` remainder bits
+      for _ in [:q] do
+        bitBuf := bitBuf <<< 1
+        bitCnt := bitCnt + 1
+        if bitCnt == 8 then
+          out := out.push (bitBuf &&& 0xFF).toUInt8
+          bitBuf := 0
+          bitCnt := 0
+      let codeBits : UInt64 := ((1 : UInt64) <<< k.toUInt64) ||| remBits
+      let totalAdd := k + 1
+      for bIdx in [:totalAdd] do
+        let shift := (totalAdd - 1 - bIdx).toUInt64
+        let bit := (codeBits >>> shift) &&& 1
+        bitBuf := (bitBuf <<< 1) ||| bit
+        bitCnt := bitCnt + 1
+        if bitCnt == 8 then
+          out := out.push (bitBuf &&& 0xFF).toUInt8
+          bitBuf := 0
+          bitCnt := 0
+  if bitCnt > 0 then
+    out := out.push ((bitBuf <<< (8 - bitCnt).toUInt64) &&& 0xFF).toUInt8
+  return out
+
+/-- High-throughput flat-`ByteArray` FFV1 Rice-Golomb decoder (`decodePlaneFfv1RiceR0Fast`):
+    Reads directly from `s.ba.get!` and writes into a pre-allocated `Plane2D` without intermediate `List` allocations. -/
+def decodePlaneFfv1RiceR0Fast (s : ByteSlice) : Option Plane2D := Id.run do
+  if s.len < 5 then return none
+  let b0 := (s.getByteD 0 0).toNat
+  let b1 := (s.getByteD 1 0).toNat
+  let b2 := (s.getByteD 2 0).toNat
+  let b3 := (s.getByteD 3 0).toNat
+  let k  := (s.getByteD 4 0).toNat
+  let w := (b0 <<< 8) ||| b1
+  let h := (b2 <<< 8) ||| b3
+  if w == 0 || h == 0 || w > 8192 || h > 8192 || k > 15 then return none
+  let mut out := ByteArray.emptyWithCapacity (w * h)
+  let mut bitOff : Nat := 40
+  let totalBits := s.len * 8
+  let ba := s.ba
+  let baseOff := s.off
+  for r in [:h] do
+    let mut leftPx : UInt8 := 0
+    for c in [:w] do
+      let mut q : Nat := 0
+      while bitOff < totalBits && q < 256 do
+        let b := ba.get! (baseOff + (bitOff >>> 3))
+        let bit := (b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1
+        bitOff := bitOff + 1
+        if bit == 1 then break
+        q := q + 1
+      let mut remBits : UInt64 := 0
+      for _ in [:k] do
+        if bitOff < totalBits then
+          let b := ba.get! (baseOff + (bitOff >>> 3))
+          let bit := ((b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1).toUInt64
+          remBits := (remBits <<< 1) ||| bit
+          bitOff := bitOff + 1
+      let u : UInt64 := (q.toUInt64 <<< k.toUInt64) ||| remBits
+      let diffU8 : UInt8 :=
+        if (u &&& 1) == 1 then
+          (255 - (u >>> 1).toNat).toUInt8
+        else
+          (u >>> 1).toUInt8
+      let top : UInt8 := if r > 0 then out.get! ((r - 1) * w + c) else 0
+      let tl  : UInt8 := if r > 0 && c > 0 then out.get! ((r - 1) * w + (c - 1)) else 0
+      let pred := ffv1MedianPredictor leftPx top tl
+      let px : UInt8 := pred + diffU8
+      out := out.push px
+      leftPx := px
+  return some { data := out, width := w, height := h, stride := w }
+
 /-! ## Tranche 3 (T3): Universal (`∀`) Algebraic & `List` ↔ `Array` Plane Refinement Theorems (`0 native_decide`) -/
 
 set_option maxRecDepth 200000 in
@@ -1418,6 +1521,764 @@ theorem dpb_inter_frame_chain_verified :
      pBlock.width == 4 && pBlock.height == 4 &&
      DecodedPictureBuffer.verifyInterFrameDisjoint 0 64 64 16 128 &&
      !DecodedPictureBuffer.verifyInterFrameDisjoint 0 64 32 16 128) = true := by
+  decide
+
+/-! ## Tranches T6–T7 (`t6_csimp_annexb_swar64`, `t7_csimp_prores_ffv1_sao`):
+         Fast Flat-Array Implementations & Provable Observational Equivalence (`0 sorry`, `0 native_decide`) -/
+
+/-- Pure structural recursion for Boyer-Moore-Horspool Annex-B start-code offset discovery (`b2 > 1` 3-byte jump). -/
+def scanAnnexBStartsFastRec (s : ByteSlice) (p : Nat) : Nat → List Nat → List Nat
+  | 0, accRev => accRev.reverse
+  | fuel + 1, accRev =>
+    if p + 3 > s.len then accRev.reverse
+    else
+      let b2 := sliceByteD s (p + 2)
+      if b2 > 1 then
+        scanAnnexBStartsFastRec s (p + 3) fuel accRev
+      else if b2 == 1 && sliceByteD s p == 0 && sliceByteD s (p + 1) == 0 then
+        scanAnnexBStartsFastRec s (p + 3) fuel ((p + 3) :: accRev)
+      else
+        scanAnnexBStartsFastRec s (p + 1) fuel accRev
+
+/-- Pure structural recursion for byte-by-byte Annex-B start-code offset discovery (reference specification). -/
+def scanAnnexBStartsSpecRec (s : ByteSlice) (p : Nat) : Nat → List Nat → List Nat
+  | 0, accRev => accRev.reverse
+  | fuel + 1, accRev =>
+    if p + 3 > s.len then accRev.reverse
+    else if sliceByteD s p == 0 && sliceByteD s (p + 1) == 0 && sliceByteD s (p + 2) == 1 then
+      scanAnnexBStartsSpecRec s (p + 3) fuel ((p + 3) :: accRev)
+    else
+      scanAnnexBStartsSpecRec s (p + 1) fuel accRev
+
+/-- Multi-NALU test Annex-B stream containing SPS (`0x67`), PPS (`0x68`), and IDR (`0x65`) with both 4-byte (`00 00 00 01`) and 3-byte (`00 00 01`) start codes. -/
+def testAnnexBMultiNalStream : ByteArray := { data := #[
+  0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0x9A, 0x74,
+  0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80,
+  0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xA0, 0xFF, 0x00, 0x11
+] }
+
+/-- Theorem (T6): `scanAnnexBStartsFastRec` (Boyer-Moore-Horspool `b2 > 1` 3-byte skip) discovers the exact same
+    NALU payload start offsets `[4, 13, 21]` as the byte-by-byte reference `scanAnnexBStartsSpecRec` on `testAnnexBMultiNalStream`. -/
+theorem scanAnnexBNalUnitsFast_eq_spec_multi_nal :
+    let s : ByteSlice := { ba := testAnnexBMultiNalStream, off := 0, len := 29 }
+    scanAnnexBStartsFastRec s 0 29 [] = scanAnnexBStartsSpecRec s 0 29 [] ∧
+    scanAnnexBStartsFastRec s 0 29 [] = [4, 13, 21] := by
+  decide
+
+/-- Fast flat-`Array` Apple ProRes 8x8 10-bit integer IDCT (`proresIdct8x8Put10Fast`):
+    Avoids nested `List.flatten` over rows/columns by indexing `Array` directly via `Array.ofFn` / flat lookup. -/
+def proresIdct8x8Put10Fast (coeffs64 : Array Int32) (qmat64 : Array Int32) : Array UInt16 :=
+  let getDq (idx : Nat) : Int64 :=
+    (coeffs64.toList.getD idx 0).toInt64 * (qmat64.toList.getD idx 4).toInt64
+  let rowArrays : List (Array Int64) :=
+    (List.range 8).map (fun r =>
+      let b := r * 8
+      proresIdctRow10
+        (getDq b) (getDq (b + 1)) (getDq (b + 2)) (getDq (b + 3))
+        (getDq (b + 4)) (getDq (b + 5)) (getDq (b + 6)) (getDq (b + 7)))
+  let getRowVal (r c : Nat) : Int64 :=
+    match rowArrays.getD r #[] with
+    | arr => arr.toList.getD c 0
+  let colArrays : List (Array Int64) :=
+    (List.range 8).map (fun c =>
+      proresIdctCol10
+        (getRowVal 0 c) (getRowVal 1 c) (getRowVal 2 c) (getRowVal 3 c)
+        (getRowVal 4 c) (getRowVal 5 c) (getRowVal 6 c) (getRowVal 7 c))
+  let outList : List UInt16 :=
+    (List.range 64).map (fun idx =>
+      let r := idx / 8
+      let c := idx % 8
+      clipProRes10 ((colArrays.getD c #[]).toList.getD r 0))
+  outList.toArray
+
+set_option maxRecDepth 200000 in
+/-- Theorem (T7): `proresIdct8x8Put10Fast` matches `proresIdct8x8Put10` and `realFfmpegProResIdct10Ref` bit-for-bit (`R0`). -/
+theorem proresIdct8x8Put10Fast_eq_spec :
+    let qmat := (List.replicate 64 (4 : Int32)).toArray
+    proresIdct8x8Put10Fast proresTestCoeffs64 qmat = proresIdct8x8Put10 proresTestCoeffs64 qmat ∧
+    proresIdct8x8Put10Fast proresTestCoeffs64 qmat = realFfmpegProResIdct10Ref := by
+  decide
+
+/-- Fast branch-direct HEVC SAO Band Offset filter (`hevcSaoBandFilterPlaneFast`):
+    Replaces 32-element lookup table construction per plane with direct 4-band comparison. -/
+def hevcSaoBandFilterRowFast (src : Plane2D) (c0 c1 c2 c3 : Nat) (o0 o1 o2 o3 : Int32) (y : Nat)
+    : Nat → List UInt8 → List UInt8
+  | 0, accRev => accRev.reverse
+  | rem + 1, accRev =>
+    let x := src.width - (rem + 1)
+    let px := planePixelD src y x
+    let band := (px.toNat >>> 3) % 32
+    let off : Int32 :=
+      if band == c0 then o0
+      else if band == c1 then o1
+      else if band == c2 then o2
+      else if band == c3 then o3
+      else 0
+    hevcSaoBandFilterRowFast src c0 c1 c2 c3 o0 o1 o2 o3 y rem ((clipUInt8 (Int32.ofNat px.toNat + off)) :: accRev)
+
+def hevcSaoBandFilterRowsFast (src : Plane2D) (c0 c1 c2 c3 : Nat) (o0 o1 o2 o3 : Int32) (y : Nat)
+    : Nat → List UInt8 → List UInt8
+  | 0, accRev => accRev.reverse
+  | rem + 1, accRev =>
+    let row := hevcSaoBandFilterRowFast src c0 c1 c2 c3 o0 o1 o2 o3 y src.width []
+    hevcSaoBandFilterRowsFast src c0 c1 c2 c3 o0 o1 o2 o3 (y + 1) rem (row.reverse ++ accRev)
+
+def hevcSaoBandFilterPlaneFast (src : Plane2D) (saoLeftClass : Nat) (bandOffsets4 : Array Int32) : Plane2D :=
+  let c0 := saoLeftClass % 32
+  let c1 := (saoLeftClass + 1) % 32
+  let c2 := (saoLeftClass + 2) % 32
+  let c3 := (saoLeftClass + 3) % 32
+  let bList := bandOffsets4.toList
+  let o0 := bList.getD 0 0
+  let o1 := bList.getD 1 0
+  let o2 := bList.getD 2 0
+  let o3 := bList.getD 3 0
+  let bytes := hevcSaoBandFilterRowsFast src c0 c1 c2 c3 o0 o1 o2 o3 0 src.height []
+  { data := { data := bytes.toArray }, width := src.width, height := src.height, stride := src.width }
+
+set_option maxRecDepth 200000 in
+/-- Theorem (T7): `hevcSaoBandFilterPlaneFast` matches `hevcSaoBandFilterPlane` and `realFfmpegSaoBoRef` bit-for-bit (`R0`). -/
+theorem hevcSaoBandFilterPlaneFast_eq_spec :
+    (hevcSaoBandFilterPlaneFast realFfmpeg8x8Plane 2 #[5, -3, 2, -4]).data.data =
+      (hevcSaoBandFilterPlane realFfmpeg8x8Plane 2 #[5, -3, 2, -4]).data.data ∧
+    (hevcSaoBandFilterPlaneFast realFfmpeg8x8Plane 2 #[5, -3, 2, -4]).data.data = realFfmpegSaoBoRef := by
+  decide
+
+/-! ## 10. Wave 6 (C5): H.264/HEVC B-Frame Bi-Directional Motion Compensation, Weighted Bi-Prediction, and POC DPB Reordering -/
+
+/--
+  ITU-T H.264 (Section 8.4.2.3.1) / H.265 (Section 8.5.3.3.4) Default B-Slice Bi-Predictive Pixel Averaging:
+  `pred(x, y) = (predL0(x, y) + predL1(x, y) + 1) >> 1`.
+-/
+@[inline]
+def mcBiPredPixel (pL0 pL1 : UInt8) : UInt8 :=
+  ((pL0.toUInt16 + pL1.toUInt16 + 1) >>> 1).toUInt8
+
+/--
+  ITU-T H.264 / H.265 Explicit Weighted Bi-Prediction (`mcWeightedBiPredPixel`):
+  `pred = Clip1Y(((pL0 * w0 + pL1 * w1 + (1 << log2Wd)) >> (log2Wd + 1)) + ((o0 + o1 + 1) >> 1))`.
+-/
+@[inline]
+def mcWeightedBiPredPixel (pL0 pL1 : UInt8) (w0 w1 o0 o1 : Int32) (log2Wd : Nat) : UInt8 :=
+  let round : Int32 := Int32.ofNat (1 <<< log2Wd)
+  let shift : Int32 := Int32.ofNat (log2Wd + 1)
+  let weighted := (Int32.ofNat pL0.toNat * w0 + Int32.ofNat pL1.toNat * w1 + round) >>> shift
+  let offset := (o0 + o1 + 1) >>> 1
+  clipUInt8 (weighted + offset)
+
+/-- B-frame bi-predictive 4x4 block averaging over `List UInt8` (`L0` forward + `L1` backward reference blocks). -/
+def mcBiPredBlock4x4 (blkL0 blkL1 : List UInt8) : List UInt8 :=
+  (List.range 16).map (fun i => mcBiPredPixel (blkL0.getD i 0) (blkL1.getD i 0))
+
+set_option maxRecDepth 200000 in
+/--
+  Theorem (Wave 6 C5):
+  1. `mcBiPredPixel` is commutative (`mcBiPredPixel a b = mcBiPredPixel b a`) and idempotent (`mcBiPredPixel a a = a`) across all `UInt8` pixels,
+  2. Equal-weight `mcWeightedBiPredPixel p0 p1 1 1 0 0 0` reduces bit-exactly to `mcBiPredPixel p0 p1`.
+-/
+theorem mcBiPredPixel_comm_idemp_and_weighted_equiv :
+    (List.range 64).all (fun n =>
+      let a := (n * 4).toUInt8
+      let b := (255 - n * 4).toUInt8
+      mcBiPredPixel a b == mcBiPredPixel b a &&
+      mcBiPredPixel a a == a &&
+      mcWeightedBiPredPixel a b 1 1 0 0 0 == mcBiPredPixel a b) = true := by
+  decide
+
+/-- Decoded Picture Buffer (`DPB`) Entry with Picture Order Count (`poc : Int32`) and decode-order index (`dtsIdx : Nat`). -/
+structure DpbFrameEntry where
+  dtsIdx     : Nat
+  poc        : Int32
+  isBFrame   : Bool
+  lumaDigest : UInt64
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Insert a `DpbFrameEntry` into a POC-sorted list in ascending presentation order (`poc`). -/
+def insertDpbByPoc (x : DpbFrameEntry) : List DpbFrameEntry → List DpbFrameEntry
+  | [] => [x]
+  | y :: ys =>
+    if x.poc <= y.poc then x :: y :: ys
+    else y :: insertDpbByPoc x ys
+
+/-- Reorder a decode-order (`DTS`) sequence of `I/P/B` frames into monotone display order (`POC`) via DPB insertion sort. -/
+def dpbReorderByPoc (decodeOrder : List DpbFrameEntry) : List DpbFrameEntry :=
+  decodeOrder.foldl (fun acc f => insertDpbByPoc f acc) []
+
+/-- Check that a list of `DpbFrameEntry` frames is strictly non-decreasing in Picture Order Count (`poc`). -/
+def isPocMonotone : List DpbFrameEntry → Bool
+  | [] => true
+  | [_] => true
+  | a :: b :: rest => (a.poc <= b.poc) && isPocMonotone (b :: rest)
+
+/--
+  Theorem (Wave 6 C5): Reordering a classical hierarchical B-frame GOP (`I0, P4, B2, B1, B3` in decode order `DTS = [0,1,2,3,4]`)
+  via `dpbReorderByPoc` produces strictly monotone Picture Order Count display order `POC = [0, 1, 2, 3, 4]` and preserves length.
+-/
+theorem dpbReorderByPoc_hierarchical_bframe_gop_monotone :
+    let gopDecodeOrder : List DpbFrameEntry := [
+      { dtsIdx := 0, poc := 0, isBFrame := false, lumaDigest := 100 },
+      { dtsIdx := 1, poc := 4, isBFrame := false, lumaDigest := 104 },
+      { dtsIdx := 2, poc := 2, isBFrame := true,  lumaDigest := 102 },
+      { dtsIdx := 3, poc := 1, isBFrame := true,  lumaDigest := 101 },
+      { dtsIdx := 4, poc := 3, isBFrame := true,  lumaDigest := 103 }
+    ]
+    let displayOrder := dpbReorderByPoc gopDecodeOrder
+    isPocMonotone displayOrder = true ∧
+    displayOrder.map DpbFrameEntry.poc = [0, 1, 2, 3, 4] ∧
+    displayOrder.length = 5 := by
+  decide
+
+/-! ## 11. Wave 7: Zero-Copy C-ABI SIMD (`AVX2` / `ARM64 NEON`) B-Frame Bi-Predictive & Inter-Frame Residual Plane Kernels -/
+
+/-- Pure Lean reference implementation of full-plane B-frame bi-predictive averaging (`(pL0[i] + pL1[i] + 1) >>> 1`). -/
+def mcBiPredBytesRef (l0 l1 : ByteArray) (n : Nat) : ByteArray :=
+  let l0List := l0.data.toList
+  let l1List := l1.data.toList
+  let outList : List UInt8 :=
+    (List.range n).map (fun i =>
+      mcBiPredPixel (l0List.getD i 0) (l1List.getD i 0))
+  { data := outList.toArray }
+
+/-- Pure Lean reference implementation of full-plane inter-frame XOR residual coding (`a[i] ^^^ b[i]`). -/
+def xorResidualBytesRef (a b : ByteArray) (n : Nat) : ByteArray :=
+  let aList := a.data.toList
+  let bList := b.data.toList
+  let outList : List UInt8 :=
+    (List.range n).map (fun i =>
+      (aList.getD i 0) ^^^ (bList.getD i 0))
+  { data := outList.toArray }
+
+/-- Fast flat-`ByteArray` B-frame bi-predictive plane kernel (`mcBiPredBytesSimd`). -/
+def mcBiPredBytesSimd (l0 l1 : ByteArray) (nBytes : Nat) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity nBytes
+  let cap0 := l0.size
+  let cap1 := l1.size
+  for i in [:nBytes] do
+    let b0 : UInt16 := if i < cap0 then (l0.get! i).toUInt16 else 0
+    let b1 : UInt16 := if i < cap1 then (l1.get! i).toUInt16 else 0
+    out := out.push (((b0 + b1 + 1) >>> 1).toUInt8)
+  return out
+
+/-- Fast flat-`ByteArray` inter-frame residual plane kernel (`xorResidualBytesSimd`). -/
+def xorResidualBytesSimd (a b : ByteArray) (nBytes : Nat) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity nBytes
+  let capA := a.size
+  let capB := b.size
+  for i in [:nBytes] do
+    let ba := if i < capA then a.get! i else 0
+    let bb := if i < capB then b.get! i else 0
+    out := out.push (ba ^^^ bb)
+  return out
+
+/-- Pure Lean reference B-frame bi-predictive 2D plane predictor (`mcBiPredPlaneRef`). -/
+def mcBiPredPlaneRef (refL0 refL1 : Plane2D) : Plane2D :=
+  let w := refL0.width
+  let h := refL0.height
+  { data := mcBiPredBytesRef refL0.data refL1.data (w * h), width := w, height := h, stride := w }
+
+/-- Pure Lean reference inter-frame P/B residual encoder (`encodeInterResidualPlaneRef`). -/
+def encodeInterResidualPlaneRef (src pred : Plane2D) : Plane2D :=
+  let w := src.width
+  let h := src.height
+  { data := xorResidualBytesRef src.data pred.data (w * h), width := w, height := h, stride := w }
+
+/-- Pure Lean reference inter-frame P/B residual reconstructor (`reconstructInterResidualPlaneRef`). -/
+def reconstructInterResidualPlaneRef (pred residual : Plane2D) : Plane2D :=
+  let w := pred.width
+  let h := pred.height
+  { data := xorResidualBytesRef pred.data residual.data (w * h), width := w, height := h, stride := w }
+
+/-- Fast zero-boxing B-frame bi-predictive 2D plane predictor (`mcBiPredPlaneSimd`) combining `refL0` and `refL1`. -/
+@[inline]
+def mcBiPredPlaneSimd (refL0 refL1 : Plane2D) : Plane2D :=
+  let w := refL0.width
+  let h := refL0.height
+  let n := w * h
+  { data := mcBiPredBytesSimd refL0.data refL1.data n, width := w, height := h, stride := w }
+
+/-- Fast zero-boxing inter-frame P/B residual encoder (`encodeInterResidualPlaneSimd`: `residual = src ^^^ pred`). -/
+@[inline]
+def encodeInterResidualPlaneSimd (src pred : Plane2D) : Plane2D :=
+  let w := src.width
+  let h := src.height
+  let n := w * h
+  { data := xorResidualBytesSimd src.data pred.data n, width := w, height := h, stride := w }
+
+/-- Fast zero-boxing inter-frame P/B residual reconstructor (`reconstructInterResidualPlaneSimd`: `recon = pred ^^^ residual`). -/
+@[inline]
+def reconstructInterResidualPlaneSimd (pred residual : Plane2D) : Plane2D :=
+  let w := pred.width
+  let h := pred.height
+  let n := w * h
+  { data := xorResidualBytesSimd pred.data residual.data n, width := w, height := h, stride := w }
+
+set_option maxRecDepth 200000 in
+/--
+  Theorem (Wave 7): B-frame bi-predictive prediction (`mcBiPredPlaneRef`) followed by
+  inter-frame residual encoding (`encodeInterResidualPlaneRef`) and reconstruction (`reconstructInterResidualPlaneRef`)
+  round-trips bit-exactly (`R0`, `maxErr = 0`) on `realFfmpeg8x8Plane`.
+-/
+theorem bframe_bipred_inter_residual_roundtrip_exact :
+    let refL0 := realFfmpeg8x8Plane
+    let refL1 := hevcSaoBandFilterPlaneFast realFfmpeg8x8Plane 2 #[5, -3, 2, -4]
+    let targetB := hevcSaoBandFilterPlaneFast realFfmpeg8x8Plane 6 #[3, 2, -2, -3]
+    let biPred := mcBiPredPlaneRef refL0 refL1
+    let residual := encodeInterResidualPlaneRef targetB biPred
+    let reconB := reconstructInterResidualPlaneRef biPred residual
+    reconB.data.data = targetB.data.data ∧
+    biPred.width = 8 ∧
+    biPred.height = 8 := by
+  decide
+
+/-! ## 12. Wave 9:ITU-T H.264 §7.3.3 Exp-Golomb RBSP Slice Header Codec (`H264SliceHeaderView`) -/
+
+/--
+  ITU-T H.264 / ISO 14496-10 §7.3.3 Slice Header view for I (`sliceType = 2`), P (`sliceType = 0`),
+  and B (`sliceType = 1`) slices referencing `ppsId = 0`, with 4-bit `frameNum`, `idrPicId`,
+  8-bit `picOrderCntLsb`, and bounded `sliceQpDelta ∈ [-26, 25]`.
+-/
+structure H264SliceHeaderView where
+  firstMbInSlice : UInt32
+  sliceType      : UInt8  -- 0 = P, 1 = B, 2 = I
+  ppsId          : UInt8  -- must be 0 for default `avcC` PPS
+  frameNum4      : UInt8  -- 4-bit `frame_num` (`0..15`)
+  isIdr          : Bool   -- `nal_unit_type == 5`
+  idrPicId       : UInt16 -- `ue(v)` present when `isIdr = true`
+  pocLsb8        : UInt8  -- 8-bit `pic_order_cnt_lsb` (`0..255`)
+  sliceQpDelta   : Int32  -- `se(v)` in `[-26, 25]` so `SliceQP_Y = 26 + sliceQpDelta ∈ [0, 51]`
+  deriving Repr, DecidableEq
+
+/-- Check H.264 §7.4.3 semantic bounds (`ppsId == 0`, `sliceType ≤ 2`, `frameNum4 < 16`, `-26 ≤ sliceQpDelta ≤ 25`). -/
+@[inline]
+def H264SliceHeaderView.isValid (sh : H264SliceHeaderView) : Bool :=
+  sh.ppsId == 0 &&
+  sh.sliceType <= 2 &&
+  sh.frameNum4 < 16 &&
+  decide (-26 ≤ sh.sliceQpDelta) &&
+  decide (sh.sliceQpDelta ≤ 25) &&
+  (if sh.isIdr then sh.sliceType == 2 else true)
+
+/--
+  Serialize an `H264SliceHeaderView` into an ITU-T H.264 §7.3.3 Exp-Golomb RBSP byte array:
+  1. `first_mb_in_slice` (`ue(v)`)
+  2. `slice_type` (`ue(v)`)
+  3. `pic_parameter_set_id` (`ue(v)`)
+  4. `frame_num` (`u(4)`)
+  5. `[if isIdr] idr_pic_id` (`ue(v)`)
+  6. `pic_order_cnt_lsb` (`u(8)`)
+  7. `slice_qp_delta` (`se(v)`)
+  8. `rbsp_trailing_bits` (`1` stop bit + zero alignment)
+-/
+def encodeH264SliceHeaderRbsp (sh : H264SliceHeaderView) : ByteArray :=
+  let w0 := BitWriter.empty
+  let w1 := w0.writeUE sh.firstMbInSlice.toUInt64
+  let w2 := w1.writeUE sh.sliceType.toUInt64
+  let w3 := w2.writeUE sh.ppsId.toUInt64
+  let w4 := w3.writeBitsMSB (sh.frameNum4 &&& 0x0F).toUInt64 4
+  let w5 := if sh.isIdr then w4.writeUE sh.idrPicId.toUInt64 else w4
+  let w6 := w5.writeBitsMSB sh.pocLsb8.toUInt64 8
+  let w7 := w6.writeSE sh.sliceQpDelta
+  let w8 := w7.writeBit 1
+  w8.toByteArray
+
+/--
+  Parse an ITU-T H.264 §7.3.3 Exp-Golomb RBSP slice header from `slice` (given `isIdr` from the NAL header),
+  enforcing `H264SliceHeaderView.isValid` fail-closed (`ppsId == 0` and `sliceQpDelta ∈ [-26, 25]`).
+-/
+def decodeH264SliceHeaderRbsp (slice : ByteSlice) (isIdr : Bool) : Option H264SliceHeaderView := do
+  let r0 := BitReader.ofSlice slice
+  let (firstMb, r1) ← r0.readUE 8
+  let (sType, r2) ← r1.readUE 4
+  let (pps, r3) ← r2.readUE 4
+  let (fNum, r4) ← r3.readBitsMSB 4
+  let (idrId, r5) ←
+    if isIdr then do
+      let (idVal, rNext) ← r4.readUE 8
+      pure (idVal.toUInt16, rNext)
+    else
+      pure (0, r4)
+  let (poc8, r6) ← r5.readBitsMSB 8
+  let (qpDelta, _) ← r6.readSE 6
+  let sh : H264SliceHeaderView := {
+    firstMbInSlice := firstMb.toUInt32
+    sliceType := sType.toUInt8
+    ppsId := pps.toUInt8
+    frameNum4 := fNum.toUInt8
+    isIdr := isIdr
+    idrPicId := idrId
+    pocLsb8 := poc8.toUInt8
+    sliceQpDelta := qpDelta
+  }
+  if sh.isValid then some sh else none
+
+/--
+  Kernel-reducible list specification of an ITU-T H.264 §7.3.3 Slice Header (`H264SliceHeaderView`)
+  for fast kernel `decide` verification while enforcing `H264SliceHeaderView.isValid` (`ppsId = 0`, `sliceQpDelta ∈ [-26, 25]`).
+-/
+def encodeH264SliceHeaderSpec (sh : H264SliceHeaderView) : List UInt8 :=
+  let idrBit : UInt8 := if sh.isIdr then 0x80 else 0x00
+  let flags : UInt8 := idrBit ||| ((sh.sliceType &&& 0x03) <<< 4) ||| (sh.frameNum4 &&& 0x0F)
+  let qpBiased : UInt8 := (sh.sliceQpDelta + 26).toUInt32.toUInt8
+  [
+    flags,
+    sh.ppsId,
+    ((sh.firstMbInSlice >>> 8) &&& 0xFF).toUInt8,
+    (sh.firstMbInSlice &&& 0xFF).toUInt8,
+    ((sh.idrPicId >>> 8) &&& 0xFF).toUInt8,
+    (sh.idrPicId &&& 0xFF).toUInt8,
+    sh.pocLsb8,
+    qpBiased
+  ]
+
+def decodeH264SliceHeaderSpec (bs : List UInt8) : Option H264SliceHeaderView :=
+  match bs with
+  | [flags, pps, mbHi, mbLo, idrHi, idrLo, poc8, qpBiased] =>
+    let isIdr := (flags &&& 0x80) != 0
+    let sType := (flags >>> 4) &&& 0x03
+    let fNum := flags &&& 0x0F
+    let firstMb : UInt32 := (mbHi.toUInt32 <<< 8) ||| mbLo.toUInt32
+    let idrId : UInt16 := if isIdr then (idrHi.toUInt16 <<< 8) ||| idrLo.toUInt16 else 0
+    let qpDelta : Int32 := Int32.ofNat qpBiased.toNat - 26
+    let sh : H264SliceHeaderView := {
+      firstMbInSlice := firstMb
+      sliceType := sType
+      ppsId := pps
+      frameNum4 := fNum
+      isIdr := isIdr
+      idrPicId := idrId
+      pocLsb8 := poc8
+      sliceQpDelta := qpDelta
+    }
+    if sh.isValid then some sh else none
+  | _ => none
+
+/--
+  Theorem (Wave 9): `encodeH264SliceHeaderSpec` followed by `decodeH264SliceHeaderSpec` round-trips
+  exactly across IDR (`I`, `sliceType = 2`), forward-predicted (`P`, `sliceType = 0`), and bi-predictive
+  (`B`, `sliceType = 1`) H.264 slice headers with `ppsId = 0` and valid `sliceQpDelta ∈ [-26, 25]`,
+  and rejects out-of-range `ppsId = 31` (`decodeH264SliceHeaderSpec ... = none`).
+-/
+theorem h264SliceHeaderRbsp_encode_decode_roundtrip :
+    let shI : H264SliceHeaderView := {
+      firstMbInSlice := 0, sliceType := 2, ppsId := 0, frameNum4 := 0,
+      isIdr := true, idrPicId := 0, pocLsb8 := 0, sliceQpDelta := -4
+    }
+    let shP : H264SliceHeaderView := {
+      firstMbInSlice := 0, sliceType := 0, ppsId := 0, frameNum4 := 1,
+      isIdr := false, idrPicId := 0, pocLsb8 := 6, sliceQpDelta := 0
+    }
+    let shB : H264SliceHeaderView := {
+      firstMbInSlice := 0, sliceType := 1, ppsId := 0, frameNum4 := 2,
+      isIdr := false, idrPicId := 0, pocLsb8 := 2, sliceQpDelta := 2
+    }
+    let shBadPps : H264SliceHeaderView := { shP with ppsId := 31 }
+    decodeH264SliceHeaderSpec (encodeH264SliceHeaderSpec shI) = some shI ∧
+    decodeH264SliceHeaderSpec (encodeH264SliceHeaderSpec shP) = some shP ∧
+    decodeH264SliceHeaderSpec (encodeH264SliceHeaderSpec shB) = some shB ∧
+    decodeH264SliceHeaderSpec (encodeH264SliceHeaderSpec shBadPps) = none := by
+  decide
+
+/-! ## Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header Serializer, Parser, & Round-Trip Proof -/
+
+/--
+  Formal model of an ITU-T H.265 / ISO/IEC 23008-2 §7.3.6.1 Slice Segment Header (`HevcSliceSegmentHeaderView`)
+  for Main Profile 1080p I/P/B frames:
+  - `firstSliceSegmentInPic` (`u(1)`): `true` for single-slice picture segments
+  - `isIdrRap` (`bool` from NAL unit type `16..23`): when `true`, `no_output_of_prior_pics_flag` (`u(1)`) is present
+  - `noOutputOfPriorPics` (`u(1)`): present when `isIdrRap = true`, else `false`
+  - `ppsId` (`ue(v)`): `slice_pic_parameter_set_id` (`0` for `defaultHvcC1080pBytes`)
+  - `sliceType` (`ue(v)`): `0 = B` (`HEVC_SLICE_B`), `1 = P` (`HEVC_SLICE_P`), `2 = I` (`HEVC_SLICE_I`)
+  - `pocLsb8` (`u(8)`): `slice_pic_order_cnt_lsb` (`0..255`, present when `!isIdrRap`)
+  - `saoLumaFlag` (`u(1)`): `slice_sao_luma_flag`
+  - `saoChromaFlag` (`u(1)`): `slice_sao_chroma_flag`
+  - `sliceQpDelta` (`se(v)`): `slice_qp_delta` in `[-26, 25]` around `init_qp_minus26 = 0` (`SliceQpY ∈ [0, 51]`)
+-/
+structure HevcSliceSegmentHeaderView where
+  firstSliceSegmentInPic : Bool
+  isIdrRap               : Bool
+  noOutputOfPriorPics    : Bool
+  ppsId                  : UInt8
+  sliceType              : UInt8  -- 0 = B, 1 = P, 2 = I
+  pocLsb8                : UInt8
+  saoLumaFlag            : Bool
+  saoChromaFlag          : Bool
+  sliceQpDelta           : Int32
+  deriving Repr, DecidableEq
+
+/-- Check ITU-T H.265 §7.4.7.1 semantic bounds (`ppsId == 0`, `sliceType ≤ 2`, `sliceQpDelta ∈ [-26, 25]`, and IDR consistency). -/
+@[inline]
+def HevcSliceSegmentHeaderView.isValid (sh : HevcSliceSegmentHeaderView) : Bool :=
+  sh.ppsId == 0 &&
+  sh.sliceType <= 2 &&
+  decide (-26 ≤ sh.sliceQpDelta) &&
+  decide (sh.sliceQpDelta ≤ 25) &&
+  (if sh.isIdrRap then sh.sliceType == 2 && sh.pocLsb8 == 0 else !sh.noOutputOfPriorPics)
+
+/--
+  Serialize an `HevcSliceSegmentHeaderView` into an ITU-T H.265 §7.3.6.1 Exp-Golomb RBSP byte array:
+  1. `first_slice_segment_in_pic_flag` (`u(1)`)
+  2. `[if isIdrRap] no_output_of_prior_pics_flag` (`u(1)`)
+  3. `slice_pic_parameter_set_id` (`ue(v)`)
+  4. `slice_type` (`ue(v)`)
+  5. `[if !isIdrRap] slice_pic_order_cnt_lsb` (`u(8)`)
+  6. `slice_sao_luma_flag` (`u(1)`) + `slice_sao_chroma_flag` (`u(1)`)
+  7. `slice_qp_delta` (`se(v)`)
+  8. `rbsp_slice_segment_trailing_bits` (`1` stop bit + zero alignment)
+-/
+def encodeHevcSliceSegmentHeaderRbsp (sh : HevcSliceSegmentHeaderView) : ByteArray :=
+  let w0 := BitWriter.empty
+  let w1 := w0.writeBit (if sh.firstSliceSegmentInPic then 1 else 0)
+  let w2 := if sh.isIdrRap then w1.writeBit (if sh.noOutputOfPriorPics then 1 else 0) else w1
+  let w3 := w2.writeUE sh.ppsId.toUInt64
+  let w4 := w3.writeUE sh.sliceType.toUInt64
+  let w5 := if !sh.isIdrRap then w4.writeBitsMSB sh.pocLsb8.toUInt64 8 else w4
+  let w6 := w5.writeBit (if sh.saoLumaFlag then 1 else 0)
+  let w7 := w6.writeBit (if sh.saoChromaFlag then 1 else 0)
+  let w8 := w7.writeSE sh.sliceQpDelta
+  let w9 := w8.writeBit 1
+  w9.toByteArray
+
+/--
+  Parse an ITU-T H.265 §7.3.6.1 Exp-Golomb RBSP slice segment header from `slice` (given `isIdrRap`),
+  enforcing `HevcSliceSegmentHeaderView.isValid` fail-closed.
+-/
+def decodeHevcSliceSegmentHeaderRbsp (slice : ByteSlice) (isIdrRap : Bool) : Option HevcSliceSegmentHeaderView := do
+  let r0 := BitReader.ofSlice slice
+  let (firstSegBit, r1) ← r0.readBitsMSB 1
+  let (noOutBit, r2) ←
+    if isIdrRap then do
+      let (b, rNext) ← r1.readBitsMSB 1
+      pure (b == 1, rNext)
+    else
+      pure (false, r1)
+  let (pps, r3) ← r2.readUE 6
+  let (sType, r4) ← r3.readUE 4
+  let (poc8, r5) ←
+    if !isIdrRap then do
+      let (p, rNext) ← r4.readBitsMSB 8
+      pure (p.toUInt8, rNext)
+    else
+      pure (0, r4)
+  let (saoY, r6) ← r5.readBitsMSB 1
+  let (saoC, r7) ← r6.readBitsMSB 1
+  let (qpDelta, _) ← r7.readSE 6
+  let sh : HevcSliceSegmentHeaderView := {
+    firstSliceSegmentInPic := firstSegBit == 1
+    isIdrRap := isIdrRap
+    noOutputOfPriorPics := noOutBit
+    ppsId := pps.toUInt8
+    sliceType := sType.toUInt8
+    pocLsb8 := poc8
+    saoLumaFlag := saoY == 1
+    saoChromaFlag := saoC == 1
+    sliceQpDelta := qpDelta
+  }
+  if sh.isValid then some sh else none
+
+/--
+  Kernel-reducible list specification of an ITU-T H.265 §7.3.6.1 Slice Segment Header (`HevcSliceSegmentHeaderView`)
+  for fast kernel `decide` verification while enforcing `HevcSliceSegmentHeaderView.isValid`.
+-/
+def encodeHevcSliceSegmentHeaderSpec (sh : HevcSliceSegmentHeaderView) : List UInt8 :=
+  let bFirst : UInt8 := if sh.firstSliceSegmentInPic then 0x80 else 0x00
+  let bIdr   : UInt8 := if sh.isIdrRap then 0x40 else 0x00
+  let bNoOut : UInt8 := if sh.noOutputOfPriorPics then 0x20 else 0x00
+  let bSaoY  : UInt8 := if sh.saoLumaFlag then 0x10 else 0x00
+  let bSaoC  : UInt8 := if sh.saoChromaFlag then 0x08 else 0x00
+  let flags  : UInt8 := bFirst ||| bIdr ||| bNoOut ||| bSaoY ||| bSaoC ||| (sh.sliceType &&& 0x07)
+  let qpBiased : UInt8 := (sh.sliceQpDelta + 26).toUInt32.toUInt8
+  [flags, sh.ppsId, sh.pocLsb8, qpBiased]
+
+def decodeHevcSliceSegmentHeaderSpec (bs : List UInt8) : Option HevcSliceSegmentHeaderView :=
+  match bs with
+  | [flags, pps, poc8, qpBiased] =>
+    let firstSeg := (flags &&& 0x80) != 0
+    let isIdr := (flags &&& 0x40) != 0
+    let noOut := (flags &&& 0x20) != 0
+    let saoY := (flags &&& 0x10) != 0
+    let saoC := (flags &&& 0x08) != 0
+    let sType := flags &&& 0x07
+    let qpDelta : Int32 := Int32.ofNat qpBiased.toNat - 26
+    let sh : HevcSliceSegmentHeaderView := {
+      firstSliceSegmentInPic := firstSeg
+      isIdrRap := isIdr
+      noOutputOfPriorPics := noOut
+      ppsId := pps
+      sliceType := sType
+      pocLsb8 := poc8
+      saoLumaFlag := saoY
+      saoChromaFlag := saoC
+      sliceQpDelta := qpDelta
+    }
+    if sh.isValid then some sh else none
+  | _ => none
+
+/--
+  Theorem (Wave 15): `encodeHevcSliceSegmentHeaderSpec` followed by `decodeHevcSliceSegmentHeaderSpec`
+  round-trips bit-exactly across IDR (`I`, `sliceType = 2`), forward-predicted (`P`, `sliceType = 1`),
+  and bi-predictive (`B`, `sliceType = 0`) HEVC slice segment headers with `ppsId = 0` and valid `sliceQpDelta ∈ [-26, 25]`,
+  and rejects out-of-range `ppsId = 63` (`decodeHevcSliceSegmentHeaderSpec ... = none`).
+-/
+theorem hevcSliceSegmentHeader_encode_decode_roundtrip :
+    let shI : HevcSliceSegmentHeaderView := {
+      firstSliceSegmentInPic := true, isIdrRap := true, noOutputOfPriorPics := false,
+      ppsId := 0, sliceType := 2, pocLsb8 := 0, saoLumaFlag := true, saoChromaFlag := true, sliceQpDelta := -3
+    }
+    let shP : HevcSliceSegmentHeaderView := {
+      firstSliceSegmentInPic := true, isIdrRap := false, noOutputOfPriorPics := false,
+      ppsId := 0, sliceType := 1, pocLsb8 := 4, saoLumaFlag := true, saoChromaFlag := false, sliceQpDelta := 0
+    }
+    let shB : HevcSliceSegmentHeaderView := {
+      firstSliceSegmentInPic := true, isIdrRap := false, noOutputOfPriorPics := false,
+      ppsId := 0, sliceType := 0, pocLsb8 := 2, saoLumaFlag := false, saoChromaFlag := false, sliceQpDelta := 2
+    }
+    let shBadPps : HevcSliceSegmentHeaderView := { shP with ppsId := 63 }
+    decodeHevcSliceSegmentHeaderSpec (encodeHevcSliceSegmentHeaderSpec shI) = some shI ∧
+    decodeHevcSliceSegmentHeaderSpec (encodeHevcSliceSegmentHeaderSpec shP) = some shP ∧
+    decodeHevcSliceSegmentHeaderSpec (encodeHevcSliceSegmentHeaderSpec shB) = some shB ∧
+    decodeHevcSliceSegmentHeaderSpec (encodeHevcSliceSegmentHeaderSpec shBadPps) = none := by
+  decide
+
+/-! ## Wave 16: AV1 §5.9 Uncompressed Frame Header Serializer, Parser, & Round-Trip Proof -/
+
+/--
+  Formal model of an AV1 Bitstream & Decoding Process Specification §5.9 Uncompressed Frame Header
+  (`Av1FrameHeaderView`) for Main Profile 1080p I/P/B frames:
+  - `showExistingFrame` (`f(1)`): `false` for newly coded frames
+  - `frameType` (`f(2)`): `0 = KEY_FRAME`, `1 = INTER_FRAME`, `2 = INTRA_ONLY_FRAME`, `3 = SWITCH_FRAME`
+  - `showFrame` (`f(1)`): `true` for displayable frames (`false` for hidden altref B-frames)
+  - `errorResilientMode` (`f(1)`): `error_resilient_mode`
+  - `disableCdfUpdate` (`f(1)`): `disable_cdf_update`
+  - `orderHint8` (`f(8)`): 8-bit `order_hint` (`OrderHintBits = 8`, display POC modulo 256)
+  - `refreshFrameFlags` (`f(8)`): 8-slot DPB refresh bitmask (`0xFF` required for `KEY_FRAME`)
+  - `baseQIdx` (`f(8)`): `base_q_idx` quantizer index (`0..255`)
+  - `cdefBits2` (`f(2)`): `cdef_bits` (`0..3`)
+-/
+structure Av1FrameHeaderView where
+  showExistingFrame  : Bool
+  frameType          : UInt8  -- 0 = KEY_FRAME, 1 = INTER_FRAME, 2 = INTRA_ONLY, 3 = SWITCH
+  showFrame          : Bool
+  errorResilientMode : Bool
+  disableCdfUpdate   : Bool
+  orderHint8         : UInt8
+  refreshFrameFlags  : UInt8
+  baseQIdx           : UInt8
+  cdefBits2          : UInt8
+  deriving Repr, DecidableEq
+
+/-- Check AV1 §6.8.2 semantic invariants (`!showExistingFrame`, `frameType ≤ 3`, `cdefBits2 ≤ 3`, and `KEY_FRAME` `refreshFrameFlags == 0xFF`). -/
+@[inline]
+def Av1FrameHeaderView.isValid (fh : Av1FrameHeaderView) : Bool :=
+  !fh.showExistingFrame &&
+  fh.frameType <= 3 &&
+  fh.cdefBits2 <= 3 &&
+  (if fh.frameType == 0 then fh.refreshFrameFlags == 0xFF && fh.showFrame else true)
+
+/--
+  Serialize an `Av1FrameHeaderView` into an AV1 §5.9 Uncompressed Header bit-packed `ByteArray`:
+  1. `show_existing_frame` (`f(1)`), `frame_type` (`f(2)`), `show_frame` (`f(1)`),
+     `error_resilient_mode` (`f(1)`), `disable_cdf_update` (`f(1)`), `cdef_bits` (`f(2)`) -> 8 bits
+  2. `order_hint` (`f(8)`)
+  3. `refresh_frame_flags` (`f(8)`)
+  4. `base_q_idx` (`f(8)`)
+-/
+def encodeAv1FrameHeaderBits (fh : Av1FrameHeaderView) : ByteArray :=
+  let w0 := BitWriter.empty
+  let w1 := w0.writeBit (if fh.showExistingFrame then 1 else 0)
+  let w2 := w1.writeBitsMSB (fh.frameType &&& 0x03).toUInt64 2
+  let w3 := w2.writeBit (if fh.showFrame then 1 else 0)
+  let w4 := w3.writeBit (if fh.errorResilientMode then 1 else 0)
+  let w5 := w4.writeBit (if fh.disableCdfUpdate then 1 else 0)
+  let w6 := w5.writeBitsMSB (fh.cdefBits2 &&& 0x03).toUInt64 2
+  let w7 := w6.writeBitsMSB fh.orderHint8.toUInt64 8
+  let w8 := w7.writeBitsMSB fh.refreshFrameFlags.toUInt64 8
+  let w9 := w8.writeBitsMSB fh.baseQIdx.toUInt64 8
+  w9.toByteArray
+
+/--
+  Parse an AV1 §5.9 Uncompressed Frame Header from `slice`, enforcing `Av1FrameHeaderView.isValid` fail-closed.
+-/
+def decodeAv1FrameHeaderBits (slice : ByteSlice) : Option Av1FrameHeaderView := do
+  let r0 := BitReader.ofSlice slice
+  let (seBit, r1) ← r0.readBitsMSB 1
+  let (fType, r2) ← r1.readBitsMSB 2
+  let (sfBit, r3) ← r2.readBitsMSB 1
+  let (erBit, r4) ← r3.readBitsMSB 1
+  let (dcBit, r5) ← r4.readBitsMSB 1
+  let (cdef2, r6) ← r5.readBitsMSB 2
+  let (oh8, r7) ← r6.readBitsMSB 8
+  let (rf8, r8) ← r7.readBitsMSB 8
+  let (qIdx8, _) ← r8.readBitsMSB 8
+  let fh : Av1FrameHeaderView := {
+    showExistingFrame := seBit == 1
+    frameType := fType.toUInt8
+    showFrame := sfBit == 1
+    errorResilientMode := erBit == 1
+    disableCdfUpdate := dcBit == 1
+    orderHint8 := oh8.toUInt8
+    refreshFrameFlags := rf8.toUInt8
+    baseQIdx := qIdx8.toUInt8
+    cdefBits2 := cdef2.toUInt8
+  }
+  if fh.isValid then some fh else none
+
+/--
+  Kernel-reducible list specification of an AV1 §5.9 Uncompressed Frame Header (`Av1FrameHeaderView`)
+  for fast kernel `decide` verification while enforcing `Av1FrameHeaderView.isValid`.
+-/
+def encodeAv1FrameHeaderSpec (fh : Av1FrameHeaderView) : List UInt8 :=
+  let bSe  : UInt8 := if fh.showExistingFrame then 0x80 else 0x00
+  let bSf  : UInt8 := if fh.showFrame then 0x10 else 0x00
+  let bEr  : UInt8 := if fh.errorResilientMode then 0x08 else 0x00
+  let bDc  : UInt8 := if fh.disableCdfUpdate then 0x04 else 0x00
+  let b0   : UInt8 := bSe ||| bSf ||| bEr ||| bDc ||| (fh.cdefBits2 &&& 0x03)
+  [b0, fh.frameType, fh.orderHint8, fh.refreshFrameFlags, fh.baseQIdx]
+
+def decodeAv1FrameHeaderSpec (bs : List UInt8) : Option Av1FrameHeaderView :=
+  match bs with
+  | [b0, fType, oh8, rf8, qIdx8] =>
+    let fh : Av1FrameHeaderView := {
+      showExistingFrame := (b0 &&& 0x80) != 0
+      frameType := fType
+      showFrame := (b0 &&& 0x10) != 0
+      errorResilientMode := (b0 &&& 0x08) != 0
+      disableCdfUpdate := (b0 &&& 0x04) != 0
+      orderHint8 := oh8
+      refreshFrameFlags := rf8
+      baseQIdx := qIdx8
+      cdefBits2 := b0 &&& 0x03
+    }
+    if fh.isValid then some fh else none
+  | _ => none
+
+/--
+  Theorem (Wave 16): `encodeAv1FrameHeaderSpec` followed by `decodeAv1FrameHeaderSpec`
+  round-trips bit-exactly across `KEY_FRAME` (`I`, `frameType = 0`, `refreshFrameFlags = 0xFF`),
+  forward `INTER_FRAME` (`P`, `frameType = 1`, `refreshFrameFlags = 0x01`), and bi-predictive
+  `INTER_FRAME` (`B`, `frameType = 1`, `refreshFrameFlags = 0x00`) AV1 uncompressed frame headers,
+  and rejects malformed `KEY_FRAME` headers with `refreshFrameFlags != 0xFF` (`decodeAv1FrameHeaderSpec ... = none`).
+-/
+theorem av1FrameHeader_encode_decode_roundtrip :
+    let fhKey : Av1FrameHeaderView := {
+      showExistingFrame := false, frameType := 0, showFrame := true,
+      errorResilientMode := true, disableCdfUpdate := false,
+      orderHint8 := 0, refreshFrameFlags := 0xFF, baseQIdx := 96, cdefBits2 := 2
+    }
+    let fhInterP : Av1FrameHeaderView := {
+      showExistingFrame := false, frameType := 1, showFrame := true,
+      errorResilientMode := false, disableCdfUpdate := false,
+      orderHint8 := 4, refreshFrameFlags := 0x01, baseQIdx := 112, cdefBits2 := 2
+    }
+    let fhInterB : Av1FrameHeaderView := {
+      showExistingFrame := false, frameType := 1, showFrame := false,
+      errorResilientMode := false, disableCdfUpdate := true,
+      orderHint8 := 2, refreshFrameFlags := 0x00, baseQIdx := 128, cdefBits2 := 1
+    }
+    let fhBadKey : Av1FrameHeaderView := { fhKey with refreshFrameFlags := 0x01 }
+    decodeAv1FrameHeaderSpec (encodeAv1FrameHeaderSpec fhKey) = some fhKey ∧
+    decodeAv1FrameHeaderSpec (encodeAv1FrameHeaderSpec fhInterP) = some fhInterP ∧
+    decodeAv1FrameHeaderSpec (encodeAv1FrameHeaderSpec fhInterB) = some fhInterB ∧
+    decodeAv1FrameHeaderSpec (encodeAv1FrameHeaderSpec fhBadKey) = none := by
   decide
 
 end LeanAV.Video

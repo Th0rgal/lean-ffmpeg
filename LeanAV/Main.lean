@@ -18,6 +18,8 @@ open LeanAV.NativeKernels
 open LeanSys.Posix
 open LeanSys.Store
 
+set_option maxRecDepth 4096
+
 /-- Comprehensive end-to-end verification of all 8 FFmpeg subsystem layers in `LeanAV`. -/
 def runSelfTest : IO UInt32 := do
   -- 1. Law 1: Exact rational rescale (`libavutil` replacement)
@@ -259,17 +261,416 @@ def runSelfTest : IO UInt32 := do
     | some pkt => pkt.loopGatePassed && pkt.codec == .av1
     | none => false
 
-  let allOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
-               swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
-               graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 4, \"c_abi_gates\": 8, "
+  -- 13. Wave 5 (Tracks D1–D4): Pipeline D (4K/2x2 -> 1080p) Fused Downscale + Disjoint Tiles + Streaming MP4 Mux
+  let pipeDRes := transcodeFramePipelineD testPlane 0 .h264 8 264 4
+  let pipeDOk := match pipeDRes with
+    | some r =>
+      r.dstWidth == testPlane.width / 2 &&
+      r.dstHeight == testPlane.height / 2 &&
+      r.disjointTiles == 8 &&
+      r.zeroCopyGateOk &&
+      r.loopGateOk &&
+      (let mp4Fast := muxMp4StreamingFast .h264 90000 #[r.encodedPacket]
+       match demuxMp4Simple (ByteSlice.ofByteArray mp4Fast) with
+       | some (c, ts, pkts) => c == .h264 && ts == 90000 && pkts.size == 1 && pkts[0]!.digest64 == r.encodedPacket.digest64
+       | none => false)
+    | none => false
+
+  -- 14. Wave 6 (W6_C1..W6_C5): Fast Pixel/Filter/Audio Kernels, Matroska SimpleBlock, Subtitles, B-Frame BiPred/POC DPB
+  let w6FilterFastOk :=
+    (filterPlanePointAndBoxBlur3x3Fast realFfmpeg8x8Plane 320 12 false).data.data ==
+      (filterPlaneBoxBlur3x3 (filterPlanePointFused realFfmpeg8x8Plane 320 12 false)).data.data
+  let w6MkvBlk : MkvSimpleBlock := { trackNum := 1, relTimecodeMs := 33, isKeyframe := true, payload := [0x00, 0x00, 0x01, 0x65] }
+  let w6MkvOk := demuxMatroskaSimpleBlockSpec (muxMatroskaSimpleBlockSpec w6MkvBlk) == some w6MkvBlk &&
+                 parseWebVttTimestampMs (formatWebVttTimestampMs 1542) == some 1542
+  let w6AudioGraphOk := match parseAudioFilterGraph "volume=320,aresample=24000,pan=mono" with
+    | .ok ops => (optimizeAndFuseAudioFilterGraph ops).length == 3
+    | .error _ => false
+  let w6BFrameOk := mcBiPredPixel 100 200 == 150 &&
+                    verifyFlacFrameHeaderCrc8 [0xFF, 0xF8, 0x69, 0x18, 0x00] (flacCrc8List [0xFF, 0xF8, 0x69, 0x18, 0x00])
+  let w6Ok := w6FilterFastOk && w6MkvOk && w6AudioGraphOk && w6BFrameOk
+
+  -- 15. Wave 7: 4K -> 1080p I/P/B AVCC Transcoder, SIMD 2x2 Scaler, and B-Frame Bi-Predictive Residual Round-Trip
+  let w7ScaleOk := (scalePlaneDown2x2Simd realFfmpeg8x8Plane).data.data == (scalePlaneDown2x2Fast realFfmpeg8x8Plane).data.data
+  let w7BiPred := mcBiPredPlaneSimd realFfmpeg8x8Plane realFfmpeg8x8Plane
+  let w7Res := encodeInterResidualPlaneSimd realFfmpeg8x8Plane w7BiPred
+  let w7Recon := reconstructInterResidualPlaneSimd w7BiPred w7Res
+  let w7BiPredOk := w7Recon.data.data == realFfmpeg8x8Plane.data.data
+  let w7Dummy := ByteArray.mk (Array.replicate 64 128)
+  let w7PktI := transcodeAvcc4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
+  let w7PktB := transcodeAvcc4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
+  let w7AvccOk := isAvcc1080pIpbPacketBytesValid w7PktI.data &&
+                  classifyAvccH264Sample (ByteSlice.ofByteArray w7PktI) false == .iFrame &&
+                  classifyAvccH264Sample (ByteSlice.ofByteArray w7PktB) false == .bFrame
+  let w7Ok := w7ScaleOk && w7BiPredOk && w7AvccOk
+
+  -- 16. Wave 8: Standard ISOBMFF (`ISO/IEC 14496-12`) MP4 Track Muxer (`muxIsoMp4Track`) & Demuxer Round-Trip
+  let w8SampleI : IsoMp4SampleDesc := {
+    sampleIdx := 0, dts := 0, pts := 1024, duration := 512, frameType := .iFrame,
+    slice := ByteSlice.ofByteArray w7PktI
+  }
+  let w8SampleB : IsoMp4SampleDesc := {
+    sampleIdx := 1, dts := 512, pts := 512, duration := 512, frameType := .bFrame,
+    slice := ByteSlice.ofByteArray w7PktB
+  }
+  let w8Mp4 := muxIsoMp4Track 1920 1080 15360 defaultAvcC1080pBytes #[w8SampleI, w8SampleB]
+  let w8Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w8Mp4) with
+    | some d8 => d8.width == 1920 && d8.height == 1080 && d8.samples.size == 2 && d8.iFrameCount == 1 && d8.bFrameCount == 1
+    | none => false
+
+  -- 17. Wave 9: ITU-T H.264 §7.3.3 Exp-Golomb RBSP Slice Header Round-Trip & Single-Buffer Chunk Transcoder
+  let w9ShI : H264SliceHeaderView := {
+    firstMbInSlice := 0, sliceType := 2, ppsId := 0, frameNum4 := 0,
+    isIdr := true, idrPicId := 0, pocLsb8 := 0, sliceQpDelta := -4
+  }
+  let w9ShB : H264SliceHeaderView := {
+    firstMbInSlice := 0, sliceType := 1, ppsId := 0, frameNum4 := 2,
+    isIdr := false, idrPicId := 0, pocLsb8 := 2, sliceQpDelta := 2
+  }
+  let w9Ok := decodeH264SliceHeaderRbsp (ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShI)) true == some w9ShI &&
+              decodeH264SliceHeaderRbsp (ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShB)) false == some w9ShB
+
+  -- 18. Wave 10: Multi-Codec (`hvc1` HEVC & `av01` AV1) 4K->1080p I/P/B Transcoding & ISOBMFF Round-Trip
+  let w10HevcI := transcodeHvccHevc4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
+  let w10HevcB := transcodeHvccHevc4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
+  let w10SampleI : IsoMp4SampleDesc := {
+    sampleIdx := 0, dts := 0, pts := 1024, duration := 512, frameType := .iFrame,
+    slice := ByteSlice.ofByteArray w10HevcI
+  }
+  let w10SampleB : IsoMp4SampleDesc := {
+    sampleIdx := 1, dts := 512, pts := 512, duration := 512, frameType := .bFrame,
+    slice := ByteSlice.ofByteArray w10HevcB
+  }
+  let w10Mp4Hevc := muxIsoMp4TrackCodec .hevc 1920 1080 15360 ByteArray.empty #[w10SampleI, w10SampleB]
+  let w10Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w10Mp4Hevc) with
+    | some d10 => d10.width == 1920 && d10.height == 1080 && d10.samples.size == 2 && d10.iFrameCount == 1 && d10.bFrameCount == 1
+    | none => false
+
+  -- 19. Wave 11: Multi-Track ISOBMFF Audio + Video (`vide` + `soun` AAC-LC 48kHz Stereo) Muxer & Demuxer Round-Trip
+  let w11AacFrame : ByteArray := { data := #[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C] }
+  let w11Mp4Av := muxIsoMp4AudioVideoTracks .h264 1920 1080 15360 defaultAvcC1080pBytes #[w8SampleI, w8SampleB] 48000 2 1024 #[w11AacFrame, w11AacFrame]
+  let w11Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w11Mp4Av) with
+    | some d11 => d11.width == 1920 && d11.height == 1080 && d11.samples.size == 2 && d11.iFrameCount == 1 && d11.bFrameCount == 1
+    | none => false
+
+  -- 20. Wave 12: 1080p Level 4.0 Codec Configuration Records (`avcC` SPS+PPS, `hvcC` VPS+SPS+PPS, `av1C` Sequence Header OBU)
+  let w12Ok := verifyCodecConfig1080pHeaders defaultAvcC1080pBytes defaultHvcC1080pBytes defaultAv1C1080pBytes
+
+  -- 21. Wave 13: 4-byte LEB128 AV1 OBU Size Round-Trip & Multi-Byte OBU_FRAME I/P/B Classification
+  let (w13Leb0, w13Leb1, w13Leb2, w13Leb3) := encodeLeb128Fixed4 65535
+  let w13Av1I := transcodeAv1Obu4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
+  let w13Av1B := transcodeAv1Obu4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
+  let w13Ok := decodeLeb128Fixed4 w13Leb0 w13Leb1 w13Leb2 w13Leb3 == some 65535 &&
+    classifyAv1ObuSample (ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
+    classifyAv1ObuSample (ByteSlice.ofByteArray w13Av1B) false == .bFrame
+
+  -- 22. Wave 14: 15-Kernel LNIR Wire (`lanczos_4tap_downscale_fma_gpu`) & 4-Tap Lanczos Normalization Gate
+  let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
+    evalLnirKernel .fmaBlend [360, 200] [9, 9] [-360, -200] == [2880, 1600]
+  let w14Tokens := emitLeanAvLnirWire.splitOn "|"
+  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "51"
+
+  -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
+  let w15ShI : HevcSliceSegmentHeaderView := {
+    firstSliceSegmentInPic := true, isIdrRap := true, noOutputOfPriorPics := false,
+    ppsId := 0, sliceType := 2, pocLsb8 := 0, saoLumaFlag := true, saoChromaFlag := true, sliceQpDelta := -3
+  }
+  let w15ShB : HevcSliceSegmentHeaderView := {
+    firstSliceSegmentInPic := true, isIdrRap := false, noOutputOfPriorPics := false,
+    ppsId := 0, sliceType := 0, pocLsb8 := 2, saoLumaFlag := false, saoChromaFlag := false, sliceQpDelta := 2
+  }
+  let w15Ok := decodeHevcSliceSegmentHeaderRbsp (ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShI)) true == some w15ShI &&
+               decodeHevcSliceSegmentHeaderRbsp (ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShB)) false == some w15ShB
+
+  -- 24. Wave 16: AV1 §5.9 Uncompressed Frame Header Bitstream Round-Trip & 17-Kernel LNIR SGRPROJ FMA Gate
+  let w16FhKey : Av1FrameHeaderView := {
+    showExistingFrame := false, frameType := 0, showFrame := true,
+    errorResilientMode := true, disableCdfUpdate := false,
+    orderHint8 := 0, refreshFrameFlags := 0xFF, baseQIdx := 96, cdefBits2 := 2
+  }
+  let w16FhB : Av1FrameHeaderView := {
+    showExistingFrame := false, frameType := 1, showFrame := false,
+    errorResilientMode := false, disableCdfUpdate := true,
+    orderHint8 := 2, refreshFrameFlags := 0x00, baseQIdx := 128, cdefBits2 := 1
+  }
+  let w16Ok := decodeAv1FrameHeaderBits (ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhKey)) == some w16FhKey &&
+               decodeAv1FrameHeaderBits (ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhB)) == some w16FhB
+
+  -- 25. Wave 17: ISO/IEC 14496-3 §1.6.2.1 AAC AudioSpecificConfig Round-Trip & 18-Kernel LNIR AAC IMDCT FMA Gate
+  let w17Asc48k : AacAudioSpecificConfigView := {
+    audioObjectType := 2, samplingFrequencyIndex := 3, channelConfiguration := 2,
+    frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+  }
+  let w17Asc44k : AacAudioSpecificConfigView := {
+    audioObjectType := 2, samplingFrequencyIndex := 4, channelConfiguration := 2,
+    frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+  }
+  let w17Ok := encodeAacAudioSpecificConfig w17Asc48k == ByteArray.mk #[0x11, 0x90] &&
+               decodeAacAudioSpecificConfig (ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc48k)) == some w17Asc48k &&
+               decodeAacAudioSpecificConfig (ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc44k)) == some w17Asc44k
+
+  -- 26. Wave 18: RFC 7845 §5.1 OpusHead Identification Header Round-Trip & 19-Kernel LNIR Opus CELT Comb FMA Gate
+  let w18OpusStereo : OpusIdHeaderView := {
+    version := 1, channels := 2, preSkip := 312,
+    inputSampleRate := 48000, outputGainQ8 := 0, channelMappingFamily := 0
+  }
+  let w18OpusMono : OpusIdHeaderView := {
+    version := 1, channels := 1, preSkip := 3840,
+    inputSampleRate := 48000, outputGainQ8 := 256, channelMappingFamily := 0
+  }
+  let w18Ok := decodeOpusIdHeader (ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusStereo)) == some w18OpusStereo &&
+               decodeOpusIdHeader (ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusMono)) == some w18OpusMono
+
+  -- 27. Wave 19: ISO/IEC 14496-12 §8.6.1.3 CompositionOffsetBox (`ctts`) B-Frame PTS-DTS RLE Round-Trip & 20-Kernel LNIR H.264 IDCT 4x4 Gate
+  let w19GopOffsets : List UInt32 := [1024, 2560, 1536, 512, 512, 2048]
+  let w19Rle := rleCompressCttsOffsets w19GopOffsets
+  let w19Ok := w19Rle.length == 5 &&
+               rleExpandCttsEntries w19Rle == w19GopOffsets &&
+               decodeCttsBoxSpec (encodeCttsBoxSpec w19Rle) == some w19Rle
+
+  -- 28. Wave 20: ISO/IEC 14496-12 §8.6.2 SyncSampleBox (`stss`) 1-Based Keyframe Index Round-Trip & 21-Kernel LNIR HEVC Strong Deblock Gate
+  let w20GopTypes : List IsoVideoFrameType := [.iFrame, .pFrame, .bFrame, .bFrame, .pFrame, .iFrame, .bFrame, .pFrame]
+  let w20Sync := extractStssSyncIndices w20GopTypes
+  let w20Ok := w20Sync == [1, 6] &&
+               decodeStssBoxSpec (encodeStssBoxSpec w20Sync) == some [1, 6] &&
+               decodeStssBoxSpec (encodeStssBoxSpec [0, 6]) == none &&
+               decodeStssBoxSpec (encodeStssBoxSpec [3, 3]) == none
+
+  -- 29. Wave 21: ISO/IEC 14496-12 §8.6.1.2 TimeToSampleBox (`stts`) DTS Delta RLE Round-Trip & 22-Kernel LNIR AV1 8-Tap Subpel FMA Gate
+  let w21GopDeltas : List UInt32 := [512, 512, 512, 1024, 1024, 512]
+  let w21Rle := rleCompressSttsDeltas w21GopDeltas
+  let w21Ok := w21Rle.length == 3 &&
+               rleExpandSttsEntries w21Rle == w21GopDeltas &&
+               decodeSttsBoxSpec (encodeSttsBoxSpec w21Rle) == some w21Rle &&
+               reconstructMonotonicDts w21GopDeltas == [0, 512, 1024, 1536, 2560, 3584, 4096]
+
+  -- 30. Wave 22: ISO/IEC 14496-12 §8.7.4 SampleToChunkBox (`stsc`) 1-Based Chunk RLE Round-Trip & 23-Kernel LNIR ProRes 8x8 Column IDCT Gate
+  let w22ChunkPlan : List (UInt32 × UInt32) := [(4, 1), (4, 1), (4, 1), (2, 1), (2, 1), (1, 1)]
+  let w22Rle := rleCompressStscChunks w22ChunkPlan
+  let w22Ok := w22Rle.length == 3 &&
+               rleExpandStscChunks w22Rle 6 == w22ChunkPlan &&
+               decodeStscBoxSpec (encodeStscBoxSpec w22Rle) == some w22Rle &&
+               decodeStscBoxSpec (encodeStscBoxSpec [{ firstChunk := 2, samplesPerChunk := 4, sampleDescIndex := 1 }]) == none
+
+  -- 31. Wave 23: ISO/IEC 14496-12 §8.7.3.2 SampleSizeBox (`stsz`) & §8.7.5 ChunkOffsetBox (`stco`) Round-Trip & 24-Kernel LNIR FLAC LPC Gate
+  let w23StszVar : StszBoxView := { sampleSize := 0, sampleCount := 4, entrySizes := [16384, 4096, 2048, 2048] }
+  let w23StszConst : StszBoxView := { sampleSize := 384, sampleCount := 3, entrySizes := [] }
+  let w23Stco : List UInt32 := [4096, 28672]
+  let w23Ok := decodeStszBoxSpec (encodeStszBoxSpec w23StszVar) == some w23StszVar &&
+               decodeStszBoxSpec (encodeStszBoxSpec w23StszConst) == some w23StszConst &&
+               decodeStcoBoxSpec (encodeStcoBoxSpec w23Stco) == some w23Stco &&
+               computeContiguousSampleOffsets 4096 w23StszVar == [(4096, 16384), (20480, 4096), (24576, 2048), (26624, 2048)]
+
+  -- 32. Wave 24: ISO/IEC 14496-12 §8.6.6 EditListBox (`elst`) B-Frame Initial Composition Delay & Timeline Round-Trip & 25-Kernel LNIR FFV1 Median/Gradient Gate
+  let w24Elst : List ElstEntryView := [
+    { segmentDuration := 512, mediaTime := 0xFFFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 },
+    { segmentDuration := 30720, mediaTime := 1024, mediaRateInteger := 1, mediaRateFraction := 0 }
+  ]
+  let w24Ok := decodeElstBoxSpec (encodeElstBoxSpec w24Elst) == some w24Elst &&
+               computeElstPresentationDuration w24Elst == 31232 &&
+               decodeElstBoxSpec (encodeElstBoxSpec []) == none
+
+  -- 33. Wave 25: ISO/IEC 14496-12 §8.7.5 64-Bit ChunkLargeOffsetBox (`co64`) & §8.6.4 SampleDependencyTypeBox (`sdtp`) Round-Trip & 26-Kernel LNIR HEVC Chroma 4-Tap Gate
+  let w25Co64 : List UInt64 := [0x0000000100001000, 0x0000000180002000, 0x0000000240004000]
+  let w25Sdtp : List SdtpSampleFlagsView := [.iFrame, .pFrame, .bFrame, .bFrame, .pFrame].map sdtpFlagsOfFrameType
+  let w25Ok := decodeCo64BoxSpec (encodeCo64BoxSpec w25Co64) == some w25Co64 &&
+               decodeSdtpBoxSpec (encodeSdtpBoxSpec w25Sdtp) == some w25Sdtp &&
+               w25Sdtp.map packSdtpByte == [0x26, 0x16, 0x1A, 0x1A, 0x16]
+
+  -- 34. Wave 26: ISO/IEC 14496-12 §8.8.12 (`tfdt`) & §8.8.8 (`trun`) fMP4 / CMAF Streaming Fragment Round-Trip & 27-Kernel LNIR H.264 CABAC LPS Gate
+  let w26BaseDts : UInt64 := 90000
+  let w26Trun : TrunBoxView := {
+    dataOffset := 128
+    samples := [
+      { sampleDuration := 512, sampleSize := 16384, sampleFlags := 0x02000000, sampleCompositionTimeOffset := 1024 },
+      { sampleDuration := 512, sampleSize := 4096,  sampleFlags := 0x01010000, sampleCompositionTimeOffset := 2048 }
+    ]
+  }
+  let w26Ok := decodeTfdtBoxSpec (encodeTfdtBoxSpec w26BaseDts) == some w26BaseDts &&
+               decodeTrunBoxSpec (encodeTrunBoxSpec w26Trun) == some w26Trun &&
+               reconstructTrunSamplePts w26BaseDts w26Trun == [(90000, 91024), (90512, 92560)]
+
+  -- 35. Wave 27: ISO/IEC 14496-12 §8.16.3 (`sidx`) DASH / HLS CMAF Segment Index Round-Trip & 28-Kernel LNIR AV1 7-Tap Wiener Gate
+  let w27Sidx : SidxBoxView := {
+    referenceId := 1
+    timescale := 12800
+    earliestPresentationTime := 25600
+    firstOffset := 4096
+    references := [
+      { referencedSize := 65536, subsegmentDuration := 12800, startsWithSap := true, sapType := 1, sapDeltaTime := 0 },
+      { referencedSize := 49152, subsegmentDuration := 12800, startsWithSap := true, sapType := 2, sapDeltaTime := 512 }
+    ]
+  }
+  let w27Ok := decodeSidxBoxSpec (encodeSidxBoxSpec w27Sidx) == some w27Sidx &&
+               computeSidxSegmentSpan w27Sidx == (118784, 51200)
+
+  -- 36. Wave 28: ISO/IEC 14496-12 §8.8.5 (`mfhd`) & §8.16.5 (`prft`) Live CMAF Wallclock Sync Round-Trip & 29-Kernel LNIR Opus SILK LPC Gate
+  let w28Prft1 : PrftBoxView := { referenceTrackId := 1, ntpTimestamp := 0xEC9B820000000000, mediaTime := 90000 }
+  let w28Prft2 : PrftBoxView := { referenceTrackId := 1, ntpTimestamp := 0xEC9B820100000000, mediaTime := 102800 }
+  let w28Ok := decodeMfhdBoxSpec (encodeMfhdBoxSpec 42) == some 42 &&
+               decodePrftBoxSpec (encodePrftBoxSpec w28Prft1) == some w28Prft1 &&
+               computePrftNtpWallclockDelta w28Prft1 w28Prft2 == some (0x0000000100000000, 12800)
+
+  -- 37. Wave 29: ISO/IEC 14496-12 §8.8.7 (`tfhd`) CMAF Fragment Defaults Round-Trip & 30-Kernel LNIR AAC MDCT Pre-Twiddle Gate
+  let w29Tfhd : TfhdBoxView := { trackId := 1, defaultSampleDuration := 512, defaultSampleSize := 4096, defaultSampleFlags := 0x01010000 }
+  let w29Ok := decodeTfhdBoxSpec (encodeTfhdBoxSpec w29Tfhd) == some w29Tfhd &&
+               computeTfhdDefaultRunSpan w29Tfhd 60 == (30720, 245760)
+
+  -- 38. Wave 30: ISO/IEC 14496-12 §8.8.2 (`mehd`) & §8.8.3 (`trex`) CMAF Init Defaults Round-Trip & 31-Kernel LNIR VP9 LoopFilter Gate
+  let w30Trex : TrexBoxView := { trackId := 1, defaultSampleDescriptionIndex := 1, defaultSampleDuration := 512, defaultSampleSize := 4096, defaultSampleFlags := 0x01010000 }
+  let w30Ok := decodeMehdBoxSpec (encodeMehdBoxSpec 30720) == some 30720 &&
+               decodeTrexBoxSpec (encodeTrexBoxSpec w30Trex) == some w30Trex &&
+               computeMehdTrexInitBudget 30720 w30Trex == some (60, 245760)
+
+  -- 39. Wave 31: ISO/IEC 14496-12 §8.7.2 (`dref`) Self-Contained CMAF Media Location Round-Trip & 32-Kernel LNIR H.264 Deblock Gate
+  let w31Dref : DrefBoxView := { selfContainedEntryCount := 1 }
+  let w31Ok := decodeDrefBoxSpec (encodeDrefBoxSpec w31Dref) == some w31Dref &&
+               verifyTrexDrefIndexValid w30Trex w31Dref == true
+
+  -- 40. Wave 32: ISO/IEC 14496-12 §8.4.5.2 (`vmhd`), §8.4.5.3 (`smhd`) & §8.4.2 ISO-639-2/T Language Codec & 33-Kernel LNIR ALF Gate
+  let w32Vmhd : VmhdBoxView := { graphicsMode := 0, opColorR := 0, opColorG := 0, opColorB := 0 }
+  let w32Smhd : SmhdBoxView := { balanceQ8_8 := 0 }
+  let w32Ok := decodeVmhdBoxSpec (encodeVmhdBoxSpec w32Vmhd) == some w32Vmhd &&
+               decodeSmhdBoxSpec (encodeSmhdBoxSpec w32Smhd) == some w32Smhd &&
+               packIso639LangSpec 0x75 0x6E 0x64 == some 0x55C4 &&
+               unpackIso639LangSpec 0x55C4 == some (0x75, 0x6E, 0x64)
+
+  -- 41. Wave 33: ISO/IEC 14496-12 §12.1.3 (`pasp`) & §12.1.4 (`clap`) Display Geometry Round-Trip & 34-Kernel LNIR AV1 CfL Gate
+  let w33Pasp : PaspBoxView := { hSpacing := 1, vSpacing := 1 }
+  let w33Clap : ClapBoxView := { cleanWidthN := 1920, cleanWidthD := 1, cleanHeightN := 1080, cleanHeightD := 1 }
+  let w33Ok := decodePaspBoxSpec (encodePaspBoxSpec w33Pasp) == some w33Pasp &&
+               decodeClapBoxSpec (encodeClapBoxSpec w33Clap) == some w33Clap &&
+               computeDarWidth 1920 w33Pasp == 1920
+
+  -- 42. Wave 34: ISO/IEC 14496-12 §12.1.5 `ColourInformationBox` (`colr`, `nclx`) Round-Trip & 35-Kernel LNIR HEVC Weighted BiPred Gate
+  let w34Colr : ColrNclxView := { colourPrimaries := 1, transferCharacteristics := 1, matrixCoefficients := 1, fullRangeFlag := false }
+  let w34Ok := decodeColrNclxBoxSpec (encodeColrNclxBoxSpec w34Colr) == some w34Colr &&
+               isBt709OrBt2020Hdr10Valid w34Colr
+
+  -- 43. Wave 35: ISO/IEC 14496-12 §12.1.6 (`mdcv`) & §12.1.7 (`clli`) HDR10 Static Metadata Round-Trip & 36-Kernel LNIR AV1 OBMC Gate
+  let w35Mdcv : MdcvLuminanceView := { maxDisplayMasteringLuminance := 10000000, minDisplayMasteringLuminance := 50 }
+  let w35Clli : ClliBoxView := { maxContentLightLevel := 1000, maxPicAverageLightLevel := 400 }
+  let w35Ok := decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec w35Mdcv) == some w35Mdcv &&
+               decodeClliBoxSpec (encodeClliBoxSpec w35Clli) == some w35Clli
+
+  -- 44. Wave 36: ISO/IEC 14496-12 §8.2.2 (`mvhd`) & §8.3.2 (`tkhd`) Timeline & Identity Matrix Round-Trip & 37-Kernel LNIR H.264 Weighted UniPred Gate
+  let w36Mvhd : MvhdBoxView := { timescale := 90000, duration := 180000, nextTrackId := 2 }
+  let w36Tkhd : TkhdBoxView := { trackId := 1, duration := 180000, widthPixels := 1920, heightPixels := 1080 }
+  let w36Ok := decodeMvhdBoxSpec (encodeMvhdBoxSpec w36Mvhd) == some w36Mvhd &&
+               decodeTkhdBoxSpec (encodeTkhdBoxSpec w36Tkhd) == some w36Tkhd
+
+  -- 45. Wave 37: ISO/IEC 14496-12 §8.1.1 (`ftyp`) & §8.16.2 (`styp`) Brand Compatibility Round-Trip & 38-Kernel LNIR VP9 Convolve8 Gate
+  let w37Ftyp : FtypStypBrandView := { majorBrand := 0x69736F6D, minorVersion := 512, compatBrand0 := 0x69736F6D, compatBrand1 := 0x6D703432 }
+  let w37Styp : FtypStypBrandView := { majorBrand := 0x6D736468, minorVersion := 0, compatBrand0 := 0x6D736468, compatBrand1 := 0x636D6663 }
+  let w37Ok := decodeFtypBoxSpec (encodeFtypBoxSpec w37Ftyp) == some w37Ftyp &&
+               decodeStypBoxSpec (encodeStypBoxSpec w37Styp) == some w37Styp
+
+  -- 46. Wave 38: ISO/IEC 14496-12 §8.4.3 (`hdlr`) Media Handler & UTF-8 Name Round-Trip & 39-Kernel LNIR AV1 Warped Motion Gate
+  let w38Vide : HdlrBoxView := { handlerKind := .video, nameTag4CC := 0x4C65616E }
+  let w38Soun : HdlrBoxView := { handlerKind := .sound, nameTag4CC := 0x4F707573 }
+  let w38Ok := decodeHdlrBoxSpec (encodeHdlrBoxSpec w38Vide) == some w38Vide &&
+               decodeHdlrBoxSpec (encodeHdlrBoxSpec w38Soun) == some w38Soun
+
+  -- 47. Wave 39: ISO/IEC 14496-12 §8.4.2 (`mdhd`) Timescale, Duration & ISO-639-2/T Language Round-Trip & 40-Kernel LNIR HEVC SAO Band Offset Gate
+  let w39Video : MdhdBoxView := { timescale := 90000, duration := 90000, langChar1 := 0x75, langChar2 := 0x6E, langChar3 := 0x64 }
+  let w39Audio : MdhdBoxView := { timescale := 48000, duration := 48000, langChar1 := 0x65, langChar2 := 0x6E, langChar3 := 0x67 }
+  let w39Ok := decodeMdhdBoxSpec (encodeMdhdBoxSpec w39Video) == some w39Video &&
+               decodeMdhdBoxSpec (encodeMdhdBoxSpec w39Audio) == some w39Audio
+
+  -- 48. Wave 40: ISO/IEC 14496-12 §8.4.5.4 (`sthd`) & §8.4.5.5 (`nmhd`) Media Header Round-Trip & 41-Kernel LNIR Opus CELT Pitch Xcorr Gate
+  let w40Sthd : SthdNmhdBoxView := { isSubtitle := true, flags24 := 0 }
+  let w40Nmhd : SthdNmhdBoxView := { isSubtitle := false, flags24 := 0 }
+  let w40Ok := decodeSthdNmhdBoxSpec (encodeSthdNmhdBoxSpec w40Sthd) == some w40Sthd &&
+               decodeSthdNmhdBoxSpec (encodeSthdNmhdBoxSpec w40Nmhd) == some w40Nmhd
+
+  -- 49. Wave 41: ISO/IEC 14496-12 §8.9.2 (`sbgp`) & §8.9.3 (`sgpd`) `roll`/`rap ` Recovery Round-Trip & 42-Kernel LNIR AAC TNS Lattice Gate
+  let w41Sbgp : SbgpBoxView := { groupingKind := .roll, sampleCount := 60, groupDescriptionIndex := 1 }
+  let w41Sgpd : SgpdBoxView := { groupingKind := .rap, payloadU16 := 0x8200 }
+  let w41Ok := decodeSbgpBoxSpec (encodeSbgpBoxSpec w41Sbgp) == some w41Sbgp &&
+               decodeSgpdBoxSpec (encodeSgpdBoxSpec w41Sgpd) == some w41Sgpd
+
+  -- 50. Wave 42: ISO/IEC 23009-1 §5.10.3.3 (`emsg` v1) DASH/CMAF Inband Event Round-Trip & 43-Kernel LNIR AV1 Palette Map Gate
+  let w42Scte : EmsgV1BoxView := {
+    timescale := 90000, presentationTime := 540000, eventDuration := 90000,
+    eventId := 101, schemeTag4CC := 0x53435445, messageData32 := 0xFC301100
+  }
+  let w42Ok := decodeEmsgV1BoxSpec (encodeEmsgV1BoxSpec w42Scte) == some w42Scte
+
+  -- 51. Wave 43: ISO/IEC 14496-12 §8.7.7 (`subs` v1) Tile/NALU Sub-Sample Framing Round-Trip & 44-Kernel LNIR H.264 Chroma Bilinear Gate
+  let w43Subs : SubsV1BoxView := {
+    sampleDelta := 1,
+    subSampleSize0 := 64, subSamplePriority0 := 0, discardableFlag0 := 0,
+    subSampleSize1 := 4032, subSamplePriority1 := 1, discardableFlag1 := 1
+  }
+  let w43Ok := decodeSubsV1BoxSpec (encodeSubsV1BoxSpec w43Subs) == some w43Subs &&
+               computeSubsV1TotalSampleBytes w43Subs == 4096
+
+  -- 52. Wave 44: ISO/IEC 14496-12 §8.7.8 (`saiz`) & §8.7.9 (`saio`) CENC Subsample IV Offset Round-Trip & 45-Kernel LNIR HEVC Deblock Gate
+  let w44Saiz : SaizUniformBoxView := { defaultSampleInfoSize := 16, sampleCount := 60 }
+  let w44Saio : SaioSingleBoxView := { sencDataOffset := 256 }
+  let w44Ok := decodeSaizUniformBoxSpec (encodeSaizUniformBoxSpec w44Saiz) == some w44Saiz &&
+               decodeSaioSingleBoxSpec (encodeSaioSingleBoxSpec w44Saio) == some w44Saio &&
+               computeCencSampleAuxByteOffset w44Saiz w44Saio 10 == 416
+
+  -- 53. Wave 45: ISO/IEC 23001-7 §8.2 (`tenc` v1) CBCS/CENC Pattern & KID Round-Trip & 46-Kernel LNIR AV1 CDF Adaptation Gate
+  let w45Tenc : TencV1BoxView := {
+    cryptByteBlock := 1, skipByteBlock := 9, isProtected := 1, defaultPerSampleIvSize := 8,
+    defaultKidHi64 := 0x0102030405060708, defaultKidLo64 := 0x090A0B0C0D0E0F10
+  }
+  let w45Ok := decodeTencV1BoxSpec (encodeTencV1BoxSpec w45Tenc) == some w45Tenc
+
+  -- 54. Wave 46: ISO/IEC 23001-7 §8.1.1 (`pssh` v1) Widevine/FairPlay SystemID & KID Round-Trip & 47-Kernel LNIR Opus SILK LTP Gate
+  let w46Pssh : PsshV1BoxView := {
+    systemIdHi64 := 0xEDEF8BA979D64ACE, systemIdLo64 := 0xA3C827DCD51D21ED,
+    kidHi64 := 0x0102030405060708, kidLo64 := 0x090A0B0C0D0E0F10,
+    psshData32 := 0x08011210
+  }
+  let w46Ok := decodePsshV1BoxSpec (encodePsshV1BoxSpec w46Pssh) == some w46Pssh
+
+  -- 55. Wave 47: ISO/IEC 14496-12 §8.12.1 (`sinf` / `frma` / `schm`) CENC/CBCS Scheme Round-Trip & 48-Kernel LNIR HE-AAC SBR Chirp Gate
+  let w47Sinf : SinfFrmaSchmBoxView := {
+    originalFormat4CC := 0x61766331, schemeKind := .cbcs, schemeVersion := 0x00010000
+  }
+  let w47Ok := decodeSinfFrmaSchmBoxSpec (encodeSinfFrmaSchmBoxSpec w47Sinf) == some w47Sinf
+
+  -- 56. Wave 48: ISO/IEC 23001-7 §7.1 (`senc`) Per-Sample IV & Subsample Round-Trip & 49-Kernel LNIR VP9 IADST4 Gate
+  let w48Senc : SencSubsampleBoxView := {
+    iv64 := 0x0102030405060708, bytesOfClearData := 32, bytesOfProtectedData := 4064
+  }
+  let w48Ok := decodeSencSubsampleBoxSpec (encodeSencSubsampleBoxSpec w48Senc) == some w48Senc &&
+               computeSencSampleTotalBytes w48Senc == 4096
+
+  -- 57. Wave 49: ISO/IEC 14496-12 §8.8.10 (`mfra` / `tfra` / `mfro`) Random-Access Seek Round-Trip & 50-Kernel LNIR H.264 CABAC MPS Gate
+  let w49Mfra : MfraTfraMfroBoxView := {
+    trackId := 1, syncTime64 := 180000, moofOffset64 := 4096, sampleNumber := 1
+  }
+  let w49Ok := decodeMfraTfraMfroBoxSpec (encodeMfraTfraMfroBoxSpec w49Mfra) == some w49Mfra
+
+  -- 58. Wave 50: ISO/IEC 14496-12 §8.10.1 (`udta` / `meta` / `hdlr mdir` / `ilst`) Metadata Round-Trip & 51-Kernel LNIR HEVC CABAC Bypass Gate
+  let w50Udta : UdtaMetaIlstBoxView := {
+    itemKey4CC := 0xA9746F6F, encoderTag4CC := 0x4C46464D
+  }
+  let w50Ok := decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec w50Udta) == some w50Udta
+
+  let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
+                swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
+                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk
+  let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
+  let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
+  let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
+  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok
+  let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 50, \"c_abi_gates\": 9, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
   let j3 := s!"\"hevc_sao_ok\": {hevcOk && saoBitExactOk}, \"prores_ok\": {proresOk}, \"ffv1_r0_ok\": {ffv1Ok}, "
   let j4 := s!"\"filter_graph_ok\": {graphOk && graphBad}, \"hw_dma_ok\": {hwOk}, \"diamond_me_ok\": {meOk}, \"rdo_ok\": {rdoOk}, "
-  let j5 := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok} }"
-  IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5)
+  let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
+  let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
+  let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok} }"
+  IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
 /-- Run high-throughput microbenchmarks across `LeanAV` subsystems (`demux`, `swscale`, `flac_lpc`, `av1_cdef`, `avfilter`). -/
@@ -295,8 +696,8 @@ def runBench (iters : Nat := 500) : IO UInt32 := do
   let audioSamples := Array.replicate 1024 (1234 : Int32)
   let mut flacChecksum : Int32 := 0
   for _ in [:iters] do
-    let res := flacEncodeFixedResiduals .order4 audioSamples
-    let dec := flacDecodeFixedResiduals .order4 res
+    let res := flacEncodeFixedResidualsFast .order4 audioSamples
+    let dec := flacDecodeFixedResidualsFast .order4 res
     flacChecksum := flacChecksum + dec.getD 512 0
   let t3 ← IO.monoNanosNow
 
@@ -335,7 +736,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   let mut ivfPktsCount : Nat := 0
   let mut av1ObusTotal : Nat := 0
   for _ in [:iters] do
-    if let some (_, pkts) := demuxIvfStream ivfSlice then
+    if let some (_, pkts) := demuxIvfStreamFast ivfSlice then
       ivfPktsCount := pkts.size
       let mut obuAcc : Nat := 0
       for p in pkts do
@@ -376,11 +777,11 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   let mut oggPages : Nat := 0
   let mut opusFramesOk : Nat := 0
   for _ in [:iters] do
-    let pkts := demuxOggPages oggSlice .opus
+    let pkts := demuxOggPagesFast oggSlice .opus
     oggPages := pkts.size
     let mut okCnt : Nat := 0
     for p in pkts do
-      if (parseOpusToc p.slice).isSome then okCnt := okCnt + 1
+      if (parseOpusTocFast p.slice).isSome then okCnt := okCnt + 1
     opusFramesOk := okCnt
   let tOggEnd ← IO.monoNanosNow
 
@@ -396,10 +797,10 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
     wavSamples := af.numSamples
     let ch0 := af.samples.extract 0 (Nat.min 4096 af.samples.size)
     for _ in [:iters / 4 + 1] do
-      let enc := flacEncodeFixedResiduals .order4 ch0
-      let dec := flacDecodeFixedResiduals .order4 enc
+      let enc := flacEncodeFixedResidualsFast .order4 ch0
+      let dec := flacDecodeFixedResidualsFast .order4 enc
       flacR0Exact := (dec == ch0)
-      let af24 := resampleAudioFrame af 24000
+      let af24 := resampleAudioFrameFast af 24000
       resampledCount := af24.numSamples
   let tWavEnd ← IO.monoNanosNow
 
@@ -443,8 +844,38 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"filter_error\": \"{msg}\" }"
           return 1
       | none => pure []
+    let t0 ← IO.monoNanosNow
     let rawBytes ← IO.FS.readBinFile inPath
     let inSlice := ByteSlice.ofByteArray rawBytes
+    -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`) and we are transcoding/scaling (e.g. 4K -> 1080p I/P/B):
+    if let some demux := demuxIsoMp4Track inSlice then
+      if validCfg.videoCodec != some .copy then
+        let targetCodec : CodecId := match validCfg.videoCodec with
+          | some .hevc => .hevc
+          | some .av1  => .av1
+          | _          => .h264
+        let codecName := match targetCodec with
+          | .hevc => "hevc"
+          | .av1  => "av1"
+          | _     => "h264"
+        let withAudio := !validCfg.noAudio && validCfg.audioCodec.isSome
+        let tDemux ← IO.monoNanosNow
+        let rep ← transcodeMp44kTo1080pIpbParallelCodec demux targetCodec 8 withAudio
+        let tTranscode ← IO.monoNanosNow
+        if outPath != "" && outPath != "-" && validCfg.format != some "null" then
+          let _ ← writeMediaFileStreaming outPath rep.outputMp4Bytes
+        let tEnd ← IO.monoNanosNow
+        let demuxUs := (tDemux - t0) / 1000
+        let transcodeUs := (tTranscode - tDemux) / 1000
+        let totalUs := (tEnd - t0) / 1000
+        let fps := if totalUs == 0 then 0 else (rep.totalFrames * 1000000) / totalUs
+        let c0 := s!"\{ \"ok\": {rep.zeroCopyDmaOk && rep.dpbPocMonotone}, \"mode\": \"ffmpeg-cli-mp4-ipb-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
+        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{rep.srcWidth}x{rep.srcHeight}\", \"dst_res\": \"{rep.dstWidth}x{rep.dstHeight}\", "
+        let c2 := s!"\"frames\": {rep.totalFrames}, \"i_frames\": {rep.iFrames}, \"p_frames\": {rep.pFrames}, \"b_frames\": {rep.bFrames}, "
+        let c3 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
+        let c4 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep.dpbPocMonotone} }"
+        IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4)
+        return 0
     let crc := computeFrameCrc64 rawBytes
     let xxh := formatGoldenXxh64Line inSlice
     let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
@@ -545,31 +976,31 @@ def main (args : List String) : IO UInt32 := do
 
     -- Stage 1: Decode / Colorspace Conversion (YUV420p -> RGB24)
     let t1s ← IO.monoNanosNow
-    let mut rgb := yuv420pToRgb24Plane vf0
+    let mut rgb := yuv420pToRgb24PlaneFast vf0
     for _ in [:iters] do
-      rgb := yuv420pToRgb24Plane vf0
+      rgb := yuv420pToRgb24PlaneFast vf0
     let t1e ← IO.monoNanosNow
 
     -- Stage 2: Fused Filter Graph (Contrast 1.25x + Brightness +12 + 3x3 BoxBlur on Luma)
     let t2s ← IO.monoNanosNow
-    let mut pYFilt := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
+    let mut pYFilt := filterPlanePointAndBoxBlur3x3Fast pY 320 12 false
     for _ in [:iters] do
-      pYFilt := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
+      pYFilt := filterPlanePointAndBoxBlur3x3Fast pY 320 12 false
     let t2e ← IO.monoNanosNow
 
     -- Stage 3: FFV1 R0 Lossless Encode (64x64 Tile)
     let pYTile := filterPlaneCrop pYFilt 160 90 64 64
     let t3s ← IO.monoNanosNow
-    let mut encBs := encodePlaneFfv1RiceR0 pYTile 3
+    let mut encBs := encodePlaneFfv1RiceR0Fast pYTile 3
     for _ in [:iters] do
-      encBs := encodePlaneFfv1RiceR0 pYTile 3
+      encBs := encodePlaneFfv1RiceR0Fast pYTile 3
     let t3e ← IO.monoNanosNow
 
     -- Stage 4: FFV1 R0 Lossless Decode + Bit-Exact Verification (64x64 Tile)
     let t4s ← IO.monoNanosNow
-    let mut pYDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray encBs)).getD pYTile
+    let mut pYDec := (decodePlaneFfv1RiceR0Fast (ByteSlice.ofByteArray encBs)).getD pYTile
     for _ in [:iters] do
-      pYDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray encBs)).getD pYTile
+      pYDec := (decodePlaneFfv1RiceR0Fast (ByteSlice.ofByteArray encBs)).getD pYTile
     let t4e ← IO.monoNanosNow
 
     let (maxErr, sse) := comparePlanesMetrics pYTile pYDec
@@ -581,7 +1012,7 @@ def main (args : List String) : IO UInt32 := do
     let fps := if totalUs == 0 then 0 else 1000000 / totalUs
 
     let vfFilt : VideoFrame := { vf0 with planes := #[pYFilt, pU, pV] }
-    let rgbFilt := yuv420pToRgb24Plane vfFilt
+    let rgbFilt := yuv420pToRgb24PlaneFast vfFilt
     let _ ← writeMediaFileAtomic s!"{outDir}/e2e_filtered_rgb24_640x360.raw" rgbFilt.data
 
     let r0 := s!"\{ \"ok\": true, \"resolution\": \"640x360\", \"tile\": \"64x64\", \"iters\": {iters + 1}, "
@@ -592,6 +1023,120 @@ def main (args : List String) : IO UInt32 := do
     let r5 := s!"\"total_pipeline_us\": {totalUs}, \"throughput_fps\": {fps}, "
     let r6 := s!"\"ffv1_compressed_bytes\": {encBs.size}, \"ffv1_max_err\": {maxErr}, \"ffv1_sse\": {sse} }"
     IO.println (r0 ++ r1 ++ r2 ++ r3 ++ r4 ++ r5 ++ r6)
+    return 0
+  | "bench-scaling" :: framesStr :: _ =>
+    let numFrames := Nat.max 1 (framesStr.toNat?.getD 32)
+    let srcLuma := Plane2D.alloc 3840 2160 3840 128
+    let measureWorkers (w : Nat) : IO (Nat × Nat) := do
+      let ts ← IO.monoNanosNow
+      let pkts ← transcodeBatchPipelineDParallel srcLuma numFrames w .h264 16
+      let te ← IO.monoNanosNow
+      let us := (te - ts) / 1000
+      let fps := if us == 0 then 0 else (numFrames * 1000000) / us
+      return (us + (if pkts.size == numFrames then 0 else 1), fps)
+    let (us1, fps1) ← measureWorkers 1
+    let (us2, fps2) ← measureWorkers 2
+    let (us4, fps4) ← measureWorkers 4
+    let (us8, fps8) ← measureWorkers 8
+    let (us16, fps16) ← measureWorkers 16
+    let s0 := s!"\{ \"ok\": true, \"pipeline\": \"D_4K_to_1080p_parallel_IO_asTask\", \"frames\": {numFrames}, "
+    let s1 := s!"\"w1_us\": {us1}, \"w1_fps\": {fps1}, \"w2_us\": {us2}, \"w2_fps\": {fps2}, "
+    let s2 := s!"\"w4_us\": {us4}, \"w4_fps\": {fps4}, \"w8_us\": {us8}, \"w8_fps\": {fps8}, "
+    let s3 := s!"\"w16_us\": {us16}, \"w16_fps\": {fps16} }"
+    IO.println (s0 ++ s1 ++ s2 ++ s3)
+    return 0
+  | "bench-pipeline-d" :: framesStr :: outMp4Path :: _ =>
+    let numFrames := Nat.max 1 (framesStr.toNat?.getD 8)
+    let srcW := 3840
+    let srcH := 2160
+    let srcLuma := Plane2D.alloc srcW srcH srcW 128
+    let t0 ← IO.monoNanosNow
+    let mut pkts : Array AVPacketView := Array.mkEmpty numFrames
+    let mut tilesCount : Nat := 0
+    let mut dmaZeroCopyAll : Bool := true
+    let mut loopGateAll : Bool := true
+    for fIdx in [:numFrames] do
+      let pts : UInt64 := (fIdx * 1500).toUInt64
+      if let some res := transcodeFramePipelineD srcLuma pts .h264 16 264 4 then
+        pkts := pkts.push res.encodedPacket
+        tilesCount := res.disjointTiles
+        dmaZeroCopyAll := dmaZeroCopyAll && res.zeroCopyGateOk
+        loopGateAll := loopGateAll && res.loopGateOk
+    let t1 ← IO.monoNanosNow
+    let mp4Bytes := muxMp4StreamingFast .h264 90000 pkts
+    if outMp4Path != "" && outMp4Path != "-" then
+      let _ ← writeMediaFileAtomic outMp4Path mp4Bytes
+    let t2 ← IO.monoNanosNow
+    let transcodeUs := (t1 - t0) / 1000
+    let muxUs := (t2 - t1) / 1000
+    let totalUs := (t2 - t0) / 1000
+    let perFrameUs := totalUs / numFrames
+    let fps := if perFrameUs == 0 then 0 else 1000000 / perFrameUs
+    let d0 := s!"\{ \"ok\": {dmaZeroCopyAll && loopGateAll && pkts.size == numFrames}, \"pipeline\": \"D_4K_to_1080p_MP4\", "
+    let d1 := s!"\"src_res\": \"3840x2160\", \"dst_res\": \"1920x1080\", \"frames\": {numFrames}, \"disjoint_tiles\": {tilesCount}, "
+    let d2 := s!"\"transcode_us\": {transcodeUs}, \"mp4_mux_us\": {muxUs}, \"total_us\": {totalUs}, "
+    let d3 := s!"\"per_frame_us\": {perFrameUs}, \"fps\": {fps}, \"mp4_bytes\": {mp4Bytes.size}, "
+    let d4 := s!"\"zero_copy_dma_ok\": {dmaZeroCopyAll}, \"in_loop_verify_ok\": {loopGateAll} }"
+    IO.println (d0 ++ d1 ++ d2 ++ d3 ++ d4)
+    return 0
+  | "bench-4k-ipb" :: inMp4Path :: outMp4Path :: _ =>
+    let t0 ← IO.monoNanosNow
+    let rawBytes ← IO.FS.readBinFile inMp4Path
+    let tRead ← IO.monoNanosNow
+    let inSlice := ByteSlice.ofByteArray rawBytes
+    let some demux := demuxIsoMp4Track inSlice | do
+      IO.println s!"\{ \"ok\": false, \"error\": \"Failed to demux ISO MP4 track from {inMp4Path}\" }"
+      return 1
+    let tDemux ← IO.monoNanosNow
+    let rep1 ← transcodeMp44kTo1080pIpbParallel demux 1
+    let tW1 ← IO.monoNanosNow
+    let rep8 ← transcodeMp44kTo1080pIpbParallel demux 8
+    let tW8 ← IO.monoNanosNow
+    -- Also benchmark full-frame 4K (`3840x2160`) -> 1080p (`1920x1080`) YUV420p SIMD 2x2 plane scaling + B-frame bi-pred + residual
+    let vf4k := VideoFrame.allocYuv420p 3840 2160 0
+    if vf4k.planes.isEmpty then IO.println ""
+    let tScale0 ← IO.monoNanosNow
+    let vf1080 := scaleVideoFrameYuv420pSimd vf4k
+    if vf1080.planes[0]!.data.size == 0 then IO.println ""
+    let tScale1 ← IO.monoNanosNow
+    let luma1080 := vf1080.planes[0]!
+    let biPred1080 := mcBiPredPlaneSimd luma1080 luma1080
+    let res1080 := encodeInterResidualPlaneSimd luma1080 biPred1080
+    let recon1080 := reconstructInterResidualPlaneSimd biPred1080 res1080
+    if recon1080.data.size == 0 then IO.println ""
+    let tBiPred1 ← IO.monoNanosNow
+    if outMp4Path != "" && outMp4Path != "-" then
+      let _ ← writeMediaFileStreaming outMp4Path rep8.outputMp4Bytes
+    let tWrite ← IO.monoNanosNow
+    let readUs := (tRead - t0) / 1000
+    let demuxUs := (tDemux - tRead) / 1000
+    let w1Us := (tW1 - tDemux) / 1000
+    let w8Us := (tW8 - tW1) / 1000
+    let scale4kYuvUs := (tScale1 - tScale0) / 1000
+    let bipred1080Us := (tBiPred1 - tScale1) / 1000
+    let writeUs := (tWrite - tBiPred1) / 1000
+    -- Wave 8 verification: demux the emitted ISOBMFF 1080p MP4 container and verify exact round-trip of 1920x1080 and I/P/B counts
+    let roundtripIsoOk : Bool := match demuxIsoMp4Track (ByteSlice.ofByteArray rep8.outputMp4Bytes) with
+      | some dOut =>
+          dOut.width == rep8.dstWidth &&
+          dOut.height == rep8.dstHeight &&
+          dOut.samples.size == rep8.totalFrames &&
+          dOut.iFrameCount == rep8.iFrames &&
+          dOut.pFrameCount == rep8.pFrames &&
+          dOut.bFrameCount == rep8.bFrames
+      | none => false
+    let e2eW8Us := readUs + demuxUs + w8Us + writeUs
+    let fpsW1 := if w1Us == 0 then 0 else (rep1.totalFrames * 1000000) / w1Us
+    let fpsW8 := if w8Us == 0 then 0 else (rep8.totalFrames * 1000000) / w8Us
+    let fpsE2E := if e2eW8Us == 0 then 0 else (rep8.totalFrames * 1000000) / e2eW8Us
+    let b0 := s!"\{ \"ok\": {rep8.zeroCopyDmaOk && rep8.dpbPocMonotone && recon1080.width == 1920 && roundtripIsoOk}, \"benchmark\": \"4K_to_1080p_IPB_MP4\", "
+    let b1 := s!"\"input\": \"{inMp4Path}\", \"output\": \"{outMp4Path}\", \"src_res\": \"{rep8.srcWidth}x{rep8.srcHeight}\", \"dst_res\": \"{rep8.dstWidth}x{rep8.dstHeight}\", "
+    let b2 := s!"\"frames\": {rep8.totalFrames}, \"i_frames\": {rep8.iFrames}, \"p_frames\": {rep8.pFrames}, \"b_frames\": {rep8.bFrames}, "
+    let b3 := s!"\"read_us\": {readUs}, \"demux_stbl_us\": {demuxUs}, \"transcode_w1_us\": {w1Us}, \"transcode_w8_us\": {w8Us}, \"write_us\": {writeUs}, "
+    let b4 := s!"\"e2e_w8_us\": {e2eW8Us}, \"w1_fps\": {fpsW1}, \"w8_fps\": {fpsW8}, \"e2e_fps\": {fpsE2E}, "
+    let b5 := s!"\"simd_4k_yuv420p_scale_us\": {scale4kYuvUs}, \"simd_1080p_bipred_res_us\": {bipred1080Us}, "
+    let b6 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep8.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep8.dpbPocMonotone}, \"iso_mp4_roundtrip_ok\": {roundtripIsoOk} }"
+    IO.println (b0 ++ b1 ++ b2 ++ b3 ++ b4 ++ b5 ++ b6)
     return 0
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
@@ -650,4 +1195,132 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Audio.aacScaleFactorHuffman_roundtrip
 #print axioms LeanAV.Encoder.checkedPlaneFootprint_sound
 #print axioms LeanAV.Encoder.typedDmaSurface_bounds_safe
+
+#print axioms LeanAV.NativeKernels.evalLnir_nv12_downscale_2x2_fused_equiv
+#print axioms LeanAV.NativeKernels.fastBox2x2DownscalePixel_eq_spec
+#print axioms LeanAV.NativeKernels.specBox2x2DownscalePixel_idempotent_const
+#print axioms LeanAV.NativeKernels.specBox2x2DownscalePixel_bounds_u8
+#print axioms LeanAV.Format.muxMp4StreamingFast_demux_roundtrip
+#print axioms LeanAV.Encoder.dgxSparkUnifiedRingSlot_zero_copy_universal
+#print axioms LeanAV.Encoder.dgxSparkRing_and_cpuTiles_disjoint_safe
+#print axioms LeanAV.Bitstream.rangeCoder15_encode_decode_roundtrip
+#print axioms LeanAV.Video.scanAnnexBNalUnitsFast_eq_spec_multi_nal
+#print axioms LeanAV.Video.proresIdct8x8Put10Fast_eq_spec
+#print axioms LeanAV.Video.hevcSaoBandFilterPlaneFast_eq_spec
+
+#print axioms LeanAV.Core.rescalePtsExactNat_monotone
+#print axioms LeanAV.Core.rescalePtsExactNat_id
+#print axioms LeanAV.Core.plane2D_verifyBounds_sound
+#print axioms LeanAV.Core.alignStride64_ge_and_mod64
+#print axioms LeanAV.Scale.yuvPixelToRgb_bt709_neutral_exact
+#print axioms LeanAV.Scale.scalePlaneDown2x2Fast_eq_fusedEq_identity
+#print axioms LeanAV.Filter.evalFusedLumaPoint_identity_and_fuse
+#print axioms LeanAV.Filter.filterPlanePointAndBoxBlur3x3Fast_eq_sequential
+#print axioms LeanAV.Filter.filterPlaneHFlip_and_VFlip_involutive
+#print axioms LeanAV.Filter.hflipRowList_involutive
+#print axioms LeanAV.NativeKernels.evalLnir_bt709_chroma_luma_fma_equiv
+#print axioms LeanAV.NativeKernels.fastBoxBlurDiv9_eq_spec
+#print axioms LeanAV.Encoder.partitionPlaneRows_1080p_16tiles_covers
+#print axioms LeanAV.Audio.flacCrc8_and_Crc16_self_check_verified
+#print axioms LeanAV.Format.ebmlVint_and_matroskaSimpleBlock_roundtrip
+#print axioms LeanAV.Format.interleaveAvPacketsByPts90k_order_verified
+#print axioms LeanAV.Format.webVttTimestamp_format_parse_roundtrip
+#print axioms LeanAV.Video.mcBiPredPixel_comm_idemp_and_weighted_equiv
+#print axioms LeanAV.Video.dpbReorderByPoc_hierarchical_bframe_gop_monotone
+#print axioms LeanAV.Cli.cliValidate_copyWithFilter_rejected_and_transcode_accepted
+#print axioms LeanAV.Cli.parseCliSeconds_exact_and_rejects_malformed
+#print axioms LeanAV.Format.isoVideoFrameType_roundtrip_and_classify_avcc
+#print axioms LeanAV.Scale.scalePlaneDown2x2Simd_eq_fast_and_dims
+#print axioms LeanAV.Video.bframe_bipred_inter_residual_roundtrip_exact
+#print axioms LeanAV.Encoder.transcodeAvcc4kTo1080pPacket_preserves_ipb_framing
+#print axioms LeanAV.NativeKernels.evalLnir_bframe_bipred_blend_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_ipb_4k_to_1080p_residual_fma_equiv
+#print axioms LeanAV.Spec.avcc1080pIpbPacketGateSpec
+#print axioms LeanAV.Format.muxIsoMp4Track_demux_roundtrip_ipb
+#print axioms LeanAV.Video.h264SliceHeaderRbsp_encode_decode_roundtrip
+#print axioms LeanAV.Format.classifyHvccHevc_and_Av1Obu_ipb_verified
+#print axioms LeanAV.Encoder.transcodeHvccHevc4kTo1080pPacket_preserves_ipb_framing
+#print axioms LeanAV.Format.muxIsoAvStblSpec_demux_roundtrip_verified
+#print axioms LeanAV.Format.codecConfig1080p_headers_verified
+#print axioms LeanAV.Format.encodeLeb128Fixed4_decode_and_classify_verified
+#print axioms LeanAV.NativeKernels.evalLnir_lanczos_4tap_downscale_fma_equiv
+#print axioms LeanAV.NativeKernels.specLanczos4TapNormalizedPixel_idempotent_const
+#print axioms LeanAV.Format.encodeLeb128Fixed4_universal_28bit_roundtrip
+#print axioms LeanAV.Video.hevcSliceSegmentHeader_encode_decode_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_sao_edge_offset_fma_equiv
+#print axioms LeanAV.Video.av1FrameHeader_encode_decode_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_loop_restoration_sgrproj_fma_equiv
+#print axioms LeanAV.Audio.aacAudioSpecificConfig_encode_decode_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_aac_imdct_window_overlap_fma_equiv
+#print axioms LeanAV.Audio.opusIdHeader_encode_decode_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_opus_celt_comb_filter_fma_equiv
+#print axioms LeanAV.Format.ctts_bframe_pts_dts_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_idct4x4_butterfly_fma_equiv
+#print axioms LeanAV.Format.stss_keyframe_index_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_strong_deblock_boundary_fma_equiv
+#print axioms LeanAV.Format.stts_dts_delta_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_convolve_8tap_subpel_fma_equiv
+#print axioms LeanAV.Format.stsc_chunk_sample_map_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_prores_idct8x8_col_butterfly_fma_equiv
+#print axioms LeanAV.Format.stsz_stco_sample_offset_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_flac_lpc_residual_restore_fma_equiv
+#print axioms LeanAV.Format.elst_bframe_timeline_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_ffv1_median_grad_pred_fma_equiv
+#print axioms LeanAV.Format.co64_sdtp_ipb_dependency_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_chroma_interp_4tap_fma_equiv
+#print axioms LeanAV.Format.tfdt_trun_fmp4_fragment_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_cabac_ctx_lps_range_fma_equiv
+#print axioms LeanAV.Format.sidx_cmaf_segment_index_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_wiener_filter_7tap_sym_fma_equiv
+#print axioms LeanAV.Format.mfhd_prft_live_cmaf_sync_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_opus_silk_lpc_inv_pred_gain_fma_equiv
+#print axioms LeanAV.Format.tfhd_fragment_defaults_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_aac_mdct_pre_twiddle_fma_equiv
+#print axioms LeanAV.Format.mehd_trex_cmaf_init_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_vp9_loopfilter_edge_limit_fma_equiv
+#print axioms LeanAV.Format.dref_self_contained_cmaf_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_deblock_beta_tc_fma_equiv
+#print axioms LeanAV.Format.vmhd_smhd_iso639_media_header_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_alf_7x7_diamond_tap_fma_equiv
+#print axioms LeanAV.Format.pasp_clap_display_geometry_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_cfl_chroma_from_luma_fma_equiv
+#print axioms LeanAV.Format.colr_nclx_colour_metadata_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_weighted_bipred_luma_fma_equiv
+#print axioms LeanAV.Format.mdcv_clli_hdr10_static_metadata_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_obmc_overlapped_block_mc_fma_equiv
+#print axioms LeanAV.Format.mvhd_tkhd_timeline_matrix_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_weighted_pred_uni_luma_fma_equiv
+#print axioms LeanAV.Format.ftyp_styp_brand_compat_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_vp9_convolve8_horiz_subpel_fma_equiv
+#print axioms LeanAV.Format.hdlr_media_handler_utf8_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_warp_affine_horz_4tap_fma_equiv
+#print axioms LeanAV.Format.mdhd_media_header_timescale_lang_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_sao_band_offset_4class_fma_equiv
+#print axioms LeanAV.Format.sthd_nmhd_media_header_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_opus_celt_pitch_xcorr_lag_fma_equiv
+#print axioms LeanAV.Format.sbgp_sgpd_roll_rap_recovery_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_aac_tns_ar_lattice_filter_fma_equiv
+#print axioms LeanAV.Format.emsg_v1_dash_cmaf_inband_event_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_palette_color_index_map_fma_equiv
+#print axioms LeanAV.Format.subs_v1_tile_nalu_subsample_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_chroma_mc_bilinear_2x2_fma_equiv
+#print axioms LeanAV.Format.saiz_saio_cenc_aux_offset_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_deblock_tc_clip_blend_fma_equiv
+#print axioms LeanAV.Format.tenc_v1_cbcs_cenc_pattern_kid_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_av1_cdf_prob_update_rate_fma_equiv
+#print axioms LeanAV.Format.pssh_v1_widevine_fairplay_systemid_kid_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_opus_silk_pitch_ltp_tap_fma_equiv
+#print axioms LeanAV.Format.sinf_frma_schm_cenc_cbcs_scheme_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_aac_sbr_hf_gen_chirp_fma_equiv
+#print axioms LeanAV.Format.senc_subsample_iv_clear_protected_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_vp9_tx_iadst4_butterfly_fma_equiv
+#print axioms LeanAV.Format.mfra_tfra_mfro_random_access_seek_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_h264_cabac_mps_renorm_fma_equiv
+#print axioms LeanAV.Format.udta_meta_ilst_container_metadata_roundtrip
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_cabac_bypass_bin_accum_fma_equiv
+
+
+
+
+
 

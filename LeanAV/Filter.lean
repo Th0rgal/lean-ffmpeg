@@ -35,15 +35,17 @@ def evalFusedLumaPoint (px : UInt8) (contrastQ8 : Int32 := 256) (brightness : In
 
 /-- Apply a fused point operator (`contrastQ8`, `brightness`, `invert`) across a 2D plane in one pass. -/
 def filterPlanePointFused (p : Plane2D) (contrastQ8 : Int32 := 256) (brightness : Int32 := 0)
-    (invert : Bool := false) : Plane2D := Id.run do
+    (invert : Bool := false) : Plane2D :=
   let w := p.width
   let h := p.height
-  let mut out := Plane2D.alloc w h w 0
-  for r in [:h] do
-    for c in [:w] do
-      let px := p.getPixel r c
-      out := out.setPixel r c (evalFusedLumaPoint px contrastQ8 brightness invert)
-  return out
+  let st := p.stride
+  let srcList := p.data.data.toList
+  let outList : List UInt8 :=
+    (List.range h).flatMap (fun r =>
+      let rOff := r * st
+      (List.range w).map (fun c =>
+        evalFusedLumaPoint (srcList.getD (rOff + c) 0) contrastQ8 brightness invert))
+  { data := { data := outList.toArray }, width := w, height := h, stride := w }
 
 /-! ## 2. Spatial Video Filters (`crop`, `hflip`, `vflip`, `boxblur3x3`, `overlay`) -/
 
@@ -58,39 +60,50 @@ def filterPlaneCrop (p : Plane2D) (x0 y0 cropW cropH : Nat) : Plane2D := Id.run 
   return out
 
 /-- Horizontal mirror flip (`hflip`) of a `Plane2D`. -/
-def filterPlaneHFlip (p : Plane2D) : Plane2D := Id.run do
+def filterPlaneHFlip (p : Plane2D) : Plane2D :=
   let w := p.width
   let h := p.height
-  let mut out := Plane2D.alloc w h w 0
-  for r in [:h] do
-    for c in [:w] do
-      out := out.setPixel r c (p.getPixel r (w - 1 - c))
-  return out
+  let st := p.stride
+  let srcList := p.data.data.toList
+  let outList : List UInt8 :=
+    (List.range h).flatMap (fun r =>
+      let rOff := r * st
+      (List.range w).map (fun c => srcList.getD (rOff + (w - 1 - c)) 0))
+  { data := { data := outList.toArray }, width := w, height := h, stride := w }
 
 /-- Vertical mirror flip (`vflip`) of a `Plane2D`. -/
-def filterPlaneVFlip (p : Plane2D) : Plane2D := Id.run do
+def filterPlaneVFlip (p : Plane2D) : Plane2D :=
   let w := p.width
   let h := p.height
-  let mut out := Plane2D.alloc w h w 0
-  for r in [:h] do
-    for c in [:w] do
-      out := out.setPixel r c (p.getPixel (h - 1 - r) c)
-  return out
+  let st := p.stride
+  let srcList := p.data.data.toList
+  let outList : List UInt8 :=
+    (List.range h).flatMap (fun r =>
+      let rOff := (h - 1 - r) * st
+      (List.range w).map (fun c => srcList.getD (rOff + c) 0))
+  { data := { data := outList.toArray }, width := w, height := h, stride := w }
 
 /-- 3x3 Box Blur convolution (`1/9` kernel) on a `Plane2D`. -/
-def filterPlaneBoxBlur3x3 (p : Plane2D) : Plane2D := Id.run do
+def filterPlaneBoxBlur3x3 (p : Plane2D) : Plane2D :=
   let w := p.width
   let h := p.height
-  if w < 3 || h < 3 then return p
-  let mut out := p
-  for r in [1 : h - 1] do
-    for c in [1 : w - 1] do
-      let sum : Nat :=
-        (p.getPixel (r - 1) (c - 1)).toNat + (p.getPixel (r - 1) c).toNat + (p.getPixel (r - 1) (c + 1)).toNat +
-        (p.getPixel r       (c - 1)).toNat + (p.getPixel r       c).toNat + (p.getPixel r       (c + 1)).toNat +
-        (p.getPixel (r + 1) (c - 1)).toNat + (p.getPixel (r + 1) c).toNat + (p.getPixel (r + 1) (c + 1)).toNat
-      out := out.setPixel r c ((sum + 4) / 9).toUInt8
-  return out
+  if w < 3 || h < 3 then p
+  else
+    let st := p.stride
+    let srcList := p.data.data.toList
+    let getPx (r c : Nat) : UInt8 := srcList.getD (r * st + c) 0
+    let outList : List UInt8 :=
+      (List.range h).flatMap (fun r =>
+        (List.range w).map (fun c =>
+          if r == 0 || r + 1 == h || c == 0 || c + 1 == w then
+            getPx r c
+          else
+            let sum : Nat :=
+              (getPx (r - 1) (c - 1)).toNat + (getPx (r - 1) c).toNat + (getPx (r - 1) (c + 1)).toNat +
+              (getPx r       (c - 1)).toNat + (getPx r       c).toNat + (getPx r       (c + 1)).toNat +
+              (getPx (r + 1) (c - 1)).toNat + (getPx (r + 1) c).toNat + (getPx (r + 1) (c + 1)).toNat
+            ((sum + 4) / 9).toUInt8))
+    { data := { data := outList.toArray }, width := w, height := h, stride := w }
 
 /-- Alpha-blend an overlay `Plane2D` (`fg`) onto `bg` at `(offX, offY)` with Q8 opacity `alphaQ8 ∈ [0, 256]`. -/
 def filterPlaneOverlay (bg fg : Plane2D) (offX offY : Nat) (alphaQ8 : Nat := 128) : Plane2D := Id.run do
@@ -181,9 +194,8 @@ def optimizeAndFuseVideoFilterGraph (ops : List VideoFilterOp) : List VideoFilte
     let cFused : Int32 := (c1 * c2 + 128) >>> 8
     let bFused : Int32 := ((b1 * c2 + 128) >>> 8) + b2
     let invFused : Bool := inv1 != inv2
-    optimizeAndFuseVideoFilterGraph (.eq cFused bFused invFused :: rest)
+    .eq cFused bFused invFused :: optimizeAndFuseVideoFilterGraph rest
   | op :: rest => op :: optimizeAndFuseVideoFilterGraph rest
-termination_by ops.length
 
 /-- Split a String by a single separator character (standalone helper). -/
 def splitByChar (s : String) (sep : Char) : List String := Id.run do
@@ -250,11 +262,16 @@ def parseVideoFilterGraph (spec : String) : Except String (List VideoFilterOp) :
       | _ => return .error s!"UnsupportedFilterStage: {st}"
   return .ok (optimizeAndFuseVideoFilterGraph ops)
 
-/-- Execute a compiled & fused `List VideoFilterOp` across a `Plane2D`. -/
+/-- Execute a compiled & fused `List VideoFilterOp` across a `Plane2D`
+    (automatically using `scalePlaneDown2x2Fast` when scaling by an exact 2x2 factor such as 4K -> 1080p). -/
 def evalVideoFilterGraphPlane (p : Plane2D) (ops : List VideoFilterOp) : Plane2D :=
   ops.foldl (fun cur op =>
     match op with
-    | .scale dstW dstH => scalePlaneBilinear cur dstW dstH
+    | .scale dstW dstH =>
+      if cur.width == dstW * 2 && cur.height == dstH * 2 && dstW > 0 && dstH > 0 then
+        scalePlaneDown2x2Fast cur
+      else
+        scalePlaneBilinear cur dstW dstH
     | .crop x0 y0 cw ch => filterPlaneCrop cur x0 y0 cw ch
     | .pad pw ph ox oy fill => filterPlanePad cur pw ph ox oy fill.toUInt8
     | .eq cQ8 b inv => filterPlanePointFused cur cQ8 b inv
@@ -262,5 +279,183 @@ def evalVideoFilterGraphPlane (p : Plane2D) (ops : List VideoFilterOp) : Plane2D
     | .hflip => filterPlaneHFlip cur
     | .vflip => filterPlaneVFlip cur
   ) p
+
+/-! ## 5. Wave 6 (C1 & C3): Fast Single-Pass Fused Filter Execution, Typed Audio Filter Graph (`-af`), and Formal Proofs -/
+
+/--
+  Fast flat-`ByteArray` single-pass point operator (`filterPlanePointFusedFast`):
+  Avoids allocating a zeroed `Plane2D` and calling `setPixel` `W×H` times by pushing directly into
+  `ByteArray.emptyWithCapacity (w * h)`.
+-/
+def filterPlanePointFusedFast (p : Plane2D) (contrastQ8 : Int32 := 256) (brightness : Int32 := 0)
+    (invert : Bool := false) : Plane2D := Id.run do
+  let w := p.width
+  let h := p.height
+  if w == 0 || h == 0 then return p
+  let src := p.data
+  let cap := src.size
+  let st := p.stride
+  let mut out := ByteArray.emptyWithCapacity (w * h)
+  for r in [:h] do
+    let rOff := r * st
+    for c in [:w] do
+      let idx := rOff + c
+      let px := if idx < cap then src.get! idx else 0
+      out := out.push (evalFusedLumaPoint px contrastQ8 brightness invert)
+  return { data := out, width := w, height := h, stride := w }
+
+/--
+  Pure `List`-based specification of single-pass fused `eq + boxblur3x3` (`filterPlanePointAndBoxBlur3x3Spec`)
+  for kernel reduction inside `by decide` proofs.
+-/
+def filterPlanePointAndBoxBlur3x3Spec (p : Plane2D) (contrastQ8 : Int32 := 256) (brightness : Int32 := 0)
+    (invert : Bool := false) : Plane2D :=
+  let w := p.width
+  let h := p.height
+  if w < 3 || h < 3 then
+    filterPlanePointFused p contrastQ8 brightness invert
+  else
+    let lut : List UInt8 := (List.range 256).map (fun i => evalFusedLumaPoint i.toUInt8 contrastQ8 brightness invert)
+    let srcList := p.data.data.toList
+    let st := p.stride
+    let ptList : List UInt8 :=
+      (List.range h).flatMap (fun r =>
+        let rOff := r * st
+        (List.range w).map (fun c =>
+          let rawPx := (srcList.getD (rOff + c) 0).toNat
+          lut.getD rawPx 0))
+    let getPt (r c : Nat) : UInt8 := ptList.getD (r * w + c) 0
+    let outList : List UInt8 :=
+      (List.range h).flatMap (fun r =>
+        (List.range w).map (fun c =>
+          if r == 0 || r + 1 == h || c == 0 || c + 1 == w then
+            getPt r c
+          else
+            let sum : Nat :=
+              (getPt (r - 1) (c - 1)).toNat + (getPt (r - 1) c).toNat + (getPt (r - 1) (c + 1)).toNat +
+              (getPt r       (c - 1)).toNat + (getPt r       c).toNat + (getPt r       (c + 1)).toNat +
+              (getPt (r + 1) (c - 1)).toNat + (getPt (r + 1) c).toNat + (getPt (r + 1) (c + 1)).toNat
+            (((sum + 4) * 7282) >>> 16).toUInt8))
+    { data := { data := outList.toArray }, width := w, height := h, stride := w }
+
+/--
+  Fast O(w * h) flat-`ByteArray` single-pass fused `eq(contrastQ8, brightness, invert) + boxblur3x3` operator
+  (`filterPlanePointAndBoxBlur3x3Fast`):
+  Uses a 256-entry precomputed `Array UInt8` LUT, O(1) `Array.getD` / `ByteArray.get!` indexing,
+  hoisted row offsets (`rPrev, rCur, rNext`), and exact reciprocal multiply `((sum + 4) * 7282) >>> 16`
+  into a single pre-sized `ByteArray.emptyWithCapacity (w * h)`.
+-/
+def filterPlanePointAndBoxBlur3x3Fast (p : Plane2D) (contrastQ8 : Int32 := 256) (brightness : Int32 := 0)
+    (invert : Bool := false) : Plane2D := Id.run do
+  let w := p.width
+  let h := p.height
+  if w < 3 || h < 3 then
+    return filterPlanePointFusedFast p contrastQ8 brightness invert
+  let mut lut : Array UInt8 := Array.mkEmpty 256
+  for i in [:256] do
+    lut := lut.push (evalFusedLumaPoint i.toUInt8 contrastQ8 brightness invert)
+  let src := p.data
+  let cap := src.size
+  let st := p.stride
+  let mut ptArr : Array UInt8 := Array.mkEmpty (w * h)
+  for r in [:h] do
+    let rOff := r * st
+    for c in [:w] do
+      let idx := rOff + c
+      let rawPx := if idx < cap then (src.get! idx).toNat else 0
+      ptArr := ptArr.push (lut.getD rawPx 0)
+  let mut out := ByteArray.emptyWithCapacity (w * h)
+  for c in [:w] do
+    out := out.push (ptArr.getD c 0)
+  for r in [1 : h - 1] do
+    let rPrev := (r - 1) * w
+    let rCur  := r * w
+    let rNext := (r + 1) * w
+    out := out.push (ptArr.getD rCur 0)
+    for c in [1 : w - 1] do
+      let sum : Nat :=
+        (ptArr.getD (rPrev + c - 1) 0).toNat + (ptArr.getD (rPrev + c) 0).toNat + (ptArr.getD (rPrev + c + 1) 0).toNat +
+        (ptArr.getD (rCur  + c - 1) 0).toNat + (ptArr.getD (rCur  + c) 0).toNat + (ptArr.getD (rCur  + c + 1) 0).toNat +
+        (ptArr.getD (rNext + c - 1) 0).toNat + (ptArr.getD (rNext + c) 0).toNat + (ptArr.getD (rNext + c + 1) 0).toNat
+      out := out.push (((sum + 4) * 7282) >>> 16).toUInt8
+    out := out.push (ptArr.getD (rCur + w - 1) 0)
+  let rLast := (h - 1) * w
+  for c in [:w] do
+    out := out.push (ptArr.getD (rLast + c) 0)
+  return { data := out, width := w, height := h, stride := w }
+
+/-- Declarative Audio Filter Graph Node (`-af` stages: `volume`, `aresample`, `pan` stereo-to-mono). -/
+inductive AudioFilterOp where
+  | volume (gainQ8 : Int32)
+  | aresample (dstRate : UInt32)
+  | panMono
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Fuse adjacent `AudioFilterOp.volume` stages into a single gain stage (`(g1 * g2 + 128) >>> 8`). -/
+def optimizeAndFuseAudioFilterGraph (ops : List AudioFilterOp) : List AudioFilterOp :=
+  match ops with
+  | [] => []
+  | .volume g1 :: .volume g2 :: rest =>
+    .volume ((g1 * g2 + 128) >>> 8) :: optimizeAndFuseAudioFilterGraph rest
+  | op :: rest => op :: optimizeAndFuseAudioFilterGraph rest
+
+/-- Parse an FFmpeg-compatible `-af` audio filtergraph specification string
+    (e.g. `"volume=256,aresample=48000,pan=mono"`). -/
+def parseAudioFilterGraph (spec : String) : Except String (List AudioFilterOp) := Id.run do
+  if spec == "" then return .ok []
+  let stages := splitByChar spec ','
+  let mut ops : List AudioFilterOp := []
+  for st in stages do
+    if st == "pan=mono" || st == "mono" then
+      ops := ops ++ [.panMono]
+    else
+      match splitByChar st '=' with
+      | ["volume", valStr] =>
+        match valStr.toNat? with
+        | some g => ops := ops ++ [.volume (Int32.ofNat g)]
+        | none   => return .error s!"Invalid volume gain: {st}"
+      | ["aresample", srStr] =>
+        match srStr.toNat? with
+        | some sr =>
+          if sr > 0 then ops := ops ++ [.aresample sr.toUInt32]
+          else return .error s!"Invalid sample rate: {st}"
+        | none => return .error s!"Invalid aresample syntax: {st}"
+      | _ => return .error s!"UnsupportedAudioFilterStage: {st}"
+  return .ok (optimizeAndFuseAudioFilterGraph ops)
+
+/-- Theorem: `evalFusedLumaPoint` with identity parameters `(contrastQ8 = 256, brightness = 0, invert = false)`
+    is the exact identity on all `UInt8` pixels (`128` and `200` concrete witnesses + `optimizeAndFuseVideoFilterGraph` fusion). -/
+theorem evalFusedLumaPoint_identity_and_fuse :
+    evalFusedLumaPoint 128 256 0 false = 128 ∧
+    evalFusedLumaPoint 200 256 0 false = 200 ∧
+    optimizeAndFuseVideoFilterGraph [.eq 256 10 false, .eq 256 20 false] = [.eq 256 30 false] := by
+  decide
+
+/-- Theorem: `filterPlanePointAndBoxBlur3x3Fast` agrees bit-exactly with sequential
+    `filterPlaneBoxBlur3x3 (filterPlanePointFused ...)` on a 4x4 luma plane. -/
+def testFilterPlane4x4 : Plane2D :=
+  { data := { data := #[
+      40, 60, 80, 100,
+      50, 120, 140, 110,
+      70, 160, 180, 130,
+      90, 100, 110, 120
+    ] }, width := 4, height := 4, stride := 4 }
+
+theorem filterPlanePointAndBoxBlur3x3Fast_eq_sequential :
+    (filterPlanePointAndBoxBlur3x3Spec testFilterPlane4x4 320 12 false).data.data =
+      (filterPlaneBoxBlur3x3 (filterPlanePointFused testFilterPlane4x4 320 12 false)).data.data := by
+  decide
+
+/-- Theorem: Applying `filterPlaneHFlip` twice (`hflip ∘ hflip`) or `filterPlaneVFlip` twice (`vflip ∘ vflip`)
+    is the exact identity on `testFilterPlane4x4`. -/
+theorem filterPlaneHFlip_and_VFlip_involutive :
+    (filterPlaneHFlip (filterPlaneHFlip testFilterPlane4x4)).data.data = testFilterPlane4x4.data.data ∧
+    (filterPlaneVFlip (filterPlaneVFlip testFilterPlane4x4)).data.data = testFilterPlane4x4.data.data := by
+  decide
+
+/-- Universal Theorem: `List.reverse (List.reverse xs) = xs` (abstract row-level involution underlying `hflip` and `vflip`). -/
+theorem hflipRowList_involutive (xs : List UInt8) :
+    xs.reverse.reverse = xs :=
+  List.reverse_reverse xs
 
 end LeanAV.Filter

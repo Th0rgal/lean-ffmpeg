@@ -43,6 +43,14 @@ def writeMediaFileAtomic (dstPath : String) (ba : ByteArray) : IO (SysResult UIn
     | .error e => pure (.error e)
     | .ok () => pure (.ok (xxh64Slice (ByteSlice.ofByteArray ba)))
 
+/-- Fast streaming media file writer (`writeMediaFileStreaming`):
+    Writes `ba` directly to `dstPath` via `LeanSys.Posix.withFd` (`O_CREAT|O_TRUNC|O_WRONLY`)
+    without forcing a synchronous hardware `fsync` or computing a secondary full-file XXH64 hash. -/
+def writeMediaFileStreaming (dstPath : String) (ba : ByteArray) : IO (SysResult UInt64) := do
+  match ← withFd dstPath 4 (fun fd => writeAll fd ba false) with
+  | .error e => pure (.error e)
+  | .ok n => pure (.ok n.toUInt64)
+
 /-- Record a verified transcode checkpoint `(streamKey, packetDigest)` in a `LeanSys.Store.Handle` WAL
     and materialize the packet payload into the content-addressable store (`casPut`). -/
 def commitPacketToCasStore (st : Handle) (streamKey : String) (pkt : AVPacketView) :

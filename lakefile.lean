@@ -7,6 +7,17 @@ package «lean-ffmpeg» where
 
 require «lean-sys» from "../lean-sys"
 
+target leanav_simd_kernels_o pkg : FilePath := do
+  let oFile := pkg.buildDir / "c" / "leanav_simd_kernels.o"
+  let srcJob ← inputTextFile <| pkg.dir / "c" / "leanav_simd_kernels.c"
+  let leanIncludeDir ← getLeanIncludeDir
+  buildO oFile srcJob #["-I", leanIncludeDir.toString] #["-O3", "-fPIC"] "cc"
+
+extern_lib libleanav_dsp pkg := do
+  let simdO ← leanav_simd_kernels_o.fetch
+  let name := nameToStaticLib "leanav_dsp"
+  buildStaticLib (pkg.staticLibDir / name) #[simdO]
+
 @[default_target]
 lean_lib «LeanAV» where
   roots := #[`LeanAV]

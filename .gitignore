@@ -3,3 +3,5 @@ build/
 .lean-native/
 artifacts/
 lake-manifest.json
+*.o
+

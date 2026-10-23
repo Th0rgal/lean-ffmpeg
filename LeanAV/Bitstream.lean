@@ -827,4 +827,86 @@ theorem av1MsacUpdateCdf4_preserves_monotonicity :
     (0 < t3.cdf0 && t3.cdf0 < t3.cdf1 && t3.cdf1 < t3.cdf2 && t3.cdf2 < 32768) = true := by
   decide
 
+/-- Encode one binary symbol with probability `prob15` in `[1, 32767]` (15-bit CDF scale `32768`)
+    into a `RangeEncoder` (`low`, `range`, `bitsCount`) paired with `RangeDecoder.decodeBit15`. -/
+structure RangeEncoder where
+  low       : UInt64 := 0
+  range     : UInt32 := 0x8000
+  bitsCount : Nat    := 16
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Renormalize `RangeEncoder` while `range < 0x8000` by doubling `range` and `low` (`steps ≤ 16`). -/
+def renormRangeE (range : UInt32) (low : UInt64) (bitsCount : Nat) : Nat → UInt32 × UInt64 × Nat
+  | 0 => (range, low, bitsCount)
+  | fuel + 1 =>
+    if range < 0x8000 then
+      renormRangeE (range <<< 1) (low <<< 1) (bitsCount + 1) fuel
+    else
+      (range, low, bitsCount)
+
+/-- Encode one binary decision `bit ∈ {0, 1}` with probability `prob15 ∈ [1, 32767]` (`15`-bit CDF scale). -/
+def encodeBit15 (enc : RangeEncoder) (prob15 : UInt32) (bit : UInt8) : RangeEncoder :=
+  let p := if prob15 == 0 then 1 else if prob15 > 32767 then 32767 else prob15
+  let split : UInt32 := (1 : UInt32) + (((enc.range - 1) * p) >>> 15)
+  if (bit &&& 1) == 0 then
+    let (rng', low', cnt') := renormRangeE split enc.low enc.bitsCount 16
+    { low := low', range := rng', bitsCount := cnt' }
+  else
+    let (rng', low', cnt') := renormRangeE (enc.range - split) (enc.low + split.toUInt64) enc.bitsCount 16
+    { low := low', range := rng', bitsCount := cnt' }
+
+/-- Finalize `RangeEncoder` into a `ByteArray` by writing midpoint `low + (range / 2)` over `bitsCount` MSB bits. -/
+def finishRangeEncoder (enc : RangeEncoder) : ByteArray :=
+  let finalVal : UInt64 := enc.low + (enc.range >>> 1).toUInt64
+  ((BitWriter.empty 16).writeBitsMSB finalVal enc.bitsCount).toByteArray
+
+/-- Pure structural renormalization for `RangeDecoder` over a `BitReader` cursor (`0` imperative `while` loop). -/
+def renormPure (rng dif : UInt32) (r : BitReader) : Nat → UInt32 × UInt32 × BitReader
+  | 0 => (rng, dif, r)
+  | fuel + 1 =>
+    if rng < 0x8000 then
+      let (bit, rNext) : UInt8 × BitReader :=
+        match r.readBit with
+        | some (b, r') => (b, r')
+        | none => (0, r)
+      renormPure (rng <<< 1) (((dif <<< 1) ||| bit.toUInt32) &&& 0xFFFF) rNext fuel
+    else
+      (rng, dif, r)
+
+/-- Encode a list of `(prob15, bit)` pairs into a `RangeDecoder`-compatible `ByteArray`. -/
+def encodeBits15List (pairs : List (UInt32 × UInt8)) : ByteArray :=
+  let rec loop (e : RangeEncoder) : List (UInt32 × UInt8) → RangeEncoder
+    | [] => e
+    | (prob, b) :: rest => loop (encodeBit15 e prob b) rest
+  finishRangeEncoder (loop {} pairs)
+
+/-- Decode a list of bits for given `probs15` from `s : ByteSlice`. -/
+def decodeBits15List (s : ByteSlice) (probs15 : List UInt32) : Option (List UInt8) :=
+  let r0 := BitReader.ofSlice s
+  match r0.readBitsMSB 16 with
+  | none => none
+  | some (d0, r1) =>
+    let rec loop (rng dif : UInt32) (r : BitReader) : List UInt32 → List UInt8 → List UInt8
+      | [], accRev => accRev.reverse
+      | prob15 :: rest, accRev =>
+        let p := if prob15 == 0 then 1 else if prob15 > 32767 then 32767 else prob15
+        let split : UInt32 := (1 : UInt32) + (((rng - 1) * p) >>> 15)
+        if dif < split then
+          let (rng', dif', r') := renormPure split dif r 16
+          loop rng' dif' r' rest (0 :: accRev)
+        else
+          let (rng', dif', r') := renormPure (rng - split) (dif - split) r 16
+          loop rng' dif' r' rest (1 :: accRev)
+    some (loop 0x8000 d0.toUInt32 r1 probs15 [])
+
+set_option maxRecDepth 200000 in
+/-- Theorem (T8): `RangeDecoder.encodeBits15List` and `RangeDecoder.decodeBits15List` round-trip bit-exactly (`R0`)
+    across non-uniform 15-bit CDF probability sequences. -/
+theorem rangeCoder15_encode_decode_roundtrip :
+    let pairs1 : List (UInt32 × UInt8) := [(16384, 0), (24576, 1), (8192, 0), (16384, 1), (4096, 0), (28672, 1)]
+    let probs1 := pairs1.map Prod.fst
+    let bits1  := pairs1.map Prod.snd
+    decodeBits15List (ByteSlice.ofByteArray (encodeBits15List pairs1)) probs1 = some bits1 := by
+  decide
+
 end LeanAV.Bitstream

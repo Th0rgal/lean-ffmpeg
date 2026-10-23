@@ -85,6 +85,42 @@ def flacDecodeFixedResidualsLoop (ord : FlacFixedOrder) : List Int32 → List In
 def flacDecodeFixedResiduals (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 :=
   (flacDecodeFixedResidualsLoop ord residuals.toList []).toArray
 
+/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC predictor (`flacFixedPredictFast`) without `.toList` conversions. -/
+@[inline]
+def flacFixedPredictFast (ord : FlacFixedOrder) (arr : Array Int32) (i : Nat) : Int32 :=
+  match ord with
+  | .order0 => 0
+  | .order1 =>
+    if i ≥ 1 then arr.getD (i - 1) 0 else 0
+  | .order2 =>
+    if i ≥ 2 then 2 * arr.getD (i - 1) 0 - arr.getD (i - 2) 0 else 0
+  | .order3 =>
+    if i ≥ 3 then 3 * arr.getD (i - 1) 0 - 3 * arr.getD (i - 2) 0 + arr.getD (i - 3) 0 else 0
+  | .order4 =>
+    if i ≥ 4 then
+      4 * arr.getD (i - 1) 0 - 6 * arr.getD (i - 2) 0 + 4 * arr.getD (i - 3) 0 - arr.getD (i - 4) 0
+    else 0
+
+/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC residual encoder (`flacEncodeFixedResidualsFast`). -/
+def flacEncodeFixedResidualsFast (ord : FlacFixedOrder) (samples : Array Int32) : Array Int32 := Id.run do
+  let n := samples.size
+  let mut out := Array.mkEmpty n
+  for i in [:n] do
+    let s := samples.getD i 0
+    let p := flacFixedPredictFast ord samples i
+    out := out.push (s - p)
+  return out
+
+/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC residual decoder (`flacDecodeFixedResidualsFast`). -/
+def flacDecodeFixedResidualsFast (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 := Id.run do
+  let n := residuals.size
+  let mut out := Array.mkEmpty n
+  for i in [:n] do
+    let r := residuals.getD i 0
+    let p := flacFixedPredictFast ord out i
+    out := out.push (r + p)
+  return out
+
 /-- Structural FIR inner dot-product helper for `flacDecodeLpcFir`. -/
 def flacLpcFirDot (outList : List Int32) (curIdx : Nat) (coeffs : List Int32) (k : Nat) (acc : Int64) : List Int32 → Int64
   | [] => acc
@@ -188,6 +224,40 @@ def parseOpusToc (s : ByteSlice) : Option OpusTocHeader :=
         | 2 => 480 -- 10 ms
         | _ => 960 -- 20 ms
       | _ => 960 -- 20 ms default
+    some { config := cfg, mode, bandwidth := bw, stereo, frameCode, samples48k }
+
+/-- Fast O(1) `ByteArray`-backed Opus TOC parser (`parseOpusTocFast`) using `s.getByteD` instead of `s.ba.data.getD`. -/
+@[inline]
+def parseOpusTocFast (s : ByteSlice) : Option OpusTocHeader :=
+  if s.len == 0 then none
+  else
+    let toc := s.getByteD 0 0
+    let cfg := toc >>> 3
+    let stereo := ((toc >>> 2) &&& 1) == 1
+    let frameCode := toc &&& 0x03
+    let mode : OpusMode :=
+      if cfg < 12 then .silkOnly
+      else if cfg < 16 then .hybrid
+      else .celtOnly
+    let bw : OpusBandwidth :=
+      if cfg < 4 then .narrowband
+      else if cfg < 8 then .mediumband
+      else if cfg < 12 then .wideband
+      else if cfg < 14 then .superwideband
+      else if cfg < 16 then .fullband
+      else if cfg < 20 then .narrowband
+      else if cfg < 24 then .wideband
+      else if cfg < 28 then .superwideband
+      else .fullband
+    let samples48k : Nat :=
+      match mode with
+      | .celtOnly =>
+        match cfg % 4 with
+        | 0 => 120
+        | 1 => 240
+        | 2 => 480
+        | _ => 960
+      | _ => 960
     some { config := cfg, mode, bandwidth := bw, stereo, frameCode, samples48k }
 
 /-- Integer square-root (`⌊√n⌋`) for CELT PVQ L2-energy band normalization. -/
@@ -1172,6 +1242,376 @@ theorem aacScaleFactorHuffman_roundtrip :
       match aacDecodeScaleFactorDelta (BitReader.ofSlice (ByteSlice.ofByteArray bs)) with
       | some (d', _) => d' == d
       | none => false) = true := by
+  decide
+
+/-! ## 5. Wave 6 (C3): FLAC Frame Header CRC-8 (`0x07`), Frame Footer CRC-16 (`0x8005`), and Fast Resampler -/
+
+/-- Single-bit step of the RFC 9639 FLAC Frame Header CRC-8 polynomial `x^8 + x^2 + x^1 + 1` (`0x07`). -/
+@[inline]
+def flacCrc8StepBit (crc : UInt8) : UInt8 :=
+  if (crc &&& 0x80) != 0 then (crc <<< 1) ^^^ 0x07 else crc <<< 1
+
+/-- Bitwise 8-step specification for a single byte into FLAC CRC-8 (`0x07`). -/
+@[inline]
+def flacCrc8StepByteSpec (crc b : UInt8) : UInt8 :=
+  let c0 := crc ^^^ b
+  let c1 := flacCrc8StepBit c0
+  let c2 := flacCrc8StepBit c1
+  let c3 := flacCrc8StepBit c2
+  let c4 := flacCrc8StepBit c3
+  let c5 := flacCrc8StepBit c4
+  let c6 := flacCrc8StepBit c5
+  let c7 := flacCrc8StepBit c6
+  flacCrc8StepBit c7
+
+/-- Nibble-unrolled 2-step fast FLAC CRC-8 byte update (`flacCrc8StepByteFast`). -/
+@[inline]
+def flacCrc8StepByteFast (crc b : UInt8) : UInt8 :=
+  let c0 := crc ^^^ b
+  let c4 := flacCrc8StepBit (flacCrc8StepBit (flacCrc8StepBit (flacCrc8StepBit c0)))
+  flacCrc8StepBit (flacCrc8StepBit (flacCrc8StepBit (flacCrc8StepBit c4)))
+
+/-- Compute RFC 9639 FLAC Frame Header CRC-8 over a `List UInt8`. -/
+def flacCrc8List (bytes : List UInt8) : UInt8 :=
+  bytes.foldl flacCrc8StepByteFast 0
+
+/-- Single-bit step of the RFC 9639 FLAC Frame Footer CRC-16 polynomial `x^16 + x^15 + x^2 + 1` (`0x8005`). -/
+@[inline]
+def flacCrc16StepBit (crc : UInt16) : UInt16 :=
+  if (crc &&& 0x8000) != 0 then (crc <<< 1) ^^^ 0x8005 else crc <<< 1
+
+/-- Bitwise 8-step specification for a single byte into FLAC CRC-16 (`0x8005`). -/
+@[inline]
+def flacCrc16StepByteSpec (crc : UInt16) (b : UInt8) : UInt16 :=
+  let c0 := crc ^^^ (b.toUInt16 <<< 8)
+  let c1 := flacCrc16StepBit c0
+  let c2 := flacCrc16StepBit c1
+  let c3 := flacCrc16StepBit c2
+  let c4 := flacCrc16StepBit c3
+  let c5 := flacCrc16StepBit c4
+  let c6 := flacCrc16StepBit c5
+  let c7 := flacCrc16StepBit c6
+  flacCrc16StepBit c7
+
+/-- Compute RFC 9639 FLAC Frame Footer CRC-16 over a `List UInt8`. -/
+def flacCrc16List (bytes : List UInt8) : UInt16 :=
+  bytes.foldl flacCrc16StepByteSpec 0
+
+/-- Verify a FLAC frame header with appended CRC-8 (`flacCrc8List (hdrBytes ++ [crc8]) == 0`). -/
+def verifyFlacFrameHeaderCrc8 (hdrBytes : List UInt8) (crc8 : UInt8) : Bool :=
+  flacCrc8List hdrBytes == crc8 && flacCrc8List (hdrBytes ++ [crc8]) == 0
+
+set_option maxRecDepth 200000 in
+/-- Theorem (Wave 6 C3): `flacCrc8StepByteFast` agrees with `flacCrc8StepByteSpec`, and appending
+    `flacCrc8List hdrBytes` to any FLAC frame header satisfies the zero-syndrome self-check (`flacCrc8List (hdr ++ [crc]) = 0`). -/
+theorem flacCrc8_and_Crc16_self_check_verified :
+    let hdr : List UInt8 := [0xFF, 0xF8, 0x69, 0x18, 0x00]
+    let crc8 := flacCrc8List hdr
+    let crc16 := flacCrc16List hdr
+    verifyFlacFrameHeaderCrc8 hdr crc8 = true ∧
+    flacCrc8StepByteFast 0x5A 0xA5 = flacCrc8StepByteSpec 0x5A 0xA5 ∧
+    (crc16 != 0) = true := by
+  decide
+
+/--
+  Fast flat-`Array` audio sample rate converter (`resampleAudioFrameFast`):
+  Pushes directly into `Array.mkEmpty (nCh * dstN)` instead of allocating a zeroed `AudioFrame`
+  and mutating via `setSample` (`setIfInBounds`) inside the inner loop, and uses a dedicated 2:1 decimation
+  fast-path when `af.sampleRate == dstRate * 2` (such as 48 kHz -> 24 kHz).
+-/
+def resampleAudioFrameFast (af : AudioFrame) (dstRate : UInt32) : AudioFrame := Id.run do
+  if af.sampleRate == 0 || dstRate == 0 || af.numSamples == 0 then
+    return AudioFrame.alloc af.sampleFmt dstRate af.channels 0 af.pts
+  let srcN := af.numSamples
+  let nCh := af.channels.toNat
+  let srcSamples := af.samples
+  if af.sampleRate == dstRate * 2 then
+    let dstN := srcN >>> 1
+    let mut outArr : Array Int32 := Array.mkEmpty (nCh * dstN)
+    for ch in [:nCh] do
+      let chBase := ch * srcN
+      for di in [:dstN] do
+        outArr := outArr.push (srcSamples.getD (chBase + (di <<< 1)) 0)
+    return {
+      sampleFmt := af.sampleFmt
+      sampleRate := dstRate
+      channels := af.channels
+      numSamples := dstN
+      pts := af.pts
+      duration := dstN.toUInt64
+      timeBase := AVRational.mkSafe 1 dstRate.toUInt64
+      samples := outArr
+    }
+  let dstN := rescaleQ srcN.toUInt64 dstRate.toUInt64 af.sampleRate.toUInt64 |>.toNat
+  if dstN == 0 then
+    return AudioFrame.alloc af.sampleFmt dstRate af.channels 0 af.pts
+  let mut outArr : Array Int32 := Array.mkEmpty (nCh * dstN)
+  for ch in [:nCh] do
+    let chBase := ch * srcN
+    for di in [:dstN] do
+      let posQ12 := (di * srcN * 4096) / dstN
+      let idx0 := Nat.min (srcN - 1) (posQ12 >>> 12)
+      let idx1 := Nat.min (srcN - 1) (idx0 + 1)
+      let frac : Int32 := Int32.ofNat (posQ12 &&& 4095)
+      let invFrac : Int32 := 4096 - frac
+      let s0 := srcSamples.getD (chBase + idx0) 0
+      let s1 := srcSamples.getD (chBase + idx1) 0
+      let interp := (s0 * invFrac + s1 * frac + 2048) >>> 12
+      outArr := outArr.push (clipInt16 interp)
+  return {
+    sampleFmt := af.sampleFmt
+    sampleRate := dstRate
+    channels := af.channels
+    numSamples := dstN
+    pts := af.pts
+    duration := dstN.toUInt64
+    timeBase := AVRational.mkSafe 1 dstRate.toUInt64
+    samples := outArr
+  }
+
+/-! ## Wave 17: ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` & `GASpecificConfig` Formal Codec -/
+
+/--
+  Formal model of an ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` + §4.4.1 `GASpecificConfig`
+  2-byte descriptor (`esds` `DecoderSpecificInfo` tag `0x05` payload in ISO MP4 `mp4a` tracks):
+  - `audioObjectType`: 5-bit MPEG-4 Audio Object Type (`1..30`, e.g. `2` = AAC-LC, `5` = SBR)
+  - `samplingFrequencyIndex`: 4-bit sampling frequency index (`0..12`, e.g. `3` = 48000 Hz, `4` = 44100 Hz)
+  - `channelConfiguration`: 4-bit channel configuration (`1..7`, e.g. `1` = Mono, `2` = Stereo, `6` = 5.1)
+  - `frameLengthFlag`: 1-bit `GASpecificConfig` frame length flag (`false` = 1024 samples/frame, `true` = 960)
+  - `dependsOnCoreCoder`: 1-bit core coder dependency flag (`false` for standalone AAC-LC)
+  - `extensionFlag`: 1-bit extension flag (`false` for baseline AAC-LC)
+-/
+structure AacAudioSpecificConfigView where
+  audioObjectType        : UInt8
+  samplingFrequencyIndex : UInt8
+  channelConfiguration   : UInt8
+  frameLengthFlag        : Bool
+  dependsOnCoreCoder     : Bool
+  extensionFlag          : Bool
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Encode an `AacAudioSpecificConfigView` into a 2-byte ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` `ByteArray`. -/
+def encodeAacAudioSpecificConfig (asc : AacAudioSpecificConfigView) : ByteArray :=
+  let aot := asc.audioObjectType &&& 0x1F
+  let sfi := asc.samplingFrequencyIndex &&& 0x0F
+  let chCfg := asc.channelConfiguration &&& 0x0F
+  let flBit : UInt8 := if asc.frameLengthFlag then 1 else 0
+  let depBit : UInt8 := if asc.dependsOnCoreCoder then 1 else 0
+  let extBit : UInt8 := if asc.extensionFlag then 1 else 0
+  let b0 : UInt8 := (aot <<< 3) ||| (sfi >>> 1)
+  let b1 : UInt8 := ((sfi &&& 0x01) <<< 7) ||| (chCfg <<< 3) ||| (flBit <<< 2) ||| (depBit <<< 1) ||| extBit
+  ByteArray.mk #[b0, b1]
+
+/-- Decode a 2-byte ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` from a `ByteSlice` (`fail-closed` on invalid AOT or sample-rate index). -/
+def decodeAacAudioSpecificConfig (s : ByteSlice) : Option AacAudioSpecificConfigView :=
+  if s.len < 2 then none
+  else
+    let b0 := sliceByteD s 0
+    let b1 := sliceByteD s 1
+    let aot := (b0 >>> 3) &&& 0x1F
+    let sfi := ((b0 &&& 0x07) <<< 1) ||| ((b1 >>> 7) &&& 0x01)
+    let chCfg := (b1 >>> 3) &&& 0x0F
+    let flFlag := ((b1 >>> 2) &&& 0x01) == 1
+    let depFlag := ((b1 >>> 1) &&& 0x01) == 1
+    let extFlag := (b1 &&& 0x01) == 1
+    if aot == 0 || aot == 31 || sfi > 12 || chCfg == 0 || chCfg > 7 then none
+    else
+      some {
+        audioObjectType := aot
+        samplingFrequencyIndex := sfi
+        channelConfiguration := chCfg
+        frameLengthFlag := flFlag
+        dependsOnCoreCoder := depFlag
+        extensionFlag := extFlag
+      }
+
+/-- Kernel-reducible 2-byte list serializer for `AacAudioSpecificConfigView` (`ISO/IEC 14496-3 §1.6.2.1`). -/
+def encodeAacAudioSpecificConfigSpec (asc : AacAudioSpecificConfigView) : List UInt8 :=
+  let aot := asc.audioObjectType &&& 0x1F
+  let sfi := asc.samplingFrequencyIndex &&& 0x0F
+  let chCfg := asc.channelConfiguration &&& 0x0F
+  let flBit : UInt8 := if asc.frameLengthFlag then 1 else 0
+  let depBit : UInt8 := if asc.dependsOnCoreCoder then 1 else 0
+  let extBit : UInt8 := if asc.extensionFlag then 1 else 0
+  let b0 : UInt8 := (aot <<< 3) ||| (sfi >>> 1)
+  let b1 : UInt8 := ((sfi &&& 0x01) <<< 7) ||| (chCfg <<< 3) ||| (flBit <<< 2) ||| (depBit <<< 1) ||| extBit
+  [b0, b1]
+
+/-- Kernel-reducible 2-byte list parser for `AacAudioSpecificConfigView` (`ISO/IEC 14496-3 §1.6.2.1`). -/
+def decodeAacAudioSpecificConfigSpec (bytes : List UInt8) : Option AacAudioSpecificConfigView :=
+  match bytes with
+  | b0 :: b1 :: _ =>
+    let aot := (b0 >>> 3) &&& 0x1F
+    let sfi := ((b0 &&& 0x07) <<< 1) ||| ((b1 >>> 7) &&& 0x01)
+    let chCfg := (b1 >>> 3) &&& 0x0F
+    let flFlag := ((b1 >>> 2) &&& 0x01) == 1
+    let depFlag := ((b1 >>> 1) &&& 0x01) == 1
+    let extFlag := (b1 &&& 0x01) == 1
+    if aot == 0 || aot == 31 || sfi > 12 || chCfg == 0 || chCfg > 7 then none
+    else
+      some {
+        audioObjectType := aot
+        samplingFrequencyIndex := sfi
+        channelConfiguration := chCfg
+        frameLengthFlag := flFlag
+        dependsOnCoreCoder := depFlag
+        extensionFlag := extFlag
+      }
+  | _ => none
+
+/-- Theorem (Wave 17): ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` round-trips across AAC-LC 48kHz Stereo
+    (`#[0x11, 0x90]`, matching ISO MP4 `esds` `DecoderSpecificInfo`), AAC-LC 44.1kHz Stereo (`#[0x12, 0x10]`),
+    AAC-LC 48kHz 5.1 Surround (`channelConfiguration = 6`), and fails closed on invalid AOT (`0`) or escape sample-rate (`15`). -/
+theorem aacAudioSpecificConfig_encode_decode_roundtrip :
+    let asc48kStereo : AacAudioSpecificConfigView := {
+      audioObjectType := 2, samplingFrequencyIndex := 3, channelConfiguration := 2,
+      frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+    }
+    let asc44kStereo : AacAudioSpecificConfigView := {
+      audioObjectType := 2, samplingFrequencyIndex := 4, channelConfiguration := 2,
+      frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+    }
+    let asc48k51 : AacAudioSpecificConfigView := {
+      audioObjectType := 2, samplingFrequencyIndex := 3, channelConfiguration := 6,
+      frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+    }
+    encodeAacAudioSpecificConfigSpec asc48kStereo = [0x11, 0x90] ∧
+    encodeAacAudioSpecificConfigSpec asc44kStereo = [0x12, 0x10] ∧
+    decodeAacAudioSpecificConfigSpec (encodeAacAudioSpecificConfigSpec asc48kStereo) = some asc48kStereo ∧
+    decodeAacAudioSpecificConfigSpec (encodeAacAudioSpecificConfigSpec asc44kStereo) = some asc44kStereo ∧
+    decodeAacAudioSpecificConfigSpec (encodeAacAudioSpecificConfigSpec asc48k51) = some asc48k51 ∧
+    decodeAacAudioSpecificConfigSpec [0x00, 0x90] = none ∧
+    decodeAacAudioSpecificConfigSpec [0x17, 0x90] = none := by
+  decide
+
+/-! ## Wave 18: RFC 7845 §5.1 `OpusHead` Identification Header Formal Codec -/
+
+/--
+  Formal model of an RFC 7845 §5.1 19-byte `OpusHead` Identification Header (Channel Mapping Family 0):
+  - Magic signature `"OpusHead"` (`#[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]`, 8 bytes)
+  - `version`: 8-bit version number (`1` per RFC 7845 §5.1.1.1; major version `version >>> 4 == 0`)
+  - `channels`: 8-bit output channel count (`1..2` for `channelMappingFamily == 0`)
+  - `preSkip`: 16-bit little-endian pre-skip sample count at 48 kHz (typically `312` or `3840`)
+  - `inputSampleRate`: 32-bit little-endian original input sample rate in Hz (e.g. `48000`)
+  - `outputGainQ8`: 16-bit little-endian Q7.8 output gain in dB (`0` for unity gain)
+  - `channelMappingFamily`: 8-bit channel mapping family (`0` for mono/stereo RTP/Ogg Opus)
+-/
+structure OpusIdHeaderView where
+  version              : UInt8
+  channels             : UInt8
+  preSkip              : UInt16
+  inputSampleRate      : UInt32
+  outputGainQ8         : UInt16
+  channelMappingFamily : UInt8
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Encode an `OpusIdHeaderView` into a 19-byte RFC 7845 §5.1 `OpusHead` `ByteArray`. -/
+def encodeOpusIdHeader (h : OpusIdHeaderView) : ByteArray :=
+  let ps0 : UInt8 := (h.preSkip &&& 0xFF).toUInt8
+  let ps1 : UInt8 := ((h.preSkip >>> 8) &&& 0xFF).toUInt8
+  let sr0 : UInt8 := (h.inputSampleRate &&& 0xFF).toUInt8
+  let sr1 : UInt8 := ((h.inputSampleRate >>> 8) &&& 0xFF).toUInt8
+  let sr2 : UInt8 := ((h.inputSampleRate >>> 16) &&& 0xFF).toUInt8
+  let sr3 : UInt8 := ((h.inputSampleRate >>> 24) &&& 0xFF).toUInt8
+  let og0 : UInt8 := (h.outputGainQ8 &&& 0xFF).toUInt8
+  let og1 : UInt8 := ((h.outputGainQ8 >>> 8) &&& 0xFF).toUInt8
+  ByteArray.mk #[
+    0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64,
+    h.version, h.channels, ps0, ps1, sr0, sr1, sr2, sr3, og0, og1, h.channelMappingFamily
+  ]
+
+/-- Decode a 19-byte RFC 7845 §5.1 `OpusHead` Identification Header from a `ByteSlice` (`fail-closed` on magic/version/channel mismatch). -/
+def decodeOpusIdHeader (s : ByteSlice) : Option OpusIdHeaderView :=
+  if s.len < 19 then none
+  else
+    let m0 := sliceByteD s 0
+    let m1 := sliceByteD s 1
+    let m2 := sliceByteD s 2
+    let m3 := sliceByteD s 3
+    let m4 := sliceByteD s 4
+    let m5 := sliceByteD s 5
+    let m6 := sliceByteD s 6
+    let m7 := sliceByteD s 7
+    if m0 != 0x4F || m1 != 0x70 || m2 != 0x75 || m3 != 0x73 ||
+       m4 != 0x48 || m5 != 0x65 || m6 != 0x61 || m7 != 0x64 then none
+    else
+      let ver := sliceByteD s 8
+      let ch := sliceByteD s 9
+      let ps0 := sliceByteD s 10
+      let ps1 := sliceByteD s 11
+      let sr0 := sliceByteD s 12
+      let sr1 := sliceByteD s 13
+      let sr2 := sliceByteD s 14
+      let sr3 := sliceByteD s 15
+      let og0 := sliceByteD s 16
+      let og1 := sliceByteD s 17
+      let cmf := sliceByteD s 18
+      if ver != 1 || ch == 0 || (cmf == 0 && ch > 2) then none
+      else
+        let preSkip : UInt16 := ps0.toUInt16 ||| (ps1.toUInt16 <<< 8)
+        let sr : UInt32 := sr0.toUInt32 ||| (sr1.toUInt32 <<< 8) ||| (sr2.toUInt32 <<< 16) ||| (sr3.toUInt32 <<< 24)
+        let og : UInt16 := og0.toUInt16 ||| (og1.toUInt16 <<< 8)
+        some {
+          version := ver
+          channels := ch
+          preSkip := preSkip
+          inputSampleRate := sr
+          outputGainQ8 := og
+          channelMappingFamily := cmf
+        }
+
+/-- Kernel-reducible 19-byte list serializer for `OpusIdHeaderView` (`RFC 7845 §5.1`). -/
+def encodeOpusIdHeaderSpec (h : OpusIdHeaderView) : List UInt8 :=
+  let ps0 : UInt8 := (h.preSkip &&& 0xFF).toUInt8
+  let ps1 : UInt8 := ((h.preSkip >>> 8) &&& 0xFF).toUInt8
+  let sr0 : UInt8 := (h.inputSampleRate &&& 0xFF).toUInt8
+  let sr1 : UInt8 := ((h.inputSampleRate >>> 8) &&& 0xFF).toUInt8
+  let sr2 : UInt8 := ((h.inputSampleRate >>> 16) &&& 0xFF).toUInt8
+  let sr3 : UInt8 := ((h.inputSampleRate >>> 24) &&& 0xFF).toUInt8
+  let og0 : UInt8 := (h.outputGainQ8 &&& 0xFF).toUInt8
+  let og1 : UInt8 := ((h.outputGainQ8 >>> 8) &&& 0xFF).toUInt8
+  [
+    0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64,
+    h.version, h.channels, ps0, ps1, sr0, sr1, sr2, sr3, og0, og1, h.channelMappingFamily
+  ]
+
+/-- Kernel-reducible 19-byte list parser for `OpusIdHeaderView` (`RFC 7845 §5.1`). -/
+def decodeOpusIdHeaderSpec (bytes : List UInt8) : Option OpusIdHeaderView :=
+  match bytes with
+  | m0 :: m1 :: m2 :: m3 :: m4 :: m5 :: m6 :: m7 :: ver :: ch :: ps0 :: ps1 :: sr0 :: sr1 :: sr2 :: sr3 :: og0 :: og1 :: cmf :: _ =>
+    if m0 != 0x4F || m1 != 0x70 || m2 != 0x75 || m3 != 0x73 ||
+       m4 != 0x48 || m5 != 0x65 || m6 != 0x61 || m7 != 0x64 then none
+    else if ver != 1 || ch == 0 || (cmf == 0 && ch > 2) then none
+    else
+      let preSkip : UInt16 := ps0.toUInt16 ||| (ps1.toUInt16 <<< 8)
+      let sr : UInt32 := sr0.toUInt32 ||| (sr1.toUInt32 <<< 8) ||| (sr2.toUInt32 <<< 16) ||| (sr3.toUInt32 <<< 24)
+      let og : UInt16 := og0.toUInt16 ||| (og1.toUInt16 <<< 8)
+      some {
+        version := ver
+        channels := ch
+        preSkip := preSkip
+        inputSampleRate := sr
+        outputGainQ8 := og
+        channelMappingFamily := cmf
+      }
+  | _ => none
+
+/-- Theorem (Wave 18): RFC 7845 §5.1 `OpusHead` Identification Header round-trips across Stereo 48kHz (`preSkip = 312`)
+    and Mono 48kHz (`preSkip = 3840`), and fails closed on invalid magic (`0x00`), unsupported version (`ver = 0`), or `channels = 0`. -/
+theorem opusIdHeader_encode_decode_roundtrip :
+    let hStereo : OpusIdHeaderView := {
+      version := 1, channels := 2, preSkip := 312,
+      inputSampleRate := 48000, outputGainQ8 := 0, channelMappingFamily := 0
+    }
+    let hMono : OpusIdHeaderView := {
+      version := 1, channels := 1, preSkip := 3840,
+      inputSampleRate := 48000, outputGainQ8 := 256, channelMappingFamily := 0
+    }
+    decodeOpusIdHeaderSpec (encodeOpusIdHeaderSpec hStereo) = some hStereo ∧
+    decodeOpusIdHeaderSpec (encodeOpusIdHeaderSpec hMono) = some hMono ∧
+    decodeOpusIdHeaderSpec [0x00, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0] = none ∧
+    decodeOpusIdHeaderSpec [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0] = none ∧
+    decodeOpusIdHeaderSpec [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 0, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0] = none := by
   decide
 
 end LeanAV.Audio

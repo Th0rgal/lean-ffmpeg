@@ -377,28 +377,62 @@ structure FrameTile where
 
 /-- Partition a plane of `height` rows and `stride` bytes/row into `numTiles` pairwise-disjoint `FrameTile`s,
     verifying adjacent tile disjointness via `LeanAV.Spec.verifyTileDisjoint`. -/
-def partitionPlaneRows (height stride numTiles : Nat) : Array FrameTile := Id.run do
-  if height == 0 || stride == 0 || numTiles == 0 then return #[]
-  let effTiles := Nat.min height numTiles
-  let rowsPerTile := (height + effTiles - 1) / effTiles
-  let cap : UInt64 := (height * stride).toUInt64
-  let mut out : Array FrameTile := Array.mkEmpty effTiles
-  let mut r := 0
-  let mut tid := 0
-  while r < height do
-    let cnt := Nat.min rowsPerTile (height - r)
-    let bOff : UInt64 := (r * stride).toUInt64
-    let bLen : UInt64 := (cnt * stride).toUInt64
-    let curTile : FrameTile := { tileId := tid, rowStart := r, rowCount := cnt, byteOff := bOff, byteLen := bLen }
-    if out.size == 0 then
-      if verifySliceBounds bOff bLen cap == 1 then
-        out := out.push curTile
-    else
-      let prev := out[out.size - 1]!
-      if verifyTileDisjoint prev.byteOff prev.byteLen bOff bLen cap == 1 then
-        out := out.push curTile
-    r := r + cnt
-    tid := tid + 1
-  return out
+def partitionPlaneRows (height stride numTiles : Nat) : Array FrameTile :=
+  if height == 0 || stride == 0 || numTiles == 0 then #[]
+  else
+    let effTiles := Nat.min height numTiles
+    let rowsPerTile := (height + effTiles - 1) / effTiles
+    let cap : UInt64 := (height * stride).toUInt64
+    let rec loop (r tid fuel : Nat) (acc : List FrameTile) : List FrameTile :=
+      match fuel with
+      | 0 => acc.reverse
+      | fuel' + 1 =>
+        if r >= height then acc.reverse
+        else
+          let cnt := Nat.min rowsPerTile (height - r)
+          let bOff : UInt64 := (r * stride).toUInt64
+          let bLen : UInt64 := (cnt * stride).toUInt64
+          let curTile : FrameTile := { tileId := tid, rowStart := r, rowCount := cnt, byteOff := bOff, byteLen := bLen }
+          let nextAcc :=
+            match acc with
+            | [] => if verifySliceBounds bOff bLen cap == 1 then [curTile] else []
+            | prev :: _ =>
+              if verifyTileDisjoint prev.byteOff prev.byteLen bOff bLen cap == 1 then curTile :: acc else acc
+          loop (r + cnt) (tid + 1) fuel' nextAcc
+    (loop 0 0 effTiles []).toArray
+
+/-! ## 6. Wave 6 (C1): Formal Proofs for `AVRational.rescalePtsExactNat`, `Plane2D`, and `AudioFrame` -/
+
+/-- Theorem: `rescalePtsExactNat` is monotone in `pts` (`pts1 ≤ pts2 → rescalePtsExactNat pts1 ... ≤ rescalePtsExactNat pts2 ...`). -/
+theorem rescalePtsExactNat_monotone (pts1 pts2 bqNum bqDen cqNum cqDen : Nat) (h : pts1 ≤ pts2) :
+    AVRational.rescalePtsExactNat pts1 bqNum bqDen cqNum cqDen ≤
+      AVRational.rescalePtsExactNat pts2 bqNum bqDen cqNum cqDen := by
+  unfold AVRational.rescalePtsExactNat rescaleFloor
+  exact Nat.div_le_div_right (Nat.mul_le_mul_right (bqNum * cqDen) h)
+
+/-- Theorem: `rescalePtsExactNat` is the exact identity on `pts` when source and destination timebases are equal (`num > 0, den > 0`). -/
+theorem rescalePtsExactNat_id (pts num den : Nat) (hNum : 0 < num) (hDen : 0 < den) :
+    AVRational.rescalePtsExactNat pts num den num den = pts := by
+  unfold AVRational.rescalePtsExactNat rescaleFloor
+  have hPos : 0 < den * num := Nat.mul_pos hDen hNum
+  have hComm : num * den = den * num := Nat.mul_comm num den
+  rw [hComm]
+  exact Nat.mul_div_cancel pts hPos
+
+/-- Theorem: `Plane2D.verifyBounds` implies the exact `FrameDimSafe` stride and capacity bounds. -/
+theorem plane2D_verifyBounds_sound (p : Plane2D)
+    (h : p.verifyBounds = true) :
+    FrameDimSafe ⟨p.width.toUInt64, p.height.toUInt64, p.stride.toUInt64, p.data.size.toUInt64⟩ := by
+  exact frameDimGateSpec.sound ⟨p.width.toUInt64, p.height.toUInt64, p.stride.toUInt64, p.data.size.toUInt64⟩ h
+
+/-- Theorem: 64-byte cache-line aligned stride utility (`alignStride64 w ≥ w` and `(alignStride64 w) % 64 = 0`). -/
+@[inline]
+def alignStride64 (w : Nat) : Nat :=
+  ((w + 63) / 64) * 64
+
+theorem alignStride64_ge_and_mod64 (w : Nat) :
+    w ≤ alignStride64 w ∧ (alignStride64 w) % 64 = 0 := by
+  unfold alignStride64
+  omega
 
 end LeanAV.Core
