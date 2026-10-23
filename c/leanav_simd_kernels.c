@@ -512,12 +512,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
 
     char dec_cmd[8192];
     snprintf(dec_cmd, sizeof(dec_cmd),
-        "%s -v error -nostdin -i %s -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
+        "%s -v error -nostdin -hwaccel auto -threads 0 -i %s -an -sn -dn -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
         ffmpeg_bin, q_in);
 
-    const char *v_enc_args = "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p";
+    const char *v_enc_args = "-c:v libx264 -preset ultrafast -crf 23 -threads 0 -pix_fmt yuv420p";
     if (codec_id_u32 == 2) {
-        v_enc_args = "-c:v libx265 -preset ultrafast -crf 22 -tag:v hvc1 -pix_fmt yuv420p";
+        v_enc_args = "-c:v libx265 -preset ultrafast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
     } else if (codec_id_u32 == 3) {
         v_enc_args = "-c:v libsvtav1 -preset 12 -crf 28 -pix_fmt yuv420p";
     }
@@ -527,7 +527,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt yuv420p -s %zux%zu -r 24000/1001 -i - "
             "-i %s -map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s -c:a aac -ac 2 -b:a 192k -movflags +faststart %s 2>/dev/null",
+            "%s -c:a copy -movflags +faststart %s 2>/dev/null",
             ffmpeg_bin, dst_w, dst_h, q_in, v_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
