@@ -406,8 +406,16 @@ static const char *leanav_color_vui_args_for_cs(int hdr_cs, uint32_t codec_id_u3
     return "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
 }
 
+static const char *leanav_ffmpeg_bin_cmd(void) {
+    return "PATH=\"/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
+}
+
+static const char *leanav_ffprobe_bin_cmd(void) {
+    return "PATH=\"/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe";
+}
+
 /*
- * Compute real 16x16 macroblock SAD and MSE against the subsampled source plane,
+ * Compute real 16x16 macroblock SAD and MSE against the area-averaged source plane,
  * plus whether every non-black reference block is strictly closer to `dst_luma` than to studio-black (Y=16).
  */
 static void leanav_measure_luma_acceptance_16x16(
@@ -436,6 +444,7 @@ static void leanav_measure_luma_acceptance_16x16(
     size_t mb_step_y = (dst_h >= 256) ? 64 : 16;
     size_t mb_step_x = (dst_w >= 256) ? 64 : 16;
     int is_2x2 = (src_w == dst_w * 2 && src_h == dst_h * 2);
+    int is_3x3 = (src_w == dst_w * 3 && src_h == dst_h * 3);
 
     for (size_t by = 0; by + 16 <= dst_h; by += mb_step_y) {
         for (size_t bx = 0; bx + 16 <= dst_w; bx += mb_step_x) {
@@ -484,12 +493,38 @@ static void leanav_measure_luma_acceptance_16x16(
                         total_sq_err += (uint64_t)ad * (uint64_t)ad;
                     }
 #endif
-                } else {
-                    size_t sy = (dy * src_h) / dst_h;
-                    const uint8_t *s_row = src_luma + sy * src_w;
+                } else if (is_3x3) {
+                    const uint8_t *s_row0 = src_luma + (dy * 3) * src_w + bx * 3;
+                    const uint8_t *s_row1 = s_row0 + src_w;
+                    const uint8_t *s_row2 = s_row1 + src_w;
                     for (size_t x = 0; x < 16; x++) {
-                        size_t sx = ((bx + x) * src_w) / dst_w;
-                        uint32_t r = s_row[sx];
+                        size_t sx = x * 3;
+                        uint32_t sum9 =
+                            (uint32_t)s_row0[sx] + (uint32_t)s_row0[sx + 1] + (uint32_t)s_row0[sx + 2] +
+                            (uint32_t)s_row1[sx] + (uint32_t)s_row1[sx + 1] + (uint32_t)s_row1[sx + 2] +
+                            (uint32_t)s_row2[sx] + (uint32_t)s_row2[sx + 1] + (uint32_t)s_row2[sx + 2];
+                        uint32_t r = ((sum9 + 4u) * 7282u) >> 16;
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad;
+                        blk_black_sad += bd;
+                        blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+                } else {
+                    size_t sy0 = (dy * src_h) / dst_h;
+                    size_t sy1 = ((dy + 1) * src_h - 1) / dst_h;
+                    if (sy1 >= src_h) sy1 = src_h - 1;
+                    const uint8_t *s_row0 = src_luma + sy0 * src_w;
+                    const uint8_t *s_row1 = src_luma + sy1 * src_w;
+                    for (size_t x = 0; x < 16; x++) {
+                        size_t dx = bx + x;
+                        size_t sx0 = (dx * src_w) / dst_w;
+                        size_t sx1 = ((dx + 1) * src_w - 1) / dst_w;
+                        if (sx1 >= src_w) sx1 = src_w - 1;
+                        uint32_t r = ((uint32_t)s_row0[sx0] + (uint32_t)s_row0[sx1] +
+                                      (uint32_t)s_row1[sx0] + (uint32_t)s_row1[sx1] + 2u) >> 2;
                         uint32_t d = d_row[x];
                         uint32_t ad = (d >= r) ? (d - r) : (r - d);
                         uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
@@ -972,8 +1007,8 @@ static void leanav_apply_pixel_filters_raw(
 static int leanav_has_encoder_cached(const char *enc_name) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-        "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' %s '",
-        enc_name);
+        "%s -hide_banner -encoders 2>/dev/null | grep -q ' %s '",
+        leanav_ffmpeg_bin_cmd(), enc_name);
     return system(cmd) == 0;
 }
 
@@ -1367,9 +1402,9 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
     }
     char probe_cmd[4096];
     snprintf(probe_cmd, sizeof(probe_cmd),
-        "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe -v error -select_streams v:0 "
+        "%s -v error -select_streams v:0 "
         "-show_entries stream=color_primaries,color_transfer,color_space -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null",
-        q_in);
+        leanav_ffprobe_bin_cmd(), q_in);
     FILE *pfp = popen(probe_cmd, "r");
     if (!pfp) return 0;
     char out[512];
@@ -1459,9 +1494,9 @@ static void leanav_probe_input_fps_rational(
     }
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe -v error -select_streams v:0 "
+        "%s -v error -select_streams v:0 "
         "-show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null",
-        q_in);
+        leanav_ffprobe_bin_cmd(), q_in);
     FILE *pfp = popen(cmd, "r");
     if (!pfp) return;
     char out[128];
@@ -1507,7 +1542,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if (leanav_shell_quote_safe(in_path, q_in, sizeof(q_in)) != 0) return 0;
     if (leanav_shell_quote_safe(out_path, q_out, sizeof(q_out)) != 0) return 0;
 
-    const char *ffmpeg_bin = "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
+    const char *ffmpeg_bin = leanav_ffmpeg_bin_cmd();
 
     char ss_arg[64] = "";
     char t_arg[64] = "";
@@ -1646,7 +1681,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     char dec_cmd[8192];
     snprintf(dec_cmd, sizeof(dec_cmd),
-        "%s -v error -nostdin -hwaccel auto -threads 0 %s-i %s %s-vsync 0 -an -sn -dn -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
+        "%s -v error -nostdin -hwaccel auto -threads 0 %s-i %s %s-fps_mode passthrough -an -sn -dn -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
         ffmpeg_bin, ss_arg, q_in, t_arg);
 
     /* Audio: if filter_flags bit 3 (8) requests 6ch->2ch stereo AAC downmix, encode `-ac 2 -c:a aac`, else `-c:a aac -b:a 128k` */
