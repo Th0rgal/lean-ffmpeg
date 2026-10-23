@@ -2996,7 +2996,6 @@ static uint64_t leanav_libav_transcode_pixel(
        threading lets a frame split across the cores the encoder is not using. */
     vdec_ctx->thread_count = 0;
     vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    vdec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
         avcodec_free_context(&vdec_ctx);
         avformat_close_input(&ifmt);
