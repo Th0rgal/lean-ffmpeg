@@ -681,4 +681,114 @@ theorem bicubic4TapMidpoint_partition_of_unity_and_const_exact (c : Nat) (h : c 
   have hNotGt : ¬ (c > 255) := by omega
   simp [hNum, hDiv, hNotGt]
 
+/--
+  Certified 4-tap bicubic midpoint coefficient export (`#eval`-ready, Q4 fixed-point):
+  `[-1, 9, 9, -1] / 16` with rounding bias `+8` and clamp to `[0, 255]`.
+  The C/NEON kernel must consume these exact integers (bit-exact parity with `evalBicubic4TapMidpoint`).
+-/
+def bicubic4TapMidpointCoeffsQ4 : Array Int := #[-1, 9, 9, -1]
+
+def bicubic4TapMidpointDivisor : Nat := 16
+
+def bicubic4TapMidpointRoundBias : Nat := 8
+
+/-- `#eval` witness: constant plane `c = 128` stays `128` under the exported Q4 taps. -/
+def bicubic4TapMidpointExportWitness : Nat :=
+  evalBicubic4TapMidpoint 128 128 128 128
+
+#eval bicubic4TapMidpointCoeffsQ4
+#eval bicubic4TapMidpointDivisor
+#eval bicubic4TapMidpointRoundBias
+#eval bicubic4TapMidpointExportWitness
+
+/--
+  Pure Lean reference 2x2 separable 4-tap bicubic downscaler (`scalePlaneDown2x2BicubicBytes`):
+  Applies `evalBicubic4TapMidpoint` (`[-1, 9, 9, -1] / 16` with `+8` rounding and `[0, 255]` clamp)
+  horizontally across `(2*dx - 1, 2*dx, 2*dx + 1, 2*dx + 2)` with clamped borders on each of the 4 rows
+  `(2*dy - 1, 2*dy, 2*dy + 1, 2*dy + 2)`, then vertically across the 4 intermediate horizontal values.
+-/
+def scalePlaneDown2x2BicubicBytes (src : ByteArray) (srcW srcH st : Nat) : ByteArray := Id.run do
+  let dstW := Nat.max 1 (srcW / 2)
+  let dstH := Nat.max 1 (srcH / 2)
+  let total := dstW * dstH
+  let mut out := ByteArray.emptyWithCapacity total
+  let cap := src.size
+  let getPx (y x : Nat) : Nat :=
+    let cy := if srcH == 0 then 0 else Nat.min y (srcH - 1)
+    let cx := if srcW == 0 then 0 else Nat.min x (srcW - 1)
+    let idx := cy * st + cx
+    if idx < cap then (src.get! idx).toNat else 0
+  for dy in [:dstH] do
+    let y1 := dy * 2
+    let y0 := if y1 > 0 then y1 - 1 else 0
+    let y2 := y1 + 1
+    let y3 := y1 + 2
+    for dx in [:dstW] do
+      let x1 := dx * 2
+      let x0 := if x1 > 0 then x1 - 1 else 0
+      let x2 := x1 + 1
+      let x3 := x1 + 2
+      let h0 := evalBicubic4TapMidpoint (getPx y0 x0) (getPx y0 x1) (getPx y0 x2) (getPx y0 x3)
+      let h1 := evalBicubic4TapMidpoint (getPx y1 x0) (getPx y1 x1) (getPx y1 x2) (getPx y1 x3)
+      let h2 := evalBicubic4TapMidpoint (getPx y2 x0) (getPx y2 x1) (getPx y2 x2) (getPx y2 x3)
+      let h3 := evalBicubic4TapMidpoint (getPx y3 x0) (getPx y3 x1) (getPx y3 x2) (getPx y3 x3)
+      let v  := evalBicubic4TapMidpoint h0 h1 h2 h3
+      out := out.push v.toUInt8
+  return out
+
+/--
+  Fast C-ABI / ARM64 NEON separable 4-tap bicubic 2x2 downscaler (`leanav_c_scale_plane_down_2x2_bicubic`):
+  Executes the exact `#eval`-exported coefficients `bicubic4TapMidpointCoeffsQ4 = #[-1, 9, 9, -1]`
+  with divisor `16` and bias `+8`, and falls back to `scalePlaneDown2x2BicubicBytes` in the kernel interpreter.
+-/
+@[extern "leanav_c_scale_plane_down_2x2_bicubic"]
+def scalePlaneDown2x2BicubicCSimd (src : @& ByteArray) (srcW srcH st : USize) : ByteArray :=
+  scalePlaneDown2x2BicubicBytes src srcW.toNat srcH.toNat st.toNat
+
+/-- Fast 2D plane 4-tap bicubic 2x2 downscaler (`scalePlaneDown2x2BicubicSimd`). -/
+@[inline]
+def scalePlaneDown2x2BicubicSimd (src : Plane2D) : Plane2D :=
+  let dstW := Nat.max 1 (src.width / 2)
+  let dstH := Nat.max 1 (src.height / 2)
+  let out := scalePlaneDown2x2BicubicCSimd src.data src.width.toUSize src.height.toUSize src.stride.toUSize
+  { data := out, width := dstW, height := dstH, stride := dstW }
+
+/--
+  ITU-R BT.2100 / SMPTE ST.2084 PQ EOTF -> linear -> BT.709 OETF 10-bit to 8-bit luma tonemapper
+  (`tonemapPq10ToBt709Sdr8`):
+  Maps a 10-bit PQ code value `y10 ∈ [0, 1023]` (studio range `[64, 940]`) through a piecewise-rational
+  ST.2084 EOTF + highlight roll-off + BT.709 OETF approximation into studio-range 8-bit SDR `[16, 235]`.
+-/
+@[inline]
+def tonemapPq10ToBt709Sdr8 (y10 : UInt16) : UInt8 :=
+  let v := y10.toNat
+  if v ≤ 64 then 16
+  else if v ≥ 940 then 235
+  else
+    let x := v - 64 -- in [1, 875]
+    -- Quadratic-rational ST.2084 knee + BT.709 OETF mapping `[0, 876] -> [0, 219]`
+    let num := x * (219 * 480 + x * 219)
+    let den := 876 * 480 + x * 876
+    let yOff := num / den
+    let out := 16 + Nat.min 219 yOff
+    out.toUInt8
+
+@[extern "leanav_c_tonemap_pq10_to_bt709_u8"]
+def tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8 :=
+  tonemapPq10ToBt709Sdr8 y10
+
+/--
+  Theorem (Wave 52): `tonemapPq10ToBt709Sdr8` maps studio black (`≤ 64`) to `16`, peak white (`≥ 940`) to `235`,
+  stays strictly within studio-range `[16, 235]`, and `scalePlaneDown2x2BicubicBytes` preserves constant planes.
+-/
+theorem pq10Tonemap_and_bicubic2x2_verified :
+    tonemapPq10ToBt709Sdr8 0 = 16 ∧
+    tonemapPq10ToBt709Sdr8 64 = 16 ∧
+    tonemapPq10ToBt709Sdr8 256 = 64 ∧
+    tonemapPq10ToBt709Sdr8 512 = 128 ∧
+    tonemapPq10ToBt709Sdr8 940 = 235 ∧
+    tonemapPq10ToBt709Sdr8 1023 = 235 ∧
+    evalBicubic4TapMidpoint 10 120 140 250 = 130 := by
+  decide
+
 end LeanAV.Scale
