@@ -1553,14 +1553,22 @@ static int leanav_find_child_box(
 ) {
     size_t pos = start;
     while (pos + 8 <= end) {
-        uint32_t sz = leanav_rd_u32be(buf + pos);
-        if (sz < 8 || pos + sz > end) break;
+        uint64_t sz = leanav_rd_u32be(buf + pos);
+        size_t hdr = 8;
+        if (sz == 1) {
+            if (pos + 16 > end) break;
+            sz = leanav_rd_u64be(buf + pos + 8);
+            hdr = 16;
+        } else if (sz == 0) {
+            sz = (uint64_t)(end - pos);
+        }
+        if (sz < hdr || sz > (uint64_t)(end - pos)) break;
         if (memcmp(buf + pos + 4, fourcc, 4) == 0) {
             if (out_pos) *out_pos = pos;
-            if (out_sz) *out_sz = sz;
+            if (out_sz) *out_sz = (size_t)sz;
             return 1;
         }
-        pos += sz;
+        pos += (size_t)sz;
     }
     return 0;
 }
@@ -2559,6 +2567,7 @@ static int leanav_open_encoder(
     if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
         const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : (strcmp(enc_name, "libx265") == 0 ? "veryfast" : "faster");
         av_opt_set(ctx->priv_data, "preset", preset, 0);
+        av_opt_set_int(ctx->priv_data, "threads", 2, 0);
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
         av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
