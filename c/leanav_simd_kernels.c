@@ -515,9 +515,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
         "%s -v error -nostdin -hwaccel auto -threads 0 -i %s -an -sn -dn -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
         ffmpeg_bin, q_in);
 
-    const char *v_enc_args = "-c:v libx264 -preset ultrafast -crf 23 -threads 0 -pix_fmt yuv420p";
+    const char *v_enc_args = "-c:v libx264 -preset veryfast -crf 23 -threads 0 -pix_fmt yuv420p";
     if (codec_id_u32 == 2) {
-        v_enc_args = "-c:v libx265 -preset ultrafast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
+        v_enc_args = "-c:v libx265 -preset veryfast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
     } else if (codec_id_u32 == 3) {
         v_enc_args = "-c:v libsvtav1 -preset 12 -crf 28 -pix_fmt yuv420p";
     }
@@ -944,6 +944,60 @@ static int leanav_has_encoder_cached(const char *enc_name) {
 }
 
 /*
+ * Fast VUI / NCLX colorimetry probe:
+ * Scans the first and last 2 MiB of `in_path` for ISO BMFF `colr` (`nclx` primaries=9, trc=16/18, matrix=9)
+ * or H.264/HEVC VUI / SEI strings (`bt2020`, `smpte2084`, `arib-std-b67`), returning:
+ *   0 -> BT.709 SDR
+ *   1 -> BT.2020 + SMPTE-2084 PQ (HDR10)
+ *   2 -> BT.2020 + ARIB-STD-B67 HLG
+ */
+static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_in) {
+    FILE *fp = fopen(in_path, "rb");
+    if (fp) {
+        size_t cap = 2 * 1024 * 1024;
+        uint8_t *buf = (uint8_t *)malloc(cap);
+        if (buf) {
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 1) {
+                    if (fseek(fp, 0, SEEK_END) != 0) break;
+                    long fsz = ftell(fp);
+                    if (fsz <= (long)cap) break;
+                    if (fseek(fp, fsz - (long)cap, SEEK_SET) != 0) break;
+                }
+                size_t n = fread(buf, 1, cap, fp);
+                if (n >= 15) {
+                    for (size_t i = 0; i + 15 <= n; i++) {
+                        if (buf[i] == 'c' && buf[i+1] == 'o' && buf[i+2] == 'l' && buf[i+3] == 'r' &&
+                            buf[i+4] == 'n' && buf[i+5] == 'c' && buf[i+6] == 'l' && buf[i+7] == 'x') {
+                            uint16_t prim = ((uint16_t)buf[i+8] << 8) | buf[i+9];
+                            uint16_t trc  = ((uint16_t)buf[i+10] << 8) | buf[i+11];
+                            if (prim == 9 && trc == 18) { free(buf); fclose(fp); return 2; }
+                            if (prim == 9) { free(buf); fclose(fp); return 1; }
+                        }
+                    }
+                }
+            }
+            free(buf);
+        }
+        fclose(fp);
+    }
+    char probe_cmd[4096];
+    snprintf(probe_cmd, sizeof(probe_cmd),
+        "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe -v error -select_streams v:0 "
+        "-show_entries stream=color_primaries,color_transfer,color_space -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null",
+        q_in);
+    FILE *pfp = popen(probe_cmd, "r");
+    if (!pfp) return 0;
+    char out[512];
+    size_t r = fread(out, 1, sizeof(out) - 1, pfp);
+    out[r] = '\0';
+    pclose(pfp);
+    if (strstr(out, "arib-std-b67") != NULL) return 2;
+    if (strstr(out, "bt2020") != NULL || strstr(out, "smpte2084") != NULL) return 1;
+    return 0;
+}
+
+/*
  * Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`leanav_c_transcode_mp4_general_verified`):
  * Supports:
  * - Lossless keyframe-aligned stream copy / remux (`codec_id_u32 == 0`) with `-ss`/`-t` seek/trim,
@@ -1046,7 +1100,22 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         hw_checked = 1;
     }
 
-    const char *v_enc_args = "-c:v libx264 -preset ultrafast -crf 23 -threads 0 -pix_fmt yuv420p";
+    /*
+     * Preserve input colorimetry (`ColorSpaceTag`: BT.709 vs BT.2020 PQ / HLG) across the rawvideo SIMD pipe
+     * unless explicit `colorspace=bt709,tonemap` (`filter_flags_u32 & 3`) converts to SDR BT.709.
+     */
+    int hdr_cs = 0;
+    if ((filter_flags_u32 & 3u) == 0u) {
+        hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
+    }
+    const char *color_vui_args = "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
+    if (hdr_cs == 1) {
+        color_vui_args = "-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv";
+    } else if (hdr_cs == 2) {
+        color_vui_args = "-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv";
+    }
+
+    const char *v_enc_args = "-c:v libx264 -preset veryfast -crf 23 -threads 0 -pix_fmt yuv420p";
     if (codec_id_u32 == 1 && has_vt_h264) {
         v_enc_args = "-c:v h264_videotoolbox -realtime 1 -b:v 6M -allow_sw 1 -pix_fmt yuv420p";
     } else if (codec_id_u32 == 1 && has_nvenc_h264) {
@@ -1057,7 +1126,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         } else if (has_nvenc_hevc) {
             v_enc_args = "-c:v hevc_nvenc -preset p1 -cq 24 -tag:v hvc1 -pix_fmt yuv420p";
         } else {
-            v_enc_args = "-c:v libx265 -preset ultrafast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
+            v_enc_args = "-c:v libx265 -preset veryfast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
         }
     } else if (codec_id_u32 == 3) {
         v_enc_args = "-c:v libsvtav1 -preset 12 -crf 28 -pix_fmt yuv420p";
@@ -1078,14 +1147,14 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt yuv420p -s %zux%zu -r 24000/1001 -i - "
             "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, dst_w, dst_h, ss_arg, q_in, t_arg, v_enc_args, a_enc_args, q_out);
+            "%s %s %s -movflags +faststart %s 2>/dev/null",
+            ffmpeg_bin, dst_w, dst_h, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt yuv420p -s %zux%zu -r 24000/1001 -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, dst_w, dst_h, v_enc_args, q_out);
+            "%s %s -movflags +faststart %s 2>/dev/null",
+            ffmpeg_bin, dst_w, dst_h, v_enc_args, color_vui_args, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");

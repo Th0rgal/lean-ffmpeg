@@ -44,10 +44,19 @@ inductive MediaFormat where
   | container (cf : ContainerFormat)
   deriving Repr, DecidableEq, Inhabited
 
+/-- Discrete VUI / NCLX (`colr`) colorimetry tag (`color_primaries / color_trc / colorspace`)
+    preventing silent HDR-to-SDR desaturation when scaling `BT.2020 PQ` 4K sources through raw pixel planes. -/
+inductive ColorSpaceTag where
+  | bt709
+  | bt2020Pq
+  | bt2020Hlg
+  deriving Repr, DecidableEq, Inhabited
+
 /--
   Phase-indexed media buffer (`MediaBuf d fmt w h`):
   Separates `.Compressed` NAL/OBU packets, `.Decoded` 2D pixel planes, and `.Container` muxed streams
   at the type level. No coercion exists between `MediaBuf .Compressed ...` and `MediaBuf .Decoded ...`.
+  Also tracks `colorSpace : ColorSpaceTag` so spatial stages (`scale`, `crop`, `pad`) cannot strip HDR `bt2020Pq` tags.
 -/
 structure MediaBuf (d : Domain) (fmt : MediaFormat) (w h : Nat) where
   private mk ::
@@ -56,6 +65,7 @@ structure MediaBuf (d : Domain) (fmt : MediaFormat) (w h : Nat) where
   durationMs   : Nat
   channelCount : Nat
   channelMask  : UInt32
+  colorSpace   : ColorSpaceTag := .bt709
   decodeErrors : Nat
 
 abbrev DecodedPlaneBuf (pf : PixelFormat) (w h : Nat) :=
@@ -69,13 +79,15 @@ abbrev ContainerStreamBuf (cf : ContainerFormat) (w h : Nat) :=
 
 /-- Checked constructor for a decoded 2D plane (`Plane2D → DecodedPlaneBuf`). -/
 @[inline]
-def DecodedPlaneBuf.ofPlane2D (pf : PixelFormat) (p : Plane2D) (durationMs : Nat := 40) :
+def DecodedPlaneBuf.ofPlane2D (pf : PixelFormat) (p : Plane2D) (durationMs : Nat := 40)
+    (colorSpace : ColorSpaceTag := .bt709) :
     DecodedPlaneBuf pf p.width p.height :=
   { payload := p.data
     stride := p.stride
     durationMs := durationMs
     channelCount := 0
     channelMask := 0
+    colorSpace := colorSpace
     decodeErrors := 0 }
 
 /-- Extract a `Plane2D` view from a `DecodedPlaneBuf` (only typable on `.Decoded` domain!). -/
@@ -87,15 +99,16 @@ def DecodedPlaneBuf.toPlane2D {pf : PixelFormat} {w h : Nat}
 /-- Checked constructor for a compressed packet buffer (`.Compressed` domain only). -/
 @[inline]
 def CompressedPacketBuf.ofBytes (cid : CodecId) (w h : Nat) (bs : ByteArray)
-    (durationMs : Nat := 40) : CompressedPacketBuf cid w h :=
+    (durationMs : Nat := 40) (colorSpace : ColorSpaceTag := .bt709) : CompressedPacketBuf cid w h :=
   { payload := bs
     stride := 0
     durationMs := durationMs
     channelCount := 0
     channelMask := 0
+    colorSpace := colorSpace
     decodeErrors := 0 }
 
-/-- Explicit decoder boundary: the ONLY bridge from `.Compressed` to `.Decoded`. -/
+/-- Explicit decoder boundary: the ONLY bridge from `.Compressed` to `.Decoded` (preserves `pkt.colorSpace`). -/
 @[inline]
 def CodecBoundary.decodeFrame (cid : CodecId) (pf : PixelFormat) (w h : Nat)
     (pkt : CompressedPacketBuf cid w h) (decodedPlane : Plane2D)
@@ -107,12 +120,13 @@ def CodecBoundary.decodeFrame (cid : CodecId) (pf : PixelFormat) (w h : Nat)
       durationMs := pkt.durationMs
       channelCount := pkt.channelCount
       channelMask := pkt.channelMask
+      colorSpace := pkt.colorSpace
       decodeErrors := 0
     }
   else
     none
 
-/-- Explicit encoder boundary: the ONLY bridge from `.Decoded` to `.Compressed`. -/
+/-- Explicit encoder boundary: the ONLY bridge from `.Decoded` to `.Compressed` (preserves `plane.colorSpace`). -/
 @[inline]
 def CodecBoundary.encodeFrame (pf : PixelFormat) (cid : CodecId) (w h : Nat)
     (plane : DecodedPlaneBuf pf w h) (encodedBytes : ByteArray) :
@@ -124,6 +138,7 @@ def CodecBoundary.encodeFrame (pf : PixelFormat) (cid : CodecId) (w h : Nat)
       durationMs := plane.durationMs
       channelCount := plane.channelCount
       channelMask := plane.channelMask
+      colorSpace := plane.colorSpace
       decodeErrors := 0
     }
   else
@@ -162,7 +177,8 @@ def LawfulTranscodeStage.comp
   preservesClean b h0 := s2.preservesClean (s1.run b) (s1.preservesClean b h0)
 
 /-- Lift any pure pixel-domain `Plane2D → Plane2D` operator into a `LawfulTranscodeStage` on `.Decoded`.
-    Notice that it is a compile-time type error to apply `liftDecodedPlaneOp` to a `.Compressed` packet! -/
+    Notice that it is a compile-time type error to apply `liftDecodedPlaneOp` to a `.Compressed` packet,
+    and `colorSpace` (`bt709` vs `bt2020Pq` HDR) is unconditionally preserved across spatial scaling/cropping! -/
 def liftDecodedPlaneOp (pf : PixelFormat) (w1 h1 w2 h2 : Nat)
     (op : Plane2D → Plane2D) :
     LawfulTranscodeStage .Decoded (.pix pf) w1 h1 .Decoded (.pix pf) w2 h2 where
@@ -173,9 +189,37 @@ def liftDecodedPlaneOp (pf : PixelFormat) (w1 h1 w2 h2 : Nat)
       durationMs := b.durationMs
       channelCount := b.channelCount
       channelMask := b.channelMask
+      colorSpace := b.colorSpace
       decodeErrors := b.decodeErrors }
   preservesDur _ := rfl
   preservesClean _ h0 := h0
+
+/-- Explicit color-space conversion stage (`lawfulStageColorConvert`):
+    The ONLY stage that transitions `colorSpace` (e.g. `.bt2020Pq -> .bt709` when `colorspace=bt709,tonemap` is active). -/
+def lawfulStageColorConvert (pf : PixelFormat) (w h : Nat) (dstCs : ColorSpaceTag)
+    (op : Plane2D → Plane2D) :
+    LawfulTranscodeStage .Decoded (.pix pf) w h .Decoded (.pix pf) w h where
+  run b :=
+    let pOut := op (DecodedPlaneBuf.toPlane2D b)
+    { payload := pOut.data
+      stride := w
+      durationMs := b.durationMs
+      channelCount := b.channelCount
+      channelMask := b.channelMask
+      colorSpace := dstCs
+      decodeErrors := b.decodeErrors }
+  preservesDur _ := rfl
+  preservesClean _ h0 := h0
+
+/-- Theorem: Any spatial decoded-plane stage lifted via `liftDecodedPlaneOp` (such as `scale=1920:1080`, `crop`, `pad`)
+    preserves `b.colorSpace` (e.g. `.bt2020Pq`), preventing accidental HDR-to-SDR tag stripping, while
+    `lawfulStageColorConvert` explicitly updates `colorSpace` to `dstCs`. -/
+theorem liftDecodedPlaneOp_preserves_colorSpace_and_explicit_convert
+    (pf : PixelFormat) (w1 h1 w2 h2 : Nat) (op : Plane2D → Plane2D)
+    (b : DecodedPlaneBuf pf w1 h1) (dstCs : ColorSpaceTag) :
+    ((liftDecodedPlaneOp pf w1 h1 w2 h2 op).run b).colorSpace = b.colorSpace ∧
+    ((lawfulStageColorConvert pf w1 h1 dstCs op).run b).colorSpace = dstCs :=
+  ⟨rfl, rfl⟩
 
 theorem lawfulTranscodeStage_comp_preserves_clean_and_dur
     {d1 d2 d3 : Domain} {f1 f2 f3 : MediaFormat} {w1 h1 w2 h2 w3 h3 : Nat}
@@ -367,6 +411,7 @@ def lawfulStageStreamCopy (cid : CodecId) (w h : Nat) :
       durationMs := buf.durationMs
       channelCount := buf.channelCount
       channelMask := buf.channelMask
+      colorSpace := buf.colorSpace
       decodeErrors := buf.decodeErrors }
   preservesDur _ := rfl
   preservesClean _ hClean := hClean
@@ -374,7 +419,7 @@ def lawfulStageStreamCopy (cid : CodecId) (w h : Nat) :
 /--
   Phase-indexed `LawfulTranscodeStage` for container-level chapter pruning + keyframe-trimmed remux
   (`.Container -> .Container`):
-  Normalizes audio channel mask (`chMaskStereo` if `0`) and preserves clean decode state and exact duration.
+  Normalizes audio channel mask (`chMaskStereo` if `0`), preserves `colorSpace`, and preserves clean decode state and exact duration.
 -/
 def lawfulStageCleanContainerRemux (cf : ContainerFormat) (w h : Nat) :
     LawfulTranscodeStage .Container (.container cf) w h .Container (.container cf) w h where
@@ -384,6 +429,7 @@ def lawfulStageCleanContainerRemux (cf : ContainerFormat) (w h : Nat) :
       durationMs := buf.durationMs
       channelCount := if buf.channelCount == 0 then 2 else buf.channelCount
       channelMask := if buf.channelMask == 0 then chMaskStereo else buf.channelMask
+      colorSpace := buf.colorSpace
       decodeErrors := buf.decodeErrors }
   preservesDur _ := rfl
   preservesClean _ hClean := hClean

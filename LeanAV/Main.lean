@@ -660,7 +660,9 @@ def runSelfTest : IO UInt32 := do
                !(ffmpegAcceptanceGateSpec.gate ffmpegAcceptanceGateSpec.negWitness) &&
                isAacChannelLayoutValid 2 chMaskStereo &&
                !(isAacChannelLayoutValid 6 0) &&
-               verifyScaledPlaneVisualFidelity (scalePlaneDown2x2Simd realFfmpeg8x8Plane) (scalePlaneDown2x2Simd realFfmpeg8x8Plane) 0 0
+               verifyScaledPlaneVisualFidelity (scalePlaneDown2x2Simd realFfmpeg8x8Plane) (scalePlaneDown2x2Simd realFfmpeg8x8Plane) 0 0 &&
+               ((lawfulStageScale2x2 .yuv420p 8 8).run (DecodedPlaneBuf.ofPlane2D .yuv420p realFfmpeg8x8Plane 40 .bt2020Pq)).colorSpace == .bt2020Pq &&
+               ((lawfulStageColorConvert .yuv420p 8 8 .bt709 id).run (DecodedPlaneBuf.ofPlane2D .yuv420p realFfmpeg8x8Plane 40 .bt2020Pq)).colorSpace == .bt709
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
@@ -1486,6 +1488,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Scale.cscBt2020ToBt709_and_tonemap_invariants
 #print axioms LeanAV.Filter.denoiseBlendTap_preserves_edges_and_flat
 #print axioms LeanAV.Filter.lawfulStageCropScaleBlur
+#print axioms LeanAV.Domain.liftDecodedPlaneOp_preserves_colorSpace_and_explicit_convert
 
 
 
