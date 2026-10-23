@@ -2572,7 +2572,6 @@ static int leanav_open_encoder(
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
         av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
-        if (strcmp(enc_name, "libx264") == 0) av_opt_set(ctx->priv_data, "tune", "ssim", 0);
     } else if (strcmp(enc_name, "libsvtav1") == 0) {
         av_opt_set(ctx->priv_data, "preset", (g_enc_preset[0] != '\0') ? g_enc_preset : "12", 0);
         char crf_buf[32];
@@ -3644,7 +3643,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     } else if (codec_id_u32 == 2) {
         snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-crf %s", eff_crf_x265);
     } else {
-        snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-crf %s -tune ssim", eff_crf_x264);
+        snprintf(v_rate_ctrl, sizeof(v_rate_ctrl), "-crf %s", eff_crf_x264);
     }
 
     char v_enc_args[512];
@@ -3683,7 +3682,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         x264_subme_suffix = "";
     } else {
         snprintf(v_enc_args, sizeof(v_enc_args),
-            "-c:v libx264 -preset %s %s -threads 0 -pix_fmt %s",
+            "-c:v libx264 -preset %s %s -threads 4 -pix_fmt %s",
             eff_preset_x264, v_rate_ctrl, eff_pix_fmt);
     }
 
