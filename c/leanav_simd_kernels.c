@@ -2989,13 +2989,10 @@ static uint64_t leanav_libav_transcode_pixel(
         avformat_close_input(&ifmt);
         return 0;
     }
-    /* Leave four cores for the encoder and one for scale/mux, and never let
-       auto thread_count climb to its 16 cap and fight libx264 for cores. */
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int dec_threads = (ncpu > 5) ? (int)ncpu - 5 : 1;
-    if (dec_threads > 8) dec_threads = 8;
-    vdec_ctx->thread_count = dec_threads;
-    vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    /* Frame threading is what took the wall time from 28 s to 8.7 s. The
+       automatic count stops at 16, and slice threading only adds contention. */
+    vdec_ctx->thread_count = 0;
+    vdec_ctx->thread_type = FF_THREAD_FRAME;
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
         avcodec_free_context(&vdec_ctx);
         avformat_close_input(&ifmt);
