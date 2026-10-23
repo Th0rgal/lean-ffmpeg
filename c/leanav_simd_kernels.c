@@ -2895,8 +2895,22 @@ static void leanav_enc_return_slot(leanav_enc_queue_t *q, int idx) {
 /* Owns venc. Drains every pending packet before blocking on the next frame,
    so send_frame can never stall forever on EAGAIN. A slot goes back to the
    pool only after the encoder has consumed it. */
+static void leanav_enc_take_packet(leanav_enc_queue_t *q, AVPacket *ep) {
+    pthread_mutex_lock(&q->mu);
+    if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
+    pthread_mutex_unlock(&q->mu);
+    ep->stream_index = q->ovs->index;
+    av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
+    AVPacket *kept = av_packet_alloc();
+    if (kept) av_packet_move_ref(kept, ep);
+    pthread_mutex_lock(&q->mu);
+    if (kept) leanav_enc_store_packet(q, kept);
+    pthread_mutex_unlock(&q->mu);
+}
+
 static void *leanav_enc_worker(void *arg) {
     leanav_enc_queue_t *q = (leanav_enc_queue_t *)arg;
+    AVPacket *ep = av_packet_alloc();
     for (;;) {
         pthread_mutex_lock(&q->mu);
         while (q->ready_count == 0 && !q->input_done) pthread_cond_wait(&q->has_frame, &q->mu);
@@ -2909,39 +2923,16 @@ static void *leanav_enc_worker(void *arg) {
         AVFrame *f = q->pool[idx];
         int send = avcodec_send_frame(q->venc, f);
         leanav_enc_return_slot(q, idx);
-        AVPacket *ep = av_packet_alloc();
         for (;;) {
             int r = ep ? avcodec_receive_packet(q->venc, ep) : AVERROR(EAGAIN);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
             if (r < 0) { q->failed = 1; break; }
-            pthread_mutex_lock(&q->mu);
-            if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
-            pthread_mutex_unlock(&q->mu);
-            ep->stream_index = q->ovs->index;
-            av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
-            AVPacket *kept = ep;
-            ep = av_packet_alloc();
-            pthread_mutex_lock(&q->mu);
-            leanav_enc_store_packet(q, kept);
-            pthread_mutex_unlock(&q->mu);
+            leanav_enc_take_packet(q, ep);
         }
-        if (ep) av_packet_free(&ep);
         if (send < 0 && send != AVERROR(EAGAIN) && send != AVERROR_EOF) q->failed = 1;
     }
     avcodec_send_frame(q->venc, NULL);
-    AVPacket *ep = av_packet_alloc();
-    while (ep && avcodec_receive_packet(q->venc, ep) >= 0) {
-        pthread_mutex_lock(&q->mu);
-        if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
-        pthread_mutex_unlock(&q->mu);
-        ep->stream_index = q->ovs->index;
-        av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
-        AVPacket *kept = ep;
-        ep = av_packet_alloc();
-        pthread_mutex_lock(&q->mu);
-        leanav_enc_store_packet(q, kept);
-        pthread_mutex_unlock(&q->mu);
-    }
+    while (ep && avcodec_receive_packet(q->venc, ep) >= 0) leanav_enc_take_packet(q, ep);
     if (ep) av_packet_free(&ep);
     return NULL;
 }
