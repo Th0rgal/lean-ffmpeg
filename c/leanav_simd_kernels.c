@@ -3251,7 +3251,6 @@ static uint64_t leanav_libav_transcode_pixel(
     }
 
     uint64_t frames_done = 0;
-    uint64_t stat_frames = 0;
     uint64_t mean_accum = 0;
     uint64_t var_accum = 0;
     uint64_t max_sad_worst = 0;
@@ -3370,11 +3369,7 @@ static uint64_t leanav_libav_transcode_pixel(
 
         uint64_t f_mean = 0, f_var = 0;
         size_t dst_y_sz = dst_w * dst_h;
-        /* One frame in four is enough for the fidelity gate and keeps the
-           decoder thread off a 65k-pixel walk on every frame. */
-        int stat_frame = ((frames_done & 3ULL) == 0ULL);
-        if (!stat_frame) {
-        } else if (is_10bit) {
+        if (is_10bit) {
             uint64_t sum = 0, sum_sq = 0, cnt = 0;
             size_t step = (dst_y_sz > 65536) ? 16 : 1;
             for (size_t y = 0; y < dst_h; y += (step > 1 ? 4 : 1)) {
@@ -3407,7 +3402,8 @@ static uint64_t leanav_libav_transcode_pixel(
                 if (!f_dist) dist_lt_black_all = 0;
             }
         }
-        if (stat_frame) { mean_accum += f_mean; var_accum += f_var; stat_frames++; }
+        mean_accum += f_mean;
+        var_accum += f_var;
 
         pthread_mutex_lock(&enc_q.mu);
         enc_q.ready_idx[enc_q.ready_tail] = slot_idx;
@@ -3498,8 +3494,8 @@ static uint64_t leanav_libav_transcode_pixel(
     if ((filter_flags & 3u) == 0u) {
         leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, (start_ms == 0 && dur_ms == 0) ? 1 : 0);
     }
-    uint64_t avg_mean = (stat_frames ? mean_accum / stat_frames : 0) & 0xFFFFFFULL;
-    uint64_t avg_var = (stat_frames ? var_accum / stat_frames : 0) & 0xFFFFFFULL;
+    uint64_t avg_mean = (mean_accum / frames_done) & 0xFFFFFFULL;
+    uint64_t avg_var = (var_accum / frames_done) & 0xFFFFFFULL;
     uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
     return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
 }
