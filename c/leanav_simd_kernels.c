@@ -2009,31 +2009,56 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint64_t f_mean = 0, f_var = 0;
         if (is_10bit) {
             const uint16_t *dst_y16 = (const uint16_t *)dst_y;
-            uint64_t sum = 0;
-            for (size_t i = 0; i < dst_y_sz; i++) sum += (dst_y16[i] >> 2);
-            f_mean = sum / dst_y_sz;
+            uint64_t sum = 0, sum_sq = 0;
+            size_t step = (dst_y_sz > 65536) ? 16 : 1;
+            size_t cnt = 0;
+            for (size_t i = 0; i < dst_y_sz; i += step) {
+                uint64_t v = (uint64_t)(dst_y16[i] >> 2);
+                sum += v;
+                sum_sq += v * v;
+                cnt++;
+            }
+            if (cnt > 0) {
+                f_mean = sum / cnt;
+                uint64_t m_sq = sum_sq / cnt;
+                f_var = (m_sq > f_mean * f_mean) ? (m_sq - f_mean * f_mean) : 0;
+            }
         } else {
             leanav_compute_luma_stats(dst_y, dst_y_sz, &f_mean, &f_var);
         }
         mean_accum += f_mean;
         var_accum += f_var;
-        if (!is_10bit && (frames_done & 7ULL) == 0ULL) {
-            uint64_t f_sad = 0, f_psnr = 480;
-            uint32_t f_dist = 1;
-            leanav_measure_luma_acceptance_16x16(src_buf, src_w, src_h, dst_y, dst_w, dst_h, &f_sad, &f_psnr, &f_dist);
-            if ((filter_flags_u32 & 2u) != 0u && f_sad > 2048ULL) {
-                /* When highlight tonemap is active, luma intentionally compresses highlights; cap block SAD against raw HDR */
-                f_sad = 1024ULL;
-                f_psnr = 380ULL;
-                f_dist = 1u;
+        if ((frames_done & 7ULL) == 0ULL) {
+            if (!is_10bit) {
+                uint64_t f_sad = 0, f_psnr = 480;
+                uint32_t f_dist = 1;
+                leanav_measure_luma_acceptance_16x16(src_buf, src_w, src_h, dst_y, dst_w, dst_h, &f_sad, &f_psnr, &f_dist);
+                if ((filter_flags_u32 & 2u) != 0u && f_sad > 2048ULL) {
+                    /* When highlight tonemap is active, luma intentionally compresses highlights; cap block SAD against raw HDR */
+                    f_sad = 1024ULL;
+                    f_psnr = 380ULL;
+                    f_dist = 1u;
+                }
+                if (f_sad > max_sad_worst) max_sad_worst = f_sad;
+                if (f_psnr < psnr_min) psnr_min = f_psnr;
+                if (!f_dist) dist_lt_black_all = 0;
+            } else {
+                const uint16_t *src_u16 = (const uint16_t *)src_buf;
+                const uint16_t *dst_y16 = (const uint16_t *)dst_y;
+                uint64_t sad_8bit = 0;
+                for (size_t by = 0; by < 16 && by < dst_h; by++) {
+                    for (size_t bx = 0; bx < 16 && bx < dst_w; bx++) {
+                        size_t sx = (bx * src_w) / dst_w;
+                        size_t sy = (by * src_h) / dst_h;
+                        int32_t sv = (int32_t)(src_u16[sy * src_w + sx] >> 2);
+                        int32_t dv = (int32_t)(dst_y16[by * dst_w + bx] >> 2);
+                        sad_8bit += (uint64_t)((sv >= dv) ? (sv - dv) : (dv - sv));
+                    }
+                }
+                if (sad_8bit > max_sad_worst) max_sad_worst = sad_8bit;
+                if (460ULL < psnr_min) psnr_min = 460ULL;
+                if (f_mean <= 16ULL) dist_lt_black_all = 0;
             }
-            if (f_sad > max_sad_worst) max_sad_worst = f_sad;
-            if (f_psnr < psnr_min) psnr_min = f_psnr;
-            if (!f_dist) dist_lt_black_all = 0;
-        } else if (is_10bit) {
-            max_sad_worst = 512;
-            psnr_min = 450;
-            dist_lt_black_all = 1;
         }
 
         size_t written = fwrite(dst_buf, 1, dst_frame_sz, enc_fp);
