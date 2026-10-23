@@ -124,6 +124,9 @@ structure CliConfig where
   noVideo        : Bool := false
   noAudio        : Bool := false
   jsonOutput     : Bool := false
+  hideBanner     : Bool := false
+  showStats      : Bool := true
+  logLevel       : String := "info"
   videoSize      : Option (Nat × Nat) := none
   videoFrames    : Option Nat := none
   audioRate      : Option Nat := none
@@ -221,6 +224,11 @@ def supportedPreset (s : String) : Bool :=
 def supportedPixFmt (s : String) : Bool :=
   ["yuv420p", "yuv420p10le", "p010le", "nv12", "yuv422p", "yuv422p10le", "yuv444p", "rgb24", "gray"].contains s
 
+/-- Supported `-loglevel` / `-v` tokens. -/
+def supportedLogLevel (s : String) : Bool :=
+  ["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace",
+   "-8", "0", "8", "16", "24", "32", "40", "48", "56"].contains s
+
 /-- Check if a string is a valid non-negative integer or decimal (`"23"`, `"22.6"`). -/
 def isValidCrfSpec (s : String) : Bool :=
   match parseCliSeconds s with
@@ -277,7 +285,11 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
   | "-json" :: rest =>
     parseFFmpegArgsLoop rest { cfg with jsonOutput := true }
   | "-hide_banner" :: rest =>
-    parseFFmpegArgsLoop rest cfg
+    parseFFmpegArgsLoop rest { cfg with hideBanner := true }
+  | "-stats" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with showStats := true }
+  | "-nostats" :: rest =>
+    parseFFmpegArgsLoop rest { cfg with showStats := false }
   | "-nostdin" :: rest =>
     parseFFmpegArgsLoop rest cfg
   | "-vn" :: rest =>
@@ -295,10 +307,18 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
       | none => cfg.fail (.unsupportedCodecOrFlag ("-s " ++ value))
   | "-loglevel" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-loglevel") else cfg
+      if value == "" then cfg.fail (.emptyValue "-loglevel")
+      else if supportedLogLevel value then
+        let quietLike := ["quiet", "panic", "fatal", "error", "-8", "0", "8", "16"].contains value
+        { cfg with logLevel := value, showStats := if quietLike then false else cfg.showStats }
+      else cfg.fail (.unsupportedCodecOrFlag ("-loglevel " ++ value))
   | "-v" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-v") else cfg
+      if value == "" then cfg.fail (.emptyValue "-v")
+      else if supportedLogLevel value then
+        let quietLike := ["quiet", "panic", "fatal", "error", "-8", "0", "8", "16"].contains value
+        { cfg with logLevel := value, showStats := if quietLike then false else cfg.showStats }
+      else cfg.fail (.unsupportedCodecOrFlag ("-v " ++ value))
   | "-threads" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
       match parseNonNegNatSpec value with
@@ -537,7 +557,8 @@ theorem resolveScaleDims_proportional_even_and_cli_flags_verified :
   into `CliConfig` and fail-closes (`errors ≠ []`) on invalid `-crf`, `-preset`, `-r`, or unknown flags (`-foobar`).
 -/
 theorem cli_encoder_options_retained_and_invalid_rejected :
-    let cfg := parseFFmpegArgs ["-i", "in.mp4", "-preset", "veryfast", "-crf", "18", "-b:v", "4M", "-b:a", "192k", "-r", "60/1", "-pix_fmt", "yuv420p10le", "out.mp4"]
+    let cfg := parseFFmpegArgs ["-hide_banner", "-nostats", "-v", "warning", "-json", "-i", "in.mp4", "-preset", "veryfast", "-crf", "18", "-b:v", "4M", "-b:a", "192k", "-r", "60/1", "-pix_fmt", "yuv420p10le", "out.mp4"]
+    let defCfg := parseFFmpegArgs ["-i", "in.mp4", "out.mp4"]
     let badCrf := parseFFmpegArgs ["-i", "in.mp4", "-crf", "99", "out.mp4"]
     let badPreset := parseFFmpegArgs ["-i", "in.mp4", "-preset", "bogus_preset", "out.mp4"]
     let badFlag := parseFFmpegArgs ["-i", "in.mp4", "-unknown_flag", "out.mp4"]
@@ -547,6 +568,13 @@ theorem cli_encoder_options_retained_and_invalid_rejected :
     cfg.audioBitrate = some "192k" ∧
     cfg.frameRate = some "60/1" ∧
     cfg.pixelFormat = some "yuv420p10le" ∧
+    cfg.hideBanner = true ∧
+    cfg.showStats = false ∧
+    cfg.logLevel = "warning" ∧
+    cfg.jsonOutput = true ∧
+    defCfg.jsonOutput = false ∧
+    defCfg.showStats = true ∧
+    defCfg.hideBanner = false ∧
     cfg.errors = [] ∧
     badCrf.errors ≠ [] ∧
     badPreset.errors ≠ [] ∧

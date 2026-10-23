@@ -875,6 +875,8 @@ def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
     (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
+  let statsBit : UInt32 := if validCfg.showStats then 1 else 0
+  let bannerBit : UInt32 := if validCfg.hideBanner then 0 else 2
   let _ ← setEncoderCliOptionsC
     (validCfg.preset.getD "")
     (validCfg.crf.getD "")
@@ -882,6 +884,7 @@ def tryFastHeaderProbeTranscode
     (validCfg.audioBitrate.getD "")
     (validCfg.frameRate.getD "")
     (validCfg.pixelFormat.getD "")
+    (statsBit ||| bannerBit)
   if validCfg.videoCodec == some .copy then
     let tDemux ← IO.monoNanosNow
     let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0
@@ -890,11 +893,12 @@ def tryFastHeaderProbeTranscode
       let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
       let outStat ← if validCfg.format != some "null" then getFileByteSizeOr outPath 0 else pure 0
       let totalUs := (tEnd - t0) / 1000
-      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
-      let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{fastDemux.width}x{fastDemux.height}\", "
-      let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
-      let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {inStat}, \"out_bytes\": {outStat} }"
-      IO.println (c0 ++ c1 ++ c2 ++ c3)
+      if validCfg.jsonOutput then
+        let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
+        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{fastDemux.width}x{fastDemux.height}\", "
+        let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
+        let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {inStat}, \"out_bytes\": {outStat} }"
+        IO.println (c0 ++ c1 ++ c2 ++ c3)
       return true
     else
       return false
@@ -936,15 +940,14 @@ def tryFastHeaderProbeTranscode
       let totalUs := (tEnd - t0) / 1000
       let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else fastDemux.samples.size
       let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
-      let audioSummary := if withAudio then "aac" else "disabled (-an)"
-      IO.eprintln s!"[lffmpeg] {inPath} ({fastDemux.width}x{fastDemux.height}) -> {outPath} ({pixRep.dstWidth}x{pixRep.dstHeight}, {codecName}, audio={audioSummary}): {nFrames} frames in {totalUs / 1000} ms ({fps} fps, {outStat / 1024} KiB)"
-      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-      let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
-      let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {fastDemux.iFrameCount}, \"p_frames\": {fastDemux.pFrameCount}, \"b_frames\": {fastDemux.bFrameCount}, "
-      let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
-      let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
-      let c5 := s!"\"in_bytes\": {inStat}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
-      IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
+      if validCfg.jsonOutput then
+        let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
+        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
+        let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {fastDemux.iFrameCount}, \"p_frames\": {fastDemux.pFrameCount}, \"b_frames\": {fastDemux.bFrameCount}, "
+        let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
+        let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
+        let c5 := s!"\"in_bytes\": {inStat}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
+        IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
       return true
     else
       return false
@@ -954,7 +957,10 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
   let cfg := parseFFmpegArgs args
   match validateCliConfig cfg with
   | .error errs =>
-    IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error_count\": {errs.length} }"
+    if cfg.jsonOutput then
+      IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error_count\": {errs.length} }"
+    else if cfg.logLevel != "quiet" && cfg.logLevel != "-8" then
+      IO.eprintln s!"Error parsing command line: {repr errs}"
     return 1
   | .ok validCfg =>
     let inPath := validCfg.inputs.headD ""
@@ -964,7 +970,10 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         match parseVideoFilterGraph vfStr with
         | .ok ops => pure ops
         | .error msg =>
-          IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"filter_error\": \"{msg}\" }"
+          if validCfg.jsonOutput then
+            IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"filter_error\": \"{msg}\" }"
+          else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+            IO.eprintln s!"Error initializing filtergraph: {msg}"
           return 1
       | none => pure []
     let t0 ← IO.monoNanosNow
@@ -1009,17 +1018,26 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         if handledFull then
           return 0
         else
-          IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{inPath}\", \"output\": \"{outPath}\" }"
+          if validCfg.jsonOutput then
+            IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{inPath}\", \"output\": \"{outPath}\" }"
+          else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+            IO.eprintln s!"Conversion failed! ({inPath} -> {outPath})"
           return 1
       let crc := computeFrameCrc64 rawBytes
       let xxh := formatGoldenXxh64Line inSlice
       let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
       if outPath != "" && outPath != "-" && validCfg.format != some "null" then
         let _ ← writeMediaFileAtomic outPath rawBytes
-      let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli\", \"input\": \"{inPath}\", \"output\": \"{outPath}\", "
-      let c1 := s!"\"bytes\": {rawBytes.size}, \"filter_stages\": {filterOps.length}, "
-      let c2 := s!"\"framecrc\": \"{frameCrcLine}\", \"digest\": \"{xxh}\" }"
-      IO.println (c0 ++ c1 ++ c2)
+      if validCfg.jsonOutput then
+        let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli\", \"input\": \"{inPath}\", \"output\": \"{outPath}\", "
+        let c1 := s!"\"bytes\": {rawBytes.size}, \"filter_stages\": {filterOps.length}, "
+        let c2 := s!"\"framecrc\": \"{frameCrcLine}\", \"digest\": \"{xxh}\" }"
+        IO.println (c0 ++ c1 ++ c2)
+      else if validCfg.showStats && !validCfg.hideBanner then
+        IO.eprintln s!"Input #0, raw, from '{inPath}':"
+        IO.eprintln s!"  Stream #0:0: Data: {rawBytes.size} bytes"
+        IO.eprintln s!"Output #0, to '{outPath}':"
+        IO.eprintln s!"  Stream #0:0: framecrc={frameCrcLine}"
       return 0
 
 def printLffmpegVersion : IO UInt32 := do

@@ -3,6 +3,14 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+
+static inline uint64_t leanav_mono_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1624,6 +1632,8 @@ static char g_enc_vb[64]      = "";
 static char g_enc_ab[64]      = "";
 static char g_enc_fps[64]     = "";
 static char g_enc_pix_fmt[64] = "";
+static int  g_ui_show_stats   = 1;
+static int  g_ui_show_banner  = 1;
 
 LEAN_EXPORT uint32_t leanav_c_set_encoder_cli_options(
     b_lean_obj_arg preset_str,
@@ -1631,7 +1641,8 @@ LEAN_EXPORT uint32_t leanav_c_set_encoder_cli_options(
     b_lean_obj_arg vb_str,
     b_lean_obj_arg ab_str,
     b_lean_obj_arg fps_str,
-    b_lean_obj_arg pix_fmt_str
+    b_lean_obj_arg pix_fmt_str,
+    uint32_t ui_flags
 ) {
     snprintf(g_enc_preset,  sizeof(g_enc_preset),  "%s", lean_string_cstr(preset_str));
     snprintf(g_enc_crf,     sizeof(g_enc_crf),     "%s", lean_string_cstr(crf_str));
@@ -1639,7 +1650,72 @@ LEAN_EXPORT uint32_t leanav_c_set_encoder_cli_options(
     snprintf(g_enc_ab,      sizeof(g_enc_ab),      "%s", lean_string_cstr(ab_str));
     snprintf(g_enc_fps,     sizeof(g_enc_fps),     "%s", lean_string_cstr(fps_str));
     snprintf(g_enc_pix_fmt, sizeof(g_enc_pix_fmt), "%s", lean_string_cstr(pix_fmt_str));
+    g_ui_show_stats  = (ui_flags & 1u) ? 1 : 0;
+    g_ui_show_banner = (ui_flags & 2u) ? 1 : 0;
     return 1u;
+}
+
+static const char *leanav_codec_label(uint32_t codec_id_u32) {
+    if (codec_id_u32 == 2) return "hevc";
+    if (codec_id_u32 == 3) return "av1";
+    return "h264";
+}
+
+static void leanav_print_ffmpeg_banner(
+    const char *in_path,
+    const char *out_path,
+    size_t src_w,
+    size_t src_h,
+    size_t dst_w,
+    size_t dst_h,
+    uint32_t codec_id_u32,
+    const char *pix_fmt,
+    const char *fps_str,
+    int with_audio,
+    const char *audio_rate
+) {
+    if (!g_ui_show_banner) return;
+    const char *codec = leanav_codec_label(codec_id_u32);
+    fprintf(stderr, "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '%s':\n", in_path);
+    fprintf(stderr, "  Stream #0:0: Video: %s, %s, %zux%zu, %s fps, %s\n",
+        codec, pix_fmt, src_w, src_h, fps_str, "yuv");
+    if (with_audio) {
+        fprintf(stderr, "  Stream #0:1: Audio: aac, %s, stereo\n", audio_rate);
+    }
+    fprintf(stderr, "Stream mapping:\n");
+    fprintf(stderr, "  Stream #0:0 -> #0:0 (scale -> %s)\n", codec);
+    if (with_audio) {
+        fprintf(stderr, "  Stream #0:1 -> #0:1 (aac)\n");
+    }
+    fprintf(stderr, "Output #0, mp4, to '%s':\n", out_path);
+    fprintf(stderr, "  Stream #0:0: Video: %s, %s, %zux%zu, q=2-31, %s fps\n",
+        codec, pix_fmt, dst_w, dst_h, fps_str);
+    if (with_audio) {
+        fprintf(stderr, "  Stream #0:1: Audio: aac, %s, stereo\n", audio_rate);
+    }
+    fflush(stderr);
+}
+
+static void leanav_print_ffmpeg_stats(
+    uint64_t frames,
+    double fps,
+    uint64_t out_bytes,
+    double time_s,
+    double speed
+) {
+    if (!g_ui_show_stats) return;
+    double bitrate_kbps = (time_s > 0.0) ? ((double)out_bytes * 8.0 / time_s / 1000.0) : 0.0;
+    fprintf(stderr,
+        "\rframe=%5llu fps=%5.1f q=22.6 size=%8lluKiB time=%02d:%02d:%05.2f bitrate=%7.1fkbits/s speed=%4.2fx    ",
+        (unsigned long long)frames,
+        fps,
+        (unsigned long long)(out_bytes / 1024ULL),
+        (int)(time_s / 3600.0),
+        ((int)time_s / 60) % 60,
+        time_s - (double)(((int)time_s / 60) * 60),
+        bitrate_kbps,
+        speed);
+    fflush(stderr);
 }
 
 /*
@@ -1910,6 +1986,11 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         snprintf(fps_str, sizeof(fps_str), "%u/%u", fps_num, fps_den);
     }
 
+    leanav_print_ffmpeg_banner(
+        in_path, out_path, src_w, src_h, dst_w, dst_h,
+        codec_id_u32, raw_pix_fmt, fps_str, with_audio_u32 != 0,
+        (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags_u32 & 8u) ? "192k" : "128k"));
+
     char enc_cmd[8192];
     if (with_audio_u32) {
         snprintf(enc_cmd, sizeof(enc_cmd),
@@ -1959,6 +2040,10 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint64_t max_sad_worst = 0;
     uint64_t psnr_min = 600;
     uint32_t dist_lt_black_all = 1;
+    uint64_t stats_t0 = leanav_mono_us();
+    double frame_dur_s = (fps_num > 0 && fps_den > 0)
+        ? ((double)fps_den / (double)fps_num)
+        : (1001.0 / 24000.0);
 
     while (1) {
         size_t got = 0;
@@ -2064,6 +2149,17 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         size_t written = fwrite(dst_buf, 1, dst_frame_sz, enc_fp);
         if (written < dst_frame_sz) break;
         frames_done++;
+        if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
+            uint64_t elapsed_us = leanav_mono_us() - stats_t0;
+            double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
+            double media_s = (double)frames_done * frame_dur_s;
+            double fps = (double)frames_done / elapsed_s;
+            struct stat st;
+            uint64_t out_bytes = 0;
+            if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
+            else out_bytes = frames_done * dst_frame_sz;
+            leanav_print_ffmpeg_stats(frames_done, fps, out_bytes, media_s, media_s / elapsed_s);
+        }
     }
 
     leanav_free_bilinear_tabs(&y_tabs);
@@ -2077,7 +2173,20 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     }
 
     if (frames_done == 0 || enc_rc != 0) {
+        if (g_ui_show_stats) fprintf(stderr, "\n");
         return 0;
+    }
+
+    if (g_ui_show_stats) {
+        uint64_t elapsed_us = leanav_mono_us() - stats_t0;
+        double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
+        double media_s = (double)frames_done * frame_dur_s;
+        struct stat st;
+        uint64_t out_bytes = 0;
+        if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
+        else out_bytes = frames_done * dst_frame_sz;
+        leanav_print_ffmpeg_stats(frames_done, (double)frames_done / elapsed_s, out_bytes, media_s, media_s / elapsed_s);
+        fprintf(stderr, "\n");
     }
 
     g_last_max_block_sad_16x16 = max_sad_worst;
