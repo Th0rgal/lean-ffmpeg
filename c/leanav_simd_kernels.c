@@ -2857,12 +2857,15 @@ static int leanav_copy_plane_to_dst(
     return 0;
 }
 
-#define LEANAV_ENC_SLOTS 2
+#define LEANAV_ENC_SLOTS 3
 #define LEANAV_PKT_QUEUE 64
 
 typedef struct {
-    AVFrame *slot[LEANAV_ENC_SLOTS];
-    int head, tail, count;
+    AVFrame *pool[LEANAV_ENC_SLOTS];
+    int free_stack[LEANAV_ENC_SLOTS];
+    int free_top;
+    int ready_idx[LEANAV_ENC_SLOTS];
+    int ready_head, ready_tail, ready_count;
     int input_done;
     AVPacket *ready[LEANAV_PKT_QUEUE];
     int pkt_head, pkt_tail, pkt_count;
@@ -2871,7 +2874,6 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t has_frame;
     pthread_cond_t has_slot;
-    pthread_cond_t has_packet;
     AVCodecContext *venc;
     AVStream *ovs;
 } leanav_enc_queue_t;
@@ -2881,26 +2883,32 @@ static void leanav_enc_store_packet(leanav_enc_queue_t *q, AVPacket *ep) {
     q->ready[q->pkt_tail] = ep;
     q->pkt_tail = (q->pkt_tail + 1) % LEANAV_PKT_QUEUE;
     q->pkt_count++;
-    pthread_cond_signal(&q->has_packet);
+}
+
+static void leanav_enc_return_slot(leanav_enc_queue_t *q, int idx) {
+    pthread_mutex_lock(&q->mu);
+    q->free_stack[q->free_top++] = idx;
+    pthread_cond_signal(&q->has_slot);
+    pthread_mutex_unlock(&q->mu);
 }
 
 /* Owns venc. Drains every pending packet before blocking on the next frame,
-   so send_frame can never stall forever on EAGAIN. */
+   so send_frame can never stall forever on EAGAIN. A slot goes back to the
+   pool only after the encoder has consumed it. */
 static void *leanav_enc_worker(void *arg) {
     leanav_enc_queue_t *q = (leanav_enc_queue_t *)arg;
     for (;;) {
         pthread_mutex_lock(&q->mu);
-        while (q->count == 0 && !q->input_done) pthread_cond_wait(&q->has_frame, &q->mu);
-        if (q->count == 0 && q->input_done) { pthread_mutex_unlock(&q->mu); break; }
-        AVFrame *f = q->slot[q->head];
-        q->slot[q->head] = NULL;
-        q->head = (q->head + 1) % LEANAV_ENC_SLOTS;
-        q->count--;
-        pthread_cond_signal(&q->has_slot);
+        while (q->ready_count == 0 && !q->input_done) pthread_cond_wait(&q->has_frame, &q->mu);
+        if (q->ready_count == 0 && q->input_done) { pthread_mutex_unlock(&q->mu); break; }
+        int idx = q->ready_idx[q->ready_head];
+        q->ready_head = (q->ready_head + 1) % LEANAV_ENC_SLOTS;
+        q->ready_count--;
         pthread_mutex_unlock(&q->mu);
 
+        AVFrame *f = q->pool[idx];
         int send = avcodec_send_frame(q->venc, f);
-        av_frame_free(&f);
+        leanav_enc_return_slot(q, idx);
         AVPacket *ep = av_packet_alloc();
         for (;;) {
             int r = ep ? avcodec_receive_packet(q->venc, ep) : AVERROR(EAGAIN);
@@ -3199,47 +3207,39 @@ static uint64_t leanav_libav_transcode_pixel(
         avformat_close_input(&ifmt);
         return 0;
     }
-    AVFrame *dst_frame = av_frame_alloc();
-    if (!dst_frame) {
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    dst_frame->format = venc->pix_fmt;
-    dst_frame->width = (int)dst_w;
-    dst_frame->height = (int)dst_h;
-    if (av_frame_get_buffer(dst_frame, 32) < 0) {
-        av_frame_free(&dst_frame);
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
     leanav_enc_queue_t enc_q;
     memset(&enc_q, 0, sizeof(enc_q));
     enc_q.venc = venc;
     enc_q.ovs = ovs;
+    int pool_ok = 1;
+    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
+        AVFrame *f = av_frame_alloc();
+        if (!f) { pool_ok = 0; break; }
+        f->format = venc->pix_fmt;
+        f->width = (int)dst_w;
+        f->height = (int)dst_h;
+        if (av_frame_get_buffer(f, 32) < 0) { av_frame_free(&f); pool_ok = 0; break; }
+        enc_q.pool[i] = f;
+        enc_q.free_stack[enc_q.free_top++] = i;
+    }
+    if (!pool_ok) {
+        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+        if (afifo) av_audio_fifo_free(afifo);
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&aenc);
+        avcodec_free_context(&adec);
+        avcodec_free_context(&venc);
+        avcodec_free_context(&vdec_ctx);
+        avformat_close_input(&ifmt);
+        return 0;
+    }
     pthread_mutex_init(&enc_q.mu, NULL);
     pthread_cond_init(&enc_q.has_frame, NULL);
     pthread_cond_init(&enc_q.has_slot, NULL);
-    pthread_cond_init(&enc_q.has_packet, NULL);
     pthread_t enc_thread;
     if (pthread_create(&enc_thread, NULL, leanav_enc_worker, &enc_q) != 0) {
         av_packet_free(&pkt);
@@ -3330,7 +3330,16 @@ static uint64_t leanav_libav_transcode_pixel(
         int fw = frame->width;
         int fh = frame->height;
         if (fw < 2 || fh < 2) { av_frame_unref(frame); continue; }
-        if (av_frame_make_writable(dst_frame) < 0) { av_frame_unref(frame); break; }
+        pthread_mutex_lock(&enc_q.mu);
+        while (enc_q.free_top == 0) {
+            pthread_mutex_unlock(&enc_q.mu);
+            leanav_enc_flush_packets(&enc_q, ofmt);
+            pthread_mutex_lock(&enc_q.mu);
+            if (enc_q.free_top == 0) pthread_cond_wait(&enc_q.has_slot, &enc_q.mu);
+        }
+        int slot_idx = enc_q.free_stack[--enc_q.free_top];
+        pthread_mutex_unlock(&enc_q.mu);
+        AVFrame *dst_frame = enc_q.pool[slot_idx];
         leanav_copy_plane_to_dst(frame->data[0], frame->linesize[0], fw, fh, src_bps,
             dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, y_tabs, is_10bit);
         leanav_copy_plane_to_dst(frame->data[1], frame->linesize[1], fw >> 1, fh >> 1, src_bps,
@@ -3402,26 +3411,13 @@ static uint64_t leanav_libav_transcode_pixel(
         mean_accum += f_mean;
         var_accum += f_var;
 
-        {
-            AVFrame *owned = av_frame_alloc();
-            if (owned && av_frame_ref(owned, dst_frame) >= 0) {
-                pthread_mutex_lock(&enc_q.mu);
-                while (enc_q.count == LEANAV_ENC_SLOTS) {
-                    pthread_mutex_unlock(&enc_q.mu);
-                    leanav_enc_flush_packets(&enc_q, ofmt);
-                    pthread_mutex_lock(&enc_q.mu);
-                    if (enc_q.count == LEANAV_ENC_SLOTS) pthread_cond_wait(&enc_q.has_slot, &enc_q.mu);
-                }
-                enc_q.slot[enc_q.tail] = owned;
-                enc_q.tail = (enc_q.tail + 1) % LEANAV_ENC_SLOTS;
-                enc_q.count++;
-                pthread_cond_signal(&enc_q.has_frame);
-                pthread_mutex_unlock(&enc_q.mu);
-                owned = NULL;
-            }
-            if (owned) av_frame_free(&owned);
-            leanav_enc_flush_packets(&enc_q, ofmt);
-        }
+        pthread_mutex_lock(&enc_q.mu);
+        enc_q.ready_idx[enc_q.ready_tail] = slot_idx;
+        enc_q.ready_tail = (enc_q.ready_tail + 1) % LEANAV_ENC_SLOTS;
+        enc_q.ready_count++;
+        pthread_cond_signal(&enc_q.has_frame);
+        pthread_mutex_unlock(&enc_q.mu);
+        leanav_enc_flush_packets(&enc_q, ofmt);
         frames_done++;
         if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
             uint64_t elapsed_us = leanav_mono_us() - stats_t0;
@@ -3446,7 +3442,7 @@ static uint64_t leanav_libav_transcode_pixel(
     pthread_mutex_destroy(&enc_q.mu);
     pthread_cond_destroy(&enc_q.has_frame);
     pthread_cond_destroy(&enc_q.has_slot);
-    pthread_cond_destroy(&enc_q.has_packet);
+    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
     if (aenc && oas && afifo) {
         int delay = swr ? swr_get_delay(swr, aenc->sample_rate) : 0;
         if (delay > 0) {
@@ -3474,7 +3470,6 @@ static uint64_t leanav_libav_transcode_pixel(
     int trailer_rc = av_write_trailer(ofmt);
     av_packet_free(&pkt);
     av_frame_free(&frame);
-    av_frame_free(&dst_frame);
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
     avformat_free_context(ofmt);
     if (afifo) av_audio_fifo_free(afifo);
