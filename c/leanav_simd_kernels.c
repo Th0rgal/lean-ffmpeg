@@ -2568,7 +2568,9 @@ static int leanav_open_encoder(
     if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
         const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
         av_opt_set(ctx->priv_data, "preset", preset, 0);
-        av_opt_set_int(ctx->priv_data, "threads", 4, 0);
+        long ncpu_enc = sysconf(_SC_NPROCESSORS_ONLN);
+        int enc_threads = (ncpu_enc > 2) ? (int)ncpu_enc / 2 : 1;
+        av_opt_set_int(ctx->priv_data, "threads", enc_threads, 0);
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
         av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
@@ -2989,9 +2991,12 @@ static uint64_t leanav_libav_transcode_pixel(
         avformat_close_input(&ifmt);
         return 0;
     }
-    /* Frame threading is what took the wall time from 28 s to 8.7 s. The
-       automatic count stops at 16, and slice threading only adds contention. */
-    vdec_ctx->thread_count = 0;
+    /* The encoder takes half the cores, so the decoder must stay inside the
+       other half or the two pools fight and the wall time goes back up. */
+    long ncpu_dec = sysconf(_SC_NPROCESSORS_ONLN);
+    int dec_threads = (ncpu_dec > 2) ? (int)ncpu_dec / 2 - 1 : 1;
+    if (dec_threads < 1) dec_threads = 1;
+    vdec_ctx->thread_count = dec_threads;
     vdec_ctx->thread_type = FF_THREAD_FRAME;
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
         avcodec_free_context(&vdec_ctx);
