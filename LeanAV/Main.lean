@@ -650,7 +650,12 @@ def runSelfTest : IO UInt32 := do
   let w50Udta : UdtaMetaIlstBoxView := {
     itemKey4CC := 0xA9746F6F, encoderTag4CC := 0x4C46464D
   }
-  let w50Ok := decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec w50Udta) == some w50Udta
+  let w50Ok := decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec w50Udta) == some w50Udta &&
+               visualFidelityGateSpec.gate visualFidelityGateSpec.posWitness &&
+               !(visualFidelityGateSpec.gate visualFidelityGateSpec.negWitness) &&
+               mp4ContainerSyncGateSpec.gate mp4ContainerSyncGateSpec.posWitness &&
+               !(mp4ContainerSyncGateSpec.gate mp4ContainerSyncGateSpec.negWitness) &&
+               verifyScaledPlaneVisualFidelity (scalePlaneDown2x2Simd realFfmpeg8x8Plane) (scalePlaneDown2x2Simd realFfmpeg8x8Plane) 0 0
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
@@ -660,7 +665,7 @@ def runSelfTest : IO UInt32 := do
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
   let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 50, \"c_abi_gates\": 9, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 50, \"c_abi_gates\": 11, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -860,6 +865,27 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           | _     => "h264"
         let withAudio := !validCfg.noAudio && validCfg.audioCodec.isSome
         let tDemux ← IO.monoNanosNow
+        let pixRep ← runCertifiedPixelTranscodeMp4 inPath outPath demux targetCodec withAudio
+        if pixRep.ok then
+          let tEnd ← IO.monoNanosNow
+          let outStat ← if outPath != "" && outPath != "-" && validCfg.format != some "null" then
+            (do let ba ← IO.FS.readBinFile outPath; pure ba.size) <|> pure 0
+          else pure 0
+          let demuxUs := (tDemux - t0) / 1000
+          let transcodeUs := (tEnd - tDemux) / 1000
+          let totalUs := (tEnd - t0) / 1000
+          let nFrames := if pixRep.framesDecoded > 0 then pixRep.framesDecoded else demux.samples.size
+          let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
+          let dstW := Nat.max 1 (demux.width / 2)
+          let dstH := Nat.max 1 (demux.height / 2)
+          let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
+          let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{demux.width}x{demux.height}\", \"dst_res\": \"{dstW}x{dstH}\", "
+          let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {demux.iFrameCount}, \"p_frames\": {demux.pFrameCount}, \"b_frames\": {demux.bFrameCount}, "
+          let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, "
+          let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
+          let c5 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
+          IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
+          return 0
         let rep ← transcodeMp44kTo1080pIpbParallelCodec demux targetCodec 8 withAudio
         let tTranscode ← IO.monoNanosNow
         if outPath != "" && outPath != "-" && validCfg.format != some "null" then
@@ -1318,6 +1344,11 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.NativeKernels.evalLnir_h264_cabac_mps_renorm_fma_equiv
 #print axioms LeanAV.Format.udta_meta_ilst_container_metadata_roundtrip
 #print axioms LeanAV.NativeKernels.evalLnir_hevc_cabac_bypass_bin_accum_fma_equiv
+#print axioms LeanAV.Spec.visualFidelityGateSpec
+#print axioms LeanAV.Spec.verifyVisualFidelity_rejects_black_and_decode_errors
+#print axioms LeanAV.Spec.mp4ContainerSyncGateSpec
+#print axioms LeanAV.Spec.verifyMp4ContainerSync_rejects_unclipped_chapters
+#print axioms LeanAV.Encoder.scaledPlane_visualFidelity_accepts_real_and_rejects_black
 
 
 

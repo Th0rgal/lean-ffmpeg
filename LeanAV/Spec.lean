@@ -502,6 +502,142 @@ theorem encoder_loop_rejects_mismatch (e : EncoderLoopCheck)
     isEncoderLoopValid e = false :=
   encoderLoopGateSpec.rejects_unsafe e h_bad
 
+/-! ### Law 9: Pixel-Domain Non-Degeneracy & Visual Fidelity Gate (`verifyVisualFidelity`) -/
+
+/--
+  Unboxed C-ABI Pixel-Domain Visual Fidelity & Non-Black Frame Gate (`leanav_verify_visual_fidelity`):
+  Certifies that a decoded/reconstructed video plane is:
+  1. Non-empty (`pixelCount > 0`),
+  2. Non-black and non-saturated (`lumaMean ≥ 17 ∧ lumaMean ≤ 250`, rejecting all-zero `Y=0` and studio-black `Y=16` frames),
+  3. Spatially non-constant (`lumaVariance > 0`, rejecting flat/solid-color synthetic frames),
+  4. Visually faithful to the reference scaled plane (`sadError ≤ maxSadBound`), and
+  5. Macroblock-clean (`decodeErrors == 0`).
+-/
+@[inline, export leanav_verify_visual_fidelity]
+def verifyVisualFidelity (pixelCount lumaMean lumaVariance sadError maxSadBound decodeErrors : UInt64) : UInt8 :=
+  if pixelCount > 0 &&
+     lumaMean ≥ 17 && lumaMean ≤ 250 &&
+     lumaVariance > 0 &&
+     sadError ≤ maxSadBound &&
+     decodeErrors == 0 then 1 else 0
+
+/-- Pixel-domain visual fidelity check parameters. -/
+structure VisualFidelityCheck where
+  pixelCount   : UInt64
+  lumaMean     : UInt64
+  lumaVariance : UInt64
+  sadError     : UInt64
+  maxSadBound  : UInt64
+  decodeErrors : UInt64
+  deriving Repr, DecidableEq
+
+/-- Executable gate for `VisualFidelityCheck`. -/
+@[inline]
+def isVisualFidelityValid (v : VisualFidelityCheck) : Bool :=
+  verifyVisualFidelity v.pixelCount v.lumaMean v.lumaVariance v.sadError v.maxSadBound v.decodeErrors == 1
+
+/-- Declarative safety predicate for `VisualFidelityCheck`. -/
+def VisualFidelitySafe (v : VisualFidelityCheck) : Prop :=
+  isVisualFidelityValid v = true
+
+/-- Layer II Bundle 9: Pixel-Domain Visual Fidelity & Non-Black Frame gate (`AVGateSpec`). -/
+def visualFidelityGateSpec : AVGateSpec VisualFidelityCheck VisualFidelitySafe where
+  gate := isVisualFidelityValid
+  sound _ hg := hg
+  complete _ hs := hs
+  posWitness := ⟨2073600, 118, 1420, 412000, 4147200, 0⟩
+  negWitness := ⟨2073600, 0, 0, 0, 4147200, 0⟩
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Corollary 9a: `verifyVisualFidelity` rejects any black frame (`lumaMean < 17`) or zero-variance flat frame (`lumaVariance == 0`). -/
+theorem visual_fidelity_rejects_black_or_corrupt (v : VisualFidelityCheck)
+    (h_bad : ¬ VisualFidelitySafe v) :
+    isVisualFidelityValid v = false :=
+  visualFidelityGateSpec.rejects_unsafe v h_bad
+
+/-- Universal Theorem 9b: Every black frame (`lumaMean ≤ 16`) or zero-variance frame (`lumaVariance = 0`)
+    or frame with macroblock decode errors (`decodeErrors > 0`) is unconditionally rejected by `verifyVisualFidelity`. -/
+theorem verifyVisualFidelity_rejects_black_and_decode_errors
+    (pixelCount lumaMean lumaVariance sadError maxSadBound decodeErrors : UInt64)
+    (h_deg : lumaMean < 17 ∨ lumaVariance = 0 ∨ decodeErrors ≠ 0) :
+    verifyVisualFidelity pixelCount lumaMean lumaVariance sadError maxSadBound decodeErrors = 0 := by
+  unfold verifyVisualFidelity
+  rcases h_deg with hBlack | hFlat | hErr
+  · have hNot : ¬ (lumaMean ≥ 17) := Nat.not_le_of_gt hBlack
+    simp [hNot]
+  · simp [hFlat]
+  · simp [hErr]
+
+/-! ### Law 10: ISOBMFF Container SPS/PPS & Chapter/Duration Synchronization Gate (`verifyMp4ContainerSync`) -/
+
+/--
+  Unboxed C-ABI ISOBMFF Container Synchronization Gate (`leanav_verify_mp4_container_sync`):
+  Certifies that an MP4 container satisfies:
+  1. Non-zero dimensions (`tkhdWidth > 0 ∧ tkhdHeight > 0`),
+  2. Exact `avcC`/`hvcC`/`av1C` SPS-to-`tkhd` resolution agreement (`spsWidth == tkhdWidth ∧ spsHeight == tkhdHeight`),
+  3. Positive movie/video duration (`videoDurationMs > 0`),
+  4. Container `mvhd` duration matches the video track duration within 100 ms (`|mvhdDurationMs - videoDurationMs| ≤ 100`), and
+  5. Zero unclipped chapter/data tracks (`unclippedChapterTracks == 0`, preventing a 3-hour `bin_data` chapter track from inflating a 10s/60s clip).
+-/
+@[inline, export leanav_verify_mp4_container_sync]
+def verifyMp4ContainerSync (tkhdWidth tkhdHeight spsWidth spsHeight : UInt32)
+    (mvhdDurationMs videoDurationMs : UInt64) (unclippedChapterTracks : UInt32) : UInt8 :=
+  let durDiff := if mvhdDurationMs ≥ videoDurationMs then mvhdDurationMs - videoDurationMs else videoDurationMs - mvhdDurationMs
+  if tkhdWidth > 0 && tkhdHeight > 0 &&
+     spsWidth == tkhdWidth && spsHeight == tkhdHeight &&
+     videoDurationMs > 0 &&
+     durDiff ≤ 100 &&
+     unclippedChapterTracks == 0 then 1 else 0
+
+/-- ISOBMFF container synchronization check parameters. -/
+structure Mp4ContainerSyncCheck where
+  tkhdWidth              : UInt32
+  tkhdHeight             : UInt32
+  spsWidth               : UInt32
+  spsHeight              : UInt32
+  mvhdDurationMs         : UInt64
+  videoDurationMs        : UInt64
+  unclippedChapterTracks : UInt32
+  deriving Repr, DecidableEq
+
+/-- Executable gate for `Mp4ContainerSyncCheck`. -/
+@[inline]
+def isMp4ContainerSyncValid (m : Mp4ContainerSyncCheck) : Bool :=
+  verifyMp4ContainerSync m.tkhdWidth m.tkhdHeight m.spsWidth m.spsHeight
+    m.mvhdDurationMs m.videoDurationMs m.unclippedChapterTracks == 1
+
+/-- Declarative safety predicate for `Mp4ContainerSyncCheck`. -/
+def Mp4ContainerSyncSafe (m : Mp4ContainerSyncCheck) : Prop :=
+  isMp4ContainerSyncValid m = true
+
+/-- Layer II Bundle 10: ISOBMFF Container SPS/PPS & Chapter/Duration Sync gate (`AVGateSpec`). -/
+def mp4ContainerSyncGateSpec : AVGateSpec Mp4ContainerSyncCheck Mp4ContainerSyncSafe where
+  gate := isMp4ContainerSyncValid
+  sound _ hg := hg
+  complete _ hs := hs
+  posWitness := ⟨1920, 1080, 1920, 1080, 60018, 60018, 0⟩
+  negWitness := ⟨3840, 2160, 3840, 2160, 12121632, 60018, 1⟩
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Corollary 10a: `verifyMp4ContainerSync` rejects any MP4 container with unclipped chapter tracks or SPS/tkhd resolution mismatch. -/
+theorem mp4_container_sync_rejects_chapter_or_sps_mismatch (m : Mp4ContainerSyncCheck)
+    (h_bad : ¬ Mp4ContainerSyncSafe m) :
+    isMp4ContainerSyncValid m = false :=
+  mp4ContainerSyncGateSpec.rejects_unsafe m h_bad
+
+/-- Universal Theorem 10b: Any MP4 container with an unclipped chapter track (`unclippedChapterTracks > 0`)
+    or mismatched `spsWidth ≠ tkhdWidth` is unconditionally rejected by `verifyMp4ContainerSync`. -/
+theorem verifyMp4ContainerSync_rejects_unclipped_chapters
+    (tkhdW tkhdH spsW spsH : UInt32) (mvhdDur videoDur : UInt64) (chapTracks : UInt32)
+    (h_bad : chapTracks ≠ 0 ∨ spsW ≠ tkhdW) :
+    verifyMp4ContainerSync tkhdW tkhdH spsW spsH mvhdDur videoDur chapTracks = 0 := by
+  unfold verifyMp4ContainerSync
+  rcases h_bad with hChap | hSps
+  · simp [hChap]
+  · simp [hSps]
+
 /-! ### Layer III: Per-Format Bitstream Gate Specifications (`AVGateSpec` with Real `ffmpeg`-Extracted Bytes) -/
 
 /--
