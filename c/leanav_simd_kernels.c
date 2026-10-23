@@ -2566,7 +2566,7 @@ static int leanav_open_encoder(
         ctx->color_range = AVCOL_RANGE_MPEG;
     }
     if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
-        const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : (strcmp(enc_name, "libx265") == 0 ? "veryfast" : "faster");
+        const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
         av_opt_set(ctx->priv_data, "preset", preset, 0);
         av_opt_set_int(ctx->priv_data, "threads", 4, 0);
         char crf_buf[32];
@@ -3633,7 +3633,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
     const char *eff_pix_fmt = (g_enc_pix_fmt[0] != '\0') ? g_enc_pix_fmt : "yuv420p";
-    const char *eff_preset_x264 = (g_enc_preset[0] != '\0') ? g_enc_preset : "faster";
+    const char *eff_preset_x264 = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
     const char *eff_preset_x265 = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
     const char *eff_crf_x264 = (g_enc_crf[0] != '\0') ? g_enc_crf : "22.6";
     const char *eff_crf_x265 = (g_enc_crf[0] != '\0') ? g_enc_crf : "24";
