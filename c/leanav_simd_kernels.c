@@ -682,6 +682,47 @@ static void leanav_scale_plane_3to2_raw(
         uint8_t *d0 = dst + by * dst_w;
         uint8_t *d1 = d0 + dst_w;
         size_t bx = 0;
+#if defined(__ARM_NEON)
+        const uint16x8_t bias4 = vdupq_n_u16(4);
+        const uint16x8_t recip7282 = vdupq_n_u16(7282);
+        for (; bx + 16 <= dst_w; bx += 16) {
+            size_t sx = (bx >> 1) * 3;
+            uint8x8x3_t t0 = vld3_u8(r0 + sx);
+            uint8x8x3_t t1 = vld3_u8(r1 + sx);
+            uint8x8x3_t t2 = vld3_u8(r2 + sx);
+
+            /* rowSum0L = 2*r0[0] + r0[1], rowSum0R = 2*r0[2] + r0[1] */
+            uint16x8_t r0_l = vaddw_u8(vshll_n_u8(t0.val[0], 1), t0.val[1]);
+            uint16x8_t r0_r = vaddw_u8(vshll_n_u8(t0.val[2], 1), t0.val[1]);
+            uint16x8_t r1_l = vaddw_u8(vshll_n_u8(t1.val[0], 1), t1.val[1]);
+            uint16x8_t r1_r = vaddw_u8(vshll_n_u8(t1.val[2], 1), t1.val[1]);
+            uint16x8_t r2_l = vaddw_u8(vshll_n_u8(t2.val[0], 1), t2.val[1]);
+            uint16x8_t r2_r = vaddw_u8(vshll_n_u8(t2.val[2], 1), t2.val[1]);
+
+            uint16x8_t a0 = vaddq_u16(vaddq_u16(vshlq_n_u16(r0_l, 1), r1_l), bias4);
+            uint16x8_t a1 = vaddq_u16(vaddq_u16(vshlq_n_u16(r0_r, 1), r1_r), bias4);
+            uint16x8_t b0 = vaddq_u16(vaddq_u16(vshlq_n_u16(r2_l, 1), r1_l), bias4);
+            uint16x8_t b1 = vaddq_u16(vaddq_u16(vshlq_n_u16(r2_r, 1), r1_r), bias4);
+
+            uint16x8_t q_a0 = vcombine_u16(
+                vshrn_n_u32(vmull_u16(vget_low_u16(a0), vget_low_u16(recip7282)), 16),
+                vshrn_n_u32(vmull_u16(vget_high_u16(a0), vget_high_u16(recip7282)), 16));
+            uint16x8_t q_a1 = vcombine_u16(
+                vshrn_n_u32(vmull_u16(vget_low_u16(a1), vget_low_u16(recip7282)), 16),
+                vshrn_n_u32(vmull_u16(vget_high_u16(a1), vget_high_u16(recip7282)), 16));
+            uint16x8_t q_b0 = vcombine_u16(
+                vshrn_n_u32(vmull_u16(vget_low_u16(b0), vget_low_u16(recip7282)), 16),
+                vshrn_n_u32(vmull_u16(vget_high_u16(b0), vget_high_u16(recip7282)), 16));
+            uint16x8_t q_b1 = vcombine_u16(
+                vshrn_n_u32(vmull_u16(vget_low_u16(b1), vget_low_u16(recip7282)), 16),
+                vshrn_n_u32(vmull_u16(vget_high_u16(b1), vget_high_u16(recip7282)), 16));
+
+            uint8x8x2_t out_top = { { vmovn_u16(q_a0), vmovn_u16(q_a1) } };
+            uint8x8x2_t out_bot = { { vmovn_u16(q_b0), vmovn_u16(q_b1) } };
+            vst2_u8(d0 + bx, out_top);
+            vst2_u8(d1 + bx, out_bot);
+        }
+#endif
         for (; bx + 1 < dst_w; bx += 2) {
             size_t sx = (bx >> 1) * 3;
             uint32_t a0 = ((uint32_t)r0[sx] * 2u + (uint32_t)r0[sx + 1]) * 2u +
@@ -702,16 +743,19 @@ static void leanav_scale_plane_3to2_raw(
 
 /*
  * Arbitrary Q8 Bilinear 2D plane scaler (`src_w x src_h -> dst_w x dst_h`):
- * Dispatches to specialized zero-division `2x2`, `3x3`, and `3:2` kernels, or precomputes
- * `sx0[dx]` and `fx[dx]` tables outside the row loop to eliminate all inner-loop divisions.
+ * Dispatches to specialized zero-division `2x2`, `3x3`, and `3:2` kernels, or uses
+ * preallocated `sx0[dx]` and `fx[dx]` tables outside the row loop to eliminate all inner-loop divisions.
  */
-static void leanav_scale_plane_bilinear_raw(
+static void leanav_scale_plane_bilinear_raw_with_tabs(
     const uint8_t *src,
     size_t src_w,
     size_t src_h,
     uint8_t *dst,
     size_t dst_w,
-    size_t dst_h
+    size_t dst_h,
+    uint32_t *sx0_tab,
+    uint32_t *sx1_tab,
+    uint16_t *fx_tab
 ) {
     if (src_w == dst_w && src_h == dst_h) {
         memcpy(dst, src, dst_w * dst_h);
@@ -729,13 +773,7 @@ static void leanav_scale_plane_bilinear_raw(
         leanav_scale_plane_3to2_raw(src, src_w, src_h, dst, dst_w, dst_h);
         return;
     }
-    uint32_t *sx0_tab = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
-    uint32_t *sx1_tab = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
-    uint16_t *fx_tab  = (uint16_t *)malloc(dst_w * sizeof(uint16_t));
     if (!sx0_tab || !sx1_tab || !fx_tab) {
-        free(sx0_tab);
-        free(sx1_tab);
-        free(fx_tab);
         return;
     }
     for (size_t dx = 0; dx < dst_w; dx++) {
@@ -768,9 +806,6 @@ static void leanav_scale_plane_bilinear_raw(
             out_row[dx] = (uint8_t)(val > 255u ? 255u : val);
         }
     }
-    free(sx0_tab);
-    free(sx1_tab);
-    free(fx_tab);
 }
 
 /*
@@ -806,7 +841,38 @@ static void leanav_apply_pixel_filters_raw(
         }
     }
     if (filter_flags & 1u) {
-        for (size_t i = 0; i < uv_sz; i++) {
+        size_t i = 0;
+#if defined(__ARM_NEON)
+        const int16x8_t bias128 = vdupq_n_s16(128);
+        const int32x4_t round512 = vdupq_n_s32(512);
+        const int16x4_t c1004 = vdup_n_s16(1004);
+        const int16x4_t cm74  = vdup_n_s16(-74);
+        const int16x4_t cm42  = vdup_n_s16(-42);
+        const int16x4_t c986  = vdup_n_s16(986);
+        for (; i + 8 <= uv_sz; i += 8) {
+            uint8x8_t u8 = vld1_u8(u_plane + i);
+            uint8x8_t v8 = vld1_u8(v_plane + i);
+            int16x8_t u0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), bias128);
+            int16x8_t v0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), bias128);
+
+            int16x4_t u_lo = vget_low_s16(u0);
+            int16x4_t u_hi = vget_high_s16(u0);
+            int16x4_t v_lo = vget_low_s16(v0);
+            int16x4_t v_hi = vget_high_s16(v0);
+
+            int32x4_t uo_lo = vmlal_s16(vmlal_s16(round512, u_lo, c1004), v_lo, cm74);
+            int32x4_t uo_hi = vmlal_s16(vmlal_s16(round512, u_hi, c1004), v_hi, cm74);
+            int32x4_t vo_lo = vmlal_s16(vmlal_s16(round512, u_lo, cm42), v_lo, c986);
+            int32x4_t vo_hi = vmlal_s16(vmlal_s16(round512, u_hi, cm42), v_hi, c986);
+
+            int16x8_t u_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(uo_lo, 10), vshrn_n_s32(uo_hi, 10)));
+            int16x8_t v_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(vo_lo, 10), vshrn_n_s32(vo_hi, 10)));
+
+            vst1_u8(u_plane + i, vqmovun_s16(u_res));
+            vst1_u8(v_plane + i, vqmovun_s16(v_res));
+        }
+#endif
+        for (; i < uv_sz; i++) {
             int32_t u0 = (int32_t)u_plane[i] - 128;
             int32_t v0 = (int32_t)v_plane[i] - 128;
             int32_t u_out = 128 + ((1004 * u0 - 74 * v0 + 512) >> 10);
@@ -1024,11 +1090,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint8_t *dst_v = dst_buf + dst_y_sz + dst_uv_sz;
 
         /* 1. Pixel-domain scaling (2x2 SIMD, 3x3 reciprocal box, or general Q8 bilinear) */
-        leanav_scale_plane_bilinear_raw(src_buf, src_w, src_h, dst_y, dst_w, dst_h);
-        leanav_scale_plane_bilinear_raw(
-            src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_u, dst_w >> 1, dst_h >> 1);
-        leanav_scale_plane_bilinear_raw(
-            src_buf + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_v, dst_w >> 1, dst_h >> 1);
+        leanav_scale_plane_bilinear_raw_with_tabs(
+            src_buf, src_w, src_h, dst_y, dst_w, dst_h, sx0_tab, sx1_tab, fx_tab);
+        leanav_scale_plane_bilinear_raw_with_tabs(
+            src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_u, dst_w >> 1, dst_h >> 1, sx0_tab, sx1_tab, fx_tab);
+        leanav_scale_plane_bilinear_raw_with_tabs(
+            src_buf + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_v, dst_w >> 1, dst_h >> 1, sx0_tab, sx1_tab, fx_tab);
 
         /* 2. Optional BT.2020->BT.709 chroma matrix & Reinhard HDR-to-SDR luma tonemap */
         if (filter_flags_u32 & 3u) {
