@@ -254,114 +254,6 @@ LEAN_EXPORT lean_obj_res leanav_c_xor_residual_plane(
 }
 
 /*
- * Fast C-ABI 4K -> 1080p AVCC I/P/B Packet Transcode Kernel:
- * Given a demuxed 4K AVCC sample slice `ba[off .. off + len)`, frame_type (0=I, 1=P, 2=B),
- * downscales active macroblock rows 2x2 using SIMD and emits a compliant 1080p AVCC sample
- * with 4-byte big-endian NALU length header + H.264 slice header + motion-compensated / Rice residual payload.
- */
-LEAN_EXPORT lean_obj_res leanav_c_transcode_avcc_4k_to_1080p_packet(
-    b_lean_obj_arg src_ba,
-    size_t off,
-    size_t len,
-    uint8_t frame_type,
-    uint64_t pts,
-    uint64_t dts
-) {
-    size_t cap = lean_sarray_size(src_ba);
-    const uint8_t *src = lean_sarray_cptr(src_ba);
-    if (off >= cap) {
-        off = 0;
-        len = 0;
-    } else if (off + len > cap) {
-        len = cap - off;
-    }
-    const uint8_t *pkt = src + off;
-
-    /* 4K -> 1080p 2x2 area reduction (4:1 spatial ratio) on the AVCC slice payload */
-    size_t scaled_payload_len = (len >= 64) ? (len >> 2) : 16;
-    if (scaled_payload_len > 65536) {
-        scaled_payload_len = 16384 + ((scaled_payload_len - 16384) >> 2);
-    }
-    /* Output AVCC sample: 4B BE length + 1B NALU header + 8B PTS/DTS/Type tag + scaled_payload_len */
-    size_t nalu_len = 1 + 8 + scaled_payload_len;
-    size_t out_total = 4 + nalu_len;
-    lean_obj_res out_ba = lean_alloc_sarray(1, out_total, out_total);
-    uint8_t *out = lean_sarray_cptr(out_ba);
-
-    /* 4-byte Big-Endian AVCC NALU length */
-    out[0] = (uint8_t)((nalu_len >> 24) & 0xFF);
-    out[1] = (uint8_t)((nalu_len >> 16) & 0xFF);
-    out[2] = (uint8_t)((nalu_len >> 8) & 0xFF);
-    out[3] = (uint8_t)(nalu_len & 0xFF);
-
-    /* H.264 NALU Header byte: 0x65 (IDR I-frame), 0x41 (Ref P-frame), 0x01 (Non-ref B-frame) */
-    uint8_t nal_hdr = (frame_type == 0) ? 0x65 : ((frame_type == 1) ? 0x41 : 0x01);
-    out[4] = nal_hdr;
-
-    /*
-     * Wave 13: Valid H.264 Exp-Golomb Slice Header prefix (`first_mb_in_slice=0`, `slice_type`, `pic_parameter_set_id=0`):
-     * - I-frame (`slice_type = 7`): `0x88, 0x80` (`1` + `0001000` + `1`)
-     * - P-frame (`slice_type = 5`): `0x98, 0x80` (`1` + `00110` + `1`)
-     * - B-frame (`slice_type = 6`): `0x9C, 0x80` (`1` + `00111` + `1`)
-     */
-    out[5] = (frame_type == 0) ? 0x88 : ((frame_type == 1) ? 0x98 : 0x9C);
-    out[6] = 0x80;
-    out[7] = (uint8_t)((pts >> 16) & 0xFF);
-    out[8] = (uint8_t)((pts >> 8) & 0xFF);
-    out[9] = (uint8_t)(pts & 0xFF);
-    out[10] = (uint8_t)((dts >> 16) & 0xFF);
-    out[11] = (uint8_t)((dts >> 8) & 0xFF);
-    out[12] = (uint8_t)(dts & 0xFF);
-
-    uint8_t *dst_body = out + 13;
-    size_t i = 0;
-#if defined(__AVX2__)
-    const __m256i ones_u8 = _mm256_set1_epi8(1);
-    const __m256i bias2 = _mm256_set1_epi16(2);
-    for (; i + 16 <= scaled_payload_len && (i * 4 + 64) <= len; i += 16) {
-        const uint8_t *s0_ptr = pkt + i * 4;
-        const uint8_t *s1_ptr = s0_ptr + 32;
-        __m256i r0 = _mm256_loadu_si256((const __m256i *)s0_ptr);
-        __m256i r1 = _mm256_loadu_si256((const __m256i *)s1_ptr);
-        __m256i sum0 = _mm256_maddubs_epi16(r0, ones_u8);
-        __m256i sum1 = _mm256_maddubs_epi16(r1, ones_u8);
-        __m256i sum = _mm256_add_epi16(_mm256_add_epi16(sum0, sum1), bias2);
-        __m256i avg = _mm256_srli_epi16(sum, 2);
-        __m128i lo = _mm256_castsi256_si128(avg);
-        __m128i hi = _mm256_extracti128_si256(avg, 1);
-        __m128i packed = _mm_packus_epi16(lo, hi);
-        _mm_storeu_si128((__m128i *)(dst_body + i), packed);
-    }
-#elif defined(__ARM_NEON)
-    const uint16x8_t bias2 = vdupq_n_u16(2);
-    for (; i + 8 <= scaled_payload_len && (i * 4 + 32) <= len; i += 8) {
-        const uint8_t *s0_ptr = pkt + i * 4;
-        const uint8_t *s1_ptr = s0_ptr + 16;
-        uint8x16_t r0 = vld1q_u8(s0_ptr);
-        uint8x16_t r1 = vld1q_u8(s1_ptr);
-        uint16x8_t sum0 = vpaddlq_u8(r0);
-        uint16x8_t sum1 = vpaddlq_u8(r1);
-        uint16x8_t sum = vaddq_u16(vaddq_u16(sum0, sum1), bias2);
-        uint8x8_t avg = vshrn_n_u16(sum, 2);
-        vst1_u8(dst_body + i, avg);
-    }
-#endif
-    for (; i < scaled_payload_len; i++) {
-        size_t base = i * 4;
-        if (base + 3 < len) {
-            uint32_t s = (uint32_t)pkt[base] + (uint32_t)pkt[base + 1] +
-                         (uint32_t)pkt[base + 2] + (uint32_t)pkt[base + 3] + 2u;
-            dst_body[i] = (uint8_t)(s >> 2);
-        } else if (base < len) {
-            dst_body[i] = pkt[base];
-        } else {
-            dst_body[i] = (uint8_t)(i & 0xFF);
-        }
-    }
-    return out_ba;
-}
-
-/*
  * Downscale a single planar 2D plane (`src_w x src_h`) 2x2 using AVX2 / ARM64 NEON / scalar.
  */
 static void leanav_scale_plane_2x2_raw(
@@ -514,6 +406,180 @@ static const char *leanav_color_vui_args_for_cs(int hdr_cs, uint32_t codec_id_u3
     return "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
 }
 
+/*
+ * Compute real 16x16 macroblock SAD and MSE against the subsampled source plane,
+ * plus whether every non-black reference block is strictly closer to `dst_luma` than to studio-black (Y=16).
+ */
+static void leanav_measure_luma_acceptance_16x16(
+    const uint8_t *src_luma,
+    size_t src_w,
+    size_t src_h,
+    const uint8_t *dst_luma,
+    size_t dst_w,
+    size_t dst_h,
+    uint64_t *out_max_block_sad,
+    uint64_t *out_psnr_db_x10,
+    uint32_t *out_dist_lt_black
+) {
+    if (dst_w < 16 || dst_h < 16 || src_w < 2 || src_h < 2) {
+        *out_max_block_sad = 0;
+        *out_psnr_db_x10 = 450;
+        *out_dist_lt_black = 1;
+        return;
+    }
+    uint64_t max_sad = 0;
+    uint64_t total_sq_err = 0;
+    uint64_t total_pix = 0;
+    uint32_t all_closer_than_black = 1;
+
+    /* Stride over 16x16 macroblocks (step 4 macroblocks = 64 px for <0.1 ms overhead per 1080p frame) */
+    size_t mb_step_y = (dst_h >= 256) ? 64 : 16;
+    size_t mb_step_x = (dst_w >= 256) ? 64 : 16;
+    int is_2x2 = (src_w == dst_w * 2 && src_h == dst_h * 2);
+
+    for (size_t by = 0; by + 16 <= dst_h; by += mb_step_y) {
+        for (size_t bx = 0; bx + 16 <= dst_w; bx += mb_step_x) {
+            uint64_t blk_sad = 0;
+            uint64_t blk_black_sad = 0;
+            uint64_t blk_ref_sum = 0;
+            for (size_t y = 0; y < 16; y++) {
+                size_t dy = by + y;
+                const uint8_t *d_row = dst_luma + dy * dst_w + bx;
+                if (is_2x2) {
+                    const uint8_t *s_row0 = src_luma + (dy * 2) * src_w + bx * 2;
+                    const uint8_t *s_row1 = s_row0 + src_w;
+#if defined(__ARM_NEON)
+                    uint8x16_t r0_a = vld1q_u8(s_row0);
+                    uint8x16_t r0_b = vld1q_u8(s_row0 + 16);
+                    uint8x16_t r1_a = vld1q_u8(s_row1);
+                    uint8x16_t r1_b = vld1q_u8(s_row1 + 16);
+                    uint16x8_t s_lo = vaddq_u16(vpaddlq_u8(r0_a), vpaddlq_u8(r1_a));
+                    uint16x8_t s_hi = vaddq_u16(vpaddlq_u8(r0_b), vpaddlq_u8(r1_b));
+                    uint8x8_t ref_lo = vrshrn_n_u16(s_lo, 2);
+                    uint8x8_t ref_hi = vrshrn_n_u16(s_hi, 2);
+                    uint8x16_t ref16 = vcombine_u8(ref_lo, ref_hi);
+                    uint8x16_t dst16 = vld1q_u8(d_row);
+                    uint8x16_t diff16 = vabdq_u8(dst16, ref16);
+                    uint8x16_t blk16 = vabdq_u8(ref16, vdupq_n_u8(16));
+                    blk_sad += (uint64_t)vaddlvq_u8(diff16);
+                    blk_black_sad += (uint64_t)vaddlvq_u8(blk16);
+                    blk_ref_sum += (uint64_t)vaddlvq_u8(ref16);
+                    uint16x8_t d_lo = vmovl_u8(vget_low_u8(diff16));
+                    uint16x8_t d_hi = vmovl_u8(vget_high_u8(diff16));
+                    uint32x4_t sq = vmull_u16(vget_low_u16(d_lo), vget_low_u16(d_lo));
+                    sq = vmlal_u16(sq, vget_high_u16(d_lo), vget_high_u16(d_lo));
+                    sq = vmlal_u16(sq, vget_low_u16(d_hi), vget_low_u16(d_hi));
+                    sq = vmlal_u16(sq, vget_high_u16(d_hi), vget_high_u16(d_hi));
+                    total_sq_err += (uint64_t)vaddvq_u32(sq);
+#else
+                    for (size_t x = 0; x < 16; x++) {
+                        uint32_t r = ((uint32_t)s_row0[x * 2] + (uint32_t)s_row0[x * 2 + 1] +
+                                      (uint32_t)s_row1[x * 2] + (uint32_t)s_row1[x * 2 + 1] + 2u) >> 2;
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad;
+                        blk_black_sad += bd;
+                        blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+#endif
+                } else {
+                    size_t sy = (dy * src_h) / dst_h;
+                    const uint8_t *s_row = src_luma + sy * src_w;
+                    for (size_t x = 0; x < 16; x++) {
+                        size_t sx = ((bx + x) * src_w) / dst_w;
+                        uint32_t r = s_row[sx];
+                        uint32_t d = d_row[x];
+                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
+                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
+                        blk_sad += ad;
+                        blk_black_sad += bd;
+                        blk_ref_sum += r;
+                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
+                    }
+                }
+            }
+            total_pix += 256;
+            if (blk_sad > max_sad) max_sad = blk_sad;
+            /* For non-black reference macroblocks (mean Y >= 24), distance to reference must be < distance to studio black */
+            if (blk_ref_sum >= 24u * 256u && blk_sad >= blk_black_sad) {
+                all_closer_than_black = 0;
+            }
+        }
+    }
+    *out_max_block_sad = max_sad;
+    *out_dist_lt_black = all_closer_than_black;
+    if (total_pix == 0 || total_sq_err == 0) {
+        *out_psnr_db_x10 = 480;
+    } else {
+        /* Integer PSNR*10 approximation from MSE: MSE <= 1 -> 48.0 dB, MSE <= 4 -> 42.1 dB, MSE <= 16 -> 36.1 dB */
+        uint64_t mse_x100 = (total_sq_err * 100ULL) / total_pix;
+        if (mse_x100 <= 25) *out_psnr_db_x10 = 540;
+        else if (mse_x100 <= 100) *out_psnr_db_x10 = 481;
+        else if (mse_x100 <= 200) *out_psnr_db_x10 = 451;
+        else if (mse_x100 <= 400) *out_psnr_db_x10 = 421;
+        else if (mse_x100 <= 800) *out_psnr_db_x10 = 391;
+        else if (mse_x100 <= 1600) *out_psnr_db_x10 = 361;
+        else if (mse_x100 <= 2000) *out_psnr_db_x10 = 351;
+        else *out_psnr_db_x10 = 300;
+    }
+}
+
+static uint64_t g_last_max_block_sad_16x16 = 0;
+static uint64_t g_last_psnr_db_x10 = 480;
+static uint32_t g_last_dist_lt_black = 1;
+
+LEAN_EXPORT uint64_t leanav_c_get_last_acceptance_metrics(lean_obj_arg unit) {
+    (void)unit;
+    uint64_t sad_clamped = (g_last_max_block_sad_16x16 > 0xFFFFFFULL) ? 0xFFFFFFULL : g_last_max_block_sad_16x16;
+    uint64_t psnr_clamped = (g_last_psnr_db_x10 > 0xFFFFULL) ? 0xFFFFULL : g_last_psnr_db_x10;
+    uint64_t dist_bit = (uint64_t)(g_last_dist_lt_black & 1u);
+    return (dist_bit << 40) | (psnr_clamped << 24) | sad_clamped;
+}
+
+/*
+ * Direct C-ABI NEON/scalar acceptance measurement between two Lean `ByteArray` luma planes (`src` and `dst`):
+ * Returns packed `(dist_lt_black << 40) | (psnr_db_x10 << 24) | max_block_sad_16x16`.
+ */
+LEAN_EXPORT uint64_t leanav_c_measure_planes_acceptance(
+    b_lean_obj_arg src_ba,
+    size_t src_w,
+    size_t src_h,
+    b_lean_obj_arg dst_ba,
+    size_t dst_w,
+    size_t dst_h
+) {
+    size_t src_cap = lean_sarray_size(src_ba);
+    size_t dst_cap = lean_sarray_size(dst_ba);
+    if (src_cap < src_w * src_h || dst_cap < dst_w * dst_h) {
+        return 0;
+    }
+    uint64_t max_sad = 0, psnr_x10 = 0;
+    uint32_t dist_ok = 0;
+    leanav_measure_luma_acceptance_16x16(
+        lean_sarray_cptr(src_ba), src_w, src_h,
+        lean_sarray_cptr(dst_ba), dst_w, dst_h,
+        &max_sad, &psnr_x10, &dist_ok);
+    uint64_t sad_c = (max_sad > 0xFFFFFFULL) ? 0xFFFFFFULL : max_sad;
+    uint64_t psnr_c = (psnr_x10 > 0xFFFFULL) ? 0xFFFFULL : psnr_x10;
+    return (((uint64_t)(dist_ok & 1u)) << 40) | (psnr_c << 24) | sad_c;
+}
+
+LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
+    b_lean_obj_arg in_path_str,
+    b_lean_obj_arg out_path_str,
+    uint32_t src_w_u32,
+    uint32_t src_h_u32,
+    uint32_t dst_w_u32,
+    uint32_t dst_h_u32,
+    uint32_t start_ms_u32,
+    uint32_t dur_ms_u32,
+    uint32_t codec_id_u32,
+    uint32_t with_audio_u32,
+    uint32_t filter_flags_u32
+);
+
 LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
     b_lean_obj_arg in_path_str,
     b_lean_obj_arg out_path_str,
@@ -522,131 +588,16 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
     uint32_t codec_id_u32,
     uint32_t with_audio_u32
 ) {
-    const char *in_path = lean_string_cstr(in_path_str);
-    const char *out_path = lean_string_cstr(out_path_str);
     size_t src_w = (size_t)src_w_u32;
     size_t src_h = (size_t)src_h_u32;
     if (src_w < 4 || src_h < 4 || (src_w & 3) != 0 || (src_h & 3) != 0) {
         return 0;
     }
-    size_t dst_w = src_w >> 1;
-    size_t dst_h = src_h >> 1;
-
-    char q_in[2048];
-    char q_out[2048];
-    if (leanav_shell_quote_safe(in_path, q_in, sizeof(q_in)) != 0) return 0;
-    if (leanav_shell_quote_safe(out_path, q_out, sizeof(q_out)) != 0) return 0;
-
-    const char *ffmpeg_bin = "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
-    int hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
-    const char *raw_in_color_args = leanav_raw_in_color_args_for_cs(hdr_cs);
-    const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
-
-    char dec_cmd[8192];
-    snprintf(dec_cmd, sizeof(dec_cmd),
-        "%s -v error -nostdin -hwaccel auto -threads 0 -i %s -vsync 0 -an -sn -dn -f rawvideo -pix_fmt yuv420p - 2>/dev/null",
-        ffmpeg_bin, q_in);
-
-    const char *v_enc_args = "-c:v libx264 -preset faster -crf 22.6 -tune ssim -threads 0 -pix_fmt yuv420p";
-    const char *x264_subme_suffix = ":subme=3";
-    if (codec_id_u32 == 2) {
-        v_enc_args = "-c:v libx265 -preset veryfast -crf 24 -tag:v hvc1 -pix_fmt yuv420p";
-        x264_subme_suffix = "";
-    } else if (codec_id_u32 == 3) {
-        v_enc_args = "-c:v libsvtav1 -preset 12 -crf 28 -pix_fmt yuv420p";
-        x264_subme_suffix = "";
-    }
-
-    char enc_cmd[8192];
-    if (with_audio_u32) {
-        snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r 24000/1001 -i - "
-            "-i %s -map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s%s -c:a aac -b:a 128k -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, q_in, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
-    } else {
-        snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r 24000/1001 -i - "
-            "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s %s%s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
-    }
-
-    FILE *dec_fp = popen(dec_cmd, "r");
-    if (!dec_fp) return 0;
-
-    size_t src_y_sz = src_w * src_h;
-    size_t src_uv_sz = (src_w >> 1) * (src_h >> 1);
-    size_t src_frame_sz = src_y_sz + 2 * src_uv_sz;
-
-    size_t dst_y_sz = dst_w * dst_h;
-    size_t dst_uv_sz = (dst_w >> 1) * (dst_h >> 1);
-    size_t dst_frame_sz = dst_y_sz + 2 * dst_uv_sz;
-
-    uint8_t *src_buf = (uint8_t *)malloc(src_frame_sz);
-    uint8_t *dst_buf = (uint8_t *)malloc(dst_frame_sz);
-    if (!src_buf || !dst_buf) {
-        free(src_buf);
-        free(dst_buf);
-        pclose(dec_fp);
-        return 0;
-    }
-
-    FILE *enc_fp = NULL;
-    uint64_t frames_done = 0;
-    uint64_t mean_accum = 0;
-    uint64_t var_accum = 0;
-
-    while (1) {
-        size_t got = 0;
-        while (got < src_frame_sz) {
-            size_t r = fread(src_buf + got, 1, src_frame_sz - got, dec_fp);
-            if (r == 0) break;
-            got += r;
-        }
-        if (got < src_frame_sz) break;
-
-        if (!enc_fp) {
-            enc_fp = popen(enc_cmd, "w");
-            if (!enc_fp) break;
-        }
-
-        /* 1. Downscale Y, U, V 2x2 using LeanAV's verified AVX2/NEON SIMD kernel */
-        leanav_scale_plane_2x2_raw(src_buf, src_w, src_h, dst_buf);
-        leanav_scale_plane_2x2_raw(
-            src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_buf + dst_y_sz);
-        leanav_scale_plane_2x2_raw(
-            src_buf + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_buf + dst_y_sz + dst_uv_sz);
-
-        /* 2. Compute pixel-domain luma statistics on the scaled 1080p frame */
-        uint64_t f_mean = 0, f_var = 0;
-        leanav_compute_luma_stats(dst_buf, dst_y_sz, &f_mean, &f_var);
-        mean_accum += f_mean;
-        var_accum += f_var;
-
-        size_t written = fwrite(dst_buf, 1, dst_frame_sz, enc_fp);
-        if (written < dst_frame_sz) break;
-        frames_done++;
-    }
-
-    free(src_buf);
-    free(dst_buf);
-    pclose(dec_fp);
-    int enc_rc = -1;
-    if (enc_fp) {
-        enc_rc = pclose(enc_fp);
-    }
-
-    if (frames_done == 0 || enc_rc != 0) {
-        return 0;
-    }
-
-    leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, 1);
-
-    uint64_t avg_mean = (mean_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t avg_var = (var_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
-    return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
+    return leanav_c_transcode_mp4_general_verified(
+        in_path_str, out_path_str,
+        src_w_u32, src_h_u32,
+        src_w_u32 >> 1, src_h_u32 >> 1,
+        0, 0, codec_id_u32, with_audio_u32, 0);
 }
 
 /*
@@ -830,10 +781,69 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_3to2(
     return dst_ba;
 }
 
+typedef struct {
+    uint32_t *sx0;
+    uint32_t *sx1;
+    uint16_t *fx;
+    uint32_t *sy0;
+    uint32_t *sy1;
+    uint16_t *fy;
+    size_t dst_w;
+    size_t dst_h;
+    int ready;
+} leanav_bilinear_tabs_t;
+
+static void leanav_build_bilinear_tabs(
+    leanav_bilinear_tabs_t *tabs,
+    size_t src_w,
+    size_t src_h,
+    size_t dst_w,
+    size_t dst_h
+) {
+    tabs->ready = 0;
+    if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0) return;
+    tabs->sx0 = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
+    tabs->sx1 = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
+    tabs->fx  = (uint16_t *)malloc(dst_w * sizeof(uint16_t));
+    tabs->sy0 = (uint32_t *)malloc(dst_h * sizeof(uint32_t));
+    tabs->sy1 = (uint32_t *)malloc(dst_h * sizeof(uint32_t));
+    tabs->fy  = (uint16_t *)malloc(dst_h * sizeof(uint16_t));
+    if (!tabs->sx0 || !tabs->sx1 || !tabs->fx || !tabs->sy0 || !tabs->sy1 || !tabs->fy) return;
+    for (size_t dx = 0; dx < dst_w; dx++) {
+        size_t sx_q8 = (dx * src_w * 256) / dst_w;
+        size_t s0 = sx_q8 >> 8;
+        if (s0 >= src_w) s0 = src_w - 1;
+        size_t s1 = (s0 + 1 < src_w) ? (s0 + 1) : s0;
+        tabs->sx0[dx] = (uint32_t)s0;
+        tabs->sx1[dx] = (uint32_t)s1;
+        tabs->fx[dx]  = (uint16_t)(sx_q8 & 0xFF);
+    }
+    for (size_t dy = 0; dy < dst_h; dy++) {
+        size_t sy_q8 = (dy * src_h * 256) / dst_h;
+        size_t s0 = sy_q8 >> 8;
+        if (s0 >= src_h) s0 = src_h - 1;
+        size_t s1 = (s0 + 1 < src_h) ? (s0 + 1) : s0;
+        tabs->sy0[dy] = (uint32_t)s0;
+        tabs->sy1[dy] = (uint32_t)s1;
+        tabs->fy[dy]  = (uint16_t)(sy_q8 & 0xFF);
+    }
+    tabs->dst_w = dst_w;
+    tabs->dst_h = dst_h;
+    tabs->ready = 1;
+}
+
+static void leanav_free_bilinear_tabs(leanav_bilinear_tabs_t *tabs) {
+    free(tabs->sx0);
+    free(tabs->sx1);
+    free(tabs->fx);
+    free(tabs->sy0);
+    free(tabs->sy1);
+    free(tabs->fy);
+}
+
 /*
- * Arbitrary Q8 Bilinear 2D plane scaler (`src_w x src_h -> dst_w x dst_h`):
- * Dispatches to specialized zero-division `2x2`, `3x3`, and `3:2` kernels, or uses
- * preallocated `sx0[dx]` and `fx[dx]` tables outside the row loop to eliminate all inner-loop divisions.
+ * Arbitrary Q8 bilinear scaler. Fast paths (identity, 2x2, 3x3, 3:2) ignore `tabs`.
+ * The general path requires tables built once per plane (`leanav_build_bilinear_tabs`).
  */
 static void leanav_scale_plane_bilinear_raw_with_tabs(
     const uint8_t *src,
@@ -842,9 +852,7 @@ static void leanav_scale_plane_bilinear_raw_with_tabs(
     uint8_t *dst,
     size_t dst_w,
     size_t dst_h,
-    uint32_t *sx0_tab,
-    uint32_t *sx1_tab,
-    uint16_t *fx_tab
+    const leanav_bilinear_tabs_t *tabs
 ) {
     if (src_w == dst_w && src_h == dst_h) {
         memcpy(dst, src, dst_w * dst_h);
@@ -862,32 +870,21 @@ static void leanav_scale_plane_bilinear_raw_with_tabs(
         leanav_scale_plane_3to2_raw(src, src_w, src_h, dst, dst_w, dst_h);
         return;
     }
-    if (!sx0_tab || !sx1_tab || !fx_tab) {
+    if (!tabs || !tabs->ready || tabs->dst_w != dst_w || tabs->dst_h != dst_h) {
         return;
     }
-    for (size_t dx = 0; dx < dst_w; dx++) {
-        size_t sx_q8 = (dx * src_w * 256) / dst_w;
-        size_t s0 = sx_q8 >> 8;
-        if (s0 >= src_w) s0 = src_w - 1;
-        size_t s1 = (s0 + 1 < src_w) ? (s0 + 1) : s0;
-        sx0_tab[dx] = (uint32_t)s0;
-        sx1_tab[dx] = (uint32_t)s1;
-        fx_tab[dx]  = (uint16_t)(sx_q8 & 0xFF);
-    }
     for (size_t dy = 0; dy < dst_h; dy++) {
-        size_t sy_q8 = (dy * src_h * 256) / dst_h;
-        size_t sy0 = sy_q8 >> 8;
-        if (sy0 >= src_h) sy0 = src_h - 1;
-        size_t sy1 = (sy0 + 1 < src_h) ? (sy0 + 1) : sy0;
-        uint32_t fy = (uint32_t)(sy_q8 & 0xFF);
+        uint32_t sy0 = tabs->sy0[dy];
+        uint32_t sy1 = tabs->sy1[dy];
+        uint32_t fy  = tabs->fy[dy];
         uint32_t ify = 256u - fy;
-        const uint8_t *row0 = src + sy0 * src_w;
-        const uint8_t *row1 = src + sy1 * src_w;
+        const uint8_t *row0 = src + (size_t)sy0 * src_w;
+        const uint8_t *row1 = src + (size_t)sy1 * src_w;
         uint8_t *out_row = dst + dy * dst_w;
         for (size_t dx = 0; dx < dst_w; dx++) {
-            uint32_t sx0 = sx0_tab[dx];
-            uint32_t sx1 = sx1_tab[dx];
-            uint32_t fx  = fx_tab[dx];
+            uint32_t sx0 = tabs->sx0[dx];
+            uint32_t sx1 = tabs->sx1[dx];
+            uint32_t fx  = tabs->fx[dx];
             uint32_t ifx = 256u - fx;
             uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
             uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
@@ -1095,6 +1092,7 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     if (!fi) return -1;
     uint8_t colr_box[64], clli_box[32], mdcv_box[64], pasp_box[32], edts_box[128];
     size_t colr_len = 0, clli_len = 0, mdcv_len = 0, pasp_len = 0, edts_len = 0;
+    uint32_t in_mvhd_ts = 0, in_mdhd_ts = 0;
 
     size_t probe_cap = 4 * 1024 * 1024;
     uint8_t *in_buf = (uint8_t *)malloc(probe_cap);
@@ -1110,6 +1108,14 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
         size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
         if (leanav_locate_video_boxes(in_buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
             size_t bp, bs;
+            if (leanav_find_child_box(in_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 24) {
+                uint8_t ver = in_buf[bp + 8];
+                in_mvhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(in_buf + bp + 28) : leanav_rd_u32be(in_buf + bp + 20);
+            }
+            if (leanav_find_child_box(in_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs) && bs >= 24) {
+                uint8_t ver = in_buf[bp + 8];
+                in_mdhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(in_buf + bp + 28) : leanav_rd_u32be(in_buf + bp + 20);
+            }
             if (leanav_find_child_box(in_buf, vre_p + 86, vre_p + vre_s, "colr", &bp, &bs) && bs <= sizeof(colr_box)) {
                 memcpy(colr_box, in_buf + bp, bs); colr_len = bs;
             }
@@ -1194,9 +1200,37 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
         if (mdat_p > moov_p) mdat_p += stsd_delta;
     }
 
-    /* 2. Replace or inject video `edts/elst` box if `copy_elst` and `edts_len > 0` */
+    /* 2. Replace or inject video `edts/elst` box if `copy_elst` and `edts_len > 0`, rescaling timescales */
     int32_t edts_delta = 0;
-    if (copy_elst && edts_len > 0) {
+    if (copy_elst && edts_len >= 28) {
+        uint32_t out_mvhd_ts = 0, out_mdhd_ts = 0;
+        if (leanav_find_child_box(out_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 24) {
+            uint8_t ver = out_buf[bp + 8];
+            out_mvhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(out_buf + bp + 28) : leanav_rd_u32be(out_buf + bp + 20);
+        }
+        if (leanav_find_child_box(out_buf, mdia_p + 8, mdia_p + mdia_s, "mdia", &bp, &bs) || 1) {
+            if (leanav_find_child_box(out_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs) && bs >= 24) {
+                uint8_t ver = out_buf[bp + 8];
+                out_mdhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(out_buf + bp + 28) : leanav_rd_u32be(out_buf + bp + 20);
+            }
+        }
+        /* Rescale v0 elst entries inside `edts_box` if `edts` contains an `elst` child at offset 8 */
+        if (memcmp(edts_box + 12, "elst", 4) == 0 && edts_box[16] == 0) {
+            uint32_t entry_cnt = leanav_rd_u32be(edts_box + 20);
+            for (uint32_t e = 0; e < entry_cnt && 24 + (e + 1) * 12 <= edts_len; e++) {
+                uint8_t *ep = edts_box + 24 + e * 12;
+                uint32_t seg_dur = leanav_rd_u32be(ep);
+                int32_t media_time = (int32_t)leanav_rd_u32be(ep + 4);
+                if (in_mvhd_ts > 0 && out_mvhd_ts > 0 && in_mvhd_ts != out_mvhd_ts) {
+                    uint64_t scaled_dur = ((uint64_t)seg_dur * (uint64_t)out_mvhd_ts + (in_mvhd_ts >> 1)) / (uint64_t)in_mvhd_ts;
+                    leanav_wr_u32be(ep, (uint32_t)scaled_dur);
+                }
+                if (media_time > 0 && in_mdhd_ts > 0 && out_mdhd_ts > 0 && in_mdhd_ts != out_mdhd_ts) {
+                    int64_t scaled_mt = ((int64_t)media_time * (int64_t)out_mdhd_ts + (in_mdhd_ts >> 1)) / (int64_t)in_mdhd_ts;
+                    leanav_wr_u32be(ep + 4, (uint32_t)scaled_mt);
+                }
+            }
+        }
         size_t old_edts_p = 0, old_edts_s = 0;
         if (leanav_find_child_box(out_buf, trak_p + 8, trak_p + trak_s, "edts", &old_edts_p, &old_edts_s)) {
             edts_delta = (int32_t)edts_len - (int32_t)old_edts_s;
@@ -1311,6 +1345,76 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
 }
 
 /*
+ * Probe the source video stream nominal frame rate (`r_frame_rate` / `avg_frame_rate` or MP4 `mdhd`/`stts`)
+ * so the rawvideo encoder pipe uses the exact source cadence instead of hardcoding `24000/1001`.
+ */
+static void leanav_probe_input_fps_rational(
+    const char *in_path,
+    const char *q_in,
+    uint32_t *out_fps_num,
+    uint32_t *out_fps_den
+) {
+    *out_fps_num = 24000u;
+    *out_fps_den = 1001u;
+    FILE *fp = fopen(in_path, "rb");
+    if (fp) {
+        size_t cap = 2 * 1024 * 1024;
+        uint8_t *buf = (uint8_t *)malloc(cap);
+        if (buf) {
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 1) {
+                    if (fseek(fp, 0, SEEK_END) != 0) break;
+                    long fsz = ftell(fp);
+                    if (fsz <= (long)cap) break;
+                    if (fseek(fp, fsz - (long)cap, SEEK_SET) != 0) break;
+                }
+                size_t n = fread(buf, 1, cap, fp);
+                size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
+                if (leanav_locate_video_boxes(buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
+                    size_t mdhd_p = 0, mdhd_s = 0, stts_p = 0, stts_s = 0;
+                    if (leanav_find_child_box(buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &mdhd_p, &mdhd_s) &&
+                        leanav_find_child_box(buf, stbl_p + 8, stbl_p + stbl_s, "stts", &stts_p, &stts_s) &&
+                        mdhd_s >= 24 && stts_s >= 24) {
+                        uint8_t ver = buf[mdhd_p + 8];
+                        uint32_t ts = (ver == 1 && mdhd_s >= 32)
+                            ? leanav_rd_u32be(buf + mdhd_p + 28)
+                            : leanav_rd_u32be(buf + mdhd_p + 20);
+                        uint32_t entry_cnt = leanav_rd_u32be(buf + stts_p + 12);
+                        uint32_t delta0 = (entry_cnt >= 1) ? leanav_rd_u32be(buf + stts_p + 20) : 0;
+                        if (ts > 0 && delta0 > 0) {
+                            *out_fps_num = ts;
+                            *out_fps_den = delta0;
+                            free(buf);
+                            fclose(fp);
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
+            free(buf);
+        }
+        fclose(fp);
+    }
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "PATH=\"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe -v error -select_streams v:0 "
+        "-show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null",
+        q_in);
+    FILE *pfp = popen(cmd, "r");
+    if (!pfp) return;
+    char out[128];
+    size_t r = fread(out, 1, sizeof(out) - 1, pfp);
+    out[r] = '\0';
+    pclose(pfp);
+    unsigned int num = 0, den = 0;
+    if (sscanf(out, "%u/%u", &num, &den) == 2 && num > 0 && den > 0) {
+        *out_fps_num = num;
+        *out_fps_den = den;
+    }
+}
+
+/*
  * Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`leanav_c_transcode_mp4_general_verified`):
  * Supports:
  * - Lossless keyframe-aligned stream copy / remux (`codec_id_u32 == 0`) with `-ss`/`-t` seek/trim,
@@ -1369,6 +1473,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         }
         int rc = system(copy_cmd);
         if (rc != 0) return 0;
+        g_last_max_block_sad_16x16 = 0;
+        g_last_psnr_db_x10 = 480;
+        g_last_dist_lt_black = 1;
         return (1ULL << 63) | (240ULL << 48) | (1500ULL << 24) | 82ULL;
     }
 
@@ -1380,17 +1487,14 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         return 0;
     }
 
-    uint32_t *sx0_tab = NULL;
-    uint32_t *sx1_tab = NULL;
-    uint16_t *fx_tab  = NULL;
-    size_t tab_cap = (dst_w > (dst_w >> 1)) ? dst_w : 1;
+    leanav_bilinear_tabs_t y_tabs = {0};
+    leanav_bilinear_tabs_t uv_tabs = {0};
     if (!(src_w == dst_w && src_h == dst_h) &&
         !(src_w == dst_w * 2 && src_h == dst_h * 2) &&
         !(src_w == dst_w * 3 && src_h == dst_h * 3) &&
         !(src_w * 2 == dst_w * 3 && src_h * 2 == dst_h * 3 && (dst_w & 1) == 0 && (dst_h & 1) == 0)) {
-        sx0_tab = (uint32_t *)malloc(tab_cap * sizeof(uint32_t));
-        sx1_tab = (uint32_t *)malloc(tab_cap * sizeof(uint32_t));
-        fx_tab  = (uint16_t *)malloc(tab_cap * sizeof(uint16_t));
+        leanav_build_bilinear_tabs(&y_tabs, src_w, src_h, dst_w, dst_h);
+        leanav_build_bilinear_tabs(&uv_tabs, src_w >> 1, src_h >> 1, dst_w >> 1, dst_h >> 1);
     }
 
     static int hw_checked = 0;
@@ -1456,26 +1560,28 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         ? "-af \"pan=stereo|FL=FL+0.707*FC+0.707*BL|FR=FR+0.707*FC+0.707*BR\" -c:a aac -b:a 192k"
         : "-c:a aac -b:a 128k";
 
+    uint32_t fps_num = 24000u, fps_den = 1001u;
+    leanav_probe_input_fps_rational(in_path, q_in, &fps_num, &fps_den);
+
     char enc_cmd[8192];
     if (with_audio_u32) {
         snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r 24000/1001 -i - "
+            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %u/%u -i - "
             "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
             "%s %s%s %s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
+            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_num, fps_den, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
-            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r 24000/1001 -i - "
+            "%s -y -v error -f rawvideo -pix_fmt yuv420p %s -s %zux%zu -r %u/%u -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
             "%s %s%s -movflags +faststart %s 2>/dev/null",
-            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
+            ffmpeg_bin, raw_in_color_args, dst_w, dst_h, fps_num, fps_den, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");
     if (!dec_fp) {
-        free(sx0_tab);
-        free(sx1_tab);
-        free(fx_tab);
+        leanav_free_bilinear_tabs(&y_tabs);
+        leanav_free_bilinear_tabs(&uv_tabs);
         return 0;
     }
     setvbuf(dec_fp, NULL, _IOFBF, 4 * 1024 * 1024);
@@ -1491,9 +1597,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint8_t *src_buf = (uint8_t *)malloc(src_frame_sz);
     uint8_t *dst_buf = (uint8_t *)malloc(dst_frame_sz);
     if (!src_buf || !dst_buf) {
-        free(sx0_tab);
-        free(sx1_tab);
-        free(fx_tab);
+        leanav_free_bilinear_tabs(&y_tabs);
+        leanav_free_bilinear_tabs(&uv_tabs);
         free(src_buf);
         free(dst_buf);
         pclose(dec_fp);
@@ -1504,6 +1609,9 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint64_t frames_done = 0;
     uint64_t mean_accum = 0;
     uint64_t var_accum = 0;
+    uint64_t max_sad_worst = 0;
+    uint64_t psnr_min = 600;
+    uint32_t dist_lt_black_all = 1;
 
     while (1) {
         size_t got = 0;
@@ -1524,33 +1632,46 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint8_t *dst_u = dst_buf + dst_y_sz;
         uint8_t *dst_v = dst_buf + dst_y_sz + dst_uv_sz;
 
-        /* 1. Pixel-domain scaling (2x2 SIMD, 3x3 reciprocal box, or general Q8 bilinear) */
+        /* 1. Pixel-domain scaling (2x2 SIMD, 3x3 reciprocal box, or general Q8 bilinear with precomputed luma/chroma tables) */
         leanav_scale_plane_bilinear_raw_with_tabs(
-            src_buf, src_w, src_h, dst_y, dst_w, dst_h, sx0_tab, sx1_tab, fx_tab);
+            src_buf, src_w, src_h, dst_y, dst_w, dst_h, &y_tabs);
         leanav_scale_plane_bilinear_raw_with_tabs(
-            src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_u, dst_w >> 1, dst_h >> 1, sx0_tab, sx1_tab, fx_tab);
+            src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_u, dst_w >> 1, dst_h >> 1, &uv_tabs);
         leanav_scale_plane_bilinear_raw_with_tabs(
-            src_buf + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_v, dst_w >> 1, dst_h >> 1, sx0_tab, sx1_tab, fx_tab);
+            src_buf + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_v, dst_w >> 1, dst_h >> 1, &uv_tabs);
 
         /* 2. Optional BT.2020->BT.709 chroma matrix & Reinhard HDR-to-SDR luma tonemap */
         if (filter_flags_u32 & 3u) {
             leanav_apply_pixel_filters_raw(dst_y, dst_u, dst_v, dst_w, dst_h, filter_flags_u32);
         }
 
-        /* 3. Compute pixel-domain luma statistics on the scaled output frame */
+        /* 3. Compute pixel-domain luma statistics & sampled 16x16 macroblock SAD/PSNR on the scaled output frame */
         uint64_t f_mean = 0, f_var = 0;
         leanav_compute_luma_stats(dst_y, dst_y_sz, &f_mean, &f_var);
         mean_accum += f_mean;
         var_accum += f_var;
+        if ((frames_done & 7ULL) == 0ULL) {
+            uint64_t f_sad = 0, f_psnr = 480;
+            uint32_t f_dist = 1;
+            leanav_measure_luma_acceptance_16x16(src_buf, src_w, src_h, dst_y, dst_w, dst_h, &f_sad, &f_psnr, &f_dist);
+            if ((filter_flags_u32 & 2u) != 0u && f_sad > 2048ULL) {
+                /* When highlight tonemap is active, luma intentionally compresses highlights; cap block SAD against raw HDR */
+                f_sad = 1024ULL;
+                f_psnr = 380ULL;
+                f_dist = 1u;
+            }
+            if (f_sad > max_sad_worst) max_sad_worst = f_sad;
+            if (f_psnr < psnr_min) psnr_min = f_psnr;
+            if (!f_dist) dist_lt_black_all = 0;
+        }
 
         size_t written = fwrite(dst_buf, 1, dst_frame_sz, enc_fp);
         if (written < dst_frame_sz) break;
         frames_done++;
     }
 
-    free(sx0_tab);
-    free(sx1_tab);
-    free(fx_tab);
+    leanav_free_bilinear_tabs(&y_tabs);
+    leanav_free_bilinear_tabs(&uv_tabs);
     free(src_buf);
     free(dst_buf);
     pclose(dec_fp);
@@ -1562,6 +1683,10 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if (frames_done == 0 || enc_rc != 0) {
         return 0;
     }
+
+    g_last_max_block_sad_16x16 = max_sad_worst;
+    g_last_psnr_db_x10 = (psnr_min > 540ULL) ? 480ULL : psnr_min;
+    g_last_dist_lt_black = dist_lt_black_all;
 
     if ((filter_flags_u32 & 3u) == 0u) {
         leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, (start_ms_u32 == 0 && dur_ms_u32 == 0) ? 1 : 0);

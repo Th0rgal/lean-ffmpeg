@@ -651,6 +651,17 @@ def runSelfTest : IO UInt32 := do
   let w50Udta : UdtaMetaIlstBoxView := {
     itemKey4CC := 0xA9746F6F, encoderTag4CC := 0x4C46464D
   }
+  let vfSrc32 := VideoFrame.allocYuv420p 32 32 0 AVRational.tb90kHz .bt709
+  let vfSrc32Plane := vfSrc32.planes[0]!
+  let vfDst16Plane := scalePlaneDown2x2Simd vfSrc32Plane
+  let vfBlack16Plane := ByteArray.mk (Array.replicate 256 (16 : UInt8))
+  let posAccPacked := measurePlanesAcceptanceC vfSrc32Plane.data 32 32 vfDst16Plane.data 16 16
+  let negAccPacked := measurePlanesAcceptanceC vfSrc32Plane.data 32 32 vfBlack16Plane 16 16
+  let realCAbiAcceptOk :=
+    LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0
+      (posAccPacked &&& 0xFFFFFF) 4096 (((posAccPacked >>> 40) &&& 1).toUInt32) ((posAccPacked >>> 24) &&& 0xFFFF) 500 == 1 &&
+    LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0
+      (negAccPacked &&& 0xFFFFFF) 4096 (((negAccPacked >>> 40) &&& 1).toUInt32) ((negAccPacked >>> 24) &&& 0xFFFF) 0 == 0
   let w50Ok := decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec w50Udta) == some w50Udta &&
                visualFidelityGateSpec.gate visualFidelityGateSpec.posWitness &&
                !(visualFidelityGateSpec.gate visualFidelityGateSpec.negWitness) &&
@@ -658,6 +669,7 @@ def runSelfTest : IO UInt32 := do
                !(mp4ContainerSyncGateSpec.gate mp4ContainerSyncGateSpec.negWitness) &&
                ffmpegAcceptanceGateSpec.gate ffmpegAcceptanceGateSpec.posWitness &&
                !(ffmpegAcceptanceGateSpec.gate ffmpegAcceptanceGateSpec.negWitness) &&
+               realCAbiAcceptOk &&
                isAacChannelLayoutValid 2 chMaskStereo &&
                !(isAacChannelLayoutValid 6 0) &&
                verifyScaledPlaneVisualFidelity (scalePlaneDown2x2Simd realFfmpeg8x8Plane) (scalePlaneDown2x2Simd realFfmpeg8x8Plane) 0 0 &&
@@ -1495,6 +1507,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Filter.lawfulStageCropScaleBlur
 #print axioms LeanAV.Domain.liftDecodedPlaneOp_preserves_colorSpace_and_explicit_convert
 #print axioms LeanAV.Format.mp4MetadataBoxInject_preserves_mdat_relative_offsets
+#print axioms LeanAV.Format.elst_rescale_mvhd_mdhd_mismatch
 #print axioms LeanAV.Cli.resolveScaleDims_proportional_even_and_cli_flags_verified
 #print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
 

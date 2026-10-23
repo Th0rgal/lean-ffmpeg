@@ -1108,6 +1108,22 @@ opaque transcodeMp4GeneralVerifiedC
     (inPath : @& String) (outPath : @& String)
     (srcW srcH dstW dstH startMs durMs codecId withAudio filterFlags : UInt32) : BaseIO UInt64
 
+/--
+  Retrieve real NEON/scalar acceptance metrics measured during the latest transcode:
+  `bit 40: distToRefLtBlack`, `bits 24..39: psnrDbX10`, `bits 0..23: maxBlockSad16x16`.
+-/
+@[extern "leanav_c_get_last_acceptance_metrics"]
+opaque getLastAcceptanceMetricsC (_ : Unit) : BaseIO UInt64
+
+/--
+  Direct C-ABI NEON/scalar 16x16 macroblock acceptance measurement between two `ByteArray` luma planes:
+  returns `(distToRefLtBlack <<< 40) ||| (psnrDbX10 <<< 24) ||| maxBlockSad16x16`.
+-/
+@[extern "leanav_c_measure_planes_acceptance"]
+opaque measurePlanesAcceptanceC
+    (src : @& ByteArray) (srcW srcH : USize)
+    (dst : @& ByteArray) (dstW dstH : USize) : UInt64
+
 /-- Certified report from the pixel-domain SIMD / hardware MP4 transcode & remux pipeline. -/
 structure CertifiedPixelTranscodeReport where
   ok                 : Bool
@@ -1116,6 +1132,8 @@ structure CertifiedPixelTranscodeReport where
   dstHeight          : Nat
   lumaMean           : UInt64
   lumaVariance       : UInt64
+  maxBlockSad16x16   : UInt64
+  psnrDbX10          : UInt64
   visualFidelityOk   : Bool
   containerSyncOk    : Bool
   ffmpegAcceptanceOk : Bool
@@ -1123,7 +1141,8 @@ structure CertifiedPixelTranscodeReport where
 /--
   Execute the certified pixel-domain MP4 transcode or stream-copy remux (`runCertifiedGeneralTranscodeMp4`)
   and validate the resulting output through `verifyVisualFidelity` (`visualFidelityGateSpec`),
-  `verifyMp4ContainerSync` (`mp4ContainerSyncGateSpec`), and Law 11 `verifyFFmpegAcceptance` (`ffmpegAcceptanceGateSpec`).
+  `verifyMp4ContainerSync` (`mp4ContainerSyncGateSpec`), and Law 11 `verifyFFmpegAcceptance` (`ffmpegAcceptanceGateSpec`)
+  using the real NEON/scalar 16x16 macroblock SAD and PSNR metrics measured on the decoded/scaled frames.
 -/
 def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4TrackDemux)
     (dstW dstH : Nat) (startMs durMs : UInt32 := 0)
@@ -1134,10 +1153,15 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
     demux.width.toUInt32 demux.height.toUInt32
     dstW.toUInt32 dstH.toUInt32
     startMs durMs codecCode (if withAudio then 1 else 0) filterFlags
+  let acceptPacked ← getLastAcceptanceMetricsC ()
   let cOk := ((packed >>> 63) &&& 1) == 1
   let frames := ((packed >>> 48) &&& 0x7FFF).toNat
   let lVar := (packed >>> 24) &&& 0xFFFFFF
   let lMean := packed &&& 0xFFFFFF
+  let realMaxSad := acceptPacked &&& 0xFFFFFF
+  let realPsnrX10 := (acceptPacked >>> 24) &&& 0xFFFF
+  let realDistLtBlack := ((acceptPacked >>> 40) &&& 1).toUInt32
+  let maxAllowedSad : UInt64 := 4096
   let pixCnt := (dstW * dstH).toUInt64
   let vfOk := cOk && verifyVisualFidelity pixCnt lMean lVar 0 (pixCnt * 2) 0 == 1
   let totalFrames := if frames > 0 then frames else if demux.samples.size > 0 then demux.samples.size else 24
@@ -1148,7 +1172,7 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
   let syncOk := cOk &&
     verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 expectedDurMs expectedDurMs 0 == 1
   let acceptOk := cOk &&
-    LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 1024 4096 1 410 lVar == 1
+    LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 realMaxSad maxAllowedSad realDistLtBlack realPsnrX10 lVar == 1
   return {
     ok := vfOk && syncOk && acceptOk
     framesDecoded := frames
@@ -1156,6 +1180,8 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
     dstHeight := dstH
     lumaMean := lMean
     lumaVariance := lVar
+    maxBlockSad16x16 := realMaxSad
+    psnrDbX10 := realPsnrX10
     visualFidelityOk := vfOk
     containerSyncOk := syncOk
     ffmpegAcceptanceOk := acceptOk

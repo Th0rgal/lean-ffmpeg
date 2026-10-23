@@ -3039,6 +3039,38 @@ def computeElstPresentationDuration : List ElstEntryView → UInt64
   | e :: rest => e.segmentDuration.toUInt64 + computeElstPresentationDuration rest
 
 /--
+  Rescale a v0 `elst` entry from the source movie/media timescales to the output movie/media timescales.
+  `mediaTime = 0xFFFFFFFF` (empty dwell) is preserved. Empty-dwell entries keep `mediaRateInteger = 1`.
+-/
+def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : Nat) : ElstEntryView :=
+  let segDur :=
+    if srcMvhdTs == 0 || dstMvhdTs == 0 || srcMvhdTs == dstMvhdTs then e.segmentDuration.toNat
+    else (e.segmentDuration.toNat * dstMvhdTs + srcMvhdTs / 2) / srcMvhdTs
+  let medTime :=
+    if e.mediaTime == 0xFFFFFFFF || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then e.mediaTime.toNat
+    else (e.mediaTime.toNat * dstMdhdTs + srcMdhdTs / 2) / srcMdhdTs
+  {
+    segmentDuration := segDur.toUInt32
+    mediaTime := medTime.toUInt32
+    mediaRateInteger := e.mediaRateInteger
+    mediaRateFraction := e.mediaRateFraction
+  }
+
+/--
+  Theorem (Wave 24b): when `mvhd.timescale != mdhd.timescale`, an `elst` copied from a source movie
+  (`mvhd = 1000`, `mdhd = 24000`) onto an output movie (`mvhd = 90000`, `mdhd = 24000`) rescales the
+  movie-timescale `segmentDuration` and preserves the media-timescale `mediaTime` and the empty dwell.
+-/
+theorem elst_rescale_mvhd_mdhd_mismatch :
+    let src : ElstEntryView := { segmentDuration := 1000, mediaTime := 24000, mediaRateInteger := 1, mediaRateFraction := 0 }
+    let dwell : ElstEntryView := { segmentDuration := 500, mediaTime := 0xFFFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 }
+    rescaleElstEntry src 1000 90000 24000 24000 =
+      { segmentDuration := 90000, mediaTime := 24000, mediaRateInteger := 1, mediaRateFraction := 0 } ∧
+    (rescaleElstEntry dwell 1000 90000 24000 24000).mediaTime = 0xFFFFFFFF ∧
+    (rescaleElstEntry dwell 1000 90000 24000 24000).segmentDuration = 45000 := by
+  decide
+
+/--
   Theorem (Wave 24): ISO/IEC 14496-12 §8.6.6 `EditListBox` (`elst`) B-frame initial composition delay & media presentation
   timeline codec (`encodeElstBoxSpec` / `decodeElstBoxSpec`) round-trips bit-for-bit on a two-entry B-frame edit list
   (initial empty dwell `0xFFFFFFFF` of `512` ticks + active media segment starting at `mediaTime = 1024` of `30720` ticks),
