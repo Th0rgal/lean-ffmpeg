@@ -1,11 +1,11 @@
 /-
-  LeanAV.Cli: FFmpeg-Compatible CLI Parser, Resident Daemon & Golden `framecrc`/`md5` Oracle
+  LeanAV.Cli: FFmpeg-Flavoured CLI Parser, Resident Daemon & Golden Digest Oracle
 
   Implements:
   1. `parseFFmpegArgs : List String → CliConfig` supporting `-i`, `-c copy`, `-c:v`, `-c:a`, `-vf`, `-af`,
      `-ss`, `-t`, `-f`, `-daemon`, `-golden`, and `<output>` with explicit fail-closed `UnsupportedCodecOrFlag`
   2. `validateCliConfig` wired to `verifyCliInvocation` (`cliInvokeGateSpec`)
-  3. Golden CRC64 / MD5 oracle (`computeFrameCrc64`, `formatGoldenFrameCrcLine`) for bit-exact regression against `ffmpeg -f framecrc`
+  3. Internal Adler-style 64-bit digest oracle (`computeFrameCrc64`, `formatGoldenFrameCrcLine`) for project regression checks
 -/
 import LeanSys.Spec
 import LeanSys.Posix
@@ -478,7 +478,7 @@ def validateCliConfig (cfg : CliConfig) : Except (List CliError) CliConfig :=
 
 /-! ## 2. Golden `framecrc` / MD5 Oracle -/
 
-/-- Compute an FFmpeg-compatible `framecrc` 64-bit Adler-style checksum over raw frame bytes. -/
+/-- Compute the project's 64-bit Adler-style digest over raw frame bytes. -/
 def computeFrameCrc64 (bytes : ByteArray) : UInt64 := Id.run do
   let mut s1 : UInt64 := 1
   let mut s2 : UInt64 := 0
@@ -497,7 +497,7 @@ def uint64ToHex16 (v : UInt64) : String := Id.run do
     chars := chars ++ [hexChars[nib]?.getD '0']
   return String.ofList chars
 
-/-- Format a single `framecrc` golden line: `streamIndex, dts, pts, duration, size, crc`. -/
+/-- Format a project digest line: `streamIndex, dts, pts, duration, size, crc`. -/
 def formatGoldenFrameCrcLine (streamIdx : Nat) (dts pts duration : UInt64) (size : Nat) (crc : UInt64) : String :=
   s!"{streamIdx}, {dts}, {pts}, {duration}, {size}, 0x{uint64ToHex16 crc}"
 

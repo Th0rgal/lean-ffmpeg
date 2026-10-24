@@ -1198,9 +1198,9 @@ def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
   IO.println "  CLI video: h264, hevc, av1, copy (delegated to linked libav/x264 where available)"
   IO.println "  CLI audio: aac, copy (audio copy is supported only in stream-copy mode)"
-  IO.println "  LeanAV library codecs: FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1"
-  IO.println "  LeanAV library formats: IVF, MP4, MKV, Ogg, MPEG-TS, WAV"
-  IO.println "  LeanAV filters: verified structural filter and color-conversion laws"
+  IO.println "  LeanAV library codecs: FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1 (library models; not all CLI-wired)"
+  IO.println "  LeanAV library formats: IVF, MP4, MKV, Ogg, MPEG-TS, WAV (library models; not all CLI-wired)"
+  IO.println "  LeanAV filters: formally checked structural filter and color-conversion laws; runtime encoding is delegated"
   return 0
 
 def printLffmpegFormats : IO UInt32 := do
