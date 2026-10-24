@@ -16,6 +16,28 @@ static inline uint64_t leanav_mono_us(void) {
     return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
 }
 
+static int leanav_has_encoder_cached(const char *enc_name);
+
+static pthread_once_t leanav_hw_once = PTHREAD_ONCE_INIT;
+static int leanav_has_vt_h264 = 0;
+static int leanav_has_vt_hevc = 0;
+static int leanav_has_nvenc_h264 = 0;
+static int leanav_has_nvenc_hevc = 0;
+
+static void leanav_init_hw_encoders(void) {
+#if defined(__APPLE__)
+    if (getenv("LEANAV_USE_VIDEOTOOLBOX") != NULL) {
+        leanav_has_vt_h264 = leanav_has_encoder_cached("h264_videotoolbox");
+        leanav_has_vt_hevc = leanav_has_encoder_cached("hevc_videotoolbox");
+    }
+#else
+    if (getenv("LEANAV_USE_NVENC") != NULL) {
+        leanav_has_nvenc_h264 = leanav_has_encoder_cached("h264_nvenc");
+        leanav_has_nvenc_hevc = leanav_has_encoder_cached("hevc_nvenc");
+    }
+#endif
+}
+
 /*
  * FFmpeg 8.0-compatible ANSI color policy on stderr (`av_log` in `libavutil/log.c`):
  *   - `AV_LOG_FORCE_NOCOLOR` or `NO_COLOR` disables colors,
@@ -58,7 +80,7 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 #include <arm_neon.h>
 #endif
 
-#if defined(__has_include)
+#if defined(__has_include) && defined(__APPLE__)
 #if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>) && __has_include(<libswresample/swresample.h>)
 #define LEANAV_HAS_LIBAV 1
 #include <libavformat/avformat.h>
@@ -3104,11 +3126,11 @@ static enum AVCodecID leanav_codec_id_from_u32(uint32_t codec_id_u32) {
     return AV_CODEC_ID_H264;
 }
 
-static const char *leanav_encoder_name_for(uint32_t codec_id_u32, int has_vt_h264, int has_vt_hevc, int has_nvenc_h264, int has_nvenc_hevc) {
-    if (codec_id_u32 == 1 && has_vt_h264) return "h264_videotoolbox";
-    if (codec_id_u32 == 1 && has_nvenc_h264) return "h264_nvenc";
-    if (codec_id_u32 == 2 && has_vt_hevc) return "hevc_videotoolbox";
-    if (codec_id_u32 == 2 && has_nvenc_hevc) return "hevc_nvenc";
+static const char *leanav_encoder_name_for(uint32_t codec_id_u32, int leanav_has_vt_h264, int leanav_has_vt_hevc, int leanav_has_nvenc_h264, int leanav_has_nvenc_hevc) {
+    if (codec_id_u32 == 1 && leanav_has_vt_h264) return "h264_videotoolbox";
+    if (codec_id_u32 == 1 && leanav_has_nvenc_h264) return "h264_nvenc";
+    if (codec_id_u32 == 2 && leanav_has_vt_hevc) return "hevc_videotoolbox";
+    if (codec_id_u32 == 2 && leanav_has_nvenc_hevc) return "hevc_nvenc";
     if (codec_id_u32 == 2) return "libx265";
     if (codec_id_u32 == 3) return "libsvtav1";
     return "libx264";
@@ -4400,7 +4422,7 @@ static uint64_t leanav_libav_transcode_pixel(
     uint32_t start_ms, uint32_t dur_ms,
     uint32_t codec_id_u32, int with_audio, uint32_t filter_flags,
     leanav_bilinear_tabs_t *y_tabs, leanav_bilinear_tabs_t *uv_tabs,
-    int has_vt_h264, int has_vt_hevc, int has_nvenc_h264, int has_nvenc_hevc,
+    int leanav_has_vt_h264, int leanav_has_vt_hevc, int leanav_has_nvenc_h264, int leanav_has_nvenc_hevc,
     int hdr_cs
 ) {
     av_log_set_level(AV_LOG_ERROR);
@@ -4516,7 +4538,7 @@ static uint64_t leanav_libav_transcode_pixel(
     }
     int crf_q = leanav_parse_crf_q(g_enc_crf, codec_id_u32 == 2 ? 24 : (codec_id_u32 == 3 ? 28 : 23));
     int64_t v_bitrate = leanav_parse_bitrate(g_enc_vb, (codec_id_u32 == 2) ? 5000000 : 6000000);
-    const char *enc_name = leanav_encoder_name_for(codec_id_u32, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc);
+    const char *enc_name = leanav_encoder_name_for(codec_id_u32, leanav_has_vt_h264, leanav_has_vt_hevc, leanav_has_nvenc_h264, leanav_has_nvenc_hevc);
     AVCodecContext *venc = NULL;
     if (leanav_open_encoder(&venc, enc_name, leanav_codec_id_from_u32(codec_id_u32),
             (int)dst_w, (int)dst_h, (int)fps_num, (int)fps_den, is_10bit, hdr_cs, v_bitrate, crf_q) < 0) {
@@ -5415,25 +5437,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         leanav_build_bilinear_tabs(&uv_tabs, src_w >> 1, src_h >> 1, dst_w >> 1, dst_h >> 1);
     }
 
-    static pthread_once_t hw_once = PTHREAD_ONCE_INIT;
-    static int has_vt_h264 = 0;
-    static int has_vt_hevc = 0;
-    static int has_nvenc_h264 = 0;
-    static int has_nvenc_hevc = 0;
-    void init_hw_encoders(void) {
-#if defined(__APPLE__)
-        if (getenv("LEANAV_USE_VIDEOTOOLBOX") != NULL) {
-            has_vt_h264 = leanav_has_encoder_cached("h264_videotoolbox");
-            has_vt_hevc = leanav_has_encoder_cached("hevc_videotoolbox");
-        }
-#else
-        if (getenv("LEANAV_USE_NVENC") != NULL) {
-            has_nvenc_h264 = leanav_has_encoder_cached("h264_nvenc");
-            has_nvenc_hevc = leanav_has_encoder_cached("hevc_nvenc");
-        }
-#endif
-    }
-    pthread_once(&hw_once, init_hw_encoders);
+    pthread_once(&leanav_hw_once, leanav_init_hw_encoders);
 
     /*
      * Preserve input colorimetry (`ColorSpaceTag`: BT.709 vs BT.2020 PQ / HLG) across the rawvideo SIMD pipe
@@ -5444,7 +5448,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint64_t libav_res = leanav_libav_transcode_pixel(
             in_path, out_path, src_w, src_h, dst_w, dst_h,
             start_ms_u32, dur_ms_u32, codec_id_u32, (int)with_audio_u32, filter_flags_u32,
-            &y_tabs, &uv_tabs, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc, 0);
+            &y_tabs, &uv_tabs, leanav_has_vt_h264, leanav_has_vt_hevc, leanav_has_nvenc_h264, leanav_has_nvenc_hevc, 0);
         leanav_free_bilinear_tabs(&y_tabs);
         leanav_free_bilinear_tabs(&uv_tabs);
         return libav_res;
@@ -5474,23 +5478,23 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     char v_enc_args[512];
     const char *x264_subme_suffix = ":subme=3";
-    if (codec_id_u32 == 1 && has_vt_h264) {
+    if (codec_id_u32 == 1 && leanav_has_vt_h264) {
         snprintf(v_enc_args, sizeof(v_enc_args),
             "-c:v h264_videotoolbox -realtime 1 -b:v %s -allow_sw 1 -pix_fmt %s",
             (g_enc_vb[0] != '\0') ? g_enc_vb : "6M", eff_pix_fmt);
         x264_subme_suffix = "";
-    } else if (codec_id_u32 == 1 && has_nvenc_h264) {
+    } else if (codec_id_u32 == 1 && leanav_has_nvenc_h264) {
         snprintf(v_enc_args, sizeof(v_enc_args),
             "-c:v h264_nvenc -preset p1 -cq %s -pix_fmt %s",
             (g_enc_crf[0] != '\0') ? g_enc_crf : "23", eff_pix_fmt);
         x264_subme_suffix = "";
     } else if (codec_id_u32 == 2) {
         x264_subme_suffix = "";
-        if (has_vt_hevc) {
+        if (leanav_has_vt_hevc) {
             snprintf(v_enc_args, sizeof(v_enc_args),
                 "-c:v hevc_videotoolbox -realtime 1 -b:v %s -allow_sw 1 -tag:v hvc1 -pix_fmt %s",
                 (g_enc_vb[0] != '\0') ? g_enc_vb : "5M", eff_pix_fmt);
-        } else if (has_nvenc_hevc) {
+        } else if (leanav_has_nvenc_hevc) {
             snprintf(v_enc_args, sizeof(v_enc_args),
                 "-c:v hevc_nvenc -preset p1 -cq %s -tag:v hvc1 -pix_fmt %s",
                 (g_enc_crf[0] != '\0') ? g_enc_crf : "24", eff_pix_fmt);

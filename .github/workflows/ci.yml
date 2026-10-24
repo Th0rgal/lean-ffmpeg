@@ -15,8 +15,8 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: Install FFmpeg development libraries
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libswresample-dev libavutil-dev pkg-config
+      - name: Install FFmpeg runtime
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Build
         run: lake build
       - name: Self-test
@@ -41,6 +41,16 @@ jobs:
       - name: Checkout lean-sys dependency
         run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
       - run: brew install ffmpeg
+      - name: Patch lean-sys socket portability
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('../lean-sys/c/lean_sys_shim.c')
+          s = p.read_text()
+          s = s.replace('int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;', 'int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;')
+          s = s.replace('accept4((int)lfd, NULL, NULL, SOCK_CLOEXEC)', 'accept((int)lfd, NULL, NULL)')
+          p.write_text(s)
+          PY
       - name: Install Lean
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
