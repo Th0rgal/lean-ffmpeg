@@ -31,19 +31,19 @@ def runSelfTest : IO UInt32 := do
   let pktOk := packetFrameGateSpec.gate packetFrameGateSpec.posWitness &&
                !(packetFrameGateSpec.gate packetFrameGateSpec.negWitness)
   let sampleBytes := ByteArray.mk #[0xA6, 0x42, 0x80, 0x7F]
-  let br := BitReader.ofSlice (ByteSlice.ofByteArray sampleBytes)
+  let br := BitReader.ofSlice (LeanSys.Posix.ByteSlice.ofByteArray sampleBytes)
   let ueOk := match br.readUE with
     | some (v, _) => v == 0
     | none => false
 
   -- 3. `libavformat` replacement: IVF & MP4/ISOBMFF & Ogg & WAV mux/demux zero-copy round-trip
-  let rawPkt0 := ByteSlice.ofByteArray (ByteArray.mk #[0x12, 0x00, 0x0A, 0x00, 0x00, 0x00])
-  let rawPkt1 := ByteSlice.ofByteArray (ByteArray.mk #[0x32, 0x04, 0xAA, 0xBB, 0xCC, 0xDD])
+  let rawPkt0 := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x12, 0x00, 0x0A, 0x00, 0x00, 0x00])
+  let rawPkt1 := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x32, 0x04, 0xAA, 0xBB, 0xCC, 0xDD])
   let p0 := AVPacketView.mkVerified 0 .av1 0 0 3000 true rawPkt0
   let p1 := AVPacketView.mkVerified 0 .av1 3000 3000 3000 false rawPkt1
   let ivfHdr : IvfHeader := { codec := .av1, width := 320, height := 240, timebase := AVRational.mkSafe 1 30, numFrames := 2 }
   let ivfBytes := muxIvfStream ivfHdr #[p0, p1]
-  let ivfOk := match demuxIvfStream (ByteSlice.ofByteArray ivfBytes) with
+  let ivfOk := match demuxIvfStream (LeanSys.Posix.ByteSlice.ofByteArray ivfBytes) with
     | some (h, pkts) =>
       h.width == 320 && h.height == 240 && pkts.size == 2 &&
       pkts[0]!.verifyIntegrity && pkts[1]!.verifyIntegrity &&
@@ -51,14 +51,14 @@ def runSelfTest : IO UInt32 := do
     | none => false
 
   let mp4Bytes := muxMp4Simple .av1 90000 #[p0, p1]
-  let mp4Ok := match demuxMp4Simple (ByteSlice.ofByteArray mp4Bytes) with
+  let mp4Ok := match demuxMp4Simple (LeanSys.Posix.ByteSlice.ofByteArray mp4Bytes) with
     | some (c, ts, pkts) =>
       c == .av1 && ts == 90000 && pkts.size == 2 &&
       pkts[0]!.digest64 == p0.digest64 && pkts[1]!.digest64 == p1.digest64
     | none => false
 
   let oggBytes := muxOggPages #[p0, p1]
-  let oggPkts := demuxOggPages (ByteSlice.ofByteArray oggBytes) .opus
+  let oggPkts := demuxOggPages (LeanSys.Posix.ByteSlice.ofByteArray oggBytes) .opus
   let oggOk := oggPkts.size == 2 && oggPkts[0]!.digest64 == p0.digest64
 
   -- 4. `libswscale` replacement: YUV420P <-> RGB24 & Bilinear 2D Scaling (`Regime R1/R2`)
@@ -77,7 +77,7 @@ def runSelfTest : IO UInt32 := do
   let (recL, recR) := flacMidSideToStereo msMid msSide
   let flacOk := flacDec == audioSignal && recL == 12345 && recR == -6789
 
-  let opusSample := ByteSlice.ofByteArray (ByteArray.mk #[0xFC, 0x01, 0x02])
+  let opusSample := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0xFC, 0x01, 0x02])
   let opusOk := match parseOpusToc opusSample with
     | some toc => toc.mode == .celtOnly && toc.bandwidth == .fullband && toc.stereo && toc.samples48k == 960
     | none => false
@@ -85,14 +85,14 @@ def runSelfTest : IO UInt32 := do
   let af48 := AudioFrame.alloc .s16p 48000 2 480 0
   let af24 := resampleAudioFrame af48 24000
   let wavBytes := muxWavPcm16LE af24
-  let wavOk := match demuxWavPcm16LE (ByteSlice.ofByteArray wavBytes) with
+  let wavOk := match demuxWavPcm16LE (LeanSys.Posix.ByteSlice.ofByteArray wavBytes) with
     | some afDec => afDec.sampleRate == 24000 && afDec.numSamples == 240 && afDec.channels == 2
     | none => false
 
   -- 6. `libavcodec` Video: AV1 OBU parser, H.264 Annex-B NALU scanner, Paeth R0 lossless, 4x4 IDCT, CDEF & Deblock
-  let av1ObuBytes := ByteSlice.ofByteArray (ByteArray.mk #[0x0A, 0x04, 0x01, 0x02, 0x03, 0x04])
+  let av1ObuBytes := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x0A, 0x04, 0x01, 0x02, 0x03, 0x04])
   let obus := parseAv1Obus av1ObuBytes
-  let annexB := ByteSlice.ofByteArray (ByteArray.mk #[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0x00, 0x00, 0x01, 0x68, 0xCE])
+  let annexB := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0x00, 0x00, 0x01, 0x68, 0xCE])
   let nalus := scanAnnexBNalUnits annexB false
   let testPlane := vfSrc.planes[0]!
   let paethRes := encodePlanePaethResiduals testPlane
@@ -125,7 +125,7 @@ def runSelfTest : IO UInt32 := do
   bw := bw.writeSE 0
   bw := bw.writeSE (-3)
   let bwBytes := bw.toByteArray
-  let bwReader := BitReader.ofSlice (ByteSlice.ofByteArray bwBytes)
+  let bwReader := BitReader.ofSlice (LeanSys.Posix.ByteSlice.ofByteArray bwBytes)
   let bitWriterOk := match bwReader.readUE with
     | some (v0, rA) =>
       match rA.readUE with
@@ -150,18 +150,18 @@ def runSelfTest : IO UInt32 := do
   -- 10. Wave 2 (T1 + T2): FLAC STREAMINFO + Subframes (Fixed/LPC/Constant/Verbatim/Rice/Escape) vs FFmpeg,
   --     AAC ADTS, Opus Codes 0..3, HEVC 2B NAL + SAO (BO + EO 0..3) vs FFmpeg, ProRes header + 8x8 IDCT vs FFmpeg,
   --     FFV1 R0 median + Rice round-trip, H.264 SPS/PPS, and all per-format AVGateSpecs
-  let flacSiSlice := ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacStreamInfoBytes)
+  let flacSiSlice := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacStreamInfoBytes)
   let flacSiOk := match parseFlacStreamInfo flacSiSlice with
     | some si =>
       si == realFfmpegFlacStreamInfo &&
-      parseFlacStreamInfo (ByteSlice.ofByteArray (serializeFlacStreamInfo si)) == some si &&
+      parseFlacStreamInfo (LeanSys.Posix.ByteSlice.ofByteArray (serializeFlacStreamInfo si)) == some si &&
       flacStreamInfoGateSpec.gate flacStreamInfoGateSpec.posWitness &&
       !(flacStreamInfoGateSpec.gate flacStreamInfoGateSpec.negWitness)
     | none => false
   let flacSubBytes := flacEncodeSubframeRiceR0 .order2 3 audioSignal
-  let flacSubFixedDec := decodeFlacSubframeSpec (ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacFixedSubframeBytes)) 64 16
-  let flacSubLpcDec   := decodeFlacSubframeSpec (ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacLpcSubframeBytes)) 64 16
-  let flacSubOk := match flacDecodeSubframeRiceR0 (ByteSlice.ofByteArray flacSubBytes) with
+  let flacSubFixedDec := decodeFlacSubframeSpec (LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacFixedSubframeBytes)) 64 16
+  let flacSubLpcDec   := decodeFlacSubframeSpec (LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegFlacLpcSubframeBytes)) 64 16
+  let flacSubOk := match flacDecodeSubframeRiceR0 (LeanSys.Posix.ByteSlice.ofByteArray flacSubBytes) with
     | some dec =>
       dec == audioSignal &&
       flacSubFixedDec == some realFfmpegFlacDecoded64Samples &&
@@ -169,7 +169,7 @@ def runSelfTest : IO UInt32 := do
       flacSubframeGateSpec.gate flacSubframeGateSpec.posWitness &&
       !(flacSubframeGateSpec.gate flacSubframeGateSpec.negWitness)
     | none => false
-  let adtsSlice := ByteSlice.ofByteArray (ByteArray.mk realFfmpegAacAdtsBytes)
+  let adtsSlice := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegAacAdtsBytes)
   let adtsOk := match parseAacAdtsHeader adtsSlice with
     | some h =>
       h == realFfmpegAacAdtsHeader &&
@@ -177,8 +177,8 @@ def runSelfTest : IO UInt32 := do
       aacAdtsGateSpec.gate aacAdtsGateSpec.posWitness &&
       !(aacAdtsGateSpec.gate aacAdtsGateSpec.negWitness)
     | none => false
-  let opusCode3VbrPad := ByteSlice.ofByteArray (ByteArray.mk #[0xFF, 0xC2, 0x03, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00, 0x00])
-  let opusPktOk := match parseOpusPacketFrames (ByteSlice.ofByteArray (ByteArray.mk realFfmpegOpusPacketBytes)),
+  let opusCode3VbrPad := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0xFF, 0xC2, 0x03, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00, 0x00])
+  let opusPktOk := match parseOpusPacketFrames (LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegOpusPacketBytes)),
                          parseOpusPacketFrames opusCode3VbrPad with
     | some pkt0, some pkt3 =>
       pkt0.frames.size == 1 && pkt0.toc.frameCode == 0 &&
@@ -186,7 +186,7 @@ def runSelfTest : IO UInt32 := do
       opusPacketGateSpec.gate opusPacketGateSpec.posWitness &&
       !(opusPacketGateSpec.gate opusPacketGateSpec.negWitness)
     | _, _ => false
-  let hevcNal := ByteSlice.ofByteArray (ByteArray.mk realFfmpegHevcNalBytes)
+  let hevcNal := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegHevcNalBytes)
   let hevcOk := match parseHevcNalHeader hevcNal with
     | some h =>
       h.nalUnitType == 32 && h.nuhTemporalId == 0 &&
@@ -207,7 +207,7 @@ def runSelfTest : IO UInt32 := do
     saoEo2Plane.data.data == realFfmpegSaoEo2Ref &&
     saoEo3Plane.data.data == realFfmpegSaoEo3Ref &&
     saoPlane.verifyBounds
-  let proresSlice := ByteSlice.ofByteArray (ByteArray.mk realFfmpegProResHeaderBytes)
+  let proresSlice := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegProResHeaderBytes)
   let proresIdctOut := proresIdct8x8Put10 proresTestCoeffs64 (Array.replicate 64 4)
   let proresOk := match parseProResFrameHeader proresSlice with
     | some h =>
@@ -218,11 +218,11 @@ def runSelfTest : IO UInt32 := do
     | none => false
   let ffv1Bytes := encodePlaneFfv1RiceR0 realFfmpeg8x8Plane 3
   let h264SpsPpsOk :=
-    (parseH264Sps (ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264SpsBytes))).isSome &&
-    (parseH264Pps (ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264PpsBytes))).isSome &&
+    (parseH264Sps (LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264SpsBytes))).isSome &&
+    (parseH264Pps (LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264PpsBytes))).isSome &&
     h264SpsGateSpec.gate h264SpsGateSpec.posWitness &&
     !(h264SpsGateSpec.gate h264SpsGateSpec.negWitness)
-  let ffv1Ok := match decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray ffv1Bytes) with
+  let ffv1Ok := match decodePlaneFfv1RiceR0 (LeanSys.Posix.ByteSlice.ofByteArray ffv1Bytes) with
     | some dec =>
       (comparePlanesMetrics realFfmpeg8x8Plane dec).1 == 0 &&
       dec.data.data == realFfmpeg8x8GrayBytes &&
@@ -272,7 +272,7 @@ def runSelfTest : IO UInt32 := do
       r.zeroCopyGateOk &&
       r.loopGateOk &&
       (let mp4Fast := muxMp4StreamingFast .h264 90000 #[r.encodedPacket]
-       match demuxMp4Simple (ByteSlice.ofByteArray mp4Fast) with
+       match demuxMp4Simple (LeanSys.Posix.ByteSlice.ofByteArray mp4Fast) with
        | some (c, ts, pkts) => c == .h264 && ts == 90000 && pkts.size == 1 && pkts[0]!.digest64 == r.encodedPacket.digest64
        | none => false)
     | none => false
@@ -301,21 +301,21 @@ def runSelfTest : IO UInt32 := do
   let w7PktI := transcodeAvcc4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
   let w7PktB := transcodeAvcc4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
   let w7AvccOk := isAvcc1080pIpbPacketBytesValid w7PktI.data &&
-                  classifyAvccH264Sample (ByteSlice.ofByteArray w7PktI) false == .iFrame &&
-                  classifyAvccH264Sample (ByteSlice.ofByteArray w7PktB) false == .bFrame
+                  classifyAvccH264Sample (LeanSys.Posix.ByteSlice.ofByteArray w7PktI) false == .iFrame &&
+                  classifyAvccH264Sample (LeanSys.Posix.ByteSlice.ofByteArray w7PktB) false == .bFrame
   let w7Ok := w7ScaleOk && w7BiPredOk && w7AvccOk
 
   -- 16. Wave 8: Standard ISOBMFF (`ISO/IEC 14496-12`) MP4 Track Muxer (`muxIsoMp4Track`) & Demuxer Round-Trip
   let w8SampleI : IsoMp4SampleDesc := {
     sampleIdx := 0, dts := 0, pts := 1024, duration := 512, frameType := .iFrame,
-    slice := ByteSlice.ofByteArray w7PktI
+    slice := LeanSys.Posix.ByteSlice.ofByteArray w7PktI
   }
   let w8SampleB : IsoMp4SampleDesc := {
     sampleIdx := 1, dts := 512, pts := 512, duration := 512, frameType := .bFrame,
-    slice := ByteSlice.ofByteArray w7PktB
+    slice := LeanSys.Posix.ByteSlice.ofByteArray w7PktB
   }
   let w8Mp4 := muxIsoMp4Track 1920 1080 15360 defaultAvcC1080pBytes #[w8SampleI, w8SampleB]
-  let w8Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w8Mp4) with
+  let w8Ok := match demuxIsoMp4Track (LeanSys.Posix.ByteSlice.ofByteArray w8Mp4) with
     | some d8 => d8.width == 1920 && d8.height == 1080 && d8.samples.size == 2 && d8.iFrameCount == 1 && d8.bFrameCount == 1
     | none => false
 
@@ -328,29 +328,29 @@ def runSelfTest : IO UInt32 := do
     firstMbInSlice := 0, sliceType := 1, ppsId := 0, frameNum4 := 2,
     isIdr := false, idrPicId := 0, pocLsb8 := 2, sliceQpDelta := 2
   }
-  let w9Ok := decodeH264SliceHeaderRbsp (ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShI)) true == some w9ShI &&
-              decodeH264SliceHeaderRbsp (ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShB)) false == some w9ShB
+  let w9Ok := decodeH264SliceHeaderRbsp (LeanSys.Posix.ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShI)) true == some w9ShI &&
+              decodeH264SliceHeaderRbsp (LeanSys.Posix.ByteSlice.ofByteArray (encodeH264SliceHeaderRbsp w9ShB)) false == some w9ShB
 
   -- 18. Wave 10: Multi-Codec (`hvc1` HEVC & `av01` AV1) 4K->1080p I/P/B Transcoding & ISOBMFF Round-Trip
   let w10HevcI := transcodeHvccHevc4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
   let w10HevcB := transcodeHvccHevc4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
   let w10SampleI : IsoMp4SampleDesc := {
     sampleIdx := 0, dts := 0, pts := 1024, duration := 512, frameType := .iFrame,
-    slice := ByteSlice.ofByteArray w10HevcI
+    slice := LeanSys.Posix.ByteSlice.ofByteArray w10HevcI
   }
   let w10SampleB : IsoMp4SampleDesc := {
     sampleIdx := 1, dts := 512, pts := 512, duration := 512, frameType := .bFrame,
-    slice := ByteSlice.ofByteArray w10HevcB
+    slice := LeanSys.Posix.ByteSlice.ofByteArray w10HevcB
   }
   let w10Mp4Hevc := muxIsoMp4TrackCodec .hevc 1920 1080 15360 ByteArray.empty #[w10SampleI, w10SampleB]
-  let w10Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w10Mp4Hevc) with
+  let w10Ok := match demuxIsoMp4Track (LeanSys.Posix.ByteSlice.ofByteArray w10Mp4Hevc) with
     | some d10 => d10.width == 1920 && d10.height == 1080 && d10.samples.size == 2 && d10.iFrameCount == 1 && d10.bFrameCount == 1
     | none => false
 
   -- 19. Wave 11: Multi-Track ISOBMFF Audio + Video (`vide` + `soun` AAC-LC 48kHz Stereo) Muxer & Demuxer Round-Trip
   let w11AacFrame : ByteArray := { data := #[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C] }
   let w11Mp4Av := muxIsoMp4AudioVideoTracks .h264 1920 1080 15360 defaultAvcC1080pBytes #[w8SampleI, w8SampleB] 48000 2 1024 #[w11AacFrame, w11AacFrame]
-  let w11Ok := match demuxIsoMp4Track (ByteSlice.ofByteArray w11Mp4Av) with
+  let w11Ok := match demuxIsoMp4Track (LeanSys.Posix.ByteSlice.ofByteArray w11Mp4Av) with
     | some d11 => d11.width == 1920 && d11.height == 1080 && d11.samples.size == 2 && d11.iFrameCount == 1 && d11.bFrameCount == 1
     | none => false
 
@@ -362,8 +362,8 @@ def runSelfTest : IO UInt32 := do
   let w13Av1I := transcodeAv1Obu4kTo1080pPacketSimd w7Dummy 0 64 0 1024 0
   let w13Av1B := transcodeAv1Obu4kTo1080pPacketSimd w7Dummy 0 64 2 1536 1024
   let w13Ok := decodeLeb128Fixed4 w13Leb0 w13Leb1 w13Leb2 w13Leb3 == some 65535 &&
-    classifyAv1ObuSample (ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
-    classifyAv1ObuSample (ByteSlice.ofByteArray w13Av1B) false == .bFrame
+    classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
+    classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1B) false == .bFrame
 
   -- 22. Wave 14: 15-Kernel LNIR Wire (`lanczos_4tap_downscale_fma_gpu`) & 4-Tap Lanczos Normalization Gate
   let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
@@ -380,8 +380,8 @@ def runSelfTest : IO UInt32 := do
     firstSliceSegmentInPic := true, isIdrRap := false, noOutputOfPriorPics := false,
     ppsId := 0, sliceType := 0, pocLsb8 := 2, saoLumaFlag := false, saoChromaFlag := false, sliceQpDelta := 2
   }
-  let w15Ok := decodeHevcSliceSegmentHeaderRbsp (ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShI)) true == some w15ShI &&
-               decodeHevcSliceSegmentHeaderRbsp (ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShB)) false == some w15ShB
+  let w15Ok := decodeHevcSliceSegmentHeaderRbsp (LeanSys.Posix.ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShI)) true == some w15ShI &&
+               decodeHevcSliceSegmentHeaderRbsp (LeanSys.Posix.ByteSlice.ofByteArray (encodeHevcSliceSegmentHeaderRbsp w15ShB)) false == some w15ShB
 
   -- 24. Wave 16: AV1 §5.9 Uncompressed Frame Header Bitstream Round-Trip & 17-Kernel LNIR SGRPROJ FMA Gate
   let w16FhKey : Av1FrameHeaderView := {
@@ -394,8 +394,8 @@ def runSelfTest : IO UInt32 := do
     errorResilientMode := false, disableCdfUpdate := true,
     orderHint8 := 2, refreshFrameFlags := 0x00, baseQIdx := 128, cdefBits2 := 1
   }
-  let w16Ok := decodeAv1FrameHeaderBits (ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhKey)) == some w16FhKey &&
-               decodeAv1FrameHeaderBits (ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhB)) == some w16FhB
+  let w16Ok := decodeAv1FrameHeaderBits (LeanSys.Posix.ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhKey)) == some w16FhKey &&
+               decodeAv1FrameHeaderBits (LeanSys.Posix.ByteSlice.ofByteArray (encodeAv1FrameHeaderBits w16FhB)) == some w16FhB
 
   -- 25. Wave 17: ISO/IEC 14496-3 §1.6.2.1 AAC AudioSpecificConfig Round-Trip & 18-Kernel LNIR AAC IMDCT FMA Gate
   let w17Asc48k : AacAudioSpecificConfigView := {
@@ -407,8 +407,8 @@ def runSelfTest : IO UInt32 := do
     frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
   }
   let w17Ok := encodeAacAudioSpecificConfig w17Asc48k == ByteArray.mk #[0x11, 0x90] &&
-               decodeAacAudioSpecificConfig (ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc48k)) == some w17Asc48k &&
-               decodeAacAudioSpecificConfig (ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc44k)) == some w17Asc44k
+               decodeAacAudioSpecificConfig (LeanSys.Posix.ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc48k)) == some w17Asc48k &&
+               decodeAacAudioSpecificConfig (LeanSys.Posix.ByteSlice.ofByteArray (encodeAacAudioSpecificConfig w17Asc44k)) == some w17Asc44k
 
   -- 26. Wave 18: RFC 7845 §5.1 OpusHead Identification Header Round-Trip & 19-Kernel LNIR Opus CELT Comb FMA Gate
   let w18OpusStereo : OpusIdHeaderView := {
@@ -419,8 +419,8 @@ def runSelfTest : IO UInt32 := do
     version := 1, channels := 1, preSkip := 3840,
     inputSampleRate := 48000, outputGainQ8 := 256, channelMappingFamily := 0
   }
-  let w18Ok := decodeOpusIdHeader (ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusStereo)) == some w18OpusStereo &&
-               decodeOpusIdHeader (ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusMono)) == some w18OpusMono
+  let w18Ok := decodeOpusIdHeader (LeanSys.Posix.ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusStereo)) == some w18OpusStereo &&
+               decodeOpusIdHeader (LeanSys.Posix.ByteSlice.ofByteArray (encodeOpusIdHeader w18OpusMono)) == some w18OpusMono
 
   -- 27. Wave 19: ISO/IEC 14496-12 §8.6.1.3 CompositionOffsetBox (`ctts`) B-Frame PTS-DTS RLE Round-Trip & 20-Kernel LNIR H.264 IDCT 4x4 Gate
   let w19GopOffsets : List UInt32 := [1024, 2560, 1536, 512, 512, 2048]
@@ -801,10 +801,10 @@ def runSelfTest : IO UInt32 := do
 /-- Run high-throughput microbenchmarks across `LeanAV` subsystems (`demux`, `swscale`, `flac_lpc`, `av1_cdef`, `avfilter`). -/
 def runBench (iters : Nat := 500) : IO UInt32 := do
   let t0 ← IO.monoNanosNow
-  let rawPkt := ByteSlice.ofByteArray (ByteArray.mk (Array.replicate 256 (0x5A : UInt8)))
+  let rawPkt := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk (Array.replicate 256 (0x5A : UInt8)))
   let pkt := AVPacketView.mkVerified 0 .av1 0 0 3000 true rawPkt
   let mp4Bytes := muxMp4Simple .av1 90000 #[pkt, pkt, pkt, pkt]
-  let mp4Slice := ByteSlice.ofByteArray mp4Bytes
+  let mp4Slice := LeanSys.Posix.ByteSlice.ofByteArray mp4Bytes
 
   let mut checksumAcc : UInt64 := 0
   for _ in [:iters] do
@@ -841,7 +841,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 1. Real MP4 (`test_720p_h264.mp4`)
   let mp4Path := s!"{mediaDir}/test_720p_h264.mp4"
   let mp4Bytes ← IO.FS.readBinFile mp4Path
-  let mp4Slice := ByteSlice.ofByteArray mp4Bytes
+  let mp4Slice := LeanSys.Posix.ByteSlice.ofByteArray mp4Bytes
   let tMp4Start ← IO.monoNanosNow
   let mut mp4BoxesTotal : Nat := 0
   let mut mp4MdatBytes : Nat := 0
@@ -856,7 +856,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 2. Real IVF AV1 (`test_720p_av1.ivf`) + AV1 OBU parser
   let ivfPath := s!"{mediaDir}/test_720p_av1.ivf"
   let ivfBytes ← IO.FS.readBinFile ivfPath
-  let ivfSlice := ByteSlice.ofByteArray ivfBytes
+  let ivfSlice := LeanSys.Posix.ByteSlice.ofByteArray ivfBytes
   let tIvfStart ← IO.monoNanosNow
   let mut ivfPktsCount : Nat := 0
   let mut av1ObusTotal : Nat := 0
@@ -872,7 +872,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 3. Real H.264 Annex-B elementary stream (`test_720p.264`)
   let h264Path := s!"{mediaDir}/test_720p.264"
   let h264Bytes ← IO.FS.readBinFile h264Path
-  let h264Slice := ByteSlice.ofByteArray h264Bytes
+  let h264Slice := LeanSys.Posix.ByteSlice.ofByteArray h264Bytes
   let tH264Start ← IO.monoNanosNow
   let mut naluCount : Nat := 0
   for _ in [:iters / 4 + 1] do
@@ -887,7 +887,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 4. Real MPEG-TS (`test_720p.ts`)
   let tsPath := s!"{mediaDir}/test_720p.ts"
   let tsBytes ← IO.FS.readBinFile tsPath
-  let tsSlice := ByteSlice.ofByteArray tsBytes
+  let tsSlice := LeanSys.Posix.ByteSlice.ofByteArray tsBytes
   let tTsStart ← IO.monoNanosNow
   let mut tsPackets : Nat := 0
   for _ in [:iters / 4 + 1] do
@@ -897,7 +897,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 5. Real Ogg Opus (`test_audio.ogg`)
   let oggPath := s!"{mediaDir}/test_audio.ogg"
   let oggBytes ← IO.FS.readBinFile oggPath
-  let oggSlice := ByteSlice.ofByteArray oggBytes
+  let oggSlice := LeanSys.Posix.ByteSlice.ofByteArray oggBytes
   let tOggStart ← IO.monoNanosNow
   let mut oggPages : Nat := 0
   let mut opusFramesOk : Nat := 0
@@ -913,7 +913,7 @@ def runBenchRealFiles (mediaDir : String) (iters : Nat := 200) : IO UInt32 := do
   -- 6. Real WAV PCM16LE (`test_audio.wav`) -> FLAC LPC Order-4 Lossless R0 Round-Trip + Swresample 48k->24k
   let wavPath := s!"{mediaDir}/test_audio.wav"
   let wavBytes ← IO.FS.readBinFile wavPath
-  let wavSlice := ByteSlice.ofByteArray wavBytes
+  let wavSlice := LeanSys.Posix.ByteSlice.ofByteArray wavBytes
   let tWavStart ← IO.monoNanosNow
   let mut wavSamples : Nat := 0
   let mut flacR0Exact : Bool := false
@@ -960,6 +960,26 @@ def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
   catch _ =>
     return fallback
 
+def jsonEscape (s : String) : String :=
+  String.mk (s.toList.flatMap fun c =>
+    match c with
+    | '"' => ['\\', '"']
+    | '\\' => ['\\', '\\']
+    | '\n' => ['\\', 'n']
+    | '\r' => ['\\', 'r']
+    | '\t' => ['\\', 't']
+    | _ => [c])
+
+def cliQuiet (level : String) : Bool :=
+  level == "quiet" || level == "-8" || level == "panic" || level == "fatal" || level == "0"
+
+def reportCliError (cfg : CliConfig) (jsonMsg textMsg : String) : IO UInt32 := do
+  if cfg.jsonOutput then
+    IO.println jsonMsg
+  else if !cliQuiet cfg.logLevel then
+    IO.eprintln textMsg
+  return 1
+
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
     (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
@@ -983,8 +1003,8 @@ def tryFastHeaderProbeTranscode
       let totalUs := (tEnd - t0) / 1000
       if validCfg.jsonOutput then
         let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-stream-copy\", \"codec\": \"copy\", \"audio_track\": {withAudio}, "
-        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{fastDemux.width}x{fastDemux.height}\", "
-        let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"ffmpeg_acceptance_ok\": {copyRep.ffmpegAcceptanceOk}, "
+        let c1 := s!"\"input\": \"{jsonEscape inPath}\", \"output\": \"{jsonEscape outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{fastDemux.width}x{fastDemux.height}\", "
+        let c2 := s!"\"start_ms\": {startMs}, \"dur_ms\": {durMs}, \"acceptance_metrics\": \"not_measured\", "
         let c3 := s!"\"demux_us\": {(tDemux - t0) / 1000}, \"total_us\": {totalUs}, \"in_bytes\": {inStat}, \"out_bytes\": {outStat} }"
         IO.println (c0 ++ c1 ++ c2 ++ c3)
       return true
@@ -1030,11 +1050,11 @@ def tryFastHeaderProbeTranscode
       let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
       if validCfg.jsonOutput then
         let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli-mp4-pixel-simd-transcode\", \"codec\": \"{codecName}\", \"audio_track\": {withAudio}, "
-        let c1 := s!"\"input\": \"{inPath}\", \"output\": \"{outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
+        let c1 := s!"\"input\": \"{jsonEscape inPath}\", \"output\": \"{jsonEscape outPath}\", \"src_res\": \"{fastDemux.width}x{fastDemux.height}\", \"dst_res\": \"{pixRep.dstWidth}x{pixRep.dstHeight}\", "
         let c2 := s!"\"frames\": {nFrames}, \"i_frames\": {fastDemux.iFrameCount}, \"p_frames\": {fastDemux.pFrameCount}, \"b_frames\": {fastDemux.bFrameCount}, "
-        let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"container_sync_ok\": {pixRep.containerSyncOk}, \"ffmpeg_acceptance_ok\": {pixRep.ffmpegAcceptanceOk}, "
+        let c3 := s!"\"luma_mean\": {pixRep.lumaMean}, \"luma_variance\": {pixRep.lumaVariance}, \"visual_fidelity_ok\": {pixRep.visualFidelityOk}, \"acceptance_metrics\": \"measured\", "
         let c4 := s!"\"demux_us\": {demuxUs}, \"transcode_mux_us\": {transcodeUs}, \"total_us\": {totalUs}, \"fps\": {fps}, "
-        let c5 := s!"\"in_bytes\": {inStat}, \"out_bytes\": {outStat}, \"dpb_poc_monotone\": true }"
+        let c5 := s!"\"in_bytes\": {inStat}, \"out_bytes\": {outStat} }"
         IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
       return true
     else
@@ -1047,7 +1067,7 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
   | .error errs =>
     if cfg.jsonOutput then
       IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error_count\": {errs.length} }"
-    else if cfg.logLevel != "quiet" && cfg.logLevel != "-8" then
+    else if !cliQuiet cfg.logLevel then
       IO.eprintln s!"Error parsing command line: {repr errs}"
     return 1
   | .ok validCfg =>
@@ -1065,15 +1085,42 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       (if validCfg.daemon.isSome then ["-daemon"] else []) ++
       (if validCfg.golden.isSome then ["-golden"] else []) ++
       (if validCfg.threads.isSome then ["-threads"] else []) ++
-      (if validCfg.format.isSome && validCfg.format != some "null" && validCfg.format != some "mp4" then ["-f"] else []) ++
-      (if validCfg.audioCodec.isSome && validCfg.audioCodec != some .copy && validCfg.audioCodec != some .aac then ["-c:a"] else [])
+      (if validCfg.bFrames.isSome then ["-bf"] else []) ++
+      (if validCfg.gopSize.isSome then ["-g"] else []) ++
+      (if validCfg.movflags.isSome then ["-movflags"] else []) ++
+      (if validCfg.videoFrames.isSome then ["-frames:v"] else []) ++
+      (if validCfg.audioRate.isSome then ["-ar"] else []) ++
+      (if validCfg.audioChannels.isSome && validCfg.audioChannels != some 2 then ["-ac"] else []) ++
+      (if validCfg.format.isSome && validCfg.format != some "mp4" then ["-f"] else []) ++
+      (if validCfg.audioCodec.isSome && validCfg.audioCodec != some .copy && validCfg.audioCodec != some .aac then ["-c:a"] else []) ++
+      (if validCfg.audioCodec == some .copy && validCfg.videoCodec != some .copy then ["-c:a copy"] else []) ++
+      (if validCfg.videoCodec == some .copy && validCfg.audioCodec == some .aac then ["-c:a aac"] else [])
     if !unsupportedExecution.isEmpty then
       let unsupportedText := String.intercalate ", " unsupportedExecution
-      if validCfg.jsonOutput then
-        IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"unsupported\": \"{unsupportedText}\" }"
-      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
-        IO.eprintln s!"Unsupported execution options: {unsupportedText}"
-      return 1
+      return ← reportCliError validCfg
+        (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"unsupported\": \"{jsonEscape unsupportedText}\" }")
+        (s!"Unsupported execution options: {unsupportedText}")
+    let codecError := match validCfg.videoCodec with
+      | some .copy | some .h264 | some .hevc | some .av1 | none => none
+      | some _ => some "-c:v codec is not implemented by the CLI"
+    if let some msg := codecError then
+      return ← reportCliError validCfg
+        (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error\": \"{jsonEscape msg}\" }") msg
+    if validCfg.format == some "null" then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"null output format is not implemented\"}"
+        "The null output format is not implemented"
+    let hasExplicitMp4 := validCfg.format == some "mp4"
+    let lowerOut := outPath.toLower
+    if !hasExplicitMp4 && !(lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v") then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"output must use .mp4 or .m4v\"}"
+        "Output must use .mp4 or .m4v"
+    if !validCfg.overwrite then
+      if (← System.FilePath.pathExists outPath) then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+          "File exists"
     let filterOps ← match validCfg.videoFilter with
       | some vfStr =>
         match parseVideoFilterGraph vfStr with
@@ -1129,7 +1176,7 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return 0
     else
       let rawBytes ← IO.FS.readBinFile inPath
-      let inSlice := ByteSlice.ofByteArray rawBytes
+      let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawBytes
       -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
       if let some demux := demuxIsoMp4Track inSlice then
         let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 demux startMs durMs withAudio
@@ -1149,11 +1196,11 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
 
 def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
-  IO.println "  libavutil     LeanAV.Core      59. 39.100 (verified Law 1 rational rescale)"
-  IO.println "  libavcodec    LeanAV.Video/Audio 61. 19.100 (verified FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1)"
-  IO.println "  libavformat   LeanAV.Format    61.  7.100 (verified IVF, MP4, MKV, Ogg, MPEG-TS, WAV)"
-  IO.println "  libavfilter   LeanAV.Filter    10.  4.100 (verified Law 5 duration-conserving DAG)"
-  IO.println "  libswscale    LeanAV.Scale      8.  3.100 (verified Q10 BT.601/709/2020 + bilinear/bicubic)"
+  IO.println "  CLI video: h264, hevc, av1, copy (delegated to linked libav/x264 where available)"
+  IO.println "  CLI audio: aac, copy (audio copy is supported only in stream-copy mode)"
+  IO.println "  LeanAV library codecs: FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1"
+  IO.println "  LeanAV library formats: IVF, MP4, MKV, Ogg, MPEG-TS, WAV"
+  IO.println "  LeanAV filters: verified structural filter and color-conversion laws"
   return 0
 
 def printLffmpegFormats : IO UInt32 := do
@@ -1164,16 +1211,14 @@ def printLffmpegFormats : IO UInt32 := do
   return 0
 
 def printLffmpegCodecs : IO UInt32 := do
-  IO.println "Codecs (lffmpeg / LeanAV):"
-  IO.println " D.V..S ffv1                 FFV1 lossless video (R0 Golomb-Rice + R1 Range Coder)"
-  IO.println " D.V.L. h264                 H.264 / AVC / MPEG-4 AVC (SPS/PPS + CABAC + DPB)"
-  IO.println " D.V.L. hevc                 HEVC / H.265 (NAL + SAO Band/Edge + CABAC)"
-  IO.println " D.V.L. prores               Apple ProRes (icpf + 10-bit 8x8 IDCT)"
-  IO.println " D.V.L. av1                  Alliance for Open Media AV1 (OBU + MSAC + CDEF + Wiener)"
-  IO.println " DEA.LS flac                 FLAC (Free Lossless Audio Codec: STREAMINFO + Fixed/LPC/Rice)"
-  IO.println " D.A.L. aac                  AAC (Advanced Audio Coding: ADTS + Huffman + IMDCT)"
-  IO.println " D.A.L. opus                 Opus (RFC 6716 Codes 0..3 + Range Coder + CELT/SILK)"
-  IO.println " DEA.S. pcm_s16le            PCM signed 16-bit little-endian"
+  IO.println "Codecs (lffmpeg CLI; linked libav/x264 implementations):"
+  IO.println " DEV h264                   H.264 / AVC"
+  IO.println " DEV hevc                   HEVC / H.265"
+  IO.println " DEV av1                    AV1"
+  IO.println " DEV copy                   stream copy"
+  IO.println " DEA aac                    AAC"
+  IO.println " DEA copy                   audio stream copy in stream-copy mode"
+  IO.println "Library-only LeanAV codecs: flac, opus, prores, ffv1, pcm_s16le"
   return 0
 
 def main (args : List String) : IO UInt32 := do
@@ -1183,8 +1228,16 @@ def main (args : List String) : IO UInt32 := do
   | "--version" :: _ => printLffmpegVersion
   | "-codecs" :: _ => printLffmpegCodecs
   | "-formats" :: _ => printLffmpegFormats
-  | "-h" :: _ => printLffmpegVersion
-  | "--help" :: _ => printLffmpegVersion
+  | "-h" :: _ => do
+    IO.println "usage: lffmpeg -i INPUT [-c:v h264|hevc|av1|copy] [-c:a aac|copy] [options] OUTPUT.mp4"
+    IO.println "options: -y | -n, -vf FILTER, -ss SECONDS, -t SECONDS, -f mp4, -pix_fmt, -preset, -crf, -b:v, -b:a, -r, -json"
+    IO.println "unsupported options fail closed rather than being silently ignored"
+    return 0
+  | "--help" :: _ => do
+    IO.println "usage: lffmpeg -i INPUT [-c:v h264|hevc|av1|copy] [-c:a aac|copy] [options] OUTPUT.mp4"
+    IO.println "options: -y | -n, -vf FILTER, -ss SECONDS, -t SECONDS, -f mp4, -pix_fmt, -preset, -crf, -b:v, -b:a, -r, -json"
+    IO.println "unsupported options fail closed rather than being silently ignored"
+    return 0
   | "bench" :: itStr :: _ => runBench (itStr.toNat?.getD 500)
   | "bench" :: [] => runBench 500
   | "bench-real" :: mediaDir :: itStr :: _ => runBenchRealFiles mediaDir (itStr.toNat?.getD 200)
@@ -1216,7 +1269,7 @@ def main (args : List String) : IO UInt32 := do
     -- 2. Verified FFV1 R0 Lossless Encode + Decode Round-Trip on a 64x64 patch and full 640x360 frame
     let pYPatch := filterPlaneCrop pY 160 90 64 64
     let ffv1Enc := encodePlaneFfv1RiceR0 pYPatch 3
-    let pYPatchDec := (decodePlaneFfv1RiceR0 (ByteSlice.ofByteArray ffv1Enc)).getD pYPatch
+    let pYPatchDec := (decodePlaneFfv1RiceR0 (LeanSys.Posix.ByteSlice.ofByteArray ffv1Enc)).getD pYPatch
     let (ffv1MaxErr, ffv1Sse) := comparePlanesMetrics pYPatch pYPatchDec
     -- 3. Verified Fused Filter Graph (Contrast 1.25x + Brightness +12 + 3x3 BoxBlur)
     let pYFiltered := filterPlaneBoxBlur3x3 (filterPlanePointFused pY 320 12 false)
@@ -1265,9 +1318,9 @@ def main (args : List String) : IO UInt32 := do
 
     -- Stage 4: FFV1 R0 Lossless Decode + Bit-Exact Verification (64x64 Tile)
     let t4s ← IO.monoNanosNow
-    let mut pYDec := (decodePlaneFfv1RiceR0Fast (ByteSlice.ofByteArray encBs)).getD pYTile
+    let mut pYDec := (decodePlaneFfv1RiceR0Fast (LeanSys.Posix.ByteSlice.ofByteArray encBs)).getD pYTile
     for _ in [:iters] do
-      pYDec := (decodePlaneFfv1RiceR0Fast (ByteSlice.ofByteArray encBs)).getD pYTile
+      pYDec := (decodePlaneFfv1RiceR0Fast (LeanSys.Posix.ByteSlice.ofByteArray encBs)).getD pYTile
     let t4e ← IO.monoNanosNow
 
     let (maxErr, sse) := comparePlanesMetrics pYTile pYDec
@@ -1383,7 +1436,7 @@ def main (args : List String) : IO UInt32 := do
     let t0 ← IO.monoNanosNow
     let rawBytes ← IO.FS.readBinFile inMp4Path
     let tRead ← IO.monoNanosNow
-    let inSlice := ByteSlice.ofByteArray rawBytes
+    let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawBytes
     let some demux := demuxIsoMp4Track inSlice | do
       IO.println s!"\{ \"ok\": false, \"error\": \"Failed to demux ISO MP4 track from {inMp4Path}\" }"
       return 1
@@ -1416,7 +1469,7 @@ def main (args : List String) : IO UInt32 := do
     let bipred1080Us := (tBiPred1 - tScale1) / 1000
     let writeUs := (tWrite - tBiPred1) / 1000
     -- Wave 8 verification: demux the emitted ISOBMFF 1080p MP4 container and verify exact round-trip of 1920x1080 and I/P/B counts
-    let roundtripIsoOk : Bool := match demuxIsoMp4Track (ByteSlice.ofByteArray rep8.outputMp4Bytes) with
+    let roundtripIsoOk : Bool := match demuxIsoMp4Track (LeanSys.Posix.ByteSlice.ofByteArray rep8.outputMp4Bytes) with
       | some dOut =>
           dOut.width == rep8.dstWidth &&
           dOut.height == rep8.dstHeight &&

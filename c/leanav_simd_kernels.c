@@ -5415,12 +5415,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         leanav_build_bilinear_tabs(&uv_tabs, src_w >> 1, src_h >> 1, dst_w >> 1, dst_h >> 1);
     }
 
-    static int hw_checked = 0;
+    static pthread_once_t hw_once = PTHREAD_ONCE_INIT;
     static int has_vt_h264 = 0;
     static int has_vt_hevc = 0;
     static int has_nvenc_h264 = 0;
     static int has_nvenc_hevc = 0;
-    if (!hw_checked) {
+    void init_hw_encoders(void) {
 #if defined(__APPLE__)
         if (getenv("LEANAV_USE_VIDEOTOOLBOX") != NULL) {
             has_vt_h264 = leanav_has_encoder_cached("h264_videotoolbox");
@@ -5432,8 +5432,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
             has_nvenc_hevc = leanav_has_encoder_cached("hevc_nvenc");
         }
 #endif
-        hw_checked = 1;
     }
+    pthread_once(&hw_once, init_hw_encoders);
 
     /*
      * Preserve input colorimetry (`ColorSpaceTag`: BT.709 vs BT.2020 PQ / HLG) across the rawvideo SIMD pipe

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Th0rgal/lean-sys
+          ref: 9a3fda9
+          path: lean-sys
+      - uses: awalterschulze/lean-action@v1
+        with:
+          lean-version: 4.31.0
+      - name: Install FFmpeg development libraries
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libswresample-dev libavutil-dev pkg-config
+      - name: Build
+        run: lake build
+      - name: Self-test
+        run: .lake/build/bin/lffmpeg self-test
+      - name: Axiom audit
+        run: lake env lean scripts/check_axioms.lean
+      - name: CLI smoke tests
+        run: |
+          set +e
+          touch /tmp/existing.mp4
+          .lake/build/bin/lffmpeg -n -i /dev/null /tmp/existing.mp4
+          test $? -ne 0
+          .lake/build/bin/lffmpeg -i /dev/null -c:v vp9 /tmp/rejected.mp4
+          test $? -ne 0
+          .lake/build/bin/lffmpeg -i /dev/null -f null /tmp/rejected.mp4
+          test $? -ne 0
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Th0rgal/lean-sys
+          ref: 9a3fda9
+          path: lean-sys
+      - uses: Homebrew/actions/setup-homebrew@master
+      - run: brew install ffmpeg
+      - uses: awalterschulze/lean-action@v1
+        with:
+          lean-version: 4.31.0
+      - run: lake build
+      - run: .lake/build/bin/lffmpeg self-test
