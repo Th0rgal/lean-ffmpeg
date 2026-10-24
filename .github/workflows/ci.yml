@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
-        run: git clone https://github.com/Th0rgal/lean-sys.git lean-sys && git -C lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
+        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
       - name: Install Lean
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
-        run: git clone https://github.com/Th0rgal/lean-sys.git lean-sys && git -C lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
+        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
       - run: brew install ffmpeg
       - name: Install Lean
         run: |
