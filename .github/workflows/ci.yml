@@ -14,9 +14,10 @@ jobs:
           repository: Th0rgal/lean-sys
           ref: 9a3fda9
           path: lean-sys
-      - uses: awalterschulze/lean-action@v1
-        with:
-          lean-version: 4.31.0
+      - name: Install Lean
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install FFmpeg development libraries
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libswresample-dev libavutil-dev pkg-config
       - name: Build
@@ -45,10 +46,10 @@ jobs:
           repository: Th0rgal/lean-sys
           ref: 9a3fda9
           path: lean-sys
-      - uses: Homebrew/actions/setup-homebrew@master
       - run: brew install ffmpeg
-      - uses: awalterschulze/lean-action@v1
-        with:
-          lean-version: 4.31.0
+      - name: Install Lean
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: lake build
       - run: .lake/build/bin/lffmpeg self-test
