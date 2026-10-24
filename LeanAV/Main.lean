@@ -1051,8 +1051,29 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       IO.eprintln s!"Error parsing command line: {repr errs}"
     return 1
   | .ok validCfg =>
+    if validCfg.inputs.length != 1 then
+      if validCfg.jsonOutput then
+        IO.println "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"exactly one input is supported\"}"
+      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+        IO.eprintln "Exactly one input is supported"
+      return 1
     let inPath := validCfg.inputs.headD ""
     let outPath := validCfg.output.getD ""
+    let unsupportedExecution : List String :=
+      (if validCfg.audioFilter.isSome then ["-af"] else []) ++
+      (if validCfg.noVideo then ["-vn"] else []) ++
+      (if validCfg.daemon.isSome then ["-daemon"] else []) ++
+      (if validCfg.golden.isSome then ["-golden"] else []) ++
+      (if validCfg.threads.isSome then ["-threads"] else []) ++
+      (if validCfg.format.isSome && validCfg.format != some "null" && validCfg.format != some "mp4" then ["-f"] else []) ++
+      (if validCfg.audioCodec.isSome && validCfg.audioCodec != some .copy && validCfg.audioCodec != some .aac then ["-c:a"] else [])
+    if !unsupportedExecution.isEmpty then
+      let unsupportedText := String.intercalate ", " unsupportedExecution
+      if validCfg.jsonOutput then
+        IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"unsupported\": \"{unsupportedText}\" }"
+      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+        IO.eprintln s!"Unsupported execution options: {unsupportedText}"
+      return 1
     let filterOps ← match validCfg.videoFilter with
       | some vfStr =>
         match parseVideoFilterGraph vfStr with
@@ -1065,10 +1086,10 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return 1
       | none => pure []
     let t0 ← IO.monoNanosNow
-    -- Fast path: read only the initial 4 MiB header window via `readMediaWindow` (`pread`) to probe `ftyp`/`moov`
-    -- (and the trailing 4 MiB window if `moov` is at the tail after `mdat`) without reading multi-hundred-MB `mdat` payloads into RAM.
+    -- Fast path: read the initial 256 KiB header window via `readMediaWindow` (`pread`) to probe `ftyp`/`moov`,
+    -- or jump directly across `mdat` via `probeMp4NextMoovWindow` without reading multi-hundred-MB `mdat` payloads into RAM.
     let hdrSliceOpt ← do
-      match ← readMediaWindow inPath 0 (4 * 1024 * 1024) with
+      match ← readMediaWindow inPath 0 (256 * 1024) with
       | .ok s => pure (some s)
       | .error _ => pure none
     let fastDemuxOpt ← match hdrSliceOpt with
@@ -1076,14 +1097,23 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         match probeIsoMp4HeaderSlice s with
         | some d => pure (some d)
         | none =>
-          let fileSz ← getFileByteSizeOr inPath 0
-          if fileSz > 4 * 1024 * 1024 then
-            let tailOff : UInt64 := (fileSz - 4 * 1024 * 1024).toUInt64
-            match ← readMediaWindow inPath tailOff (4 * 1024 * 1024) with
-            | .ok tailSlice => pure (probeIsoMp4HeaderSlice tailSlice)
-            | .error _ => pure none
-          else
-            pure none
+          let nextOpt ← match probeMp4NextMoovWindow s 0 with
+            | some (nextOff, nextWin) =>
+              match ← readMediaWindow inPath nextOff nextWin with
+              | .ok nextSlice => pure (probeIsoMp4HeaderSlice nextSlice)
+              | .error _ => pure none
+            | none => pure none
+          match nextOpt with
+          | some d => pure (some d)
+          | none =>
+            let fileSz ← getFileByteSizeOr inPath 0
+            if fileSz > 4 * 1024 * 1024 then
+              let tailOff : UInt64 := (fileSz - 4 * 1024 * 1024).toUInt64
+              match ← readMediaWindow inPath tailOff (4 * 1024 * 1024) with
+              | .ok tailSlice => pure (probeIsoMp4HeaderSlice tailSlice)
+              | .error _ => pure none
+            else
+              pure none
       | none => pure none
     let startMs : UInt32 := match validCfg.startSec with
       | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
@@ -1111,22 +1141,11 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
             IO.eprintln s!"Conversion failed! ({inPath} -> {outPath})"
           return 1
-      let crc := computeFrameCrc64 rawBytes
-      let xxh := formatGoldenXxh64Line inSlice
-      let frameCrcLine := formatGoldenFrameCrcLine 0 0 0 3000 rawBytes.size crc
-      if outPath != "" && outPath != "-" && validCfg.format != some "null" then
-        let _ ← writeMediaFileAtomic outPath rawBytes
       if validCfg.jsonOutput then
-        let c0 := s!"\{ \"ok\": true, \"mode\": \"ffmpeg-cli\", \"input\": \"{inPath}\", \"output\": \"{outPath}\", "
-        let c1 := s!"\"bytes\": {rawBytes.size}, \"filter_stages\": {filterOps.length}, "
-        let c2 := s!"\"framecrc\": \"{frameCrcLine}\", \"digest\": \"{xxh}\" }"
-        IO.println (c0 ++ c1 ++ c2)
-      else if validCfg.showStats && !validCfg.hideBanner then
-        IO.eprintln s!"Input #0, raw, from '{inPath}':"
-        IO.eprintln s!"  Stream #0:0: Data: {rawBytes.size} bytes"
-        IO.eprintln s!"Output #0, to '{outPath}':"
-        IO.eprintln s!"  Stream #0:0: framecrc={frameCrcLine}"
-      return 0
+        IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error\": \"unsupported input container or invalid media\" }"
+      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+        IO.eprintln s!"Unsupported input container or invalid media: {inPath}"
+      return 1
 
 def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
@@ -1135,6 +1154,13 @@ def printLffmpegVersion : IO UInt32 := do
   IO.println "  libavformat   LeanAV.Format    61.  7.100 (verified IVF, MP4, MKV, Ogg, MPEG-TS, WAV)"
   IO.println "  libavfilter   LeanAV.Filter    10.  4.100 (verified Law 5 duration-conserving DAG)"
   IO.println "  libswscale    LeanAV.Scale      8.  3.100 (verified Q10 BT.601/709/2020 + bilinear/bicubic)"
+  return 0
+
+def printLffmpegFormats : IO UInt32 := do
+  IO.println "Formats (lffmpeg CLI):"
+  IO.println " DE mp4                 ISO Base Media File Format"
+  IO.println "  E null                Null muxer"
+  IO.println "Library-only demuxers (not wired to the CLI): matroska, mpegts, ivf, wav, ogg"
   return 0
 
 def printLffmpegCodecs : IO UInt32 := do
@@ -1156,7 +1182,7 @@ def main (args : List String) : IO UInt32 := do
   | "-version" :: _ => printLffmpegVersion
   | "--version" :: _ => printLffmpegVersion
   | "-codecs" :: _ => printLffmpegCodecs
-  | "-formats" :: _ => printLffmpegCodecs
+  | "-formats" :: _ => printLffmpegFormats
   | "-h" :: _ => printLffmpegVersion
   | "--help" :: _ => printLffmpegVersion
   | "bench" :: itStr :: _ => runBench (itStr.toNat?.getD 500)

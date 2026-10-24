@@ -1096,11 +1096,13 @@ partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := 
           nSamplesFound := sampleCount
     return (wFound, hFound, tsFound, nSamplesFound)
 
-  -- Fallback: if `moov` was placed after `mdat` (or not in the top-level walk), scan `s` for a raw `"moov"` atom header
+  -- Fallback: if `moov` was placed after `mdat` (and `s` is an unaligned tail slice without top-level `ftyp`/`moov`), scan `s` for a raw `"moov"` atom header
   let (w0, h0, ts0, n0) := Id.run do
     let (wa, ha, tsa, na) := if hasFtypOrMoov then walkMeta topBoxes 8 else (0, 0, 0, 0)
     if wa > 0 && ha > 0 then
       return (wa, ha, tsa, na)
+    else if hasFtypOrMoov then
+      return (0, 0, 0, 0)
     else
       let mut wScan : Nat := 0
       let mut hScan : Nat := 0
@@ -1133,6 +1135,41 @@ partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := 
     bFrameCount := nFrames - Nat.max 1 (nFrames / 48) - (nFrames / 4)
     mdatBytes := s.len
   }
+
+/--
+  Given a slice `s` starting at file offset `baseOff`, walk top-level MP4 boxes (`ftyp`, `free`, `mdat`, `moov`, etc.)
+  and if a box extends beyond `s.len`, return `(nextOffset, readWindowBytes)`:
+  - `(baseOff + pos, min rawBoxLen 4MiB)` if the truncated box is `"moov"` itself,
+  - `(baseOff + pos + rawBoxLen, 4MiB)` if the truncated box is `"mdat"` (jumping directly to the top-level box after `mdat`).
+-/
+def probeMp4NextMoovWindow (s : ByteSlice) (baseOff : UInt64 := 0) : Option (UInt64 × Nat) := Id.run do
+  let mut pos : Nat := 0
+  let mut fuel : Nat := 128
+  let mut sawTop : Bool := false
+  while pos + 8 ≤ s.len && fuel > 0 do
+    fuel := fuel - 1
+    let sz32 := (readU32BE s pos).toNat
+    let fcc := readFourCCString s (pos + 4)
+    if fcc == "ftyp" || fcc == "moov" || fcc == "mdat" || fcc == "free" || fcc == "wide" || fcc == "skip" || fcc == "uuid" then
+      sawTop := true
+    if !sawTop then
+      return none
+    let (rawBoxLen, hdrLen) : Nat × Nat :=
+      if sz32 == 1 && pos + 16 ≤ s.len then
+        ((readU64BE s (pos + 8)).toNat, 16)
+      else if sz32 == 0 then
+        (0, 8)
+      else
+        (sz32, 8)
+    if rawBoxLen < hdrLen then
+      return none
+    if pos + rawBoxLen > s.len then
+      if fcc == "moov" then
+        return some (baseOff + pos.toUInt64, Nat.min rawBoxLen (4 * 1024 * 1024))
+      else
+        return some (baseOff + (pos + rawBoxLen).toUInt64, 4 * 1024 * 1024)
+    pos := pos + rawBoxLen
+  return none
 
 /--
   Demux a real ISO/IEC 14496-12 MP4 file (`s : ByteSlice`) with `stbl` (`stsd`/`avc1`/`avcC`, `stts`, `stss`, `ctts`, `stsz`)

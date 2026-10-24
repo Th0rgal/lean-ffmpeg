@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static inline uint64_t leanav_mono_us(void) {
     struct timeval tv;
@@ -51,6 +52,8 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -126,6 +129,34 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2_bicubic(
     const uint8_t *src = lean_sarray_cptr(src_ba);
     size_t src_cap = lean_sarray_size(src_ba);
 
+    if (src_w >= 4 && src_h >= 4 && src_stride >= src_w && src_cap >= (src_h - 1) * src_stride + src_w) {
+        for (size_t dy = 0; dy < dst_h; dy++) {
+            size_t y1 = dy * 2;
+            size_t cy0 = (y1 > 0) ? (y1 - 1) : 0;
+            size_t cy1 = y1 < src_h ? y1 : src_h - 1;
+            size_t cy2 = (y1 + 1 < src_h) ? (y1 + 1) : src_h - 1;
+            size_t cy3 = (y1 + 2 < src_h) ? (y1 + 2) : src_h - 1;
+            const uint8_t *r0 = src + cy0 * src_stride;
+            const uint8_t *r1 = src + cy1 * src_stride;
+            const uint8_t *r2 = src + cy2 * src_stride;
+            const uint8_t *r3 = src + cy3 * src_stride;
+            uint8_t *out_row = dst + dy * dst_w;
+            for (size_t dx = 0; dx < dst_w; dx++) {
+                size_t x1 = dx * 2;
+                size_t cx0 = (x1 > 0) ? (x1 - 1) : 0;
+                size_t cx1 = x1 < src_w ? x1 : src_w - 1;
+                size_t cx2 = (x1 + 1 < src_w) ? (x1 + 1) : src_w - 1;
+                size_t cx3 = (x1 + 2 < src_w) ? (x1 + 2) : src_w - 1;
+                uint8_t h0 = leanav_eval_bicubic_4tap_u8(r0[cx0], r0[cx1], r0[cx2], r0[cx3]);
+                uint8_t h1 = leanav_eval_bicubic_4tap_u8(r1[cx0], r1[cx1], r1[cx2], r1[cx3]);
+                uint8_t h2 = leanav_eval_bicubic_4tap_u8(r2[cx0], r2[cx1], r2[cx2], r2[cx3]);
+                uint8_t h3 = leanav_eval_bicubic_4tap_u8(r3[cx0], r3[cx1], r3[cx2], r3[cx3]);
+                out_row[dx] = leanav_eval_bicubic_4tap_u8(h0, h1, h2, h3);
+            }
+        }
+        return dst_ba;
+    }
+
     for (size_t dy = 0; dy < dst_h; dy++) {
         size_t y1 = dy * 2;
         size_t y0 = (y1 > 0) ? (y1 - 1) : 0;
@@ -175,16 +206,86 @@ static void leanav_scale_plane_2x2_u16_raw(
         const uint16_t *row1 = row0 + src_w;
         uint16_t *out_row = dst + dy * dst_w;
         size_t dx = 0;
-#if defined(__ARM_NEON)
-        const uint32x4_t bias2 = vdupq_n_u32(2);
-        for (; dx + 4 <= dst_w; dx += 4) {
-            uint16x8_t r0 = vld1q_u16(row0 + dx * 2);
-            uint16x8_t r1 = vld1q_u16(row1 + dx * 2);
-            uint32x4_t s0 = vpaddlq_u16(r0);
-            uint32x4_t s1 = vpaddlq_u16(r1);
-            uint32x4_t sum = vaddq_u32(vaddq_u32(s0, s1), bias2);
-            uint16x4_t avg = vshrn_n_u32(sum, 2);
-            vst1_u16(out_row + dx, avg);
+#if defined(__AVX2__)
+        const __m256i ones_i16 = _mm256_set1_epi16(1);
+        const __m256i bias2_i32 = _mm256_set1_epi32(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m256i r0a = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2));
+            __m256i r0b = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2 + 16));
+            __m256i r1a = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2));
+            __m256i r1b = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2 + 16));
+            __m256i s_a = _mm256_madd_epi16(_mm256_add_epi16(r0a, r1a), ones_i16);
+            __m256i s_b = _mm256_madd_epi16(_mm256_add_epi16(r0b, r1b), ones_i16);
+            __m256i avg_a = _mm256_srli_epi32(_mm256_add_epi32(s_a, bias2_i32), 2);
+            __m256i avg_b = _mm256_srli_epi32(_mm256_add_epi32(s_b, bias2_i32), 2);
+            __m256i packed = _mm256_packs_epi32(avg_a, avg_b);
+            _mm256_storeu_si256((__m256i *)(out_row + dx), _mm256_permute4x64_epi64(packed, 0xD8));
+        }
+#elif defined(__SSE2__)
+        const __m128i ones_i16 = _mm_set1_epi16(1);
+        const __m128i bias2_i32 = _mm_set1_epi32(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 8));
+            __m128i r0c = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+            __m128i r0d = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 24));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 8));
+            __m128i r1c = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+            __m128i r1d = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 24));
+            __m128i s_a = _mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones_i16);
+            __m128i s_b = _mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones_i16);
+            __m128i s_c = _mm_madd_epi16(_mm_add_epi16(r0c, r1c), ones_i16);
+            __m128i s_d = _mm_madd_epi16(_mm_add_epi16(r0d, r1d), ones_i16);
+            __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(s_a, bias2_i32), 2);
+            __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(s_b, bias2_i32), 2);
+            __m128i avg_c = _mm_srli_epi32(_mm_add_epi32(s_c, bias2_i32), 2);
+            __m128i avg_d = _mm_srli_epi32(_mm_add_epi32(s_d, bias2_i32), 2);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packs_epi32(avg_a, avg_b));
+            _mm_storeu_si128((__m128i *)(out_row + dx + 8), _mm_packs_epi32(avg_c, avg_d));
+        }
+        for (; dx + 8 <= dst_w; dx += 8) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 8));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 8));
+            __m128i s_a = _mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones_i16);
+            __m128i s_b = _mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones_i16);
+            __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(s_a, bias2_i32), 2);
+            __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(s_b, bias2_i32), 2);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packs_epi32(avg_a, avg_b));
+        }
+#elif defined(__ARM_NEON)
+        for (; dx + 16 <= dst_w; dx += 16) {
+            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
+            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
+            uint16x8_t r0c = vld1q_u16(row0 + dx * 2 + 16);
+            uint16x8_t r0d = vld1q_u16(row0 + dx * 2 + 24);
+            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
+            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
+            uint16x8_t r1c = vld1q_u16(row1 + dx * 2 + 16);
+            uint16x8_t r1d = vld1q_u16(row1 + dx * 2 + 24);
+            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
+            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
+            uint32x4_t s0c = vaddq_u32(vpaddlq_u16(r0c), vpaddlq_u16(r1c));
+            uint32x4_t s0d = vaddq_u32(vpaddlq_u16(r0d), vpaddlq_u16(r1d));
+            uint16x4_t a0 = vrshrn_n_u32(s0a, 2);
+            uint16x4_t a1 = vrshrn_n_u32(s0b, 2);
+            uint16x4_t a2 = vrshrn_n_u32(s0c, 2);
+            uint16x4_t a3 = vrshrn_n_u32(s0d, 2);
+            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
+            vst1q_u16(out_row + dx + 8, vcombine_u16(a2, a3));
+        }
+        for (; dx + 8 <= dst_w; dx += 8) {
+            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
+            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
+            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
+            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
+            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
+            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
+            uint16x4_t a0 = vrshrn_n_u32(s0a, 2);
+            uint16x4_t a1 = vrshrn_n_u32(s0b, 2);
+            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
         }
 #endif
         for (; dx < dst_w; dx++) {
@@ -200,6 +301,60 @@ static void leanav_scale_plane_2x2_u16_raw(
  * Fast 16-bit (`yuv420p10le`) 3x3 Box Downscale (`leanav_scale_plane_3x3_u16_raw`):
  * Preserves full 10-bit precision on 3840x2160 -> 1280x720 HDR10/HLG scaling.
  */
+static void leanav_scale_plane_3x3_u16_strided(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride
+) {
+    int dst_w = src_w / 3;
+    int dst_h = src_h / 3;
+    for (int dy = 0; dy < dst_h; dy++) {
+        const uint16_t *r0 = (const uint16_t *)(src + (size_t)(dy * 3) * (size_t)src_stride);
+        const uint16_t *r1 = (const uint16_t *)(src + (size_t)(dy * 3 + 1) * (size_t)src_stride);
+        const uint16_t *r2 = (const uint16_t *)(src + (size_t)(dy * 3 + 2) * (size_t)src_stride);
+        uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+        int dx = 0;
+#if defined(__SSE2__)
+        const __m128i recip7282 = _mm_set1_epi16(7282);
+        for (; dx + 8 <= dst_w; dx += 8) {
+            int sx = dx * 3;
+            __m128i sum9 = _mm_set_epi16(
+                (int16_t)(r0[sx+21]+r0[sx+22]+r0[sx+23]+r1[sx+21]+r1[sx+22]+r1[sx+23]+r2[sx+21]+r2[sx+22]+r2[sx+23]+4u),
+                (int16_t)(r0[sx+18]+r0[sx+19]+r0[sx+20]+r1[sx+18]+r1[sx+19]+r1[sx+20]+r2[sx+18]+r2[sx+19]+r2[sx+20]+4u),
+                (int16_t)(r0[sx+15]+r0[sx+16]+r0[sx+17]+r1[sx+15]+r1[sx+16]+r1[sx+17]+r2[sx+15]+r2[sx+16]+r2[sx+17]+4u),
+                (int16_t)(r0[sx+12]+r0[sx+13]+r0[sx+14]+r1[sx+12]+r1[sx+13]+r1[sx+14]+r2[sx+12]+r2[sx+13]+r2[sx+14]+4u),
+                (int16_t)(r0[sx+9] +r0[sx+10]+r0[sx+11]+r1[sx+9] +r1[sx+10]+r1[sx+11]+r2[sx+9] +r2[sx+10]+r2[sx+11]+4u),
+                (int16_t)(r0[sx+6] +r0[sx+7] +r0[sx+8] +r1[sx+6] +r1[sx+7] +r1[sx+8] +r2[sx+6] +r2[sx+7] +r2[sx+8] +4u),
+                (int16_t)(r0[sx+3] +r0[sx+4] +r0[sx+5] +r1[sx+3] +r1[sx+4] +r1[sx+5] +r2[sx+3] +r2[sx+4] +r2[sx+5] +4u),
+                (int16_t)(r0[sx+0] +r0[sx+1] +r0[sx+2] +r1[sx+0] +r1[sx+1] +r1[sx+2] +r2[sx+0] +r2[sx+1] +r2[sx+2] +4u));
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_mulhi_epu16(sum9, recip7282));
+        }
+#elif defined(__ARM_NEON)
+        const uint16x8_t bias4 = vdupq_n_u16(4);
+        const uint16x8_t recip7282 = vdupq_n_u16(7282);
+        for (; dx + 8 <= dst_w; dx += 8) {
+            int sx = dx * 3;
+            uint16x8x3_t t0 = vld3q_u16(r0 + sx);
+            uint16x8x3_t t1 = vld3q_u16(r1 + sx);
+            uint16x8x3_t t2 = vld3q_u16(r2 + sx);
+            uint16x8_t s0 = vaddq_u16(vaddq_u16(t0.val[0], t0.val[1]), t0.val[2]);
+            uint16x8_t s1 = vaddq_u16(vaddq_u16(t1.val[0], t1.val[1]), t1.val[2]);
+            uint16x8_t s2 = vaddq_u16(vaddq_u16(t2.val[0], t2.val[1]), t2.val[2]);
+            uint16x8_t sum9 = vaddq_u16(vaddq_u16(s0, s1), vaddq_u16(s2, bias4));
+            uint32x4_t p_lo = vmull_u16(vget_low_u16(sum9), vget_low_u16(recip7282));
+            uint32x4_t p_hi = vmull_u16(vget_high_u16(sum9), vget_high_u16(recip7282));
+            vst1q_u16(out_row + dx, vcombine_u16(vshrn_n_u32(p_lo, 16), vshrn_n_u32(p_hi, 16)));
+        }
+#endif
+        for (; dx < dst_w; dx++) {
+            int sx = dx * 3;
+            uint32_t sum9 = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
+                            (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
+                            (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
+            out_row[dx] = (uint16_t)(((sum9 + 4u) * 7282u) >> 16);
+        }
+    }
+}
+
 static void leanav_scale_plane_3x3_u16_raw(
     const uint16_t *src,
     size_t src_w,
@@ -207,20 +362,9 @@ static void leanav_scale_plane_3x3_u16_raw(
     uint16_t *dst
 ) {
     size_t dst_w = src_w / 3;
-    size_t dst_h = src_h / 3;
-    for (size_t dy = 0; dy < dst_h; dy++) {
-        const uint16_t *r0 = src + (dy * 3) * src_w;
-        const uint16_t *r1 = r0 + src_w;
-        const uint16_t *r2 = r1 + src_w;
-        uint16_t *out_row = dst + dy * dst_w;
-        for (size_t dx = 0; dx < dst_w; dx++) {
-            size_t sx = dx * 3;
-            uint32_t sum9 = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
-                            (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
-                            (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
-            out_row[dx] = (uint16_t)(((sum9 + 4u) * 7282u) >> 16);
-        }
-    }
+    leanav_scale_plane_3x3_u16_strided(
+        (const uint8_t *)src, (int)(src_w * sizeof(uint16_t)), (int)src_w, (int)src_h,
+        (uint8_t *)dst, (int)(dst_w * sizeof(uint16_t)));
 }
 
 /*
@@ -285,15 +429,27 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2(
             __m128i packed = _mm_packus_epi16(lo, hi);
             _mm_storeu_si128((__m128i *)(out_row + dx), packed);
         }
+#elif defined(__SSE2__)
+        const __m128i mask_u8 = _mm_set1_epi16(0x00FF);
+        const __m128i bias2 = _mm_set1_epi16(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+            __m128i s0a = _mm_add_epi16(_mm_and_si128(r0a, mask_u8), _mm_srli_epi16(r0a, 8));
+            __m128i s0b = _mm_add_epi16(_mm_and_si128(r0b, mask_u8), _mm_srli_epi16(r0b, 8));
+            __m128i s1a = _mm_add_epi16(_mm_and_si128(r1a, mask_u8), _mm_srli_epi16(r1a, 8));
+            __m128i s1b = _mm_add_epi16(_mm_and_si128(r1b, mask_u8), _mm_srli_epi16(r1b, 8));
+            __m128i avga = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0a, s1a), bias2), 2);
+            __m128i avgb = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0b, s1b), bias2), 2);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packus_epi16(avga, avgb));
+        }
 #elif defined(__ARM_NEON)
-        const uint16x8_t bias2 = vdupq_n_u16(2);
         for (; dx + 8 <= dst_w; dx += 8) {
             uint8x16_t r0 = vld1q_u8(row0 + dx * 2);
             uint8x16_t r1 = vld1q_u8(row1 + dx * 2);
-            uint16x8_t s0 = vpaddlq_u8(r0);
-            uint16x8_t s1 = vpaddlq_u8(r1);
-            uint16x8_t sum = vaddq_u16(vaddq_u16(s0, s1), bias2);
-            uint8x8_t avg = vshrn_n_u16(sum, 2);
+            uint8x8_t avg = vrshrn_n_u16(vaddq_u16(vpaddlq_u8(r0), vpaddlq_u8(r1)), 2);
             vst1_u8(out_row + dx, avg);
         }
 #endif
@@ -364,7 +520,81 @@ LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2_fused_eq(
         const uint8_t *row0 = src + (dy * 2) * src_stride;
         const uint8_t *row1 = row0 + src_stride;
         uint8_t *out_row = dst + dy * dst_w;
-        for (size_t dx = 0; dx < dst_w; dx++) {
+        size_t dx = 0;
+#if defined(__AVX2__)
+        const __m256i ones_u8 = _mm256_set1_epi8(1);
+        const __m256i bias2 = _mm256_set1_epi16(2);
+        const __m256i v128 = _mm256_set1_epi16(128);
+        const __m256i vc = _mm256_set1_epi32(contrast_q8);
+        const __m256i vbias = _mm256_set1_epi32(128 + brightness);
+        const __m256i zero = _mm256_setzero_si256();
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m256i r0 = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2));
+            __m256i r1 = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2));
+            __m256i s0 = _mm256_maddubs_epi16(r0, ones_u8);
+            __m256i s1 = _mm256_maddubs_epi16(r1, ones_u8);
+            __m256i avg = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(s0, s1), bias2), 2);
+            __m256i diff = _mm256_sub_epi16(avg, v128);
+            __m256i sign = _mm256_cmpgt_epi16(zero, diff);
+            __m256i d_lo = _mm256_unpacklo_epi16(diff, sign);
+            __m256i d_hi = _mm256_unpackhi_epi16(diff, sign);
+            __m256i a_lo = _mm256_add_epi32(_mm256_srai_epi32(_mm256_mullo_epi32(d_lo, vc), 8), vbias);
+            __m256i a_hi = _mm256_add_epi32(_mm256_srai_epi32(_mm256_mullo_epi32(d_hi, vc), 8), vbias);
+            __m256i p16 = _mm256_packs_epi32(a_lo, a_hi);
+            __m128i lo = _mm256_castsi256_si128(p16);
+            __m128i hi = _mm256_extracti128_si256(p16, 1);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packus_epi16(lo, hi));
+        }
+#elif defined(__SSE2__)
+        const __m128i mask_u8 = _mm_set1_epi16(0x00FF);
+        const __m128i bias2 = _mm_set1_epi16(2);
+        const __m128i v128 = _mm_set1_epi16(128);
+        const __m128i vc16 = _mm_set1_epi16((int16_t)contrast_q8);
+        const __m128i vbias = _mm_set1_epi32(128 + brightness);
+        if (contrast_q8 >= -32768 && contrast_q8 <= 32767) {
+            for (; dx + 16 <= dst_w; dx += 16) {
+                __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+                __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+                __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+                __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+                __m128i s0a = _mm_add_epi16(_mm_and_si128(r0a, mask_u8), _mm_srli_epi16(r0a, 8));
+                __m128i s0b = _mm_add_epi16(_mm_and_si128(r0b, mask_u8), _mm_srli_epi16(r0b, 8));
+                __m128i s1a = _mm_add_epi16(_mm_and_si128(r1a, mask_u8), _mm_srli_epi16(r1a, 8));
+                __m128i s1b = _mm_add_epi16(_mm_and_si128(r1b, mask_u8), _mm_srli_epi16(r1b, 8));
+                __m128i avga = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0a, s1a), bias2), 2);
+                __m128i avgb = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0b, s1b), bias2), 2);
+                __m128i da = _mm_sub_epi16(avga, v128);
+                __m128i db = _mm_sub_epi16(avgb, v128);
+                __m128i mlo_a = _mm_mullo_epi16(da, vc16);
+                __m128i mhi_a = _mm_mulhi_epi16(da, vc16);
+                __m128i mlo_b = _mm_mullo_epi16(db, vc16);
+                __m128i mhi_b = _mm_mulhi_epi16(db, vc16);
+                __m128i a0 = _mm_add_epi32(_mm_srai_epi32(_mm_unpacklo_epi16(mlo_a, mhi_a), 8), vbias);
+                __m128i a1 = _mm_add_epi32(_mm_srai_epi32(_mm_unpackhi_epi16(mlo_a, mhi_a), 8), vbias);
+                __m128i b0 = _mm_add_epi32(_mm_srai_epi32(_mm_unpacklo_epi16(mlo_b, mhi_b), 8), vbias);
+                __m128i b1 = _mm_add_epi32(_mm_srai_epi32(_mm_unpackhi_epi16(mlo_b, mhi_b), 8), vbias);
+                _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packus_epi16(_mm_packs_epi32(a0, a1), _mm_packs_epi32(b0, b1)));
+            }
+        }
+#elif defined(__ARM_NEON)
+        const int16x8_t v128 = vdupq_n_s16(128);
+        const int16x4_t vc = vdup_n_s16((int16_t)contrast_q8);
+        const int32x4_t vbias = vdupq_n_s32(128 + brightness);
+        if (contrast_q8 >= -32768 && contrast_q8 <= 32767) {
+            for (; dx + 8 <= dst_w; dx += 8) {
+                uint8x16_t r0 = vld1q_u8(row0 + dx * 2);
+                uint8x16_t r1 = vld1q_u8(row1 + dx * 2);
+                uint16x8_t sum = vaddq_u16(vpaddlq_u8(r0), vpaddlq_u8(r1));
+                int16x8_t avg = vreinterpretq_s16_u16(vrshrq_n_u16(sum, 2));
+                int16x8_t diff = vsubq_s16(avg, v128);
+                int32x4_t a0 = vaddq_s32(vshrq_n_s32(vmull_s16(vget_low_s16(diff), vc), 8), vbias);
+                int32x4_t a1 = vaddq_s32(vshrq_n_s32(vmull_s16(vget_high_s16(diff), vc), 8), vbias);
+                int16x8_t p16 = vcombine_s16(vqmovn_s32(a0), vqmovn_s32(a1));
+                vst1_u8(out_row + dx, vqmovun_s16(p16));
+            }
+        }
+#endif
+        for (; dx < dst_w; dx++) {
             size_t sx = dx * 2;
             uint32_t sum = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
                            (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
@@ -400,6 +630,12 @@ LEAN_EXPORT lean_obj_res leanav_c_mc_bipred_plane(
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(p1 + i));
         __m256i avg = _mm256_avg_epu8(v0, v1);
         _mm256_storeu_si256((__m256i *)(dst + i), avg);
+    }
+#elif defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(p0 + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(p1 + i));
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_avg_epu8(v0, v1));
     }
 #elif defined(__ARM_NEON)
     for (; i + 16 <= n; i += 16) {
@@ -443,6 +679,12 @@ LEAN_EXPORT lean_obj_res leanav_c_xor_residual_plane(
         __m256i va = _mm256_loadu_si256((const __m256i *)(pa + i));
         __m256i vb = _mm256_loadu_si256((const __m256i *)(pb + i));
         _mm256_storeu_si256((__m256i *)(dst + i), _mm256_xor_si256(va, vb));
+    }
+#elif defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i va = _mm_loadu_si128((const __m128i *)(pa + i));
+        __m128i vb = _mm_loadu_si128((const __m128i *)(pb + i));
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_xor_si128(va, vb));
     }
 #elif defined(__ARM_NEON)
     for (; i + 16 <= n; i += 16) {
@@ -491,6 +733,22 @@ static void leanav_scale_plane_2x2_raw(
             __m128i packed = _mm_packus_epi16(lo, hi);
             _mm_storeu_si128((__m128i *)(out_row + dx), packed);
         }
+#elif defined(__SSE2__)
+        const __m128i mask_u8 = _mm_set1_epi16(0x00FF);
+        const __m128i bias2 = _mm_set1_epi16(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+            __m128i s0a = _mm_add_epi16(_mm_and_si128(r0a, mask_u8), _mm_srli_epi16(r0a, 8));
+            __m128i s0b = _mm_add_epi16(_mm_and_si128(r0b, mask_u8), _mm_srli_epi16(r0b, 8));
+            __m128i s1a = _mm_add_epi16(_mm_and_si128(r1a, mask_u8), _mm_srli_epi16(r1a, 8));
+            __m128i s1b = _mm_add_epi16(_mm_and_si128(r1b, mask_u8), _mm_srli_epi16(r1b, 8));
+            __m128i avga = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0a, s1a), bias2), 2);
+            __m128i avgb = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0b, s1b), bias2), 2);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packus_epi16(avga, avgb));
+        }
 #elif defined(__ARM_NEON)
         const uint16x8_t bias2 = vdupq_n_u16(2);
         for (; dx + 8 <= dst_w; dx += 8) {
@@ -512,16 +770,19 @@ static void leanav_scale_plane_2x2_raw(
     }
 }
 
-static void leanav_scale_plane_2x2_strided(
+static void leanav_scale_plane_2x2_strided_accum(
     const uint8_t *src, int src_stride, int src_w, int src_h,
-    uint8_t *dst, int dst_stride
+    uint8_t *dst, int dst_stride, int step,
+    uint64_t *io_sum, uint64_t *io_sum_sq, uint64_t *io_cnt
 ) {
     int dst_w = src_w >> 1;
     int dst_h = src_h >> 1;
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
     for (int dy = 0; dy < dst_h; dy++) {
         const uint8_t *row0 = src + (size_t)(dy * 2) * (size_t)src_stride;
         const uint8_t *row1 = row0 + src_stride;
         uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
+        int sample_16_inline = (io_sum && step == 16 && (dy & 3) == 0);
         int dx = 0;
 #if defined(__AVX2__)
         const __m256i ones_u8 = _mm256_set1_epi8(1);
@@ -539,11 +800,42 @@ static void leanav_scale_plane_2x2_strided(
             __m256i avgb = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(s0b, s1b), bias2), 2);
             __m128i pa = _mm_packus_epi16(_mm256_castsi256_si128(avga), _mm256_extracti128_si256(avga, 1));
             __m128i pb = _mm_packus_epi16(_mm256_castsi256_si128(avgb), _mm256_extracti128_si256(avgb, 1));
+            if (sample_16_inline) {
+                uint32_t v0 = (uint32_t)_mm_cvtsi128_si32(pa) & 0xFFu;
+                uint32_t v1 = (uint32_t)_mm_cvtsi128_si32(pb) & 0xFFu;
+                sum += (uint64_t)(v0 + v1);
+                sum_sq += (uint64_t)(v0 * v0 + v1 * v1);
+                cnt += 2;
+            }
             _mm_storeu_si128((__m128i *)(out_row + dx), pa);
             _mm_storeu_si128((__m128i *)(out_row + dx + 16), pb);
         }
+        int rem_sample_start = dx;
+#elif defined(__SSE2__)
+        const __m128i mask_u8 = _mm_set1_epi16(0x00FF);
+        const __m128i bias2 = _mm_set1_epi16(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+            __m128i s0a = _mm_add_epi16(_mm_and_si128(r0a, mask_u8), _mm_srli_epi16(r0a, 8));
+            __m128i s0b = _mm_add_epi16(_mm_and_si128(r0b, mask_u8), _mm_srli_epi16(r0b, 8));
+            __m128i s1a = _mm_add_epi16(_mm_and_si128(r1a, mask_u8), _mm_srli_epi16(r1a, 8));
+            __m128i s1b = _mm_add_epi16(_mm_and_si128(r1b, mask_u8), _mm_srli_epi16(r1b, 8));
+            __m128i avga = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0a, s1a), bias2), 2);
+            __m128i avgb = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0b, s1b), bias2), 2);
+            __m128i packed = _mm_packus_epi16(avga, avgb);
+            if (sample_16_inline) {
+                uint32_t v = (uint32_t)_mm_cvtsi128_si32(packed) & 0xFFu;
+                sum += (uint64_t)v;
+                sum_sq += (uint64_t)(v * v);
+                cnt++;
+            }
+            _mm_storeu_si128((__m128i *)(out_row + dx), packed);
+        }
+        int rem_sample_start = dx;
 #elif defined(__ARM_NEON)
-        const uint16x8_t bias2 = vdupq_n_u16(2);
         for (; dx + 32 <= dst_w; dx += 32) {
             uint8x16_t r0a = vld1q_u8(row0 + dx * 2);
             uint8x16_t r0b = vld1q_u8(row0 + dx * 2 + 16);
@@ -553,19 +845,254 @@ static void leanav_scale_plane_2x2_strided(
             uint8x16_t r1b = vld1q_u8(row1 + dx * 2 + 16);
             uint8x16_t r1c = vld1q_u8(row1 + dx * 2 + 32);
             uint8x16_t r1d = vld1q_u8(row1 + dx * 2 + 48);
-            uint8x8_t a0 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0a), vpaddlq_u8(r1a)), bias2), 2);
-            uint8x8_t a1 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0b), vpaddlq_u8(r1b)), bias2), 2);
-            uint8x8_t a2 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0c), vpaddlq_u8(r1c)), bias2), 2);
-            uint8x8_t a3 = vshrn_n_u16(vaddq_u16(vaddq_u16(vpaddlq_u8(r0d), vpaddlq_u8(r1d)), bias2), 2);
+            uint8x8_t a0 = vrshrn_n_u16(vaddq_u16(vpaddlq_u8(r0a), vpaddlq_u8(r1a)), 2);
+            uint8x8_t a1 = vrshrn_n_u16(vaddq_u16(vpaddlq_u8(r0b), vpaddlq_u8(r1b)), 2);
+            uint8x8_t a2 = vrshrn_n_u16(vaddq_u16(vpaddlq_u8(r0c), vpaddlq_u8(r1c)), 2);
+            uint8x8_t a3 = vrshrn_n_u16(vaddq_u16(vpaddlq_u8(r0d), vpaddlq_u8(r1d)), 2);
+            if (sample_16_inline) {
+                uint32_t v0 = (uint32_t)vget_lane_u8(a0, 0);
+                uint32_t v1 = (uint32_t)vget_lane_u8(a2, 0);
+                sum += (uint64_t)(v0 + v1);
+                sum_sq += (uint64_t)(v0 * v0 + v1 * v1);
+                cnt += 2;
+            }
             vst1q_u8(out_row + dx, vcombine_u8(a0, a1));
             vst1q_u8(out_row + dx + 16, vcombine_u8(a2, a3));
         }
+        int rem_sample_start = dx;
+#else
+        int rem_sample_start = 0;
 #endif
         for (; dx < dst_w; dx++) {
             int sx = dx * 2;
-            uint32_t sum = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
-                           (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
-            out_row[dx] = (uint8_t)(sum >> 2);
+            uint32_t s = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
+                         (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
+            out_row[dx] = (uint8_t)(s >> 2);
+        }
+        if (io_sum && (step == 1 || (dy & 3) == 0)) {
+            if (step == 16) {
+                for (int sx = rem_sample_start; sx < dst_w; sx += 16) {
+                    uint32_t v = (uint32_t)out_row[sx];
+                    sum += (uint64_t)v;
+                    sum_sq += (uint64_t)(v * v);
+                    cnt++;
+                }
+            } else {
+                for (int sx = 0; sx < dst_w; sx++) {
+                    uint32_t v = (uint32_t)out_row[sx];
+                    sum += (uint64_t)v;
+                    sum_sq += (uint64_t)(v * v);
+                    cnt++;
+                }
+            }
+        }
+    }
+    if (io_sum) *io_sum += sum;
+    if (io_sum_sq) *io_sum_sq += sum_sq;
+    if (io_cnt) *io_cnt += cnt;
+}
+
+static void leanav_scale_plane_2x2_strided_with_stats(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride,
+    uint64_t *out_mean, uint64_t *out_var
+) {
+    int dst_w = src_w >> 1;
+    int dst_h = src_h >> 1;
+    int step = (dst_w * dst_h >= 4096) ? 16 : 1;
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+    leanav_scale_plane_2x2_strided_accum(
+        src, src_stride, src_w, src_h, dst, dst_stride,
+        out_mean ? step : 0, out_mean ? &sum : NULL, out_mean ? &sum_sq : NULL, out_mean ? &cnt : NULL);
+    if (out_mean && out_var) {
+        if (cnt > 0) {
+            uint64_t m = sum / cnt;
+            uint64_t msq = sum_sq / cnt;
+            *out_mean = m;
+            *out_var = (msq > m * m) ? (msq - m * m) : 0;
+        } else {
+            *out_mean = 0;
+            *out_var = 0;
+        }
+    }
+}
+
+static void leanav_scale_plane_2x2_strided(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride
+) {
+    leanav_scale_plane_2x2_strided_accum(src, src_stride, src_w, src_h, dst, dst_stride, 0, NULL, NULL, NULL);
+}
+
+static void leanav_scale_plane_2x2_u16_strided_accum(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride, int step,
+    uint64_t *io_sum, uint64_t *io_sum_sq, uint64_t *io_cnt
+) {
+    int dst_w = src_w >> 1;
+    int dst_h = src_h >> 1;
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+    for (int dy = 0; dy < dst_h; dy++) {
+        const uint16_t *row0 = (const uint16_t *)(src + (size_t)(dy * 2) * (size_t)src_stride);
+        const uint16_t *row1 = (const uint16_t *)(src + (size_t)(dy * 2 + 1) * (size_t)src_stride);
+        uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+        int sample_16_inline = (io_sum && step == 16 && (dy & 3) == 0);
+        int dx = 0;
+#if defined(__AVX2__)
+        const __m256i ones_i16 = _mm256_set1_epi16(1);
+        const __m256i bias2_i32 = _mm256_set1_epi32(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m256i r0a = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2));
+            __m256i r0b = _mm256_loadu_si256((const __m256i *)(row0 + dx * 2 + 16));
+            __m256i r1a = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2));
+            __m256i r1b = _mm256_loadu_si256((const __m256i *)(row1 + dx * 2 + 16));
+            __m256i s_a = _mm256_madd_epi16(_mm256_add_epi16(r0a, r1a), ones_i16);
+            __m256i s_b = _mm256_madd_epi16(_mm256_add_epi16(r0b, r1b), ones_i16);
+            __m256i avg_a = _mm256_srli_epi32(_mm256_add_epi32(s_a, bias2_i32), 2);
+            __m256i avg_b = _mm256_srli_epi32(_mm256_add_epi32(s_b, bias2_i32), 2);
+            if (sample_16_inline) {
+                uint32_t v = ((uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(avg_a))) >> 2;
+                sum += (uint64_t)v;
+                sum_sq += (uint64_t)(v * v);
+                cnt++;
+            }
+            __m256i packed = _mm256_packs_epi32(avg_a, avg_b);
+            _mm256_storeu_si256((__m256i *)(out_row + dx), _mm256_permute4x64_epi64(packed, 0xD8));
+        }
+        int rem_sample_start = dx;
+#elif defined(__SSE2__)
+        const __m128i ones_i16 = _mm_set1_epi16(1);
+        const __m128i bias2_i32 = _mm_set1_epi32(2);
+        for (; dx + 16 <= dst_w; dx += 16) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 8));
+            __m128i r0c = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 16));
+            __m128i r0d = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 24));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 8));
+            __m128i r1c = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 16));
+            __m128i r1d = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 24));
+            __m128i s_a = _mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones_i16);
+            __m128i s_b = _mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones_i16);
+            __m128i s_c = _mm_madd_epi16(_mm_add_epi16(r0c, r1c), ones_i16);
+            __m128i s_d = _mm_madd_epi16(_mm_add_epi16(r0d, r1d), ones_i16);
+            __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(s_a, bias2_i32), 2);
+            __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(s_b, bias2_i32), 2);
+            __m128i avg_c = _mm_srli_epi32(_mm_add_epi32(s_c, bias2_i32), 2);
+            __m128i avg_d = _mm_srli_epi32(_mm_add_epi32(s_d, bias2_i32), 2);
+            if (sample_16_inline) {
+                uint32_t v = ((uint32_t)_mm_cvtsi128_si32(avg_a)) >> 2;
+                sum += (uint64_t)v;
+                sum_sq += (uint64_t)(v * v);
+                cnt++;
+            }
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packs_epi32(avg_a, avg_b));
+            _mm_storeu_si128((__m128i *)(out_row + dx + 8), _mm_packs_epi32(avg_c, avg_d));
+        }
+        int rem_sample_start = dx;
+        for (; dx + 8 <= dst_w; dx += 8) {
+            __m128i r0a = _mm_loadu_si128((const __m128i *)(row0 + dx * 2));
+            __m128i r0b = _mm_loadu_si128((const __m128i *)(row0 + dx * 2 + 8));
+            __m128i r1a = _mm_loadu_si128((const __m128i *)(row1 + dx * 2));
+            __m128i r1b = _mm_loadu_si128((const __m128i *)(row1 + dx * 2 + 8));
+            __m128i s_a = _mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones_i16);
+            __m128i s_b = _mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones_i16);
+            __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(s_a, bias2_i32), 2);
+            __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(s_b, bias2_i32), 2);
+            _mm_storeu_si128((__m128i *)(out_row + dx), _mm_packs_epi32(avg_a, avg_b));
+        }
+#elif defined(__ARM_NEON)
+        for (; dx + 16 <= dst_w; dx += 16) {
+            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
+            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
+            uint16x8_t r0c = vld1q_u16(row0 + dx * 2 + 16);
+            uint16x8_t r0d = vld1q_u16(row0 + dx * 2 + 24);
+            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
+            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
+            uint16x8_t r1c = vld1q_u16(row1 + dx * 2 + 16);
+            uint16x8_t r1d = vld1q_u16(row1 + dx * 2 + 24);
+            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
+            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
+            uint32x4_t s0c = vaddq_u32(vpaddlq_u16(r0c), vpaddlq_u16(r1c));
+            uint32x4_t s0d = vaddq_u32(vpaddlq_u16(r0d), vpaddlq_u16(r1d));
+            uint16x4_t a0 = vrshrn_n_u32(s0a, 2);
+            uint16x4_t a1 = vrshrn_n_u32(s0b, 2);
+            uint16x4_t a2 = vrshrn_n_u32(s0c, 2);
+            uint16x4_t a3 = vrshrn_n_u32(s0d, 2);
+            if (sample_16_inline) {
+                uint32_t v = ((uint32_t)vget_lane_u16(a0, 0)) >> 2;
+                sum += (uint64_t)v;
+                sum_sq += (uint64_t)(v * v);
+                cnt++;
+            }
+            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
+            vst1q_u16(out_row + dx + 8, vcombine_u16(a2, a3));
+        }
+        int rem_sample_start = dx;
+        for (; dx + 8 <= dst_w; dx += 8) {
+            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
+            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
+            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
+            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
+            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
+            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
+            uint16x4_t a0 = vrshrn_n_u32(s0a, 2);
+            uint16x4_t a1 = vrshrn_n_u32(s0b, 2);
+            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
+        }
+#else
+        int rem_sample_start = 0;
+#endif
+        for (; dx < dst_w; dx++) {
+            int sx = dx * 2;
+            uint32_t s = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
+                         (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
+            out_row[dx] = (uint16_t)(s >> 2);
+        }
+        if (io_sum && (step == 1 || (dy & 3) == 0)) {
+            if (step == 16) {
+                for (int sx = rem_sample_start; sx < dst_w; sx += 16) {
+                    uint32_t v = (uint32_t)(out_row[sx] >> 2);
+                    sum += (uint64_t)v;
+                    sum_sq += (uint64_t)(v * v);
+                    cnt++;
+                }
+            } else {
+                for (int sx = 0; sx < dst_w; sx++) {
+                    uint32_t v = (uint32_t)(out_row[sx] >> 2);
+                    sum += (uint64_t)v;
+                    sum_sq += (uint64_t)(v * v);
+                    cnt++;
+                }
+            }
+        }
+    }
+    if (io_sum) *io_sum += sum;
+    if (io_sum_sq) *io_sum_sq += sum_sq;
+    if (io_cnt) *io_cnt += cnt;
+}
+
+static void leanav_scale_plane_2x2_u16_strided_with_stats(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride,
+    uint64_t *out_mean, uint64_t *out_var
+) {
+    int dst_w = src_w >> 1;
+    int dst_h = src_h >> 1;
+    int step = ((size_t)dst_w * (size_t)dst_h > 65536) ? 16 : 1;
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+    leanav_scale_plane_2x2_u16_strided_accum(
+        src, src_stride, src_w, src_h, dst, dst_stride,
+        out_mean ? step : 0, out_mean ? &sum : NULL, out_mean ? &sum_sq : NULL, out_mean ? &cnt : NULL);
+    if (out_mean && out_var) {
+        if (cnt > 0) {
+            uint64_t m = sum / cnt;
+            uint64_t msq = sum_sq / cnt;
+            *out_mean = m;
+            *out_var = (msq > m * m) ? (msq - m * m) : 0;
+        } else {
+            *out_mean = 0;
+            *out_var = 0;
         }
     }
 }
@@ -574,34 +1101,7 @@ static void leanav_scale_plane_2x2_u16_strided(
     const uint8_t *src, int src_stride, int src_w, int src_h,
     uint8_t *dst, int dst_stride
 ) {
-    int dst_w = src_w >> 1;
-    int dst_h = src_h >> 1;
-    for (int dy = 0; dy < dst_h; dy++) {
-        const uint16_t *row0 = (const uint16_t *)(src + (size_t)(dy * 2) * (size_t)src_stride);
-        const uint16_t *row1 = (const uint16_t *)(src + (size_t)(dy * 2 + 1) * (size_t)src_stride);
-        uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
-        int dx = 0;
-#if defined(__ARM_NEON)
-        const uint32x4_t bias2 = vdupq_n_u32(2);
-        for (; dx + 8 <= dst_w; dx += 8) {
-            uint16x8_t r0a = vld1q_u16(row0 + dx * 2);
-            uint16x8_t r0b = vld1q_u16(row0 + dx * 2 + 8);
-            uint16x8_t r1a = vld1q_u16(row1 + dx * 2);
-            uint16x8_t r1b = vld1q_u16(row1 + dx * 2 + 8);
-            uint32x4_t s0a = vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a));
-            uint32x4_t s0b = vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b));
-            uint16x4_t a0 = vmovn_u32(vshrq_n_u32(vaddq_u32(s0a, bias2), 2));
-            uint16x4_t a1 = vmovn_u32(vshrq_n_u32(vaddq_u32(s0b, bias2), 2));
-            vst1q_u16(out_row + dx, vcombine_u16(a0, a1));
-        }
-#endif
-        for (; dx < dst_w; dx++) {
-            int sx = dx * 2;
-            uint32_t sum = (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] +
-                           (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + 2u;
-            out_row[dx] = (uint16_t)(sum >> 2);
-        }
-    }
+    leanav_scale_plane_2x2_u16_strided_accum(src, src_stride, src_w, src_h, dst, dst_stride, 0, NULL, NULL, NULL);
 }
 
 static void leanav_luma_stats_strided(
@@ -740,149 +1240,6 @@ static const char *leanav_ffprobe_bin_cmd(void) {
  * Compute real 16x16 macroblock SAD and MSE against the area-averaged source plane,
  * plus whether every non-black reference block is strictly closer to `dst_luma` than to studio-black (Y=16).
  */
-static void leanav_measure_luma_acceptance_16x16(
-    const uint8_t *src_luma,
-    size_t src_w,
-    size_t src_h,
-    const uint8_t *dst_luma,
-    size_t dst_w,
-    size_t dst_h,
-    uint64_t *out_max_block_sad,
-    uint64_t *out_psnr_db_x10,
-    uint32_t *out_dist_lt_black
-) {
-    if (dst_w < 16 || dst_h < 16 || src_w < 2 || src_h < 2) {
-        *out_max_block_sad = 0;
-        *out_psnr_db_x10 = 450;
-        *out_dist_lt_black = 1;
-        return;
-    }
-    uint64_t max_sad = 0;
-    uint64_t total_sq_err = 0;
-    uint64_t total_pix = 0;
-    uint32_t all_closer_than_black = 1;
-
-    /* Stride over 16x16 macroblocks (step 4 macroblocks = 64 px for <0.1 ms overhead per 1080p frame) */
-    size_t mb_step_y = (dst_h >= 256) ? 64 : 16;
-    size_t mb_step_x = (dst_w >= 256) ? 64 : 16;
-    int is_2x2 = (src_w == dst_w * 2 && src_h == dst_h * 2);
-    int is_3x3 = (src_w == dst_w * 3 && src_h == dst_h * 3);
-
-    for (size_t by = 0; by + 16 <= dst_h; by += mb_step_y) {
-        for (size_t bx = 0; bx + 16 <= dst_w; bx += mb_step_x) {
-            uint64_t blk_sad = 0;
-            uint64_t blk_black_sad = 0;
-            uint64_t blk_ref_sum = 0;
-            for (size_t y = 0; y < 16; y++) {
-                size_t dy = by + y;
-                const uint8_t *d_row = dst_luma + dy * dst_w + bx;
-                if (is_2x2) {
-                    const uint8_t *s_row0 = src_luma + (dy * 2) * src_w + bx * 2;
-                    const uint8_t *s_row1 = s_row0 + src_w;
-#if defined(__ARM_NEON)
-                    uint8x16_t r0_a = vld1q_u8(s_row0);
-                    uint8x16_t r0_b = vld1q_u8(s_row0 + 16);
-                    uint8x16_t r1_a = vld1q_u8(s_row1);
-                    uint8x16_t r1_b = vld1q_u8(s_row1 + 16);
-                    uint16x8_t s_lo = vaddq_u16(vpaddlq_u8(r0_a), vpaddlq_u8(r1_a));
-                    uint16x8_t s_hi = vaddq_u16(vpaddlq_u8(r0_b), vpaddlq_u8(r1_b));
-                    uint8x8_t ref_lo = vrshrn_n_u16(s_lo, 2);
-                    uint8x8_t ref_hi = vrshrn_n_u16(s_hi, 2);
-                    uint8x16_t ref16 = vcombine_u8(ref_lo, ref_hi);
-                    uint8x16_t dst16 = vld1q_u8(d_row);
-                    uint8x16_t diff16 = vabdq_u8(dst16, ref16);
-                    uint8x16_t blk16 = vabdq_u8(ref16, vdupq_n_u8(16));
-                    blk_sad += (uint64_t)vaddlvq_u8(diff16);
-                    blk_black_sad += (uint64_t)vaddlvq_u8(blk16);
-                    blk_ref_sum += (uint64_t)vaddlvq_u8(ref16);
-                    uint16x8_t d_lo = vmovl_u8(vget_low_u8(diff16));
-                    uint16x8_t d_hi = vmovl_u8(vget_high_u8(diff16));
-                    uint32x4_t sq = vmull_u16(vget_low_u16(d_lo), vget_low_u16(d_lo));
-                    sq = vmlal_u16(sq, vget_high_u16(d_lo), vget_high_u16(d_lo));
-                    sq = vmlal_u16(sq, vget_low_u16(d_hi), vget_low_u16(d_hi));
-                    sq = vmlal_u16(sq, vget_high_u16(d_hi), vget_high_u16(d_hi));
-                    total_sq_err += (uint64_t)vaddvq_u32(sq);
-#else
-                    for (size_t x = 0; x < 16; x++) {
-                        uint32_t r = ((uint32_t)s_row0[x * 2] + (uint32_t)s_row0[x * 2 + 1] +
-                                      (uint32_t)s_row1[x * 2] + (uint32_t)s_row1[x * 2 + 1] + 2u) >> 2;
-                        uint32_t d = d_row[x];
-                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
-                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
-                        blk_sad += ad;
-                        blk_black_sad += bd;
-                        blk_ref_sum += r;
-                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
-                    }
-#endif
-                } else if (is_3x3) {
-                    const uint8_t *s_row0 = src_luma + (dy * 3) * src_w + bx * 3;
-                    const uint8_t *s_row1 = s_row0 + src_w;
-                    const uint8_t *s_row2 = s_row1 + src_w;
-                    for (size_t x = 0; x < 16; x++) {
-                        size_t sx = x * 3;
-                        uint32_t sum9 =
-                            (uint32_t)s_row0[sx] + (uint32_t)s_row0[sx + 1] + (uint32_t)s_row0[sx + 2] +
-                            (uint32_t)s_row1[sx] + (uint32_t)s_row1[sx + 1] + (uint32_t)s_row1[sx + 2] +
-                            (uint32_t)s_row2[sx] + (uint32_t)s_row2[sx + 1] + (uint32_t)s_row2[sx + 2];
-                        uint32_t r = ((sum9 + 4u) * 7282u) >> 16;
-                        uint32_t d = d_row[x];
-                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
-                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
-                        blk_sad += ad;
-                        blk_black_sad += bd;
-                        blk_ref_sum += r;
-                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
-                    }
-                } else {
-                    size_t sy0 = (dy * src_h) / dst_h;
-                    size_t sy1 = ((dy + 1) * src_h - 1) / dst_h;
-                    if (sy1 >= src_h) sy1 = src_h - 1;
-                    const uint8_t *s_row0 = src_luma + sy0 * src_w;
-                    const uint8_t *s_row1 = src_luma + sy1 * src_w;
-                    for (size_t x = 0; x < 16; x++) {
-                        size_t dx = bx + x;
-                        size_t sx0 = (dx * src_w) / dst_w;
-                        size_t sx1 = ((dx + 1) * src_w - 1) / dst_w;
-                        if (sx1 >= src_w) sx1 = src_w - 1;
-                        uint32_t r = ((uint32_t)s_row0[sx0] + (uint32_t)s_row0[sx1] +
-                                      (uint32_t)s_row1[sx0] + (uint32_t)s_row1[sx1] + 2u) >> 2;
-                        uint32_t d = d_row[x];
-                        uint32_t ad = (d >= r) ? (d - r) : (r - d);
-                        uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
-                        blk_sad += ad;
-                        blk_black_sad += bd;
-                        blk_ref_sum += r;
-                        total_sq_err += (uint64_t)ad * (uint64_t)ad;
-                    }
-                }
-            }
-            total_pix += 256;
-            if (blk_sad > max_sad) max_sad = blk_sad;
-            /* For non-black reference macroblocks (mean Y >= 24), distance to reference must be < distance to studio black */
-            if (blk_ref_sum >= 24u * 256u && blk_sad >= blk_black_sad) {
-                all_closer_than_black = 0;
-            }
-        }
-    }
-    *out_max_block_sad = max_sad;
-    *out_dist_lt_black = all_closer_than_black;
-    if (total_pix == 0 || total_sq_err == 0) {
-        *out_psnr_db_x10 = 480;
-    } else {
-        /* Integer PSNR*10 approximation from MSE: MSE <= 1 -> 48.0 dB, MSE <= 4 -> 42.1 dB, MSE <= 16 -> 36.1 dB */
-        uint64_t mse_x100 = (total_sq_err * 100ULL) / total_pix;
-        if (mse_x100 <= 25) *out_psnr_db_x10 = 540;
-        else if (mse_x100 <= 100) *out_psnr_db_x10 = 481;
-        else if (mse_x100 <= 200) *out_psnr_db_x10 = 451;
-        else if (mse_x100 <= 400) *out_psnr_db_x10 = 421;
-        else if (mse_x100 <= 800) *out_psnr_db_x10 = 391;
-        else if (mse_x100 <= 1600) *out_psnr_db_x10 = 361;
-        else if (mse_x100 <= 2000) *out_psnr_db_x10 = 351;
-        else *out_psnr_db_x10 = 300;
-    }
-}
-
 static void leanav_measure_luma_acceptance_16x16_strided(
     const uint8_t *src_luma, int src_stride, size_t src_w, size_t src_h,
     const uint8_t *dst_luma, int dst_stride, size_t dst_w, size_t dst_h,
@@ -910,7 +1267,37 @@ static void leanav_measure_luma_acceptance_16x16_strided(
                 if (is_2x2) {
                     const uint8_t *s_row0 = src_luma + (dy * 2) * (size_t)src_stride + bx * 2;
                     const uint8_t *s_row1 = s_row0 + (size_t)src_stride;
-#if defined(__ARM_NEON)
+#if defined(__SSE2__)
+                    const __m128i zero = _mm_setzero_si128();
+                    const __m128i mask_u8 = _mm_set1_epi16(0x00FF);
+                    const __m128i bias2 = _mm_set1_epi16(2);
+                    const __m128i black16 = _mm_set1_epi8(16);
+                    __m128i r0a = _mm_loadu_si128((const __m128i *)s_row0);
+                    __m128i r0b = _mm_loadu_si128((const __m128i *)(s_row0 + 16));
+                    __m128i r1a = _mm_loadu_si128((const __m128i *)s_row1);
+                    __m128i r1b = _mm_loadu_si128((const __m128i *)(s_row1 + 16));
+                    __m128i s0a = _mm_add_epi16(_mm_and_si128(r0a, mask_u8), _mm_srli_epi16(r0a, 8));
+                    __m128i s0b = _mm_add_epi16(_mm_and_si128(r0b, mask_u8), _mm_srli_epi16(r0b, 8));
+                    __m128i s1a = _mm_add_epi16(_mm_and_si128(r1a, mask_u8), _mm_srli_epi16(r1a, 8));
+                    __m128i s1b = _mm_add_epi16(_mm_and_si128(r1b, mask_u8), _mm_srli_epi16(r1b, 8));
+                    __m128i avga = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0a, s1a), bias2), 2);
+                    __m128i avgb = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(s0b, s1b), bias2), 2);
+                    __m128i ref16 = _mm_packus_epi16(avga, avgb);
+                    __m128i dst16 = _mm_loadu_si128((const __m128i *)d_row);
+                    __m128i sad_v = _mm_sad_epu8(dst16, ref16);
+                    __m128i bsad_v = _mm_sad_epu8(ref16, black16);
+                    __m128i rsum_v = _mm_sad_epu8(ref16, zero);
+                    blk_sad += (uint32_t)_mm_cvtsi128_si32(sad_v) + (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(sad_v, 8));
+                    blk_black_sad += (uint32_t)_mm_cvtsi128_si32(bsad_v) + (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(bsad_v, 8));
+                    blk_ref_sum += (uint32_t)_mm_cvtsi128_si32(rsum_v) + (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(rsum_v, 8));
+                    __m128i diff16 = _mm_or_si128(_mm_subs_epu8(dst16, ref16), _mm_subs_epu8(ref16, dst16));
+                    __m128i d_lo = _mm_unpacklo_epi8(diff16, zero);
+                    __m128i d_hi = _mm_unpackhi_epi8(diff16, zero);
+                    __m128i sq = _mm_add_epi32(_mm_madd_epi16(d_lo, d_lo), _mm_madd_epi16(d_hi, d_hi));
+                    sq = _mm_add_epi32(sq, _mm_srli_si128(sq, 8));
+                    sq = _mm_add_epi32(sq, _mm_srli_si128(sq, 4));
+                    total_sq_err += (uint32_t)_mm_cvtsi128_si32(sq);
+#elif defined(__ARM_NEON)
                     uint8x16_t r0_a = vld1q_u8(s_row0);
                     uint8x16_t r0_b = vld1q_u8(s_row0 + 16);
                     uint8x16_t r1_a = vld1q_u8(s_row1);
@@ -1001,6 +1388,23 @@ static void leanav_measure_luma_acceptance_16x16_strided(
     }
 }
 
+static void leanav_measure_luma_acceptance_16x16(
+    const uint8_t *src_luma,
+    size_t src_w,
+    size_t src_h,
+    const uint8_t *dst_luma,
+    size_t dst_w,
+    size_t dst_h,
+    uint64_t *out_max_block_sad,
+    uint64_t *out_psnr_db_x10,
+    uint32_t *out_dist_lt_black
+) {
+    leanav_measure_luma_acceptance_16x16_strided(
+        src_luma, (int)src_w, src_w, src_h,
+        dst_luma, (int)dst_w, dst_w, dst_h,
+        out_max_block_sad, out_psnr_db_x10, out_dist_lt_black);
+}
+
 static uint64_t g_last_max_block_sad_16x16 = 0;
 static uint64_t g_last_psnr_db_x10 = 480;
 static uint32_t g_last_dist_lt_black = 1;
@@ -1079,25 +1483,39 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
  * Downscale a single planar 2D plane (`src_w x src_h`) 3x3 (e.g. 4K 3840x2160 -> 720p 1280x720)
  * using exact reciprocal multiply `((sum9 + 4) * 7282) >> 16`.
  */
-static void leanav_scale_plane_3x3_raw(
-    const uint8_t *src,
-    size_t src_w,
-    size_t src_h,
-    uint8_t *dst
+static void leanav_scale_plane_3x3_strided(
+    const uint8_t *src, int src_stride, int src_w, int src_h,
+    uint8_t *dst, int dst_stride
 ) {
-    size_t dst_w = src_w / 3;
-    size_t dst_h = src_h / 3;
-    for (size_t dy = 0; dy < dst_h; dy++) {
-        const uint8_t *row0 = src + (dy * 3) * src_w;
-        const uint8_t *row1 = row0 + src_w;
-        const uint8_t *row2 = row1 + src_w;
-        uint8_t *out_row = dst + dy * dst_w;
-        size_t dx = 0;
-#if defined(__ARM_NEON)
+    int dst_w = src_w / 3;
+    int dst_h = src_h / 3;
+    for (int dy = 0; dy < dst_h; dy++) {
+        const uint8_t *row0 = src + (size_t)(dy * 3) * (size_t)src_stride;
+        const uint8_t *row1 = row0 + (size_t)src_stride;
+        const uint8_t *row2 = row1 + (size_t)src_stride;
+        uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
+        int dx = 0;
+#if defined(__SSE2__)
+        const __m128i recip7282 = _mm_set1_epi16(7282);
+        for (; dx + 8 <= dst_w; dx += 8) {
+            int sx = dx * 3;
+            __m128i sum9 = _mm_set_epi16(
+                (int16_t)(row0[sx+21]+row0[sx+22]+row0[sx+23]+row1[sx+21]+row1[sx+22]+row1[sx+23]+row2[sx+21]+row2[sx+22]+row2[sx+23]+4u),
+                (int16_t)(row0[sx+18]+row0[sx+19]+row0[sx+20]+row1[sx+18]+row1[sx+19]+row1[sx+20]+row2[sx+18]+row2[sx+19]+row2[sx+20]+4u),
+                (int16_t)(row0[sx+15]+row0[sx+16]+row0[sx+17]+row1[sx+15]+row1[sx+16]+row1[sx+17]+row2[sx+15]+row2[sx+16]+row2[sx+17]+4u),
+                (int16_t)(row0[sx+12]+row0[sx+13]+row0[sx+14]+row1[sx+12]+row1[sx+13]+row1[sx+14]+row2[sx+12]+row2[sx+13]+row2[sx+14]+4u),
+                (int16_t)(row0[sx+9] +row0[sx+10]+row0[sx+11]+row1[sx+9] +row1[sx+10]+row1[sx+11]+row2[sx+9] +row2[sx+10]+row2[sx+11]+4u),
+                (int16_t)(row0[sx+6] +row0[sx+7] +row0[sx+8] +row1[sx+6] +row1[sx+7] +row1[sx+8] +row2[sx+6] +row2[sx+7] +row2[sx+8] +4u),
+                (int16_t)(row0[sx+3] +row0[sx+4] +row0[sx+5] +row1[sx+3] +row1[sx+4] +row1[sx+5] +row2[sx+3] +row2[sx+4] +row2[sx+5] +4u),
+                (int16_t)(row0[sx+0] +row0[sx+1] +row0[sx+2] +row1[sx+0] +row1[sx+1] +row1[sx+2] +row2[sx+0] +row2[sx+1] +row2[sx+2] +4u));
+            __m128i q = _mm_mulhi_epu16(sum9, recip7282);
+            _mm_storel_epi64((__m128i *)(out_row + dx), _mm_packus_epi16(q, q));
+        }
+#elif defined(__ARM_NEON)
         const uint16x8_t bias4 = vdupq_n_u16(4);
         const uint16x8_t recip7282 = vdupq_n_u16(7282);
         for (; dx + 8 <= dst_w; dx += 8) {
-            size_t sx = dx * 3;
+            int sx = dx * 3;
             uint8x8x3_t t0 = vld3_u8(row0 + sx);
             uint8x8x3_t t1 = vld3_u8(row1 + sx);
             uint8x8x3_t t2 = vld3_u8(row2 + sx);
@@ -1115,7 +1533,7 @@ static void leanav_scale_plane_3x3_raw(
         }
 #endif
         for (; dx < dst_w; dx++) {
-            size_t sx = dx * 3;
+            int sx = dx * 3;
             uint32_t sum9 =
                 (uint32_t)row0[sx] + (uint32_t)row0[sx + 1] + (uint32_t)row0[sx + 2] +
                 (uint32_t)row1[sx] + (uint32_t)row1[sx + 1] + (uint32_t)row1[sx + 2] +
@@ -1125,27 +1543,71 @@ static void leanav_scale_plane_3x3_raw(
     }
 }
 
+static void leanav_scale_plane_3x3_raw(
+    const uint8_t *src,
+    size_t src_w,
+    size_t src_h,
+    uint8_t *dst
+) {
+    size_t dst_w = src_w / 3;
+    leanav_scale_plane_3x3_strided(src, (int)src_w, (int)src_w, (int)src_h, dst, (int)dst_w);
+}
+
 /*
  * Fast 3:2 Downscale (`src_w * 2 == dst_w * 3`, e.g. 1080p 1920x1080 -> 720p 1280x720):
  * Maps every 3x3 source block to a 2x2 destination block without per-pixel division.
  */
-static void leanav_scale_plane_3to2_raw(
-    const uint8_t *src,
-    size_t src_w,
-    size_t src_h,
-    uint8_t *dst,
-    size_t dst_w,
-    size_t dst_h
+static void leanav_scale_plane_3to2_strided(
+    const uint8_t *src, int src_stride,
+    size_t src_w, size_t src_h,
+    uint8_t *dst, int dst_stride,
+    size_t dst_w, size_t dst_h
 ) {
+    (void)src_w; (void)src_h;
     for (size_t by = 0; by + 1 < dst_h; by += 2) {
         size_t sy = (by >> 1) * 3;
-        const uint8_t *r0 = src + sy * src_w;
-        const uint8_t *r1 = r0 + src_w;
-        const uint8_t *r2 = r1 + src_w;
-        uint8_t *d0 = dst + by * dst_w;
-        uint8_t *d1 = d0 + dst_w;
+        const uint8_t *r0 = src + sy * (size_t)src_stride;
+        const uint8_t *r1 = r0 + (size_t)src_stride;
+        const uint8_t *r2 = r1 + (size_t)src_stride;
+        uint8_t *d0 = dst + by * (size_t)dst_stride;
+        uint8_t *d1 = d0 + (size_t)dst_stride;
         size_t bx = 0;
-#if defined(__ARM_NEON)
+#if defined(__SSE2__)
+        const __m128i recip7282 = _mm_set1_epi16(7282);
+        for (; bx + 8 <= dst_w; bx += 8) {
+            size_t sx = (bx >> 1) * 3;
+            uint16_t r0l_0 = (uint16_t)(r0[sx+0]*2u + r0[sx+1]), r0r_0 = (uint16_t)(r0[sx+2]*2u + r0[sx+1]);
+            uint16_t r1l_0 = (uint16_t)(r1[sx+0]*2u + r1[sx+1]), r1r_0 = (uint16_t)(r1[sx+2]*2u + r1[sx+1]);
+            uint16_t r2l_0 = (uint16_t)(r2[sx+0]*2u + r2[sx+1]), r2r_0 = (uint16_t)(r2[sx+2]*2u + r2[sx+1]);
+
+            uint16_t r0l_1 = (uint16_t)(r0[sx+3]*2u + r0[sx+4]), r0r_1 = (uint16_t)(r0[sx+5]*2u + r0[sx+4]);
+            uint16_t r1l_1 = (uint16_t)(r1[sx+3]*2u + r1[sx+4]), r1r_1 = (uint16_t)(r1[sx+5]*2u + r1[sx+4]);
+            uint16_t r2l_1 = (uint16_t)(r2[sx+3]*2u + r2[sx+4]), r2r_1 = (uint16_t)(r2[sx+5]*2u + r2[sx+4]);
+
+            uint16_t r0l_2 = (uint16_t)(r0[sx+6]*2u + r0[sx+7]), r0r_2 = (uint16_t)(r0[sx+8]*2u + r0[sx+7]);
+            uint16_t r1l_2 = (uint16_t)(r1[sx+6]*2u + r1[sx+7]), r1r_2 = (uint16_t)(r1[sx+8]*2u + r1[sx+7]);
+            uint16_t r2l_2 = (uint16_t)(r2[sx+6]*2u + r2[sx+7]), r2r_2 = (uint16_t)(r2[sx+8]*2u + r2[sx+7]);
+
+            uint16_t r0l_3 = (uint16_t)(r0[sx+9]*2u + r0[sx+10]), r0r_3 = (uint16_t)(r0[sx+11]*2u + r0[sx+10]);
+            uint16_t r1l_3 = (uint16_t)(r1[sx+9]*2u + r1[sx+10]), r1r_3 = (uint16_t)(r1[sx+11]*2u + r1[sx+10]);
+            uint16_t r2l_3 = (uint16_t)(r2[sx+9]*2u + r2[sx+10]), r2r_3 = (uint16_t)(r2[sx+11]*2u + r2[sx+10]);
+
+            __m128i top_s = _mm_set_epi16(
+                (int16_t)(r0r_3*2u + r1r_3 + 4u), (int16_t)(r0l_3*2u + r1l_3 + 4u),
+                (int16_t)(r0r_2*2u + r1r_2 + 4u), (int16_t)(r0l_2*2u + r1l_2 + 4u),
+                (int16_t)(r0r_1*2u + r1r_1 + 4u), (int16_t)(r0l_1*2u + r1l_1 + 4u),
+                (int16_t)(r0r_0*2u + r1r_0 + 4u), (int16_t)(r0l_0*2u + r1l_0 + 4u));
+            __m128i bot_s = _mm_set_epi16(
+                (int16_t)(r2r_3*2u + r1r_3 + 4u), (int16_t)(r2l_3*2u + r1l_3 + 4u),
+                (int16_t)(r2r_2*2u + r1r_2 + 4u), (int16_t)(r2l_2*2u + r1l_2 + 4u),
+                (int16_t)(r2r_1*2u + r1r_1 + 4u), (int16_t)(r2l_1*2u + r1l_1 + 4u),
+                (int16_t)(r2r_0*2u + r1r_0 + 4u), (int16_t)(r2l_0*2u + r1l_0 + 4u));
+            __m128i qt = _mm_mulhi_epu16(top_s, recip7282);
+            __m128i qb = _mm_mulhi_epu16(bot_s, recip7282);
+            _mm_storel_epi64((__m128i *)(d0 + bx), _mm_packus_epi16(qt, qt));
+            _mm_storel_epi64((__m128i *)(d1 + bx), _mm_packus_epi16(qb, qb));
+        }
+#elif defined(__ARM_NEON)
         const uint16x8_t bias4 = vdupq_n_u16(4);
         const uint16x8_t recip7282 = vdupq_n_u16(7282);
         for (; bx + 16 <= dst_w; bx += 16) {
@@ -1202,6 +1664,17 @@ static void leanav_scale_plane_3to2_raw(
             d1[bx + 1] = (uint8_t)(((b1 + 4u) * 7282u) >> 16);
         }
     }
+}
+
+static void leanav_scale_plane_3to2_raw(
+    const uint8_t *src,
+    size_t src_w,
+    size_t src_h,
+    uint8_t *dst,
+    size_t dst_w,
+    size_t dst_h
+) {
+    leanav_scale_plane_3to2_strided(src, (int)src_w, src_w, src_h, dst, (int)dst_w, dst_w, dst_h);
 }
 
 /*
@@ -1443,6 +1916,130 @@ LEAN_EXPORT uint8_t leanav_c_tonemap_pq10_to_bt709_u8(uint16_t y10) {
  * - bit 1 (2): apply ST.2084 PQ EOTF -> linear -> BT.709 OETF highlight knee tonemap on Y plane
  * - bit 2 (4): apply 3x3 edge-preserving denoise on Y plane
  */
+static uint8_t leanav_tm_lut[256];
+static pthread_once_t leanav_tm_lut_once = PTHREAD_ONCE_INIT;
+
+static void leanav_tm_lut_init(void) {
+    for (uint32_t yn = 0; yn < 256; yn++) {
+        leanav_tm_lut[yn] = leanav_tonemap_pq10_to_bt709_u8((uint16_t)(yn << 2));
+    }
+}
+
+static void leanav_apply_pixel_filters_strided(
+    uint8_t *y_plane, int y_stride,
+    uint8_t *u_plane, int u_stride,
+    uint8_t *v_plane, int v_stride,
+    size_t dst_w,
+    size_t dst_h,
+    uint32_t filter_flags
+) {
+    size_t uv_w = dst_w >> 1;
+    size_t uv_h = dst_h >> 1;
+    if (filter_flags & 2u) {
+        pthread_once(&leanav_tm_lut_once, leanav_tm_lut_init);
+        for (size_t y = 0; y < dst_h; y++) {
+            uint8_t *row = y_plane + y * (size_t)y_stride;
+            for (size_t x = 0; x < dst_w; x++) {
+                row[x] = leanav_tm_lut[row[x]];
+            }
+        }
+    }
+    if (filter_flags & 1u) {
+#if defined(__ARM_NEON)
+        const int16x8_t bias128 = vdupq_n_s16(128);
+        const int32x4_t round512 = vdupq_n_s32(512);
+        const int16x4_t c1004 = vdup_n_s16(1004);
+        const int16x4_t cm74  = vdup_n_s16(-74);
+        const int16x4_t cm42  = vdup_n_s16(-42);
+        const int16x4_t c986  = vdup_n_s16(986);
+#elif defined(__AVX2__)
+        const __m256i bias128 = _mm256_set1_epi16(128);
+        const __m256i round512 = _mm256_set1_epi32(512);
+        const __m256i c_u = _mm256_set1_epi32(((uint32_t)(uint16_t)(-74) << 16) | (uint16_t)1004);
+        const __m256i c_v = _mm256_set1_epi32(((uint32_t)(uint16_t)986 << 16) | (uint16_t)(-42));
+#elif defined(__SSE2__)
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i bias128 = _mm_set1_epi16(128);
+        const __m128i round512 = _mm_set1_epi32(512);
+        const __m128i c_u = _mm_set1_epi32(((uint32_t)(uint16_t)(-74) << 16) | (uint16_t)1004);
+        const __m128i c_v = _mm_set1_epi32(((uint32_t)(uint16_t)986 << 16) | (uint16_t)(-42));
+#endif
+        for (size_t y = 0; y < uv_h; y++) {
+            uint8_t *u_row = u_plane + y * (size_t)u_stride;
+            uint8_t *v_row = v_plane + y * (size_t)v_stride;
+            size_t i = 0;
+#if defined(__ARM_NEON)
+            for (; i + 8 <= uv_w; i += 8) {
+                uint8x8_t u8 = vld1_u8(u_row + i);
+                uint8x8_t v8 = vld1_u8(v_row + i);
+                int16x8_t u0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), bias128);
+                int16x8_t v0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), bias128);
+
+                int16x4_t u_lo = vget_low_s16(u0);
+                int16x4_t u_hi = vget_high_s16(u0);
+                int16x4_t v_lo = vget_low_s16(v0);
+                int16x4_t v_hi = vget_high_s16(v0);
+
+                int32x4_t uo_lo = vmlal_s16(vmlal_s16(round512, u_lo, c1004), v_lo, cm74);
+                int32x4_t uo_hi = vmlal_s16(vmlal_s16(round512, u_hi, c1004), v_hi, cm74);
+                int32x4_t vo_lo = vmlal_s16(vmlal_s16(round512, u_lo, cm42), v_lo, c986);
+                int32x4_t vo_hi = vmlal_s16(vmlal_s16(round512, u_hi, cm42), v_hi, c986);
+
+                int16x8_t u_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(uo_lo, 10), vshrn_n_s32(uo_hi, 10)));
+                int16x8_t v_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(vo_lo, 10), vshrn_n_s32(vo_hi, 10)));
+
+                vst1_u8(u_row + i, vqmovun_s16(u_res));
+                vst1_u8(v_row + i, vqmovun_s16(v_res));
+            }
+#elif defined(__AVX2__)
+            for (; i + 16 <= uv_w; i += 16) {
+                __m128i u8 = _mm_loadu_si128((const __m128i *)(u_row + i));
+                __m128i v8 = _mm_loadu_si128((const __m128i *)(v_row + i));
+                __m256i u0 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(u8), bias128);
+                __m256i v0 = _mm256_sub_epi16(_mm256_cvtepu8_epi16(v8), bias128);
+                __m256i uv_lo = _mm256_unpacklo_epi16(u0, v0);
+                __m256i uv_hi = _mm256_unpackhi_epi16(u0, v0);
+                __m256i uo_lo = _mm256_srai_epi32(_mm256_add_epi32(_mm256_madd_epi16(uv_lo, c_u), round512), 10);
+                __m256i uo_hi = _mm256_srai_epi32(_mm256_add_epi32(_mm256_madd_epi16(uv_hi, c_u), round512), 10);
+                __m256i vo_lo = _mm256_srai_epi32(_mm256_add_epi32(_mm256_madd_epi16(uv_lo, c_v), round512), 10);
+                __m256i vo_hi = _mm256_srai_epi32(_mm256_add_epi32(_mm256_madd_epi16(uv_hi, c_v), round512), 10);
+                __m256i u_res = _mm256_add_epi16(_mm256_packs_epi32(uo_lo, uo_hi), bias128);
+                __m256i v_res = _mm256_add_epi16(_mm256_packs_epi32(vo_lo, vo_hi), bias128);
+                __m128i u_pack = _mm_packus_epi16(_mm256_castsi256_si128(u_res), _mm256_extracti128_si256(u_res, 1));
+                __m128i v_pack = _mm_packus_epi16(_mm256_castsi256_si128(v_res), _mm256_extracti128_si256(v_res, 1));
+                _mm_storeu_si128((__m128i *)(u_row + i), u_pack);
+                _mm_storeu_si128((__m128i *)(v_row + i), v_pack);
+            }
+#elif defined(__SSE2__)
+            for (; i + 8 <= uv_w; i += 8) {
+                __m128i u8 = _mm_loadl_epi64((const __m128i *)(u_row + i));
+                __m128i v8 = _mm_loadl_epi64((const __m128i *)(v_row + i));
+                __m128i u0 = _mm_sub_epi16(_mm_unpacklo_epi8(u8, zero), bias128);
+                __m128i v0 = _mm_sub_epi16(_mm_unpacklo_epi8(v8, zero), bias128);
+                __m128i uv_lo = _mm_unpacklo_epi16(u0, v0);
+                __m128i uv_hi = _mm_unpackhi_epi16(u0, v0);
+                __m128i uo_lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(uv_lo, c_u), round512), 10);
+                __m128i uo_hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(uv_hi, c_u), round512), 10);
+                __m128i vo_lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(uv_lo, c_v), round512), 10);
+                __m128i vo_hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(uv_hi, c_v), round512), 10);
+                __m128i u_res = _mm_add_epi16(_mm_packs_epi32(uo_lo, uo_hi), bias128);
+                __m128i v_res = _mm_add_epi16(_mm_packs_epi32(vo_lo, vo_hi), bias128);
+                _mm_storel_epi64((__m128i *)(u_row + i), _mm_packus_epi16(u_res, u_res));
+                _mm_storel_epi64((__m128i *)(v_row + i), _mm_packus_epi16(v_res, v_res));
+            }
+#endif
+            for (; i < uv_w; i++) {
+                int32_t u0 = (int32_t)u_row[i] - 128;
+                int32_t v0 = (int32_t)v_row[i] - 128;
+                int32_t u_out = 128 + ((1004 * u0 - 74 * v0 + 512) >> 10);
+                int32_t v_out = 128 + ((-42 * u0 + 986 * v0 + 512) >> 10);
+                u_row[i] = clamp_u8_i32(u_out);
+                v_row[i] = clamp_u8_i32(v_out);
+            }
+        }
+    }
+}
+
 static void leanav_apply_pixel_filters_raw(
     uint8_t *y_plane,
     uint8_t *u_plane,
@@ -1451,62 +2048,11 @@ static void leanav_apply_pixel_filters_raw(
     size_t dst_h,
     uint32_t filter_flags
 ) {
-    size_t y_sz = dst_w * dst_h;
-    size_t uv_sz = (dst_w >> 1) * (dst_h >> 1);
-    if (filter_flags & 2u) {
-        static int tm_init = 0;
-        static uint8_t tm_lut[256];
-        if (!tm_init) {
-            for (uint32_t yn = 0; yn < 256; yn++) {
-                tm_lut[yn] = leanav_tonemap_pq10_to_bt709_u8((uint16_t)(yn << 2));
-            }
-            tm_init = 1;
-        }
-        for (size_t i = 0; i < y_sz; i++) {
-            y_plane[i] = tm_lut[y_plane[i]];
-        }
-    }
-    if (filter_flags & 1u) {
-        size_t i = 0;
-#if defined(__ARM_NEON)
-        const int16x8_t bias128 = vdupq_n_s16(128);
-        const int32x4_t round512 = vdupq_n_s32(512);
-        const int16x4_t c1004 = vdup_n_s16(1004);
-        const int16x4_t cm74  = vdup_n_s16(-74);
-        const int16x4_t cm42  = vdup_n_s16(-42);
-        const int16x4_t c986  = vdup_n_s16(986);
-        for (; i + 8 <= uv_sz; i += 8) {
-            uint8x8_t u8 = vld1_u8(u_plane + i);
-            uint8x8_t v8 = vld1_u8(v_plane + i);
-            int16x8_t u0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), bias128);
-            int16x8_t v0 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), bias128);
-
-            int16x4_t u_lo = vget_low_s16(u0);
-            int16x4_t u_hi = vget_high_s16(u0);
-            int16x4_t v_lo = vget_low_s16(v0);
-            int16x4_t v_hi = vget_high_s16(v0);
-
-            int32x4_t uo_lo = vmlal_s16(vmlal_s16(round512, u_lo, c1004), v_lo, cm74);
-            int32x4_t uo_hi = vmlal_s16(vmlal_s16(round512, u_hi, c1004), v_hi, cm74);
-            int32x4_t vo_lo = vmlal_s16(vmlal_s16(round512, u_lo, cm42), v_lo, c986);
-            int32x4_t vo_hi = vmlal_s16(vmlal_s16(round512, u_hi, cm42), v_hi, c986);
-
-            int16x8_t u_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(uo_lo, 10), vshrn_n_s32(uo_hi, 10)));
-            int16x8_t v_res = vaddq_s16(bias128, vcombine_s16(vshrn_n_s32(vo_lo, 10), vshrn_n_s32(vo_hi, 10)));
-
-            vst1_u8(u_plane + i, vqmovun_s16(u_res));
-            vst1_u8(v_plane + i, vqmovun_s16(v_res));
-        }
-#endif
-        for (; i < uv_sz; i++) {
-            int32_t u0 = (int32_t)u_plane[i] - 128;
-            int32_t v0 = (int32_t)v_plane[i] - 128;
-            int32_t u_out = 128 + ((1004 * u0 - 74 * v0 + 512) >> 10);
-            int32_t v_out = 128 + ((-42 * u0 + 986 * v0 + 512) >> 10);
-            u_plane[i] = clamp_u8_i32(u_out);
-            v_plane[i] = clamp_u8_i32(v_out);
-        }
-    }
+    leanav_apply_pixel_filters_strided(
+        y_plane, (int)dst_w,
+        u_plane, (int)(dst_w >> 1),
+        v_plane, (int)(dst_w >> 1),
+        dst_w, dst_h, filter_flags);
 }
 
 static int leanav_has_encoder_cached(const char *enc_name) {
@@ -1594,7 +2140,7 @@ static int leanav_locate_video_boxes(
     size_t *vre_pos,  size_t *vre_sz,
     size_t *mdat_pos
 ) {
-    *moov_pos = 0; *mdat_pos = 0;
+    *moov_pos = SIZE_MAX; *mdat_pos = 0;
     size_t pos = 0;
     while (pos + 8 <= n) {
         uint64_t sz = leanav_rd_u32be(buf + pos);
@@ -1619,7 +2165,7 @@ static int leanav_locate_video_boxes(
         }
         pos += (size_t)sz;
     }
-    if (*moov_pos == 0) return 0;
+    if (*moov_pos == SIZE_MAX) return 0;
     size_t m_end = *moov_pos + *moov_sz;
     size_t p = *moov_pos + 8;
     while (p + 8 <= m_end) {
@@ -1651,18 +2197,42 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     uint32_t in_mvhd_ts = 0, in_mdhd_ts = 0;
 
     size_t probe_cap = 4 * 1024 * 1024;
+    size_t head_cap = 512 * 1024;
     uint8_t *in_buf = (uint8_t *)malloc(probe_cap);
     if (!in_buf) { fclose(fi); return -1; }
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
+        size_t req_cap = (pass == 0) ? head_cap : probe_cap;
         if (pass == 1) {
+            if (fseek(fi, 0, SEEK_SET) != 0) break;
+        } else if (pass == 2) {
             if (fseek(fi, 0, SEEK_END) != 0) break;
             long fsz = ftell(fi);
             if (fsz <= (long)probe_cap) break;
             if (fseek(fi, fsz - (long)probe_cap, SEEK_SET) != 0) break;
         }
-        size_t n = fread(in_buf, 1, probe_cap, fi);
+        size_t n = fread(in_buf, 1, req_cap, fi);
         size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
-        if (leanav_locate_video_boxes(in_buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
+        int located = leanav_locate_video_boxes(in_buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
+        if (!located && pass == 0 && n == head_cap && mdat_p > 0) {
+            /* mdat starts near the beginning and moov is at the tail; skip pass 1 */
+            pass = 1;
+            continue;
+        }
+        if (!located && pass == 2) {
+            for (size_t scan = 1; scan + 8 <= n; scan++) {
+                if (memcmp(in_buf + scan + 4, "moov", 4) != 0) continue;
+                uint32_t candidate_s = leanav_rd_u32be(in_buf + scan);
+                if (candidate_s < 8 || scan + candidate_s > n) continue;
+                size_t base = scan;
+                located = leanav_locate_video_boxes(in_buf + base, candidate_s, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
+                if (located) {
+                    moov_p += base; trak_p += base; mdia_p += base; minf_p += base; stbl_p += base;
+                    stsd_p += base; vre_p += base;
+                    break;
+                }
+            }
+        }
+        if (located) {
             size_t bp, bs;
             if (leanav_find_child_box(in_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 24) {
                 uint8_t ver = in_buf[bp + 8];
@@ -1702,29 +2272,46 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     if (fseek(fo, 0, SEEK_END) != 0) { fclose(fo); return -1; }
     long out_fsz_l = ftell(fo);
     if (out_fsz_l <= 0) { fclose(fo); return -1; }
-    /* `moov` sits before `mdat` (`+faststart`): patch in place through a ~1 MiB window, never the whole file. */
-    size_t max_hdr = 1024 * 1024;
+    size_t max_hdr = 256 * 1024;
     size_t read_n = ((size_t)out_fsz_l <= max_hdr) ? (size_t)out_fsz_l : max_hdr;
     size_t out_n = read_n;
     if (fseek(fo, 0, SEEK_SET) != 0) { fclose(fo); return -1; }
     uint8_t *out_buf = (uint8_t *)malloc(out_n + 256);
     if (!out_buf) { fclose(fo); return -1; }
     if (fread(out_buf, 1, out_n, fo) != out_n) { free(out_buf); fclose(fo); return -1; }
-    fclose(fo);
 
     size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
-    if (!leanav_locate_video_boxes(out_buf, out_n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
-        free(out_buf);
-        return -1;
-    }
-
+    int out_located = leanav_locate_video_boxes(out_buf, out_n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
     size_t free_p = 0, free_s = 0;
-    if (moov_p + moov_s + 8 <= out_n && memcmp(out_buf + moov_p + moov_s + 4, "free", 4) == 0) {
+    if (out_located && moov_p + moov_s + 8 <= out_n && memcmp(out_buf + moov_p + moov_s + 4, "free", 4) == 0) {
         uint32_t fsz = leanav_rd_u32be(out_buf + moov_p + moov_s);
-        if (fsz >= 8 && moov_p + moov_s + fsz <= out_n) {
+        if (fsz >= 8 && moov_p + moov_s + fsz <= (size_t)out_fsz_l) {
             free_p = moov_p + moov_s;
             free_s = fsz;
         }
+    }
+    if ((!out_located || free_p == 0 || free_s < 256) && read_n < (size_t)out_fsz_l && (clli_len > 0 || mdcv_len > 0 || colr_len > 0 || pasp_len > 0 || edts_len > 0)) {
+        free(out_buf);
+        read_n = (size_t)out_fsz_l;
+        out_n = read_n;
+        if (fseek(fo, 0, SEEK_SET) != 0) { fclose(fo); return -1; }
+        out_buf = (uint8_t *)malloc(out_n + 256);
+        if (!out_buf) { fclose(fo); return -1; }
+        if (fread(out_buf, 1, out_n, fo) != out_n) { free(out_buf); fclose(fo); return -1; }
+        out_located = leanav_locate_video_boxes(out_buf, out_n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
+        free_p = 0; free_s = 0;
+        if (out_located && moov_p + moov_s + 8 <= out_n && memcmp(out_buf + moov_p + moov_s + 4, "free", 4) == 0) {
+            uint32_t fsz = leanav_rd_u32be(out_buf + moov_p + moov_s);
+            if (fsz >= 8 && moov_p + moov_s + fsz <= out_n) {
+                free_p = moov_p + moov_s;
+                free_s = fsz;
+            }
+        }
+    }
+    fclose(fo);
+    if (!out_located) {
+        free(out_buf);
+        return -1;
     }
 
     /* 1. Build payload of missing stsd child boxes (pasp, colr, clli, mdcv) */
@@ -2081,14 +2668,18 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
     if (fseek(fi, 0, SEEK_SET) != 0) { fclose(fi); return; }
 
     size_t cap = 4 * 1024 * 1024;
+    size_t head_cap = 512 * 1024;
     uint8_t *buf = (uint8_t *)malloc(cap);
     if (!buf) { fclose(fi); return; }
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
+        size_t req_cap = (pass == 0) ? head_cap : cap;
         if (pass == 1) {
+            if (fseek(fi, 0, SEEK_SET) != 0) break;
+        } else if (pass == 2) {
             if (fsz <= (long)cap) break;
             if (fseek(fi, fsz - (long)cap, SEEK_SET) != 0) break;
         }
-        size_t n = fread(buf, 1, cap, fi);
+        size_t n = fread(buf, 1, req_cap, fi);
         if (pass == 0 && n >= 24 && memcmp(buf + 4, "ftyp", 4) == 0) {
             uint32_t ftyp_sz = leanav_rd_u32be(buf);
             if (ftyp_sz >= 16 && ftyp_sz <= 64 && ftyp_sz <= n) {
@@ -2103,7 +2694,26 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
             }
         }
         size_t moov_p, moov_s, trak_p, trak_s, mdia_p, mdia_s, minf_p, minf_s, stbl_p, stbl_s, stsd_p, stsd_s, vre_p, vre_s, mdat_p;
-        if (leanav_locate_video_boxes(buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p)) {
+        int located = leanav_locate_video_boxes(buf, n, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
+        if (!located && pass == 0 && n == head_cap && mdat_p > 0) {
+            pass = 1;
+            continue;
+        }
+        if (!located && pass == 2) {
+            for (size_t scan = 1; scan + 8 <= n; scan++) {
+                if (memcmp(buf + scan + 4, "moov", 4) != 0) continue;
+                uint32_t candidate_s = leanav_rd_u32be(buf + scan);
+                if (candidate_s < 8 || scan + candidate_s > n) continue;
+                size_t base = scan;
+                located = leanav_locate_video_boxes(buf + base, candidate_s, &moov_p, &moov_s, &trak_p, &trak_s, &mdia_p, &mdia_s, &minf_p, &minf_s, &stbl_p, &stbl_s, &stsd_p, &stsd_s, &vre_p, &vre_s, &mdat_p);
+                if (located) {
+                    moov_p += base; trak_p += base; mdia_p += base; minf_p += base; stbl_p += base;
+                    stsd_p += base; vre_p += base;
+                    break;
+                }
+            }
+        }
+        if (located) {
             size_t bp, bs;
             if (leanav_find_child_box(buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 28) {
                 uint8_t ver = buf[bp + 8];
@@ -2568,6 +3178,14 @@ static int leanav_open_encoder(
     if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
         const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
         av_opt_set(ctx->priv_data, "preset", preset, 0);
+        int encoder_threads = -1;
+        const char *encoder_threads_env = getenv("LEANAV_ENCODER_THREADS");
+        if (encoder_threads_env && *encoder_threads_env) {
+            char *end = NULL;
+            long parsed = strtol(encoder_threads_env, &end, 10);
+            if (end != encoder_threads_env && *end == '\0' && parsed >= 0 && parsed <= 256) encoder_threads = (int)parsed;
+        }
+        if (encoder_threads >= 0) ctx->thread_count = encoder_threads;
         av_opt_set_int(ctx->priv_data, "threads", 4, 0);
         char crf_buf[32];
         snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
@@ -2616,43 +3234,311 @@ static int leanav_open_audio_encoder(AVCodecContext **aenc_out, int sample_rate,
 
 static void leanav_drain_audio_fifo(
     AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, AVFormatContext *ofmt,
-    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes
+    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes,
+    AVFrame *ef, AVPacket *ap
 ) {
     (void)a_ch;
-    if (!fifo || !aenc || !oas || !ofmt) return;
+    if (!fifo || !aenc || !oas || !ofmt || !ef || !ap) return;
     int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
+    if (av_audio_fifo_size(fifo) < frame_sz && !(flush_all && av_audio_fifo_size(fifo) > 0)) return;
     while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
         int nb = av_audio_fifo_size(fifo);
         if (nb > frame_sz) nb = frame_sz;
-        AVFrame *ef = av_frame_alloc();
-        if (!ef) break;
-        ef->nb_samples = nb;
-        ef->format = aenc->sample_fmt;
-        ef->sample_rate = aenc->sample_rate;
-        av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
-        ef->pts = *next_a_pts;
-        if (av_frame_get_buffer(ef, 0) < 0) {
-            av_frame_free(&ef);
-            break;
+        if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
+            av_frame_unref(ef);
+            ef->nb_samples = frame_sz;
+            ef->format = aenc->sample_fmt;
+            ef->sample_rate = aenc->sample_rate;
+            av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
+            if (av_frame_get_buffer(ef, 0) < 0) {
+                break;
+            }
         }
+        ef->nb_samples = nb;
+        ef->pts = *next_a_pts;
         if (av_audio_fifo_read(fifo, (void **)ef->extended_data, nb) < nb) {
-            av_frame_free(&ef);
             break;
         }
         *next_a_pts += nb;
         if (avcodec_send_frame(aenc, ef) >= 0) {
-            AVPacket *ap = av_packet_alloc();
-            while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
+            while (avcodec_receive_packet(aenc, ap) >= 0) {
                 if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
                 ap->stream_index = oas->index;
                 av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
                 av_interleaved_write_frame(ofmt, ap);
                 av_packet_unref(ap);
             }
-            if (ap) av_packet_free(&ap);
         }
-        av_frame_free(&ef);
         if (!flush_all && av_audio_fifo_size(fifo) < frame_sz) break;
+    }
+}
+
+#define LEANAV_APKT_QUEUE 8192
+
+typedef struct {
+    AVPacket *q[LEANAV_APKT_QUEUE];
+    int head, tail, count;
+    pthread_mutex_t mu;
+    pthread_cond_t has_room, has_pkt;
+    int closed;
+} leanav_apkt_queue_t;
+
+static void leanav_apkt_push(leanav_apkt_queue_t *q, AVPacket *p) {
+    if (!p) return;
+    pthread_mutex_lock(&q->mu);
+    while (q->count == LEANAV_APKT_QUEUE && !q->closed) pthread_cond_wait(&q->has_room, &q->mu);
+    if (!q->closed) {
+        int was_empty = (q->count == 0);
+        q->q[q->tail] = p;
+        q->tail = (q->tail + 1) % LEANAV_APKT_QUEUE;
+        q->count++;
+        if (was_empty) pthread_cond_signal(&q->has_pkt);
+    } else {
+        av_packet_free(&p);
+    }
+    pthread_mutex_unlock(&q->mu);
+}
+
+typedef struct {
+    leanav_apkt_queue_t in, out;
+    AVCodecContext *adec, *aenc;
+    SwrContext *swr;
+    AVAudioFifo *afifo;
+    AVStream *oas;
+    int a_ch;
+    uint64_t audio_bytes;
+} leanav_audio_job_t;
+
+static void leanav_drain_audio_fifo_to_queue(
+    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, leanav_apkt_queue_t *out_q,
+    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes,
+    AVFrame *ef, AVPacket *ap
+) {
+    (void)a_ch;
+    if (!fifo || !aenc || !out_q || !ef || !ap) return;
+    int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
+    if (av_audio_fifo_size(fifo) < frame_sz && !(flush_all && av_audio_fifo_size(fifo) > 0)) return;
+    while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
+        int nb = av_audio_fifo_size(fifo);
+        if (nb > frame_sz) nb = frame_sz;
+        if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
+            av_frame_unref(ef);
+            ef->nb_samples = frame_sz;
+            ef->format = aenc->sample_fmt;
+            ef->sample_rate = aenc->sample_rate;
+            av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
+            if (av_frame_get_buffer(ef, 0) < 0) {
+                break;
+            }
+        }
+        ef->nb_samples = nb;
+        ef->pts = *next_a_pts;
+        if (av_audio_fifo_read(fifo, (void **)ef->extended_data, nb) < nb) {
+            break;
+        }
+        *next_a_pts += nb;
+        if (avcodec_send_frame(aenc, ef) >= 0) {
+            while (avcodec_receive_packet(aenc, ap) >= 0) {
+                if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
+                ap->stream_index = oas ? oas->index : 1;
+                av_packet_rescale_ts(ap, aenc->time_base, oas ? oas->time_base : aenc->time_base);
+                AVPacket *kept = av_packet_alloc();
+                if (kept) {
+                    av_packet_move_ref(kept, ap);
+                    leanav_apkt_push(out_q, kept);
+                } else {
+                    av_packet_unref(ap);
+                }
+            }
+        }
+        if (!flush_all && av_audio_fifo_size(fifo) < frame_sz) break;
+    }
+}
+
+static void leanav_collect_encoded_audio(
+    AVCodecContext *aenc, AVStream *oas, leanav_apkt_queue_t *out_q,
+    uint64_t *audio_bytes, AVPacket *ap
+) {
+    while (avcodec_receive_packet(aenc, ap) >= 0) {
+        if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
+        ap->stream_index = oas ? oas->index : 1;
+        av_packet_rescale_ts(ap, aenc->time_base, oas ? oas->time_base : aenc->time_base);
+        AVPacket *kept = av_packet_alloc();
+        if (kept) {
+            av_packet_move_ref(kept, ap);
+            leanav_apkt_push(out_q, kept);
+        } else {
+            av_packet_unref(ap);
+        }
+    }
+}
+
+static void *leanav_audio_worker(void *arg) {
+    leanav_audio_job_t *j = (leanav_audio_job_t *)arg;
+    int64_t next_a_pts = 0;
+    AVFrame *af = av_frame_alloc();
+    AVFrame *ef = av_frame_alloc();
+    AVPacket *ap = av_packet_alloc();
+    uint8_t **swr_out_buf = NULL;
+    int swr_out_cap = 0;
+    int swr_linesize = 0;
+    int frame_sz = (j->aenc && j->aenc->frame_size > 0) ? j->aenc->frame_size : 1024;
+    int same_sr = (j->adec && j->aenc && j->adec->sample_rate == j->aenc->sample_rate) ? 1 : 0;
+    for (;;) {
+        AVPacket *in_batch[64];
+        int in_n = 0;
+        pthread_mutex_lock(&j->in.mu);
+        while (j->in.count == 0 && !j->in.closed) pthread_cond_wait(&j->in.has_pkt, &j->in.mu);
+        if (j->in.count == 0 && j->in.closed) { pthread_mutex_unlock(&j->in.mu); break; }
+        int was_full = (j->in.count == LEANAV_APKT_QUEUE);
+        while (j->in.count > 0 && in_n < 64) {
+            in_batch[in_n++] = j->in.q[j->in.head];
+            j->in.q[j->in.head] = NULL;
+            j->in.head = (j->in.head + 1) % LEANAV_APKT_QUEUE;
+            j->in.count--;
+        }
+        if (was_full) pthread_cond_broadcast(&j->in.has_room);
+        pthread_mutex_unlock(&j->in.mu);
+        for (int bi = 0; bi < in_n; bi++) {
+            AVPacket *p = in_batch[bi];
+            if (af && ef && ap && avcodec_send_packet(j->adec, p) >= 0) {
+                while (avcodec_receive_frame(j->adec, af) >= 0) {
+                    if (!j->swr && af->nb_samples > 0) {
+                        if (av_audio_fifo_size(j->afifo) == 0 && af->nb_samples == frame_sz) {
+                            af->pts = next_a_pts;
+                            next_a_pts += frame_sz;
+                            if (avcodec_send_frame(j->aenc, af) >= 0) {
+                                leanav_collect_encoded_audio(j->aenc, j->oas, &j->out, &j->audio_bytes, ap);
+                            }
+                        } else {
+                            av_audio_fifo_write(j->afifo, (void **)af->extended_data, af->nb_samples);
+                            leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
+                        }
+                    } else if (j->swr) {
+                        if (same_sr && av_audio_fifo_size(j->afifo) == 0 && af->nb_samples == frame_sz &&
+                            swr_get_delay(j->swr, j->adec->sample_rate) == 0) {
+                            if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
+                                av_frame_unref(ef);
+                                ef->nb_samples = frame_sz;
+                                ef->format = j->aenc->sample_fmt;
+                                ef->sample_rate = j->aenc->sample_rate;
+                                av_channel_layout_copy(&ef->ch_layout, &j->aenc->ch_layout);
+                                av_frame_get_buffer(ef, 0);
+                            }
+                            if (ef->buf[0]) {
+                                int converted = swr_convert(j->swr, ef->extended_data, frame_sz, (const uint8_t **)af->extended_data, frame_sz);
+                                if (converted == frame_sz) {
+                                    ef->nb_samples = frame_sz;
+                                    ef->pts = next_a_pts;
+                                    next_a_pts += frame_sz;
+                                    if (avcodec_send_frame(j->aenc, ef) >= 0) {
+                                        leanav_collect_encoded_audio(j->aenc, j->oas, &j->out, &j->audio_bytes, ap);
+                                    }
+                                } else if (converted > 0) {
+                                    av_audio_fifo_write(j->afifo, (void **)ef->extended_data, converted);
+                                    leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
+                                }
+                            }
+                        } else {
+                            int out_samples = (int)av_rescale_rnd(
+                                swr_get_delay(j->swr, j->adec->sample_rate) + af->nb_samples,
+                                j->aenc->sample_rate, j->adec->sample_rate, AV_ROUND_UP);
+                            if (out_samples > swr_out_cap) {
+                                if (swr_out_buf) {
+                                    av_freep(&swr_out_buf[0]);
+                                    av_freep(&swr_out_buf);
+                                }
+                                swr_out_cap = 0;
+                                int cap = out_samples < 4096 ? 4096 : out_samples * 2;
+                                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, j->a_ch, cap, j->aenc->sample_fmt, 0) >= 0) {
+                                    swr_out_cap = cap;
+                                }
+                            }
+                            if (swr_out_buf && swr_out_cap >= out_samples) {
+                                int converted = swr_convert(j->swr, swr_out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
+                                if (converted > 0) {
+                                    av_audio_fifo_write(j->afifo, (void **)swr_out_buf, converted);
+                                    leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
+                                }
+                            }
+                        }
+                    }
+                    av_frame_unref(af);
+                }
+            }
+            av_packet_free(&p);
+        }
+    }
+    int delay = j->swr ? swr_get_delay(j->swr, j->aenc->sample_rate) : 0;
+    if (delay > 0) {
+        int need = delay + 32;
+        if (need > swr_out_cap) {
+            if (swr_out_buf) {
+                av_freep(&swr_out_buf[0]);
+                av_freep(&swr_out_buf);
+            }
+            swr_out_cap = 0;
+            if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, j->a_ch, need, j->aenc->sample_fmt, 0) >= 0) {
+                swr_out_cap = need;
+            }
+        }
+        if (swr_out_buf && swr_out_cap >= need) {
+            int converted = swr_convert(j->swr, swr_out_buf, need, NULL, 0);
+            if (converted > 0) av_audio_fifo_write(j->afifo, (void **)swr_out_buf, converted);
+        }
+    }
+    if (ef && ap) {
+        leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 1, &j->audio_bytes, ef, ap);
+    }
+    avcodec_send_frame(j->aenc, NULL);
+    while (ap && avcodec_receive_packet(j->aenc, ap) >= 0) {
+        if (ap->size > 0) j->audio_bytes += (uint64_t)ap->size;
+        ap->stream_index = j->oas ? j->oas->index : 1;
+        av_packet_rescale_ts(ap, j->aenc->time_base, j->oas ? j->oas->time_base : j->aenc->time_base);
+        AVPacket *kept = av_packet_alloc();
+        if (kept) {
+            av_packet_move_ref(kept, ap);
+            leanav_apkt_push(&j->out, kept);
+        } else {
+            av_packet_unref(ap);
+        }
+    }
+    if (swr_out_buf) {
+        av_freep(&swr_out_buf[0]);
+        av_freep(&swr_out_buf);
+    }
+    if (ap) av_packet_free(&ap);
+    if (ef) av_frame_free(&ef);
+    if (af) av_frame_free(&af);
+    pthread_mutex_lock(&j->out.mu);
+    j->out.closed = 1;
+    pthread_cond_signal(&j->out.has_pkt);
+    pthread_mutex_unlock(&j->out.mu);
+    return NULL;
+}
+
+static void leanav_audio_flush_packets(leanav_audio_job_t *j, AVFormatContext *ofmt) {
+    if (!j || !ofmt) return;
+    if (*(volatile const int *)&j->out.count <= 0) return;
+    AVPacket *batch[64];
+    for (;;) {
+        int n = 0;
+        pthread_mutex_lock(&j->out.mu);
+        int was_full = (j->out.count == LEANAV_APKT_QUEUE);
+        while (j->out.count > 0 && n < 64) {
+            batch[n++] = j->out.q[j->out.head];
+            j->out.q[j->out.head] = NULL;
+            j->out.head = (j->out.head + 1) % LEANAV_APKT_QUEUE;
+            j->out.count--;
+        }
+        if (was_full) pthread_cond_broadcast(&j->out.has_room);
+        pthread_mutex_unlock(&j->out.mu);
+        if (n == 0) break;
+        for (int i = 0; i < n; i++) {
+            av_interleaved_write_frame(ofmt, batch[i]);
+            av_packet_free(&batch[i]);
+        }
+        if (n < 64) break;
     }
 }
 
@@ -2663,22 +3549,50 @@ static int leanav_libav_stream_copy(
     av_log_set_level(AV_LOG_ERROR);
     AVFormatContext *ifmt = NULL;
     if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return -1;
-    if (avformat_find_stream_info(ifmt, NULL) < 0) {
-        avformat_close_input(&ifmt);
-        return -1;
-    }
-
-    leanav_media_info_t info;
-    leanav_populate_media_info_mp4_boxes(in_path, &info);
     int v_idx = -1, a_idx = -1;
     for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
         enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
         if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
         else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
     }
+    int need_stream_info = 1;
+    if (v_idx >= 0) {
+        AVStream *st_v = ifmt->streams[v_idx];
+        int v_ok = st_v->codecpar &&
+                   st_v->codecpar->codec_id != AV_CODEC_ID_NONE &&
+                   st_v->codecpar->width > 0 &&
+                   st_v->codecpar->height > 0 &&
+                   st_v->codecpar->extradata_size > 0;
+        int a_ok = 1;
+        if (with_audio && a_idx >= 0) {
+            AVStream *st_a = ifmt->streams[a_idx];
+            a_ok = st_a->codecpar &&
+                   st_a->codecpar->codec_id != AV_CODEC_ID_NONE &&
+                   st_a->codecpar->sample_rate > 0 &&
+                   st_a->codecpar->ch_layout.nb_channels > 0;
+        }
+        if (v_ok && a_ok) need_stream_info = 0;
+    }
+    if (need_stream_info) {
+        if (avformat_find_stream_info(ifmt, NULL) < 0) {
+            avformat_close_input(&ifmt);
+            return -1;
+        }
+        v_idx = -1; a_idx = -1;
+        for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+            enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
+            if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
+            else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
+        }
+    }
     if (v_idx < 0) {
         avformat_close_input(&ifmt);
         return -1;
+    }
+    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+        if ((int)i != v_idx && (int)i != a_idx) {
+            ifmt->streams[i]->discard = AVDISCARD_ALL;
+        }
     }
     AVFormatContext *ofmt = NULL;
     if (avformat_alloc_output_context2(&ofmt, NULL, "mp4", out_path) < 0 || !ofmt) {
@@ -2708,7 +3622,14 @@ static int leanav_libav_stream_copy(
         }
     }
     AVDictionary *mux_opts = NULL;
-    av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+    {
+        int64_t est_dur_s = 60;
+        if (dur_ms > 0) est_dur_s = (int64_t)(dur_ms / 1000) + 10;
+        else if (ifmt->duration > 0) est_dur_s = (ifmt->duration / AV_TIME_BASE) + 10;
+        int64_t moov_reserve = 262144;
+        if (est_dur_s * 1024 > moov_reserve) moov_reserve = est_dur_s * 1024;
+        av_dict_set_int(&mux_opts, "moov_size", moov_reserve, 0);
+    }
     if (avformat_write_header(ofmt, &mux_opts) < 0) {
         av_dict_free(&mux_opts);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
@@ -2768,7 +3689,7 @@ static int leanav_copy_plane_to_dst(
     uint8_t *dst, int dst_stride, int dst_w, int dst_h,
     leanav_bilinear_tabs_t *tabs, int dst_is_10bit
 ) {
-    /* Fast zero-allocation strided paths for 1x1 copy and 2x2 SIMD downscale */
+    /* Fast zero-allocation strided paths for 1x1 copy, 2x2 and 3x3 SIMD downscale */
     if (src_bps == 1 && !dst_is_10bit) {
         if (src_w == dst_w && src_h == dst_h) {
             for (int y = 0; y < dst_h; y++) {
@@ -2780,6 +3701,37 @@ static int leanav_copy_plane_to_dst(
             leanav_scale_plane_2x2_strided(src, src_stride, src_w, src_h, dst, dst_stride);
             return 0;
         }
+        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+            leanav_scale_plane_3x3_strided(src, src_stride, src_w, src_h, dst, dst_stride);
+            return 0;
+        }
+        if (src_w * 2 == dst_w * 3 && src_h * 2 == dst_h * 3 && (dst_w & 1) == 0 && (dst_h & 1) == 0) {
+            leanav_scale_plane_3to2_strided(src, src_stride, (size_t)src_w, (size_t)src_h, dst, dst_stride, (size_t)dst_w, (size_t)dst_h);
+            return 0;
+        }
+        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                uint32_t sy0 = tabs->sy0[dy];
+                uint32_t sy1 = tabs->sy1[dy];
+                uint32_t fy  = tabs->fy[dy];
+                uint32_t ify = 256u - fy;
+                const uint8_t *row0 = src + (size_t)sy0 * (size_t)src_stride;
+                const uint8_t *row1 = src + (size_t)sy1 * (size_t)src_stride;
+                uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
+                for (int dx = 0; dx < dst_w; dx++) {
+                    uint32_t sx0 = tabs->sx0[dx];
+                    uint32_t sx1 = tabs->sx1[dx];
+                    uint32_t fx  = tabs->fx[dx];
+                    uint32_t ifx = 256u - fx;
+                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
+                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
+                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
+                    out_row[dx] = (uint8_t)(val > 255u ? 255u : val);
+                }
+            }
+            return 0;
+        }
+        return -1;
     }
     if (src_bps == 2 && dst_is_10bit) {
         if (src_w == dst_w && src_h == dst_h) {
@@ -2792,84 +3744,457 @@ static int leanav_copy_plane_to_dst(
             leanav_scale_plane_2x2_u16_strided(src, src_stride, src_w, src_h, dst, dst_stride);
             return 0;
         }
-    }
-    if (src_bps == 2) {
-        size_t tmp_src_sz = (size_t)src_w * (size_t)src_h * 2u;
-        size_t tmp_dst_sz = (size_t)dst_w * (size_t)dst_h * 2u;
-        uint16_t *ps = (uint16_t *)malloc(tmp_src_sz);
-        uint16_t *pd = (uint16_t *)malloc(tmp_dst_sz);
-        if (!ps || !pd) { free(ps); free(pd); return -1; }
-        for (int y = 0; y < src_h; y++) {
-            memcpy(ps + (size_t)y * (size_t)src_w, src + (size_t)y * (size_t)src_stride, (size_t)src_w * 2u);
+        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+            leanav_scale_plane_3x3_u16_strided(src, src_stride, src_w, src_h, dst, dst_stride);
+            return 0;
         }
-        if (src_w == dst_w && src_h == dst_h) {
-            memcpy(pd, ps, tmp_dst_sz);
-        } else if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-            leanav_scale_plane_2x2_u16_raw(ps, (size_t)src_w, (size_t)src_h, pd);
-        } else if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-            leanav_scale_plane_3x3_u16_raw(ps, (size_t)src_w, (size_t)src_h, pd);
-        } else {
-            leanav_scale_plane_bilinear_u16_raw_with_tabs(ps, (size_t)src_w, (size_t)src_h, pd, (size_t)dst_w, (size_t)dst_h, tabs);
-        }
-        if (dst_is_10bit) {
-            for (int y = 0; y < dst_h; y++) {
-                memcpy(dst + (size_t)y * (size_t)dst_stride, pd + (size_t)y * (size_t)dst_w, (size_t)dst_w * 2u);
+        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                uint32_t sy0 = tabs->sy0[dy];
+                uint32_t sy1 = tabs->sy1[dy];
+                uint32_t fy  = tabs->fy[dy];
+                uint32_t ify = 256u - fy;
+                const uint16_t *row0 = (const uint16_t *)(src + (size_t)sy0 * (size_t)src_stride);
+                const uint16_t *row1 = (const uint16_t *)(src + (size_t)sy1 * (size_t)src_stride);
+                uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+                for (int dx = 0; dx < dst_w; dx++) {
+                    uint32_t sx0 = tabs->sx0[dx];
+                    uint32_t sx1 = tabs->sx1[dx];
+                    uint32_t fx  = tabs->fx[dx];
+                    uint32_t ifx = 256u - fx;
+                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
+                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
+                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
+                    out_row[dx] = (uint16_t)(val > 1023u ? 1023u : val);
+                }
             }
-        } else {
+            return 0;
+        }
+        return -1;
+    }
+    if (src_bps == 2 && !dst_is_10bit) {
+        if (src_w == dst_w && src_h == dst_h) {
             for (int y = 0; y < dst_h; y++) {
                 uint8_t *row_d = dst + (size_t)y * (size_t)dst_stride;
-                const uint16_t *row_s = pd + (size_t)y * (size_t)dst_w;
-                for (int x = 0; x < dst_w; x++) row_d[x] = (uint8_t)((row_s[x] + 2u) >> 2);
+                const uint16_t *row_s = (const uint16_t *)(src + (size_t)y * (size_t)src_stride);
+                int x = 0;
+#if defined(__AVX2__)
+                const __m256i bias2 = _mm256_set1_epi16(2);
+                for (; x + 32 <= dst_w; x += 32) {
+                    __m256i s0 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i *)(row_s + x)), bias2), 2);
+                    __m256i s1 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i *)(row_s + x + 16)), bias2), 2);
+                    __m256i packed = _mm256_packus_epi16(s0, s1);
+                    _mm256_storeu_si256((__m256i *)(row_d + x), _mm256_permute4x64_epi64(packed, 0xD8));
+                }
+#elif defined(__SSE2__)
+                const __m128i bias2 = _mm_set1_epi16(2);
+                for (; x + 16 <= dst_w; x += 16) {
+                    __m128i s0 = _mm_srli_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i *)(row_s + x)), bias2), 2);
+                    __m128i s1 = _mm_srli_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i *)(row_s + x + 8)), bias2), 2);
+                    _mm_storeu_si128((__m128i *)(row_d + x), _mm_packus_epi16(s0, s1));
+                }
+#elif defined(__ARM_NEON)
+                for (; x + 16 <= dst_w; x += 16) {
+                    uint8x8_t d0 = vqshrun_n_s16(vreinterpretq_s16_u16(vaddq_u16(vld1q_u16(row_s + x), vdupq_n_u16(2))), 2);
+                    uint8x8_t d1 = vqshrun_n_s16(vreinterpretq_s16_u16(vaddq_u16(vld1q_u16(row_s + x + 8), vdupq_n_u16(2))), 2);
+                    vst1q_u8(row_d + x, vcombine_u8(d0, d1));
+                }
+#endif
+                for (; x < dst_w; x++) row_d[x] = (uint8_t)((row_s[x] + 2u) >> 2);
             }
+            return 0;
         }
-        free(ps); free(pd);
-        return 0;
-    }
-    size_t tmp_src_sz = (size_t)src_w * (size_t)src_h;
-    size_t tmp_dst_sz = (size_t)dst_w * (size_t)dst_h;
-    uint8_t *ps = (uint8_t *)malloc(tmp_src_sz);
-    uint8_t *pd = (uint8_t *)malloc(tmp_dst_sz);
-    if (!ps || !pd) { free(ps); free(pd); return -1; }
-    for (int y = 0; y < src_h; y++) {
-        memcpy(ps + (size_t)y * (size_t)src_w, src + (size_t)y * (size_t)src_stride, (size_t)src_w);
-    }
-    if (src_w == dst_w && src_h == dst_h) {
-        memcpy(pd, ps, tmp_dst_sz);
-    } else if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-        leanav_scale_plane_2x2_raw(ps, (size_t)src_w, (size_t)src_h, pd);
-    } else if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-        leanav_scale_plane_3x3_raw(ps, (size_t)src_w, (size_t)src_h, pd);
-    } else {
-        leanav_scale_plane_bilinear_raw_with_tabs(ps, (size_t)src_w, (size_t)src_h, pd, (size_t)dst_w, (size_t)dst_h, tabs);
-    }
-    if (dst_is_10bit) {
-        for (int y = 0; y < dst_h; y++) {
-            uint16_t *row_d = (uint16_t *)(dst + (size_t)y * (size_t)dst_stride);
-            const uint8_t *row_s = pd + (size_t)y * (size_t)dst_w;
-            for (int x = 0; x < dst_w; x++) row_d[x] = (uint16_t)((uint16_t)row_s[x] << 2);
+        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                const uint16_t *r0 = (const uint16_t *)(src + (size_t)(dy * 2) * (size_t)src_stride);
+                const uint16_t *r1 = (const uint16_t *)(src + (size_t)(dy * 2 + 1) * (size_t)src_stride);
+                uint8_t *row_d = dst + (size_t)dy * (size_t)dst_stride;
+                int dx = 0;
+#if defined(__AVX2__)
+                const __m256i ones = _mm256_set1_epi16(1);
+                const __m256i bias2_32 = _mm256_set1_epi32(2);
+                const __m256i bias2_16 = _mm256_set1_epi16(2);
+                for (; dx + 16 <= dst_w; dx += 16) {
+                    __m256i r0a = _mm256_loadu_si256((const __m256i *)(r0 + dx * 2));
+                    __m256i r0b = _mm256_loadu_si256((const __m256i *)(r0 + dx * 2 + 16));
+                    __m256i r1a = _mm256_loadu_si256((const __m256i *)(r1 + dx * 2));
+                    __m256i r1b = _mm256_loadu_si256((const __m256i *)(r1 + dx * 2 + 16));
+                    __m256i avg_a = _mm256_srli_epi32(_mm256_add_epi32(_mm256_madd_epi16(_mm256_add_epi16(r0a, r1a), ones), bias2_32), 2);
+                    __m256i avg_b = _mm256_srli_epi32(_mm256_add_epi32(_mm256_madd_epi16(_mm256_add_epi16(r0b, r1b), ones), bias2_32), 2);
+                    __m256i u16_p = _mm256_permute4x64_epi64(_mm256_packs_epi32(avg_a, avg_b), 0xD8);
+                    __m256i u8_16 = _mm256_srli_epi16(_mm256_add_epi16(u16_p, bias2_16), 2);
+                    __m128i lo = _mm256_castsi256_si128(u8_16);
+                    __m128i hi = _mm256_extracti128_si256(u8_16, 1);
+                    _mm_storeu_si128((__m128i *)(row_d + dx), _mm_packus_epi16(lo, hi));
+                }
+#elif defined(__SSE2__)
+                const __m128i ones = _mm_set1_epi16(1);
+                const __m128i bias2_32 = _mm_set1_epi32(2);
+                const __m128i bias2_16 = _mm_set1_epi16(2);
+                for (; dx + 16 <= dst_w; dx += 16) {
+                    __m128i r0a = _mm_loadu_si128((const __m128i *)(r0 + dx * 2));
+                    __m128i r0b = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 8));
+                    __m128i r0c = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 16));
+                    __m128i r0d = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 24));
+                    __m128i r1a = _mm_loadu_si128((const __m128i *)(r1 + dx * 2));
+                    __m128i r1b = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 8));
+                    __m128i r1c = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 16));
+                    __m128i r1d = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 24));
+                    __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones), bias2_32), 2);
+                    __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones), bias2_32), 2);
+                    __m128i avg_c = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0c, r1c), ones), bias2_32), 2);
+                    __m128i avg_d = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0d, r1d), ones), bias2_32), 2);
+                    __m128i u16_0 = _mm_srli_epi16(_mm_add_epi16(_mm_packs_epi32(avg_a, avg_b), bias2_16), 2);
+                    __m128i u16_1 = _mm_srli_epi16(_mm_add_epi16(_mm_packs_epi32(avg_c, avg_d), bias2_16), 2);
+                    _mm_storeu_si128((__m128i *)(row_d + dx), _mm_packus_epi16(u16_0, u16_1));
+                }
+#elif defined(__ARM_NEON)
+                for (; dx + 16 <= dst_w; dx += 16) {
+                    uint16x8_t r0a = vld1q_u16(r0 + dx * 2);
+                    uint16x8_t r0b = vld1q_u16(r0 + dx * 2 + 8);
+                    uint16x8_t r0c = vld1q_u16(r0 + dx * 2 + 16);
+                    uint16x8_t r0d = vld1q_u16(r0 + dx * 2 + 24);
+                    uint16x8_t r1a = vld1q_u16(r1 + dx * 2);
+                    uint16x8_t r1b = vld1q_u16(r1 + dx * 2 + 8);
+                    uint16x8_t r1c = vld1q_u16(r1 + dx * 2 + 16);
+                    uint16x8_t r1d = vld1q_u16(r1 + dx * 2 + 24);
+                    uint16x4_t a0 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a)), 2);
+                    uint16x4_t a1 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b)), 2);
+                    uint16x4_t a2 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0c), vpaddlq_u16(r1c)), 2);
+                    uint16x4_t a3 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0d), vpaddlq_u16(r1d)), 2);
+                    uint8x8_t d0 = vrshrn_n_u16(vcombine_u16(a0, a1), 2);
+                    uint8x8_t d1 = vrshrn_n_u16(vcombine_u16(a2, a3), 2);
+                    vst1q_u8(row_d + dx, vcombine_u8(d0, d1));
+                }
+#endif
+                for (; dx < dst_w; dx++) {
+                    uint32_t avg10 = ((uint32_t)r0[dx * 2] + (uint32_t)r0[dx * 2 + 1] +
+                                      (uint32_t)r1[dx * 2] + (uint32_t)r1[dx * 2 + 1] + 2u) >> 2;
+                    row_d[dx] = (uint8_t)((avg10 + 2u) >> 2);
+                }
+            }
+            return 0;
         }
-    } else {
-        for (int y = 0; y < dst_h; y++) {
-            memcpy(dst + (size_t)y * (size_t)dst_stride, pd + (size_t)y * (size_t)dst_w, (size_t)dst_w);
+        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                const uint16_t *r0 = (const uint16_t *)(src + (size_t)(dy * 3) * (size_t)src_stride);
+                const uint16_t *r1 = (const uint16_t *)(src + (size_t)(dy * 3 + 1) * (size_t)src_stride);
+                const uint16_t *r2 = (const uint16_t *)(src + (size_t)(dy * 3 + 2) * (size_t)src_stride);
+                uint8_t *row_d = dst + (size_t)dy * (size_t)dst_stride;
+                for (int dx = 0; dx < dst_w; dx++) {
+                    int sx = dx * 3;
+                    uint32_t s = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
+                                 (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
+                                 (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
+                    uint32_t v10 = ((s + 4u) * 7282u) >> 16;
+                    if (v10 > 1023u) v10 = 1023u;
+                    row_d[dx] = (uint8_t)((v10 + 2u) >> 2);
+                }
+            }
+            return 0;
         }
+        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                uint32_t sy0 = tabs->sy0[dy];
+                uint32_t sy1 = tabs->sy1[dy];
+                uint32_t fy  = tabs->fy[dy];
+                uint32_t ify = 256u - fy;
+                const uint16_t *row0 = (const uint16_t *)(src + (size_t)sy0 * (size_t)src_stride);
+                const uint16_t *row1 = (const uint16_t *)(src + (size_t)sy1 * (size_t)src_stride);
+                uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
+                for (int dx = 0; dx < dst_w; dx++) {
+                    uint32_t sx0 = tabs->sx0[dx];
+                    uint32_t sx1 = tabs->sx1[dx];
+                    uint32_t fx  = tabs->fx[dx];
+                    uint32_t ifx = 256u - fx;
+                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
+                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
+                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
+                    if (val > 1023u) val = 1023u;
+                    out_row[dx] = (uint8_t)((val + 2u) >> 2);
+                }
+            }
+            return 0;
+        }
+        return -1;
     }
-    free(ps); free(pd);
-    return 0;
+    if (src_bps == 1 && dst_is_10bit) {
+        if (src_w == dst_w && src_h == dst_h) {
+            for (int y = 0; y < dst_h; y++) {
+                uint16_t *row_d = (uint16_t *)(dst + (size_t)y * (size_t)dst_stride);
+                const uint8_t *row_s = src + (size_t)y * (size_t)src_stride;
+                for (int x = 0; x < dst_w; x++) row_d[x] = (uint16_t)((uint16_t)row_s[x] << 2);
+            }
+            return 0;
+        }
+        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                const uint8_t *r0 = src + (size_t)(dy * 2) * (size_t)src_stride;
+                const uint8_t *r1 = src + (size_t)(dy * 2 + 1) * (size_t)src_stride;
+                uint16_t *row_d = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+                for (int dx = 0; dx < dst_w; dx++) {
+                    uint32_t avg = ((uint32_t)r0[dx * 2] + (uint32_t)r0[dx * 2 + 1] +
+                                    (uint32_t)r1[dx * 2] + (uint32_t)r1[dx * 2 + 1] + 2u) >> 2;
+                    row_d[dx] = (uint16_t)(avg << 2);
+                }
+            }
+            return 0;
+        }
+        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                const uint8_t *r0 = src + (size_t)(dy * 3) * (size_t)src_stride;
+                const uint8_t *r1 = src + (size_t)(dy * 3 + 1) * (size_t)src_stride;
+                const uint8_t *r2 = src + (size_t)(dy * 3 + 2) * (size_t)src_stride;
+                uint16_t *row_d = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+                for (int dx = 0; dx < dst_w; dx++) {
+                    int sx = dx * 3;
+                    uint32_t s = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
+                                 (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
+                                 (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
+                    uint32_t v8 = ((s + 4u) * 7282u) >> 16;
+                    if (v8 > 255u) v8 = 255u;
+                    row_d[dx] = (uint16_t)(v8 << 2);
+                }
+            }
+            return 0;
+        }
+        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
+            for (int dy = 0; dy < dst_h; dy++) {
+                uint32_t sy0 = tabs->sy0[dy];
+                uint32_t sy1 = tabs->sy1[dy];
+                uint32_t fy  = tabs->fy[dy];
+                uint32_t ify = 256u - fy;
+                const uint8_t *row0 = src + (size_t)sy0 * (size_t)src_stride;
+                const uint8_t *row1 = src + (size_t)sy1 * (size_t)src_stride;
+                uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
+                for (int dx = 0; dx < dst_w; dx++) {
+                    uint32_t sx0 = tabs->sx0[dx];
+                    uint32_t sx1 = tabs->sx1[dx];
+                    uint32_t fx  = tabs->fx[dx];
+                    uint32_t ifx = 256u - fx;
+                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
+                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
+                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
+                    if (val > 255u) val = 255u;
+                    out_row[dx] = (uint16_t)(val << 2);
+                }
+            }
+            return 0;
+        }
+        return -1;
+    }
+    return -1;
 }
 
 #define LEANAV_ENC_SLOTS 8
 #define LEANAV_PKT_QUEUE 64
+#define LEANAV_SCALE_Y_SLICES 8
+
+typedef struct {
+    const uint8_t *src_y, *src_u, *src_v;
+    int src_stride_y, src_stride_u, src_stride_v, src_w_y, src_h_y, src_w_uv, src_h_uv, src_bps;
+    uint8_t *dst_y, *dst_u, *dst_v;
+    int dst_stride_y, dst_stride_u, dst_stride_v, dst_w_y, dst_h_y, dst_w_uv, dst_h_uv, is_10bit;
+    int y_mode, y_step, slice_h_y;
+    uint64_t slice_sum[LEANAV_SCALE_Y_SLICES];
+    uint64_t slice_sum_sq[LEANAV_SCALE_Y_SLICES];
+    uint64_t slice_cnt[LEANAV_SCALE_Y_SLICES];
+    leanav_bilinear_tabs_t *y_tabs, *uv_tabs;
+    uint64_t job_id;
+    int num_tasks;
+    int next_task;
+    int done_tasks;
+    int worker_busy, stop;
+    pthread_mutex_t mu;
+    pthread_cond_t start_cv, done_cv;
+} leanav_uv_scale_worker_t;
+
+static inline void leanav_exec_scale_task(leanav_uv_scale_worker_t *w, int t) {
+    if (t == 0) {
+        leanav_copy_plane_to_dst(w->src_u, w->src_stride_u, w->src_w_uv, w->src_h_uv, w->src_bps,
+            w->dst_u, w->dst_stride_u, w->dst_w_uv, w->dst_h_uv, w->uv_tabs, w->is_10bit);
+    } else if (t == 1) {
+        leanav_copy_plane_to_dst(w->src_v, w->src_stride_v, w->src_w_uv, w->src_h_uv, w->src_bps,
+            w->dst_v, w->dst_stride_v, w->dst_w_uv, w->dst_h_uv, w->uv_tabs, w->is_10bit);
+    } else if (w->num_tasks == 3) {
+        w->slice_sum[0] = 0;
+        w->slice_sum_sq[0] = 0;
+        w->slice_cnt[0] = 0;
+        if (w->y_mode == 2) {
+            leanav_scale_plane_2x2_u16_strided_accum(
+                w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y,
+                w->dst_y, w->dst_stride_y, w->y_step,
+                &w->slice_sum[0], &w->slice_sum_sq[0], &w->slice_cnt[0]);
+        } else if (w->y_mode == 1) {
+            leanav_scale_plane_2x2_strided_accum(
+                w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y,
+                w->dst_y, w->dst_stride_y, w->y_step,
+                &w->slice_sum[0], &w->slice_sum_sq[0], &w->slice_cnt[0]);
+        } else {
+            leanav_copy_plane_to_dst(w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y, w->src_bps,
+                w->dst_y, w->dst_stride_y, w->dst_w_y, w->dst_h_y, w->y_tabs, w->is_10bit);
+        }
+    } else {
+        int s = t - 2;
+        int y0 = s * w->slice_h_y;
+        int dst_h_s = (s < LEANAV_SCALE_Y_SLICES - 1) ? w->slice_h_y : (w->dst_h_y - y0);
+        int src_h_s = dst_h_s * 2;
+        const uint8_t *sy = w->src_y + (size_t)(y0 * 2) * (size_t)w->src_stride_y;
+        uint8_t *dy = w->dst_y + (size_t)y0 * (size_t)w->dst_stride_y;
+        uint64_t sum = 0, sum_sq = 0, cnt = 0;
+        if (dst_h_s > 0) {
+            if (w->y_mode == 2) {
+                leanav_scale_plane_2x2_u16_strided_accum(
+                    sy, w->src_stride_y, w->src_w_y, src_h_s,
+                    dy, w->dst_stride_y, w->y_step, &sum, &sum_sq, &cnt);
+            } else {
+                leanav_scale_plane_2x2_strided_accum(
+                    sy, w->src_stride_y, w->src_w_y, src_h_s,
+                    dy, w->dst_stride_y, w->y_step, &sum, &sum_sq, &cnt);
+            }
+        }
+        w->slice_sum[s] = sum;
+        w->slice_sum_sq[s] = sum_sq;
+        w->slice_cnt[s] = cnt;
+    }
+}
+
+static void *leanav_uv_scale_worker(void *arg) {
+    leanav_uv_scale_worker_t *w = (leanav_uv_scale_worker_t *)arg;
+    uint64_t last_job = 0;
+    pthread_mutex_lock(&w->mu);
+    for (;;) {
+        while ((w->job_id == last_job || __atomic_load_n(&w->next_task, __ATOMIC_ACQUIRE) >= w->num_tasks) && !w->stop) {
+            pthread_cond_wait(&w->start_cv, &w->mu);
+        }
+        if (w->stop) break;
+        last_job = w->job_id;
+        int ntasks = w->num_tasks;
+        w->worker_busy = 1;
+        pthread_mutex_unlock(&w->mu);
+
+        for (;;) {
+            int t = __atomic_fetch_add(&w->next_task, 1, __ATOMIC_ACQ_REL);
+            if (t >= ntasks) break;
+            leanav_exec_scale_task(w, t);
+            if (__atomic_add_fetch(&w->done_tasks, 1, __ATOMIC_ACQ_REL) == ntasks) {
+                pthread_mutex_lock(&w->mu);
+                w->worker_busy = 0;
+                pthread_mutex_unlock(&w->mu);
+                pthread_cond_signal(&w->done_cv);
+                goto relock;
+            }
+        }
+
+        pthread_mutex_lock(&w->mu);
+        w->worker_busy = 0;
+        pthread_cond_signal(&w->done_cv);
+        continue;
+relock:
+        pthread_mutex_lock(&w->mu);
+    }
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+
+static void leanav_run_parallel_scale(
+    leanav_uv_scale_worker_t *w,
+    const uint8_t *src_y, int src_stride_y,
+    const uint8_t *src_u, int src_stride_u,
+    const uint8_t *src_v, int src_stride_v,
+    int fw, int fh, int src_bps,
+    uint8_t *dst_y, int dst_stride_y,
+    uint8_t *dst_u, int dst_stride_u,
+    uint8_t *dst_v, int dst_stride_v,
+    int dst_w, int dst_h, int is_10bit,
+    int y_mode, int y_step,
+    leanav_bilinear_tabs_t *y_tabs, leanav_bilinear_tabs_t *uv_tabs,
+    uint64_t *out_sum, uint64_t *out_sum_sq, uint64_t *out_cnt
+) {
+    int split_y = (y_mode != 0 && dst_h >= (LEANAV_SCALE_Y_SLICES * 4));
+    int ntasks = split_y ? (2 + LEANAV_SCALE_Y_SLICES) : 3;
+    pthread_mutex_lock(&w->mu);
+    while (w->worker_busy) pthread_cond_wait(&w->done_cv, &w->mu);
+    w->src_y = src_y;
+    w->src_stride_y = src_stride_y;
+    w->src_u = src_u;
+    w->src_stride_u = src_stride_u;
+    w->src_v = src_v;
+    w->src_stride_v = src_stride_v;
+    w->src_w_y = fw;
+    w->src_h_y = fh;
+    w->src_w_uv = fw >> 1;
+    w->src_h_uv = fh >> 1;
+    w->src_bps = src_bps;
+    w->dst_y = dst_y;
+    w->dst_stride_y = dst_stride_y;
+    w->dst_u = dst_u;
+    w->dst_stride_u = dst_stride_u;
+    w->dst_v = dst_v;
+    w->dst_stride_v = dst_stride_v;
+    w->dst_w_y = dst_w;
+    w->dst_h_y = dst_h;
+    w->dst_w_uv = dst_w >> 1;
+    w->dst_h_uv = dst_h >> 1;
+    w->is_10bit = is_10bit;
+    w->y_mode = y_mode;
+    w->y_step = y_step;
+    w->slice_h_y = split_y ? ((dst_h / LEANAV_SCALE_Y_SLICES) & ~3) : dst_h;
+    w->y_tabs = y_tabs;
+    w->uv_tabs = uv_tabs;
+    w->num_tasks = ntasks;
+    __atomic_store_n(&w->next_task, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&w->done_tasks, 0, __ATOMIC_RELEASE);
+    w->job_id++;
+    pthread_mutex_unlock(&w->mu);
+    pthread_cond_signal(&w->start_cv);
+
+    for (;;) {
+        int t = __atomic_fetch_add(&w->next_task, 1, __ATOMIC_ACQ_REL);
+        if (t >= ntasks) break;
+        leanav_exec_scale_task(w, t);
+        __atomic_add_fetch(&w->done_tasks, 1, __ATOMIC_ACQ_REL);
+    }
+    if (__atomic_load_n(&w->done_tasks, __ATOMIC_ACQUIRE) < ntasks) {
+        pthread_mutex_lock(&w->mu);
+        while (__atomic_load_n(&w->done_tasks, __ATOMIC_ACQUIRE) < ntasks) {
+            pthread_cond_wait(&w->done_cv, &w->mu);
+        }
+        pthread_mutex_unlock(&w->mu);
+    }
+    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+    int nslices = split_y ? LEANAV_SCALE_Y_SLICES : 1;
+    for (int s = 0; s < nslices; s++) {
+        sum += w->slice_sum[s];
+        sum_sq += w->slice_sum_sq[s];
+        cnt += w->slice_cnt[s];
+    }
+    *out_sum = sum;
+    *out_sum_sq = sum_sq;
+    *out_cnt = cnt;
+}
 
 typedef struct {
     AVFrame *pool[LEANAV_ENC_SLOTS];
+    AVFrame *src_pool[LEANAV_ENC_SLOTS];
     int free_stack[LEANAV_ENC_SLOTS];
     int free_top;
     int ready_idx[LEANAV_ENC_SLOTS];
     int ready_head, ready_tail, ready_count;
     int input_done;
+    int worker_done;
     AVPacket *ready[LEANAV_PKT_QUEUE];
     int pkt_head, pkt_tail, pkt_count;
     uint64_t video_bytes;
+    uint64_t mean_accum, var_accum;
+    int scale_in_worker;
+    int is_10bit;
+    size_t dst_w, dst_h;
+    uint32_t filter_flags;
+    leanav_bilinear_tabs_t *y_tabs, *uv_tabs;
+    leanav_uv_scale_worker_t uv_worker;
+    pthread_t uv_thread;
+    int uv_thread_on;
     int failed;
     pthread_mutex_t mu;
     pthread_cond_t has_frame;
@@ -2883,22 +4208,15 @@ static void leanav_enc_store_packet(leanav_enc_queue_t *q, AVPacket *ep) {
     q->ready[q->pkt_tail] = ep;
     q->pkt_tail = (q->pkt_tail + 1) % LEANAV_PKT_QUEUE;
     q->pkt_count++;
-}
-
-static void leanav_enc_return_slot(leanav_enc_queue_t *q, int idx) {
-    pthread_mutex_lock(&q->mu);
-    q->free_stack[q->free_top++] = idx;
-    pthread_cond_signal(&q->has_slot);
-    pthread_mutex_unlock(&q->mu);
+    if (q->input_done) pthread_cond_signal(&q->has_frame);
 }
 
 /* Owns venc. Drains every pending packet before blocking on the next frame,
    so send_frame can never stall forever on EAGAIN. A slot goes back to the
    pool only after the encoder has consumed it. */
 static void leanav_enc_take_packet(leanav_enc_queue_t *q, AVPacket *ep) {
-    pthread_mutex_lock(&q->mu);
     if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
-    pthread_mutex_unlock(&q->mu);
+    if (ep->duration <= 0) ep->duration = 1;
     ep->stream_index = q->ovs->index;
     av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
     AVPacket *kept = av_packet_alloc();
@@ -2921,40 +4239,159 @@ static void *leanav_enc_worker(void *arg) {
         pthread_mutex_unlock(&q->mu);
 
         AVFrame *f = q->pool[idx];
+        if (q->scale_in_worker) {
+            AVFrame *src_f = q->src_pool[idx];
+            int src_bps = (src_f->format == AV_PIX_FMT_YUV420P10LE) ? 2 : 1;
+            int fw = src_f->width;
+            int fh = src_f->height;
+            uint64_t f_mean = 0, f_var = 0;
+            int fused_10bit = (src_bps == 2 && q->is_10bit && fw == (int)q->dst_w * 2 && fh == (int)q->dst_h * 2);
+            int fused_8bit = (src_bps == 1 && !q->is_10bit && (q->filter_flags & 2u) == 0u && fw == (int)q->dst_w * 2 && fh == (int)q->dst_h * 2);
+            int y_mode = fused_10bit ? 2 : (fused_8bit ? 1 : 0);
+            int y_step = fused_10bit ? ((q->dst_w * q->dst_h > 65536) ? 16 : 1) : ((q->dst_w * q->dst_h >= 4096) ? 16 : 1);
+            uint64_t sum_top = 0, sum_sq_top = 0, cnt_top = 0;
+            if (q->uv_thread_on) {
+                leanav_run_parallel_scale(
+                    &q->uv_worker,
+                    src_f->data[0], src_f->linesize[0],
+                    src_f->data[1], src_f->linesize[1],
+                    src_f->data[2], src_f->linesize[2],
+                    fw, fh, src_bps,
+                    f->data[0], f->linesize[0],
+                    f->data[1], f->linesize[1],
+                    f->data[2], f->linesize[2],
+                    (int)q->dst_w, (int)q->dst_h, q->is_10bit,
+                    y_mode, y_step, q->y_tabs, q->uv_tabs,
+                    &sum_top, &sum_sq_top, &cnt_top);
+            } else {
+                if (fused_10bit) {
+                    leanav_scale_plane_2x2_u16_strided_accum(
+                        src_f->data[0], src_f->linesize[0], fw, fh,
+                        f->data[0], f->linesize[0], y_step, &sum_top, &sum_sq_top, &cnt_top);
+                } else if (fused_8bit) {
+                    leanav_scale_plane_2x2_strided_accum(
+                        src_f->data[0], src_f->linesize[0], fw, fh,
+                        f->data[0], f->linesize[0], y_step, &sum_top, &sum_sq_top, &cnt_top);
+                } else {
+                    leanav_copy_plane_to_dst(src_f->data[0], src_f->linesize[0], fw, fh, src_bps,
+                        f->data[0], f->linesize[0], (int)q->dst_w, (int)q->dst_h, q->y_tabs, q->is_10bit);
+                }
+                leanav_copy_plane_to_dst(src_f->data[1], src_f->linesize[1], fw >> 1, fh >> 1, src_bps,
+                    f->data[1], f->linesize[1], (int)(q->dst_w >> 1), (int)(q->dst_h >> 1), q->uv_tabs, q->is_10bit);
+                leanav_copy_plane_to_dst(src_f->data[2], src_f->linesize[2], fw >> 1, fh >> 1, src_bps,
+                    f->data[2], f->linesize[2], (int)(q->dst_w >> 1), (int)(q->dst_h >> 1), q->uv_tabs, q->is_10bit);
+            }
+            if ((fused_10bit || fused_8bit) && cnt_top > 0) {
+                f_mean = sum_top / cnt_top;
+                uint64_t msq = sum_sq_top / cnt_top;
+                f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
+            }
+            av_frame_unref(src_f);
+            if (!q->is_10bit && (q->filter_flags & 3u) != 0u) {
+                leanav_apply_pixel_filters_strided(
+                    f->data[0], f->linesize[0],
+                    f->data[1], f->linesize[1],
+                    f->data[2], f->linesize[2],
+                    q->dst_w, q->dst_h, q->filter_flags);
+            }
+            if (q->is_10bit) {
+                if (!fused_10bit) {
+                    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+                    size_t dst_y_sz = q->dst_w * q->dst_h;
+                    size_t step = (dst_y_sz > 65536) ? 16 : 1;
+                    size_t ystep = (step > 1) ? 4 : 1;
+                    for (size_t y = 0; y < q->dst_h; y += ystep) {
+                        const uint16_t *row = (const uint16_t *)(f->data[0] + y * (size_t)f->linesize[0]);
+                        for (size_t x = 0; x < q->dst_w; x += step) {
+                            uint32_t v = (uint32_t)(row[x] >> 2);
+                            sum += (uint64_t)v;
+                            sum_sq += (uint64_t)(v * v);
+                            cnt++;
+                        }
+                    }
+                    if (cnt > 0) {
+                        f_mean = sum / cnt;
+                        uint64_t msq = sum_sq / cnt;
+                        f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
+                    }
+                }
+            } else if (!fused_8bit) {
+                leanav_luma_stats_strided(f->data[0], f->linesize[0], (int)q->dst_w, (int)q->dst_h, &f_mean, &f_var);
+            }
+            q->mean_accum += f_mean;
+            q->var_accum += f_var;
+        }
         int send = avcodec_send_frame(q->venc, f);
         /* Hand the buffer back at once. x264 copies what it still needs, and
            holding the slot here stalls the decoder for the whole encode. */
-        leanav_enc_return_slot(q, idx);
+        pthread_mutex_lock(&q->mu);
+        int was_no_slot = (q->free_top == 0);
+        q->free_stack[q->free_top++] = idx;
+        if (was_no_slot) pthread_cond_signal(&q->has_slot);
+        pthread_mutex_unlock(&q->mu);
+        AVPacket *batch[LEANAV_PKT_QUEUE];
+        int nb = 0;
         for (;;) {
             int r = ep ? avcodec_receive_packet(q->venc, ep) : AVERROR(EAGAIN);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
             if (r < 0) { q->failed = 1; break; }
-            leanav_enc_take_packet(q, ep);
+            if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
+            if (ep->duration <= 0) ep->duration = 1;
+            ep->stream_index = q->ovs->index;
+            av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
+            AVPacket *kept = av_packet_alloc();
+            if (kept) {
+                av_packet_move_ref(kept, ep);
+                if (nb < LEANAV_PKT_QUEUE) {
+                    batch[nb++] = kept;
+                } else {
+                    pthread_mutex_lock(&q->mu);
+                    leanav_enc_store_packet(q, kept);
+                    pthread_mutex_unlock(&q->mu);
+                }
+            } else {
+                av_packet_unref(ep);
+            }
+        }
+        if (nb > 0) {
+            pthread_mutex_lock(&q->mu);
+            for (int i = 0; i < nb; i++) {
+                leanav_enc_store_packet(q, batch[i]);
+            }
+            pthread_mutex_unlock(&q->mu);
         }
         if (send < 0 && send != AVERROR(EAGAIN) && send != AVERROR_EOF) q->failed = 1;
     }
     avcodec_send_frame(q->venc, NULL);
     while (ep && avcodec_receive_packet(q->venc, ep) >= 0) leanav_enc_take_packet(q, ep);
     if (ep) av_packet_free(&ep);
+    pthread_mutex_lock(&q->mu);
+    q->worker_done = 1;
+    pthread_cond_signal(&q->has_frame);
+    pthread_mutex_unlock(&q->mu);
     return NULL;
 }
 
 /* Only the demux thread writes the container. Packets are emitted in DTS order
    against the audio already written, which av_interleaved_write_frame enforces. */
 static void leanav_enc_flush_packets(leanav_enc_queue_t *q, AVFormatContext *ofmt) {
+    if (*(volatile const int *)&q->pkt_count <= 0) return;
+    AVPacket *batch[LEANAV_PKT_QUEUE];
+    int n = 0;
     pthread_mutex_lock(&q->mu);
-    while (q->pkt_count > 0) {
-        AVPacket *p = q->ready[q->pkt_head];
+    int was_full = (q->pkt_count == LEANAV_PKT_QUEUE);
+    while (q->pkt_count > 0 && n < LEANAV_PKT_QUEUE) {
+        batch[n++] = q->ready[q->pkt_head];
         q->ready[q->pkt_head] = NULL;
         q->pkt_head = (q->pkt_head + 1) % LEANAV_PKT_QUEUE;
         q->pkt_count--;
-        pthread_cond_signal(&q->has_slot);
-        pthread_mutex_unlock(&q->mu);
-        av_interleaved_write_frame(ofmt, p);
-        av_packet_free(&p);
-        pthread_mutex_lock(&q->mu);
     }
+    if (was_full) pthread_cond_broadcast(&q->has_slot);
     pthread_mutex_unlock(&q->mu);
+    for (int i = 0; i < n; i++) {
+        av_interleaved_write_frame(ofmt, batch[i]);
+        av_packet_free(&batch[i]);
+    }
 }
 
 static uint64_t leanav_libav_transcode_pixel(
@@ -2969,21 +4406,66 @@ static uint64_t leanav_libav_transcode_pixel(
     av_log_set_level(AV_LOG_ERROR);
     AVFormatContext *ifmt = NULL;
     if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return 0;
-    if (avformat_find_stream_info(ifmt, NULL) < 0) {
-        avformat_close_input(&ifmt);
-        return 0;
-    }
     int v_idx = -1, a_idx = -1;
     for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
         enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
         if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
         else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
     }
+    int need_stream_info = 1;
+    if (v_idx >= 0) {
+        AVStream *st_v = ifmt->streams[v_idx];
+        int v_ok = st_v->codecpar &&
+                   st_v->codecpar->codec_id != AV_CODEC_ID_NONE &&
+                   st_v->codecpar->width > 0 &&
+                   st_v->codecpar->height > 0 &&
+                   st_v->codecpar->extradata_size > 0 &&
+                   ((st_v->r_frame_rate.num > 0 && st_v->r_frame_rate.den > 0) ||
+                    (st_v->avg_frame_rate.num > 0 && st_v->avg_frame_rate.den > 0));
+        int a_ok = 1;
+        if (with_audio && a_idx >= 0) {
+            AVStream *st_a = ifmt->streams[a_idx];
+            a_ok = st_a->codecpar &&
+                   st_a->codecpar->codec_id != AV_CODEC_ID_NONE &&
+                   st_a->codecpar->sample_rate > 0 &&
+                   st_a->codecpar->ch_layout.nb_channels > 0;
+        }
+        if (v_ok && a_ok) need_stream_info = 0;
+    }
+    if (need_stream_info) {
+        if (avformat_find_stream_info(ifmt, NULL) < 0) {
+            avformat_close_input(&ifmt);
+            return 0;
+        }
+        v_idx = -1; a_idx = -1;
+        for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+            enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
+            if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
+            else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
+        }
+    }
     if (v_idx < 0) {
         avformat_close_input(&ifmt);
         return 0;
     }
+    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
+        if ((int)i != v_idx && (int)i != a_idx) {
+            ifmt->streams[i]->discard = AVDISCARD_ALL;
+        }
+    }
     AVStream *ivs = ifmt->streams[v_idx];
+    if ((filter_flags & 3u) == 0u && hdr_cs == 0 && ivs->codecpar) {
+        if (ivs->codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            hdr_cs = 2;
+        } else if (ivs->codecpar->color_primaries == AVCOL_PRI_BT2020 ||
+                   ivs->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ||
+                   ivs->codecpar->color_space == AVCOL_SPC_BT2020_NCL ||
+                   ivs->codecpar->color_space == AVCOL_SPC_BT2020_CL) {
+            hdr_cs = 1;
+        } else {
+            hdr_cs = leanav_probe_input_hdr_colorspace(in_path, "");
+        }
+    }
     const AVCodec *vdec = avcodec_find_decoder(ivs->codecpar->codec_id);
     if (!vdec) { avformat_close_input(&ifmt); return 0; }
     AVCodecContext *vdec_ctx = avcodec_alloc_context3(vdec);
@@ -2996,10 +4478,23 @@ static uint64_t leanav_libav_transcode_pixel(
        threading lets a frame split across the cores the encoder is not using. */
     vdec_ctx->thread_count = 0;
     vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    const char *decoder_thread_type = getenv("LEANAV_DECODER_THREAD_TYPE");
+    if (decoder_thread_type && strcmp(decoder_thread_type, "slice") == 0) vdec_ctx->thread_type = FF_THREAD_SLICE;
+    else if (decoder_thread_type && strcmp(decoder_thread_type, "frame") == 0) vdec_ctx->thread_type = FF_THREAD_FRAME;
+    const char *decoder_threads = getenv("LEANAV_DECODER_THREADS");
+    if (decoder_threads && decoder_threads[0] >= '0' && decoder_threads[0] <= '9') {
+        char *end = NULL;
+        long count = strtol(decoder_threads, &end, 10);
+        if (*end == '\0' && count >= 0 && count <= 256) vdec_ctx->thread_count = (int)count;
+    }
     if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
         avcodec_free_context(&vdec_ctx);
         avformat_close_input(&ifmt);
         return 0;
+    }
+    if (getenv("LEANAV_PROFILE")) {
+        fprintf(stderr, "LEANAV_PROFILE_DECODER threads=%d active_thread_type=%d\n",
+            vdec_ctx->thread_count, vdec_ctx->active_thread_type);
     }
     int is_10bit = (strcmp(g_enc_pix_fmt, "yuv420p10le") == 0 || strcmp(g_enc_pix_fmt, "p010le") == 0) ? 1 : 0;
     uint32_t fps_num = 24000u, fps_den = 1001u;
@@ -3048,19 +4543,29 @@ static uint64_t leanav_libav_transcode_pixel(
                 a_ch = dst_ch;
                 int64_t a_br = leanav_parse_bitrate(g_enc_ab, (filter_flags & 8u) ? 192000 : 128000);
                 if (leanav_open_audio_encoder(&aenc, a_sr, a_ch, a_br) == 0) {
-                    swr = swr_alloc();
-                    if (swr) {
-                        av_opt_set_chlayout(swr, "in_chlayout", &adec->ch_layout, 0);
-                        av_opt_set_int(swr, "in_sample_rate", adec->sample_rate, 0);
-                        av_opt_set_sample_fmt(swr, "in_sample_fmt", adec->sample_fmt, 0);
-                        av_opt_set_chlayout(swr, "out_chlayout", &aenc->ch_layout, 0);
-                        av_opt_set_int(swr, "out_sample_rate", aenc->sample_rate, 0);
-                        av_opt_set_sample_fmt(swr, "out_sample_fmt", aenc->sample_fmt, 0);
-                        if (swr_init(swr) < 0) {
-                            swr_free(&swr);
-                            avcodec_free_context(&aenc);
-                        } else {
-                            afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
+                    const char *audio_direct = getenv("LEANAV_AUDIO_DIRECT");
+                    int allow_audio_direct = !audio_direct || strcmp(audio_direct, "0") != 0;
+                    int same_layout = allow_audio_direct &&
+                                      av_channel_layout_compare(&adec->ch_layout, &aenc->ch_layout) == 0 &&
+                                      adec->sample_rate == aenc->sample_rate &&
+                                      adec->sample_fmt == aenc->sample_fmt;
+                    if (same_layout) {
+                        afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
+                    } else {
+                        swr = swr_alloc();
+                        if (swr) {
+                            av_opt_set_chlayout(swr, "in_chlayout", &adec->ch_layout, 0);
+                            av_opt_set_int(swr, "in_sample_rate", adec->sample_rate, 0);
+                            av_opt_set_sample_fmt(swr, "in_sample_fmt", adec->sample_fmt, 0);
+                            av_opt_set_chlayout(swr, "out_chlayout", &aenc->ch_layout, 0);
+                            av_opt_set_int(swr, "out_sample_rate", aenc->sample_rate, 0);
+                            av_opt_set_sample_fmt(swr, "out_sample_fmt", aenc->sample_fmt, 0);
+                            if (swr_init(swr) < 0) {
+                                swr_free(&swr);
+                                avcodec_free_context(&aenc);
+                            } else {
+                                afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
+                            }
                         }
                     }
                 }
@@ -3115,8 +4620,14 @@ static uint64_t leanav_libav_transcode_pixel(
         }
     }
     AVDictionary *mux_opts = NULL;
-    av_dict_set(&mux_opts, "movflags", "+faststart", 0);
-    av_dict_set(&mux_opts, "reserve_index_space", "65536", 0);
+    {
+        int64_t est_dur_s = 60;
+        if (dur_ms > 0) est_dur_s = (int64_t)(dur_ms / 1000) + 10;
+        else if (ifmt->duration > 0) est_dur_s = (ifmt->duration / AV_TIME_BASE) + 10;
+        int64_t moov_reserve = 262144;
+        if (est_dur_s * 1024 > moov_reserve) moov_reserve = est_dur_s * 1024;
+        av_dict_set_int(&mux_opts, "moov_size", moov_reserve, 0);
+    }
     if (avformat_write_header(ofmt, &mux_opts) < 0) {
         av_dict_free(&mux_opts);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
@@ -3132,46 +4643,48 @@ static uint64_t leanav_libav_transcode_pixel(
     }
     av_dict_free(&mux_opts);
 
-    char fps_str[64];
-    double fps_val = (fps_den > 0) ? ((double)fps_num / (double)fps_den) : 23.98;
-    snprintf(fps_str, sizeof(fps_str), "%.2f", fps_val);
-    const char *raw_pix = is_10bit ? "yuv420p10le" : "yuv420p";
+    if (g_ui_show_banner) {
+        char fps_str[64];
+        double fps_val = (fps_den > 0) ? ((double)fps_num / (double)fps_den) : 23.98;
+        snprintf(fps_str, sizeof(fps_str), "%.2f", fps_val);
+        const char *raw_pix = is_10bit ? "yuv420p10le" : "yuv420p";
 
-    leanav_media_info_t info;
-    leanav_populate_media_info_mp4_boxes(in_path, &info);
-    if (ifmt->duration > 0) {
-        info.duration_s = (double)ifmt->duration / (double)AV_TIME_BASE;
-    }
-    if (ifmt->bit_rate > 0) {
-        info.bitrate_kbps = ifmt->bit_rate / 1000;
-    }
-    if (ifmt->metadata) {
-        AVDictionaryEntry *e = NULL;
-        if ((e = av_dict_get(ifmt->metadata, "major_brand", NULL, 0)) && e->value)
-            snprintf(info.major_brand, sizeof(info.major_brand), "%s", e->value);
-        if ((e = av_dict_get(ifmt->metadata, "minor_version", NULL, 0)) && e->value)
-            info.minor_version = (uint32_t)strtoul(e->value, NULL, 10);
-        if ((e = av_dict_get(ifmt->metadata, "compatible_brands", NULL, 0)) && e->value)
-            snprintf(info.compatible_brands, sizeof(info.compatible_brands), "%s", e->value);
-        if ((e = av_dict_get(ifmt->metadata, "encoder", NULL, 0)) && e->value)
-            snprintf(info.encoder, sizeof(info.encoder), "%s", e->value);
-    }
-    if (ivs->codecpar->sample_aspect_ratio.num > 0 && ivs->codecpar->sample_aspect_ratio.den > 0) {
-        info.sar_num = ivs->codecpar->sample_aspect_ratio.num;
-        info.sar_den = ivs->codecpar->sample_aspect_ratio.den;
-    }
-    if (a_idx >= 0 && adec) {
-        info.audio_sample_rate = adec->sample_rate > 0 ? adec->sample_rate : 48000;
-        info.audio_channels = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
-        if (ifmt->streams[a_idx]->codecpar->bit_rate > 0)
-            info.audio_bitrate_kbps = ifmt->streams[a_idx]->codecpar->bit_rate / 1000;
-    }
+        leanav_media_info_t info;
+        leanav_populate_media_info_mp4_boxes(in_path, &info);
+        if (ifmt->duration > 0) {
+            info.duration_s = (double)ifmt->duration / (double)AV_TIME_BASE;
+        }
+        if (ifmt->bit_rate > 0) {
+            info.bitrate_kbps = ifmt->bit_rate / 1000;
+        }
+        if (ifmt->metadata) {
+            AVDictionaryEntry *e = NULL;
+            if ((e = av_dict_get(ifmt->metadata, "major_brand", NULL, 0)) && e->value)
+                snprintf(info.major_brand, sizeof(info.major_brand), "%s", e->value);
+            if ((e = av_dict_get(ifmt->metadata, "minor_version", NULL, 0)) && e->value)
+                info.minor_version = (uint32_t)strtoul(e->value, NULL, 10);
+            if ((e = av_dict_get(ifmt->metadata, "compatible_brands", NULL, 0)) && e->value)
+                snprintf(info.compatible_brands, sizeof(info.compatible_brands), "%s", e->value);
+            if ((e = av_dict_get(ifmt->metadata, "encoder", NULL, 0)) && e->value)
+                snprintf(info.encoder, sizeof(info.encoder), "%s", e->value);
+        }
+        if (ivs->codecpar->sample_aspect_ratio.num > 0 && ivs->codecpar->sample_aspect_ratio.den > 0) {
+            info.sar_num = ivs->codecpar->sample_aspect_ratio.num;
+            info.sar_den = ivs->codecpar->sample_aspect_ratio.den;
+        }
+        if (a_idx >= 0 && adec) {
+            info.audio_sample_rate = adec->sample_rate > 0 ? adec->sample_rate : 48000;
+            info.audio_channels = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
+            if (ifmt->streams[a_idx]->codecpar->bit_rate > 0)
+                info.audio_bitrate_kbps = ifmt->streams[a_idx]->codecpar->bit_rate / 1000;
+        }
 
-    leanav_print_ffmpeg_banner(
-        in_path, out_path, src_w, src_h, dst_w, dst_h,
-        codec_id_u32, raw_pix, fps_str, aenc != NULL,
-        (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags & 8u) ? "192k" : "128k"),
-        &info, enc_name);
+        leanav_print_ffmpeg_banner(
+            in_path, out_path, src_w, src_h, dst_w, dst_h,
+            codec_id_u32, raw_pix, fps_str, aenc != NULL,
+            (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags & 8u) ? "192k" : "128k"),
+            &info, enc_name);
+    }
 
     int64_t start_pts = AV_NOPTS_VALUE;
     int64_t end_pts = AV_NOPTS_VALUE;
@@ -3187,9 +4700,16 @@ static uint64_t leanav_libav_transcode_pixel(
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    if (!pkt || !frame) {
+    AVFrame *af = av_frame_alloc();
+    AVFrame *ef_sync = NULL;
+    AVPacket *ap_sync = NULL;
+    uint8_t **swr_out_buf = NULL;
+    int swr_out_cap = 0;
+    int swr_linesize = 0;
+    if (!pkt || !frame || !af) {
         if (pkt) av_packet_free(&pkt);
         if (frame) av_frame_free(&frame);
+        if (af) av_frame_free(&af);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
         avformat_free_context(ofmt);
         if (afifo) av_audio_fifo_free(afifo);
@@ -3205,21 +4725,62 @@ static uint64_t leanav_libav_transcode_pixel(
     memset(&enc_q, 0, sizeof(enc_q));
     enc_q.venc = venc;
     enc_q.ovs = ovs;
+    enc_q.is_10bit = is_10bit;
+    enc_q.dst_w = dst_w;
+    enc_q.dst_h = dst_h;
+    enc_q.filter_flags = filter_flags;
+    enc_q.y_tabs = y_tabs;
+    enc_q.uv_tabs = uv_tabs;
+    const char *scale_worker_env = getenv("LEANAV_SCALE_IN_WORKER");
+    enc_q.scale_in_worker = is_10bit && scale_worker_env && strcmp(scale_worker_env, "1") == 0;
+    const char *uv_thread_env = getenv("LEANAV_UV_THREAD");
+    int allow_uv_thread = !uv_thread_env || strcmp(uv_thread_env, "0") != 0;
+    if (allow_uv_thread) {
+        pthread_mutex_init(&enc_q.uv_worker.mu, NULL);
+        pthread_cond_init(&enc_q.uv_worker.start_cv, NULL);
+        pthread_cond_init(&enc_q.uv_worker.done_cv, NULL);
+        enc_q.uv_thread_on = pthread_create(&enc_q.uv_thread, NULL, leanav_uv_scale_worker, &enc_q.uv_worker) == 0;
+        if (!enc_q.uv_thread_on) {
+            pthread_mutex_destroy(&enc_q.uv_worker.mu);
+            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
+            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
+        }
+    }
     int pool_ok = 1;
     for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
         AVFrame *f = av_frame_alloc();
-        if (!f) { pool_ok = 0; break; }
+        AVFrame *sf = enc_q.scale_in_worker ? av_frame_alloc() : NULL;
+        if (!f || (enc_q.scale_in_worker && !sf)) { if (f) av_frame_free(&f); if (sf) av_frame_free(&sf); pool_ok = 0; break; }
         f->format = venc->pix_fmt;
         f->width = (int)dst_w;
         f->height = (int)dst_h;
-        if (av_frame_get_buffer(f, 32) < 0) { av_frame_free(&f); pool_ok = 0; break; }
+        f->color_primaries = venc->color_primaries;
+        f->color_trc = venc->color_trc;
+        f->colorspace = venc->colorspace;
+        f->color_range = venc->color_range;
+        if (av_frame_get_buffer(f, 32) < 0) { av_frame_free(&f); if (sf) av_frame_free(&sf); pool_ok = 0; break; }
         enc_q.pool[i] = f;
+        enc_q.src_pool[i] = sf;
         enc_q.free_stack[enc_q.free_top++] = i;
     }
     if (!pool_ok) {
-        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
+        if (enc_q.uv_thread_on) {
+            pthread_mutex_lock(&enc_q.uv_worker.mu);
+            enc_q.uv_worker.stop = 1;
+            pthread_cond_signal(&enc_q.uv_worker.start_cv);
+            pthread_mutex_unlock(&enc_q.uv_worker.mu);
+            pthread_join(enc_q.uv_thread, NULL);
+            pthread_mutex_destroy(&enc_q.uv_worker.mu);
+            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
+            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
+        }
+        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
+            if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
+            if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
+        }
         av_packet_free(&pkt);
         av_frame_free(&frame);
+        av_frame_free(&af);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
         avformat_free_context(ofmt);
         if (afifo) av_audio_fifo_free(afifo);
@@ -3236,8 +4797,26 @@ static uint64_t leanav_libav_transcode_pixel(
     pthread_cond_init(&enc_q.has_slot, NULL);
     pthread_t enc_thread;
     if (pthread_create(&enc_thread, NULL, leanav_enc_worker, &enc_q) != 0) {
+        if (enc_q.uv_thread_on) {
+            pthread_mutex_lock(&enc_q.uv_worker.mu);
+            enc_q.uv_worker.stop = 1;
+            pthread_cond_signal(&enc_q.uv_worker.start_cv);
+            pthread_mutex_unlock(&enc_q.uv_worker.mu);
+            pthread_join(enc_q.uv_thread, NULL);
+            pthread_mutex_destroy(&enc_q.uv_worker.mu);
+            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
+            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
+        }
+        pthread_mutex_destroy(&enc_q.mu);
+        pthread_cond_destroy(&enc_q.has_frame);
+        pthread_cond_destroy(&enc_q.has_slot);
+        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
+            if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
+            if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
+        }
         av_packet_free(&pkt);
         av_frame_free(&frame);
+        av_frame_free(&af);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
         avformat_free_context(ofmt);
         if (afifo) av_audio_fifo_free(afifo);
@@ -3264,51 +4843,124 @@ static uint64_t leanav_libav_transcode_pixel(
     int64_t next_a_pts = 0;
     int video_done = 0;
     int read_eof = 0;
+    leanav_audio_job_t ajob;
+    pthread_t athread;
+    int athread_on = 0;
+    memset(&ajob, 0, sizeof(ajob));
+    const char *audio_thread_env = getenv("LEANAV_AUDIO_THREAD");
+    int allow_audio_thread = !audio_thread_env || strcmp(audio_thread_env, "0") != 0;
+    if (allow_audio_thread && adec && aenc && oas && afifo) {
+        ajob.adec = adec; ajob.aenc = aenc; ajob.swr = swr; ajob.afifo = afifo;
+        ajob.oas = oas; ajob.a_ch = a_ch;
+        pthread_mutex_init(&ajob.in.mu, NULL);
+        pthread_cond_init(&ajob.in.has_room, NULL);
+        pthread_cond_init(&ajob.in.has_pkt, NULL);
+        pthread_mutex_init(&ajob.out.mu, NULL);
+        pthread_cond_init(&ajob.out.has_room, NULL);
+        pthread_cond_init(&ajob.out.has_pkt, NULL);
+        athread_on = pthread_create(&athread, NULL, leanav_audio_worker, &ajob) == 0;
+        if (!athread_on) {
+            pthread_mutex_destroy(&ajob.in.mu);
+            pthread_cond_destroy(&ajob.in.has_room);
+            pthread_cond_destroy(&ajob.in.has_pkt);
+            pthread_mutex_destroy(&ajob.out.mu);
+            pthread_cond_destroy(&ajob.out.has_room);
+            pthread_cond_destroy(&ajob.out.has_pkt);
+        }
+    }
+    if (!athread_on && aenc && oas && afifo) {
+        ef_sync = av_frame_alloc();
+        ap_sync = av_packet_alloc();
+    }
+    const int profile_enabled = getenv("LEANAV_PROFILE") != NULL;
+    uint64_t profile_t0 = 0;
+    uint64_t demux_us = 0, video_send_us = 0, video_receive_us = 0;
+    uint64_t audio_aggregate_including_mux_us = 0, slot_wait_us = 0;
+    uint64_t scale_stats_aggregate_us = 0, mux_flush_us = 0, encoder_join_us = 0;
+    uint64_t scale_filter_us = 0, scale_y_us = 0, scale_u_us = 0, scale_v_us = 0, stats_acceptance_us = 0, encoder_finish_wait_us = 0;
+    uint64_t scale_cpu_ns = 0;
+    uint64_t queue_samples = 0, ready_sum = 0, packet_sum = 0, no_free_samples = 0;
+    int ready_peak = 0, packet_peak = 0;
 
     while (!video_done) {
-        if (!read_eof && av_read_frame(ifmt, pkt) >= 0) {
+        int read_rc = -1;
+        if (!read_eof) {
+            if (profile_enabled) profile_t0 = leanav_mono_us();
+            read_rc = av_read_frame(ifmt, pkt);
+            if (profile_enabled) demux_us += leanav_mono_us() - profile_t0;
+        }
+        if (!read_eof && read_rc >= 0) {
             if (pkt->stream_index == v_idx) {
                 if (end_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= end_pts) {
                     video_done = 1;
                     av_packet_unref(pkt);
                     continue;
                 }
-                if (avcodec_send_packet(vdec_ctx, pkt) < 0) {
+                if (profile_enabled) profile_t0 = leanav_mono_us();
+                int send_rc = avcodec_send_packet(vdec_ctx, pkt);
+                if (profile_enabled) video_send_us += leanav_mono_us() - profile_t0;
+                if (send_rc < 0) {
                     av_packet_unref(pkt);
                     continue;
                 }
-            } else if (a_idx >= 0 && pkt->stream_index == a_idx && adec && swr && aenc && oas && afifo) {
-                if (avcodec_send_packet(adec, pkt) >= 0) {
-                    AVFrame *af = av_frame_alloc();
-                    while (af && avcodec_receive_frame(adec, af) >= 0) {
-                        int out_samples = (int)av_rescale_rnd(
-                            swr_get_delay(swr, adec->sample_rate) + af->nb_samples,
-                            aenc->sample_rate, adec->sample_rate, AV_ROUND_UP);
-                        uint8_t **out_buf = NULL;
-                        int linesize = 0;
-                        if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, out_samples, aenc->sample_fmt, 0) >= 0) {
-                            int converted = swr_convert(swr, out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
-                            if (converted > 0) {
-                                av_audio_fifo_write(afifo, (void **)out_buf, converted);
-                                leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes);
+            } else if (a_idx >= 0 && pkt->stream_index == a_idx && adec && aenc && oas && afifo) {
+                if (profile_enabled) profile_t0 = leanav_mono_us();
+                if (athread_on) {
+                    AVPacket *acopy = av_packet_alloc();
+                    if (acopy) {
+                        av_packet_move_ref(acopy, pkt);
+                        leanav_apkt_push(&ajob.in, acopy);
+                    }
+                    leanav_audio_flush_packets(&ajob, ofmt);
+                } else if (avcodec_send_packet(adec, pkt) >= 0) {
+                    while (avcodec_receive_frame(adec, af) >= 0) {
+                        if (!swr && af->nb_samples > 0) {
+                            av_audio_fifo_write(afifo, (void **)af->extended_data, af->nb_samples);
+                            leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes, ef_sync, ap_sync);
+                        } else if (swr) {
+                            int out_samples = (int)av_rescale_rnd(
+                                swr_get_delay(swr, adec->sample_rate) + af->nb_samples,
+                                aenc->sample_rate, adec->sample_rate, AV_ROUND_UP);
+                            if (out_samples > swr_out_cap) {
+                                if (swr_out_buf) {
+                                    av_freep(&swr_out_buf[0]);
+                                    av_freep(&swr_out_buf);
+                                }
+                                swr_out_cap = 0;
+                                int cap = out_samples < 4096 ? 4096 : out_samples * 2;
+                                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, a_ch, cap, aenc->sample_fmt, 0) >= 0) {
+                                    swr_out_cap = cap;
+                                }
                             }
-                            if (out_buf) {
-                                av_freep(&out_buf[0]);
-                                av_freep(&out_buf);
+                            if (swr_out_buf && swr_out_cap >= out_samples) {
+                                int converted = swr_convert(swr, swr_out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
+                                if (converted > 0) {
+                                    av_audio_fifo_write(afifo, (void **)swr_out_buf, converted);
+                                    leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes, ef_sync, ap_sync);
+                                }
                             }
                         }
                         av_frame_unref(af);
                     }
-                    av_frame_free(&af);
                 }
+                if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
+                av_packet_unref(pkt);
+                continue;
+            } else {
+                av_packet_unref(pkt);
+                continue;
             }
             av_packet_unref(pkt);
-        } else {
+        } else if (!read_eof) {
             read_eof = 1;
+            if (profile_enabled) profile_t0 = leanav_mono_us();
             avcodec_send_packet(vdec_ctx, NULL);
+            if (profile_enabled) video_send_us += leanav_mono_us() - profile_t0;
         }
 
+        if (profile_enabled) profile_t0 = leanav_mono_us();
         int got = avcodec_receive_frame(vdec_ctx, frame);
+        if (profile_enabled) video_receive_us += leanav_mono_us() - profile_t0;
         if (got == AVERROR(EAGAIN)) {
             if (read_eof) break;
             continue;
@@ -3324,94 +4976,179 @@ static uint64_t leanav_libav_transcode_pixel(
         int fw = frame->width;
         int fh = frame->height;
         if (fw < 2 || fh < 2) { av_frame_unref(frame); continue; }
+        if (profile_enabled) profile_t0 = leanav_mono_us();
         pthread_mutex_lock(&enc_q.mu);
+        if (profile_enabled) {
+            queue_samples++;
+            ready_sum += (uint64_t)enc_q.ready_count;
+            packet_sum += (uint64_t)enc_q.pkt_count;
+            if (enc_q.ready_count > ready_peak) ready_peak = enc_q.ready_count;
+            if (enc_q.pkt_count > packet_peak) packet_peak = enc_q.pkt_count;
+            if (enc_q.free_top == 0) no_free_samples++;
+        }
         while (enc_q.free_top == 0) {
             pthread_mutex_unlock(&enc_q.mu);
+            if (profile_enabled) {
+                uint64_t now = leanav_mono_us();
+                slot_wait_us += now - profile_t0;
+                profile_t0 = now;
+            }
             leanav_enc_flush_packets(&enc_q, ofmt);
+            if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
+            if (profile_enabled) {
+                uint64_t now = leanav_mono_us();
+                mux_flush_us += now - profile_t0;
+                profile_t0 = now;
+            }
             pthread_mutex_lock(&enc_q.mu);
             if (enc_q.free_top == 0) pthread_cond_wait(&enc_q.has_slot, &enc_q.mu);
         }
         int slot_idx = enc_q.free_stack[--enc_q.free_top];
         pthread_mutex_unlock(&enc_q.mu);
+        if (profile_enabled) slot_wait_us += leanav_mono_us() - profile_t0;
+        if (profile_enabled) profile_t0 = leanav_mono_us();
         AVFrame *dst_frame = enc_q.pool[slot_idx];
-        leanav_copy_plane_to_dst(frame->data[0], frame->linesize[0], fw, fh, src_bps,
-            dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, y_tabs, is_10bit);
-        leanav_copy_plane_to_dst(frame->data[1], frame->linesize[1], fw >> 1, fh >> 1, src_bps,
-            dst_frame->data[1], dst_frame->linesize[1], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
-        leanav_copy_plane_to_dst(frame->data[2], frame->linesize[2], fw >> 1, fh >> 1, src_bps,
-            dst_frame->data[2], dst_frame->linesize[2], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
-        if (!is_10bit && (filter_flags & 3u) != 0u) {
-            size_t ysz = dst_w * dst_h;
-            size_t uvsz = (dst_w >> 1) * (dst_h >> 1);
-            uint8_t *y_pack = (uint8_t *)malloc(ysz);
-            uint8_t *u_pack = (uint8_t *)malloc(uvsz);
-            uint8_t *v_pack = (uint8_t *)malloc(uvsz);
-            if (y_pack && u_pack && v_pack) {
-                for (size_t y = 0; y < dst_h; y++) memcpy(y_pack + y * dst_w, dst_frame->data[0] + y * (size_t)dst_frame->linesize[0], dst_w);
-                for (size_t y = 0; y < (dst_h >> 1); y++) {
-                    memcpy(u_pack + y * (dst_w >> 1), dst_frame->data[1] + y * (size_t)dst_frame->linesize[1], dst_w >> 1);
-                    memcpy(v_pack + y * (dst_w >> 1), dst_frame->data[2] + y * (size_t)dst_frame->linesize[2], dst_w >> 1);
-                }
-                leanav_apply_pixel_filters_raw(y_pack, u_pack, v_pack, dst_w, dst_h, filter_flags);
-                for (size_t y = 0; y < dst_h; y++) memcpy(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0], y_pack + y * dst_w, dst_w);
-                for (size_t y = 0; y < (dst_h >> 1); y++) {
-                    memcpy(dst_frame->data[1] + y * (size_t)dst_frame->linesize[1], u_pack + y * (dst_w >> 1), dst_w >> 1);
-                    memcpy(dst_frame->data[2] + y * (size_t)dst_frame->linesize[2], v_pack + y * (dst_w >> 1), dst_w >> 1);
-                }
-            }
-            free(y_pack); free(u_pack); free(v_pack);
-        }
         dst_frame->pts = next_v_pts++;
-        dst_frame->color_primaries = venc->color_primaries;
-        dst_frame->color_trc = venc->color_trc;
-        dst_frame->colorspace = venc->colorspace;
-        dst_frame->color_range = venc->color_range;
-
-        uint64_t f_mean = 0, f_var = 0;
-        size_t dst_y_sz = dst_w * dst_h;
-        if (is_10bit) {
-            uint64_t sum = 0, sum_sq = 0, cnt = 0;
-            size_t step = (dst_y_sz > 65536) ? 16 : 1;
-            for (size_t y = 0; y < dst_h; y += (step > 1 ? 4 : 1)) {
-                const uint16_t *row = (const uint16_t *)(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0]);
-                for (size_t x = 0; x < dst_w; x += step) {
-                    uint64_t v = (uint64_t)(row[x] >> 2);
-                    sum += v; sum_sq += v * v; cnt++;
+        if (enc_q.scale_in_worker) {
+            av_frame_unref(enc_q.src_pool[slot_idx]);
+            av_frame_move_ref(enc_q.src_pool[slot_idx], frame);
+        } else {
+            uint64_t f_mean = 0, f_var = 0;
+            int fused_10bit_stats = (src_bps == 2 && is_10bit && fw == (int)dst_w * 2 && fh == (int)dst_h * 2);
+            int fused_8bit_stats = (src_bps == 1 && !is_10bit && (filter_flags & 2u) == 0u && fw == (int)dst_w * 2 && fh == (int)dst_h * 2);
+            int y_mode = fused_10bit_stats ? 2 : (fused_8bit_stats ? 1 : 0);
+            int y_step = fused_10bit_stats ? ((dst_w * dst_h > 65536) ? 16 : 1) : ((dst_w * dst_h >= 4096) ? 16 : 1);
+            uint64_t sum_top = 0, sum_sq_top = 0, cnt_top = 0;
+            uint64_t scale_t0 = profile_enabled ? leanav_mono_us() : 0;
+            struct timespec scale_cpu_start;
+            int scale_cpu_valid = profile_enabled && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &scale_cpu_start) == 0;
+            if (enc_q.uv_thread_on) {
+                leanav_run_parallel_scale(
+                    &enc_q.uv_worker,
+                    frame->data[0], frame->linesize[0],
+                    frame->data[1], frame->linesize[1],
+                    frame->data[2], frame->linesize[2],
+                    fw, fh, src_bps,
+                    dst_frame->data[0], dst_frame->linesize[0],
+                    dst_frame->data[1], dst_frame->linesize[1],
+                    dst_frame->data[2], dst_frame->linesize[2],
+                    (int)dst_w, (int)dst_h, is_10bit,
+                    y_mode, y_step, y_tabs, uv_tabs,
+                    &sum_top, &sum_sq_top, &cnt_top);
+                if (profile_enabled) scale_y_us += leanav_mono_us() - scale_t0;
+            } else {
+                if (fused_10bit_stats) {
+                    leanav_scale_plane_2x2_u16_strided_accum(
+                        frame->data[0], frame->linesize[0], fw, fh,
+                        dst_frame->data[0], dst_frame->linesize[0],
+                        y_step, &sum_top, &sum_sq_top, &cnt_top);
+                } else if (fused_8bit_stats) {
+                    leanav_scale_plane_2x2_strided_accum(
+                        frame->data[0], frame->linesize[0], fw, fh,
+                        dst_frame->data[0], dst_frame->linesize[0],
+                        y_step, &sum_top, &sum_sq_top, &cnt_top);
+                } else {
+                    leanav_copy_plane_to_dst(frame->data[0], frame->linesize[0], fw, fh, src_bps,
+                        dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, y_tabs, is_10bit);
                 }
+                uint64_t plane_t0 = profile_enabled ? leanav_mono_us() : 0;
+                if (profile_enabled) scale_y_us += plane_t0 - scale_t0;
+                leanav_copy_plane_to_dst(frame->data[1], frame->linesize[1], fw >> 1, fh >> 1, src_bps,
+                    dst_frame->data[1], dst_frame->linesize[1], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
+                uint64_t plane_u_t1 = profile_enabled ? leanav_mono_us() : 0;
+                if (profile_enabled) scale_u_us += plane_u_t1 - plane_t0;
+                leanav_copy_plane_to_dst(frame->data[2], frame->linesize[2], fw >> 1, fh >> 1, src_bps,
+                    dst_frame->data[2], dst_frame->linesize[2], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
+                if (profile_enabled) scale_v_us += leanav_mono_us() - plane_u_t1;
             }
-            if (cnt > 0) {
-                f_mean = sum / cnt;
-                uint64_t msq = sum_sq / cnt;
+            if ((fused_10bit_stats || fused_8bit_stats) && cnt_top > 0) {
+                f_mean = sum_top / cnt_top;
+                uint64_t msq = sum_sq_top / cnt_top;
                 f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
             }
-        } else {
-            /* Zero-allocation strided luma stats & sampled 16x16 macroblock acceptance */
-            leanav_luma_stats_strided(dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, &f_mean, &f_var);
-            if ((frames_done & 7ULL) == 0ULL && src_bps == 1) {
-                uint64_t f_sad = 0, f_psnr = 480;
-                uint32_t f_dist = 1;
-                leanav_measure_luma_acceptance_16x16_strided(
-                    frame->data[0], frame->linesize[0], (size_t)fw, (size_t)fh,
-                    dst_frame->data[0], dst_frame->linesize[0], dst_w, dst_h,
-                    &f_sad, &f_psnr, &f_dist);
-                if ((filter_flags & 2u) != 0u && f_sad > 2048ULL) {
-                    f_sad = 1024ULL; f_psnr = 380ULL; f_dist = 1u;
+            if (profile_enabled && frames_done == 0) fprintf(stderr, "LEANAV_PROFILE_FORMAT format=%d expected10=%d src_bps=%d dst10=%d width=%d height=%d strides=%d,%d,%d\n", frame->format, AV_PIX_FMT_YUV420P10LE, src_bps, is_10bit, fw, fh, frame->linesize[0], frame->linesize[1], frame->linesize[2]);
+            if (!is_10bit && (filter_flags & 3u) != 0u) {
+                leanav_apply_pixel_filters_strided(
+                    dst_frame->data[0], dst_frame->linesize[0],
+                    dst_frame->data[1], dst_frame->linesize[1],
+                    dst_frame->data[2], dst_frame->linesize[2],
+                    dst_w, dst_h, filter_flags);
+            }
+            if (profile_enabled) {
+                scale_filter_us += leanav_mono_us() - scale_t0;
+                if (scale_cpu_valid) {
+                    struct timespec scale_cpu_end;
+                    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &scale_cpu_end) == 0) {
+                        int64_t elapsed_ns = (int64_t)(scale_cpu_end.tv_sec - scale_cpu_start.tv_sec) * 1000000000LL + scale_cpu_end.tv_nsec - scale_cpu_start.tv_nsec;
+                        if (elapsed_ns >= 0) scale_cpu_ns += (uint64_t)elapsed_ns;
+                    }
                 }
-                if (f_sad > max_sad_worst) max_sad_worst = f_sad;
-                if (f_psnr < psnr_min) psnr_min = f_psnr;
-                if (!f_dist) dist_lt_black_all = 0;
+            }
+            uint64_t stats_t0_us = profile_enabled ? leanav_mono_us() : 0;
+            size_t dst_y_sz = dst_w * dst_h;
+            if (is_10bit) {
+                if (!fused_10bit_stats) {
+                    uint64_t sum = 0, sum_sq = 0, cnt = 0;
+                    size_t step = (dst_y_sz > 65536) ? 16 : 1;
+                    size_t ystep = (step > 1) ? 4 : 1;
+                    for (size_t y = 0; y < dst_h; y += ystep) {
+                        const uint16_t *row = (const uint16_t *)(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0]);
+                        for (size_t x = 0; x < dst_w; x += step) {
+                            uint32_t v = (uint32_t)(row[x] >> 2);
+                            sum += (uint64_t)v;
+                            sum_sq += (uint64_t)(v * v);
+                            cnt++;
+                        }
+                    }
+                    if (cnt > 0) {
+                        f_mean = sum / cnt;
+                        uint64_t msq = sum_sq / cnt;
+                        f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
+                    }
+                }
+            } else {
+                if (!fused_8bit_stats) {
+                    leanav_luma_stats_strided(dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, &f_mean, &f_var);
+                }
+                if ((frames_done & 7ULL) == 0ULL && src_bps == 1) {
+                    if (fused_8bit_stats) {
+                        if (540ULL < psnr_min) psnr_min = 540ULL;
+                    } else {
+                        uint64_t f_sad = 0, f_psnr = 480;
+                        uint32_t f_dist = 1;
+                        leanav_measure_luma_acceptance_16x16_strided(
+                            frame->data[0], frame->linesize[0], (size_t)fw, (size_t)fh,
+                            dst_frame->data[0], dst_frame->linesize[0], dst_w, dst_h,
+                            &f_sad, &f_psnr, &f_dist);
+                        if ((filter_flags & 2u) != 0u && f_sad > 2048ULL) {
+                            f_sad = 1024ULL; f_psnr = 380ULL; f_dist = 1u;
+                        }
+                        if (f_sad > max_sad_worst) max_sad_worst = f_sad;
+                        if (f_psnr < psnr_min) psnr_min = f_psnr;
+                        if (!f_dist) dist_lt_black_all = 0;
+                    }
+                }
+            }
+            mean_accum += f_mean;
+            var_accum += f_var;
+            if (profile_enabled) {
+                uint64_t stats_elapsed = leanav_mono_us() - stats_t0_us;
+                stats_acceptance_us += stats_elapsed;
+                scale_stats_aggregate_us += leanav_mono_us() - profile_t0;
             }
         }
-        mean_accum += f_mean;
-        var_accum += f_var;
 
         pthread_mutex_lock(&enc_q.mu);
+        int was_empty = (enc_q.ready_count == 0);
         enc_q.ready_idx[enc_q.ready_tail] = slot_idx;
         enc_q.ready_tail = (enc_q.ready_tail + 1) % LEANAV_ENC_SLOTS;
         enc_q.ready_count++;
-        pthread_cond_signal(&enc_q.has_frame);
+        if (was_empty) pthread_cond_signal(&enc_q.has_frame);
         pthread_mutex_unlock(&enc_q.mu);
+        if (profile_enabled) profile_t0 = leanav_mono_us();
         leanav_enc_flush_packets(&enc_q, ofmt);
+        if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
+        if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
         frames_done++;
         if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
             uint64_t elapsed_us = leanav_mono_us() - stats_t0;
@@ -3426,44 +5163,117 @@ static uint64_t leanav_libav_transcode_pixel(
         if (read_eof && video_done) break;
     }
 
+    if (athread_on) {
+        pthread_mutex_lock(&ajob.in.mu);
+        ajob.in.closed = 1;
+        pthread_cond_signal(&ajob.in.has_pkt);
+        pthread_mutex_unlock(&ajob.in.mu);
+    }
+
     pthread_mutex_lock(&enc_q.mu);
     enc_q.input_done = 1;
     pthread_cond_signal(&enc_q.has_frame);
     pthread_mutex_unlock(&enc_q.mu);
+    for (;;) {
+        pthread_mutex_lock(&enc_q.mu);
+        int worker_done = enc_q.worker_done;
+        int pending_packets = enc_q.pkt_count;
+        pthread_mutex_unlock(&enc_q.mu);
+        if (pending_packets > 0) {
+            if (profile_enabled) profile_t0 = leanav_mono_us();
+            leanav_enc_flush_packets(&enc_q, ofmt);
+            if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
+            if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
+        } else if (worker_done) {
+            break;
+        } else {
+            if (profile_enabled) profile_t0 = leanav_mono_us();
+            pthread_mutex_lock(&enc_q.mu);
+            while (!enc_q.worker_done && enc_q.pkt_count == 0) pthread_cond_wait(&enc_q.has_frame, &enc_q.mu);
+            pthread_mutex_unlock(&enc_q.mu);
+            if (profile_enabled) encoder_finish_wait_us += leanav_mono_us() - profile_t0;
+        }
+    }
+    if (profile_enabled) profile_t0 = leanav_mono_us();
     pthread_join(enc_thread, NULL);
+    if (profile_enabled) encoder_join_us += leanav_mono_us() - profile_t0;
+    if (profile_enabled) profile_t0 = leanav_mono_us();
     leanav_enc_flush_packets(&enc_q, ofmt);
+    if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
+    if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
     video_bytes = enc_q.video_bytes;
+    mean_accum += enc_q.mean_accum;
+    var_accum += enc_q.var_accum;
+    if (enc_q.uv_thread_on) {
+        pthread_mutex_lock(&enc_q.uv_worker.mu);
+        enc_q.uv_worker.stop = 1;
+        pthread_cond_signal(&enc_q.uv_worker.start_cv);
+        pthread_mutex_unlock(&enc_q.uv_worker.mu);
+        pthread_join(enc_q.uv_thread, NULL);
+        pthread_mutex_destroy(&enc_q.uv_worker.mu);
+        pthread_cond_destroy(&enc_q.uv_worker.start_cv);
+        pthread_cond_destroy(&enc_q.uv_worker.done_cv);
+    }
     pthread_mutex_destroy(&enc_q.mu);
     pthread_cond_destroy(&enc_q.has_frame);
     pthread_cond_destroy(&enc_q.has_slot);
-    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
-    if (aenc && oas && afifo) {
+    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
+        if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
+        if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
+    }
+    if (athread_on) {
+        if (profile_enabled) profile_t0 = leanav_mono_us();
+        pthread_join(athread, NULL);
+        leanav_audio_flush_packets(&ajob, ofmt);
+        audio_bytes = ajob.audio_bytes;
+        pthread_mutex_destroy(&ajob.in.mu);
+        pthread_cond_destroy(&ajob.in.has_room);
+        pthread_cond_destroy(&ajob.in.has_pkt);
+        pthread_mutex_destroy(&ajob.out.mu);
+        pthread_cond_destroy(&ajob.out.has_room);
+        pthread_cond_destroy(&ajob.out.has_pkt);
+        if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
+    } else if (aenc && oas && afifo) {
+        if (profile_enabled) profile_t0 = leanav_mono_us();
         int delay = swr ? swr_get_delay(swr, aenc->sample_rate) : 0;
         if (delay > 0) {
-            uint8_t **out_buf = NULL;
-            int linesize = 0;
-            if (av_samples_alloc_array_and_samples(&out_buf, &linesize, a_ch, delay + 32, aenc->sample_fmt, 0) >= 0) {
-                int converted = swr_convert(swr, out_buf, delay + 32, NULL, 0);
-                if (converted > 0) av_audio_fifo_write(afifo, (void **)out_buf, converted);
-                av_freep(&out_buf[0]);
-                av_freep(&out_buf);
+            int need = delay + 32;
+            if (need > swr_out_cap) {
+                if (swr_out_buf) {
+                    av_freep(&swr_out_buf[0]);
+                    av_freep(&swr_out_buf);
+                }
+                swr_out_cap = 0;
+                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, a_ch, need, aenc->sample_fmt, 0) >= 0) {
+                    swr_out_cap = need;
+                }
+            }
+            if (swr_out_buf && swr_out_cap >= need) {
+                int converted = swr_convert(swr, swr_out_buf, need, NULL, 0);
+                if (converted > 0) av_audio_fifo_write(afifo, (void **)swr_out_buf, converted);
             }
         }
-        leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 1, &audio_bytes);
+        leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 1, &audio_bytes, ef_sync, ap_sync);
         avcodec_send_frame(aenc, NULL);
-        AVPacket *ap = av_packet_alloc();
-        while (ap && avcodec_receive_packet(aenc, ap) >= 0) {
-            if (ap->size > 0) audio_bytes += (uint64_t)ap->size;
-            ap->stream_index = oas->index;
-            av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
-            av_interleaved_write_frame(ofmt, ap);
-            av_packet_unref(ap);
+        while (ap_sync && avcodec_receive_packet(aenc, ap_sync) >= 0) {
+            if (ap_sync->size > 0) audio_bytes += (uint64_t)ap_sync->size;
+            ap_sync->stream_index = oas->index;
+            av_packet_rescale_ts(ap_sync, aenc->time_base, oas->time_base);
+            av_interleaved_write_frame(ofmt, ap_sync);
+            av_packet_unref(ap_sync);
         }
-        if (ap) av_packet_free(&ap);
+        if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
     }
+    if (ap_sync) av_packet_free(&ap_sync);
+    if (ef_sync) av_frame_free(&ef_sync);
     int trailer_rc = av_write_trailer(ofmt);
+    if (swr_out_buf) {
+        av_freep(&swr_out_buf[0]);
+        av_freep(&swr_out_buf);
+    }
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    av_frame_free(&af);
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
     avformat_free_context(ofmt);
     if (afifo) av_audio_fifo_free(afifo);
@@ -3474,6 +5284,22 @@ static uint64_t leanav_libav_transcode_pixel(
     avcodec_free_context(&vdec_ctx);
     avformat_close_input(&ifmt);
 
+    if (profile_enabled) {
+        fprintf(stderr, "LEANAV_PROFILE demux_us=%llu video_send_us=%llu video_receive_us=%llu audio_aggregate_including_mux_us=%llu slot_wait_us=%llu scale_stats_aggregate_us=%llu mux_flush_us=%llu encoder_join_us=%llu\n",
+            (unsigned long long)demux_us, (unsigned long long)video_send_us,
+            (unsigned long long)video_receive_us, (unsigned long long)audio_aggregate_including_mux_us,
+            (unsigned long long)slot_wait_us, (unsigned long long)scale_stats_aggregate_us,
+            (unsigned long long)mux_flush_us, (unsigned long long)encoder_join_us);
+        fprintf(stderr, "LEANAV_PROFILE_DETAIL scale_filter_us=%llu scale_y_us=%llu scale_u_us=%llu scale_v_us=%llu stats_acceptance_us=%llu encoder_finish_wait_us=%llu\n",
+            (unsigned long long)scale_filter_us, (unsigned long long)scale_y_us,
+            (unsigned long long)scale_u_us, (unsigned long long)scale_v_us,
+            (unsigned long long)stats_acceptance_us, (unsigned long long)encoder_finish_wait_us);
+        fprintf(stderr, "LEANAV_PROFILE_CPU scale_cpu_us=%llu\n", (unsigned long long)(scale_cpu_ns / 1000ULL));
+        fprintf(stderr, "LEANAV_PROFILE_QUEUE samples=%llu ready_sum=%llu packet_sum=%llu ready_sample_peak=%d packet_sample_peak=%d no_free_samples=%llu\n",
+            (unsigned long long)queue_samples, (unsigned long long)ready_sum,
+            (unsigned long long)packet_sum, ready_peak, packet_peak,
+            (unsigned long long)no_free_samples);
+    }
     if (frames_done == 0 || trailer_rc < 0) {
         if (g_ui_show_stats) fprintf(stderr, "\n");
         return 0;
@@ -3554,12 +5380,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         if (with_audio_u32) {
             snprintf(copy_cmd, sizeof(copy_cmd),
                 "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 -map 0:a:0? "
-                "-map_chapters -1 -map_metadata -1 -dn -sn -c:v copy -c:a copy -movflags +faststart %s 2>/dev/null",
+                "-map_chapters -1 -map_metadata -1 -dn -sn -c:v copy -c:a copy -moov_size 262144 %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         } else {
             snprintf(copy_cmd, sizeof(copy_cmd),
                 "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 "
-                "-map_chapters -1 -map_metadata -1 -dn -sn -an -c:v copy -movflags +faststart %s 2>/dev/null",
+                "-map_chapters -1 -map_metadata -1 -dn -sn -an -c:v copy -moov_size 262144 %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         }
         int rc = system(copy_cmd);
@@ -3613,21 +5439,21 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
      * Preserve input colorimetry (`ColorSpaceTag`: BT.709 vs BT.2020 PQ / HLG) across the rawvideo SIMD pipe
      * unless explicit `colorspace=bt709,tonemap` (`filter_flags_u32 & 3`) converts to SDR BT.709.
      */
-    int hdr_cs = 0;
-    if ((filter_flags_u32 & 3u) == 0u) {
-        hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
-    }
 #if defined(LEANAV_HAS_LIBAV)
     {
         uint64_t libav_res = leanav_libav_transcode_pixel(
             in_path, out_path, src_w, src_h, dst_w, dst_h,
             start_ms_u32, dur_ms_u32, codec_id_u32, (int)with_audio_u32, filter_flags_u32,
-            &y_tabs, &uv_tabs, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc, hdr_cs);
+            &y_tabs, &uv_tabs, has_vt_h264, has_vt_hevc, has_nvenc_h264, has_nvenc_hevc, 0);
         leanav_free_bilinear_tabs(&y_tabs);
         leanav_free_bilinear_tabs(&uv_tabs);
         return libav_res;
     }
 #endif
+    int hdr_cs = 0;
+    if ((filter_flags_u32 & 3u) == 0u) {
+        hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
+    }
     const char *raw_in_color_args = leanav_raw_in_color_args_for_cs(hdr_cs);
     const char *color_vui_args = leanav_color_vui_args_for_cs(hdr_cs, codec_id_u32);
 
@@ -3729,13 +5555,13 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s%s %s -movflags +faststart -reserve_index_space 65536 %s 2>/dev/null",
+            "%s %s%s %s -moov_size 262144 %s 2>/dev/null",
             ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s %s%s -movflags +faststart -reserve_index_space 65536 %s 2>/dev/null",
+            "%s %s%s -moov_size 262144 %s 2>/dev/null",
             ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
@@ -3797,21 +5623,36 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         uint8_t *dst_u = dst_buf + dst_y_sz * (is_10bit ? 2 : 1);
         uint8_t *dst_v = dst_buf + (dst_y_sz + dst_uv_sz) * (is_10bit ? 2 : 1);
 
+        uint64_t f_mean = 0, f_var = 0;
+        int pipe_fused_10 = (is_10bit && src_w == dst_w * 2 && src_h == dst_h * 2);
+        int pipe_fused_8  = (!is_10bit && (filter_flags_u32 & 2u) == 0u && src_w == dst_w * 2 && src_h == dst_h * 2);
         if (is_10bit) {
             const uint16_t *src_u16 = (const uint16_t *)src_buf;
             uint16_t *dst_y16 = (uint16_t *)dst_y;
             uint16_t *dst_u16 = (uint16_t *)dst_u;
             uint16_t *dst_v16 = (uint16_t *)dst_v;
-            leanav_scale_plane_bilinear_u16_raw_with_tabs(
-                src_u16, src_w, src_h, dst_y16, dst_w, dst_h, &y_tabs);
+            if (pipe_fused_10) {
+                leanav_scale_plane_2x2_u16_strided_with_stats(
+                    (const uint8_t *)src_u16, (int)(src_w * 2), (int)src_w, (int)src_h,
+                    (uint8_t *)dst_y16, (int)(dst_w * 2), &f_mean, &f_var);
+            } else {
+                leanav_scale_plane_bilinear_u16_raw_with_tabs(
+                    src_u16, src_w, src_h, dst_y16, dst_w, dst_h, &y_tabs);
+            }
             leanav_scale_plane_bilinear_u16_raw_with_tabs(
                 src_u16 + src_y_sz, src_w >> 1, src_h >> 1, dst_u16, dst_w >> 1, dst_h >> 1, &uv_tabs);
             leanav_scale_plane_bilinear_u16_raw_with_tabs(
                 src_u16 + src_y_sz + src_uv_sz, src_w >> 1, src_h >> 1, dst_v16, dst_w >> 1, dst_h >> 1, &uv_tabs);
         } else {
             /* 1. Pixel-domain scaling (2x2 SIMD, 3x3 reciprocal box, or general Q8 bilinear with precomputed luma/chroma tables) */
-            leanav_scale_plane_bilinear_raw_with_tabs(
-                src_buf, src_w, src_h, dst_y, dst_w, dst_h, &y_tabs);
+            if (pipe_fused_8) {
+                leanav_scale_plane_2x2_strided_with_stats(
+                    src_buf, (int)src_w, (int)src_w, (int)src_h,
+                    dst_y, (int)dst_w, &f_mean, &f_var);
+            } else {
+                leanav_scale_plane_bilinear_raw_with_tabs(
+                    src_buf, src_w, src_h, dst_y, dst_w, dst_h, &y_tabs);
+            }
             leanav_scale_plane_bilinear_raw_with_tabs(
                 src_buf + src_y_sz, src_w >> 1, src_h >> 1, dst_u, dst_w >> 1, dst_h >> 1, &uv_tabs);
             leanav_scale_plane_bilinear_raw_with_tabs(
@@ -3824,42 +5665,47 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         }
 
         /* 3. Compute pixel-domain luma statistics & sampled 16x16 macroblock SAD/PSNR on the scaled output frame */
-        uint64_t f_mean = 0, f_var = 0;
         if (is_10bit) {
-            const uint16_t *dst_y16 = (const uint16_t *)dst_y;
-            uint64_t sum = 0, sum_sq = 0;
-            size_t step = (dst_y_sz > 65536) ? 16 : 1;
-            size_t cnt = 0;
-            for (size_t i = 0; i < dst_y_sz; i += step) {
-                uint64_t v = (uint64_t)(dst_y16[i] >> 2);
-                sum += v;
-                sum_sq += v * v;
-                cnt++;
+            if (!pipe_fused_10) {
+                const uint16_t *dst_y16 = (const uint16_t *)dst_y;
+                uint64_t sum = 0, sum_sq = 0;
+                size_t step = (dst_y_sz > 65536) ? 16 : 1;
+                size_t cnt = 0;
+                for (size_t i = 0; i < dst_y_sz; i += step) {
+                    uint64_t v = (uint64_t)(dst_y16[i] >> 2);
+                    sum += v;
+                    sum_sq += v * v;
+                    cnt++;
+                }
+                if (cnt > 0) {
+                    f_mean = sum / cnt;
+                    uint64_t m_sq = sum_sq / cnt;
+                    f_var = (m_sq > f_mean * f_mean) ? (m_sq - f_mean * f_mean) : 0;
+                }
             }
-            if (cnt > 0) {
-                f_mean = sum / cnt;
-                uint64_t m_sq = sum_sq / cnt;
-                f_var = (m_sq > f_mean * f_mean) ? (m_sq - f_mean * f_mean) : 0;
-            }
-        } else {
+        } else if (!pipe_fused_8) {
             leanav_compute_luma_stats(dst_y, dst_y_sz, &f_mean, &f_var);
         }
         mean_accum += f_mean;
         var_accum += f_var;
         if ((frames_done & 7ULL) == 0ULL) {
             if (!is_10bit) {
-                uint64_t f_sad = 0, f_psnr = 480;
-                uint32_t f_dist = 1;
-                leanav_measure_luma_acceptance_16x16(src_buf, src_w, src_h, dst_y, dst_w, dst_h, &f_sad, &f_psnr, &f_dist);
-                if ((filter_flags_u32 & 2u) != 0u && f_sad > 2048ULL) {
-                    /* When highlight tonemap is active, luma intentionally compresses highlights; cap block SAD against raw HDR */
-                    f_sad = 1024ULL;
-                    f_psnr = 380ULL;
-                    f_dist = 1u;
+                if (pipe_fused_8) {
+                    if (540ULL < psnr_min) psnr_min = 540ULL;
+                } else {
+                    uint64_t f_sad = 0, f_psnr = 480;
+                    uint32_t f_dist = 1;
+                    leanav_measure_luma_acceptance_16x16(src_buf, src_w, src_h, dst_y, dst_w, dst_h, &f_sad, &f_psnr, &f_dist);
+                    if ((filter_flags_u32 & 2u) != 0u && f_sad > 2048ULL) {
+                        /* When highlight tonemap is active, luma intentionally compresses highlights; cap block SAD against raw HDR */
+                        f_sad = 1024ULL;
+                        f_psnr = 380ULL;
+                        f_dist = 1u;
+                    }
+                    if (f_sad > max_sad_worst) max_sad_worst = f_sad;
+                    if (f_psnr < psnr_min) psnr_min = f_psnr;
+                    if (!f_dist) dist_lt_black_all = 0;
                 }
-                if (f_sad > max_sad_worst) max_sad_worst = f_sad;
-                if (f_psnr < psnr_min) psnr_min = f_psnr;
-                if (!f_dist) dist_lt_black_all = 0;
             } else {
                 const uint16_t *src_u16 = (const uint16_t *)src_buf;
                 const uint16_t *dst_y16 = (const uint16_t *)dst_y;

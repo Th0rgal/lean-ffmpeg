@@ -16,3 +16,11 @@ import LeanAV.Filter
 import LeanAV.Encoder
 import LeanAV.Cli
 import LeanAV.NativeKernels
+import LeanAV.HdrColrFidelity
+import LeanAV.HdrStaticFidelity
+import LeanAV.Sad16x16Bound
+import LeanAV.Scale2x2Arithmetic
+import LeanAV.Scale2x2Checksum
+import LeanAV.StridedScale2x2
+import LeanAV.StridedSimdBound
+import LeanAV.StridedSimdConcrete
