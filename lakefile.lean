@@ -35,7 +35,9 @@ extern_lib libleanav_dsp pkg := do
       lnirOptFlags := lnirOptFlags ++ #["-mavx2", "-mfma"]
     else
       lnirOptFlags := lnirOptFlags ++ #["-msse4.2"]
-  let lnirO ← buildO lnirOFile lnirSrcJob #[] lnirOptFlags "clang"
+  let bundledClang := (← getLeanSysroot) / "bin" / "clang"
+  let clangBin ← if ← bundledClang.pathExists then pure bundledClang.toString else pure "clang"
+  let lnirO ← buildO lnirOFile lnirSrcJob #[] lnirOptFlags clangBin
   let name := nameToStaticLib "leanav_dsp"
   buildStaticLib (pkg.staticLibDir / name) #[simdO, lnirO]
 
