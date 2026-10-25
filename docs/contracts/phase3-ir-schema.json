@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "phase": 3,
+  "wave": "wave_d_typed_plan_ir",
+  "contract": "media_plan_ir_schema_and_roundtrip",
+  "module": "LeanAV/PlanIR.lean",
+  "cli_inspection_modes": [
+    "lffmpeg plan <args>",
+    "lffmpeg -dump-plan <args>",
+    "lffmpeg --dump-plan <args>"
+  ],
+  "ir_sections": [
+    "inputs",
+    "outputs",
+    "streams",
+    "programs",
+    "maps",
+    "graphs",
+    "timeline",
+    "metadata",
+    "resources",
+    "errors",
+    "backend"
+  ],
+  "formal_theorems": [
+    "LeanAV.PlanIR.streamMapSpec_parse_format_roundtrip",
+    "LeanAV.PlanIR.planIR_cli_roundtrip_verified",
+    "LeanAV.PlanIR.validatePlanIR_sound_and_rejects_unsafe"
+  ],
+  "invariants": {
+    "cli_ir_roundtrip_exact": true,
+    "pre_execution_validation_fail_closed": true,
+    "serializable_single_line_json": true,
+    "existing_mp4_cases_preserved": true
+  }
+}

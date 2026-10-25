@@ -1,0 +1,68 @@
+[
+  {
+    "branch_id": "wave_a_registry_probe",
+    "branch_type": "PROBE",
+    "domain": "formal_spec",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.98,
+    "impact": 0.82,
+    "effort_p50": 900,
+    "effort_p90": 1800
+  },
+  {
+    "branch_id": "wave_a_registry_reproducibility",
+    "branch_type": "SPEC",
+    "domain": "formal_spec",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.92,
+    "impact": 0.91,
+    "effort_p50": 2400,
+    "effort_p90": 4800
+  },
+  {
+    "branch_id": "wave_a_runtime_inventory_boundary",
+    "branch_type": "SPEC",
+    "domain": "formal_spec",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.88,
+    "impact": 0.95,
+    "effort_p50": 3600,
+    "effort_p90": 7200
+  },
+  {
+    "branch_id": "wave_a_model_quorum_contract",
+    "branch_type": "PROBE",
+    "domain": "formal_spec",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.84,
+    "impact": 0.87,
+    "effort_p50": 3000,
+    "effort_p90": 6000
+  },
+  {
+    "branch_id": "wave_a_lean_build_gate",
+    "branch_type": "PROVE",
+    "domain": "lean_proof",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.8,
+    "impact": 0.8,
+    "effort_p50": 1800,
+    "effort_p90": 3600
+  },
+  {
+    "branch_id": "wave_a_registry_mutant_check",
+    "branch_type": "PROVE",
+    "domain": "formal_spec",
+    "goal_class": "lean_ffmpeg_parity_wave_a_baseline",
+    "race_group": "wave_a_baseline",
+    "p": 0.86,
+    "impact": 0.9,
+    "effort_p50": 2800,
+    "effort_p90": 5600
+  }
+]

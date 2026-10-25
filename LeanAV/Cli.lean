@@ -95,6 +95,13 @@ def parseCliSeconds (s : String) : Option CliSeconds := Id.run do
   if !seenDigit then return none
   return some { num := n, den := den }
 
+def cliSecondsToMillis (s : CliSeconds) : Option UInt32 :=
+  if s.den == 0 then
+    none
+  else
+    let millis := (s.num * 1000) / s.den
+    if millis ≤ 4294967295 then some millis.toUInt32 else none
+
 /-- Fail-closed CLI error taxonomy (`0` silent fallback). -/
 inductive CliError where
   | unsupportedCodecOrFlag (token : String)
@@ -309,15 +316,21 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
     parseFFmpegArgsLoop rest <|
       if value == "" then cfg.fail (.emptyValue "-loglevel")
       else if supportedLogLevel value then
-        let quietLike := ["quiet", "panic", "fatal", "error", "-8", "0", "8", "16"].contains value
-        { cfg with logLevel := value, showStats := if quietLike then false else cfg.showStats }
+        let quietLike := ["quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"].contains value
+        { cfg with
+          logLevel := value
+          showStats := if quietLike then false else cfg.showStats
+          hideBanner := if quietLike then true else cfg.hideBanner }
       else cfg.fail (.unsupportedCodecOrFlag ("-loglevel " ++ value))
   | "-v" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
       if value == "" then cfg.fail (.emptyValue "-v")
       else if supportedLogLevel value then
-        let quietLike := ["quiet", "panic", "fatal", "error", "-8", "0", "8", "16"].contains value
-        { cfg with logLevel := value, showStats := if quietLike then false else cfg.showStats }
+        let quietLike := ["quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"].contains value
+        { cfg with
+          logLevel := value
+          showStats := if quietLike then false else cfg.showStats
+          hideBanner := if quietLike then true else cfg.hideBanner }
       else cfg.fail (.unsupportedCodecOrFlag ("-v " ++ value))
   | "-threads" :: value :: rest =>
     parseFFmpegArgsLoop rest <|
@@ -536,6 +549,14 @@ theorem parseCliSeconds_exact_and_rejects_malformed :
     parseCliSeconds "" = none ∧
     parseCliSeconds "abc" = none := by
   decide
+
+theorem cliSecondsToMillis_exact_and_rejects_overflow :
+    (parseCliSeconds "0.5").bind cliSecondsToMillis = some 500 ∧
+    (parseCliSeconds "1.25").bind cliSecondsToMillis = some 1250 ∧
+    (parseCliSeconds "4294967").bind cliSecondsToMillis = some 4294967000 ∧
+    (parseCliSeconds "4294968").bind cliSecondsToMillis = none ∧
+    cliSecondsToMillis { num := 1, den := 0 } = none := by
+  simp [parseCliSeconds, cliSecondsToMillis]
 
 /--
   Theorem (Wave 51): `resolveScaleDims` preserves exact 16:9 aspect ratio with even YUV420p alignment

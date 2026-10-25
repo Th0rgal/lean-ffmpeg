@@ -24,3 +24,4 @@ import LeanAV.Scale2x2Checksum
 import LeanAV.StridedScale2x2
 import LeanAV.StridedSimdBound
 import LeanAV.StridedSimdConcrete
+import LeanAV.PlanIR

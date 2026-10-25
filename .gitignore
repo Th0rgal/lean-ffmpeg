@@ -5,4 +5,9 @@ artifacts/
 lake-manifest.json
 *.o
 .tools/
+tests/differential/fixtures/input.mp4
+tests/differential/fixtures/input-av.mp4
+__pycache__/
+*.pyc
+
 

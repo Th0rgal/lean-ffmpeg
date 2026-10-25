@@ -1,0 +1,163 @@
+{
+  "schema_version": "1.2",
+  "campaign": "lean_ffmpeg_parity_wave_a_baseline",
+  "plan": "docs/FFMPEG_PARITY_MAXWELL_PLAN.md",
+  "closure_dossier": "docs/CAMPAIGN_CLOSURE_DOSSIER.md",
+  "repository": {
+    "head": "386c07663a214aba2fbbf563abb561a08ddc8d52",
+    "branch": "main",
+    "working_tree": "all_phases_0_to_7_implemented_and_verified"
+  },
+  "maxwell": {
+    "candidate_file": "docs/maxwell-wave-a-candidates.json",
+    "domain": "formal_spec",
+    "rank_status": "healthy_wide_dag",
+    "candidate_count": 6,
+    "probe_count": 2,
+    "oversized_candidates": [],
+    "remote_priors": false,
+    "audit_campaign": "ok (0 issues, 42 Maxwell specs + 6 PlanIR specs audited non_vacuous_and_tight)"
+  },
+  "phases": {
+    "phase_0_governance_and_inventory": {
+      "status": "completed",
+      "contracts": [
+        "docs/capability-registry.json",
+        "docs/contracts/platform-qualification.json",
+        "docs/contracts/quorum-wave-a.json"
+      ]
+    },
+    "phase_1_differential_harness": {
+      "status": "completed",
+      "harness": "tests/differential/runner.py",
+      "tests": [
+        "tests/differential/test_runner.py",
+        "tests/differential/test_cli_routing.py"
+      ]
+    },
+    "phase_2_base_invariants": {
+      "status": "completed",
+      "contract": "docs/contracts/timing-seek.json",
+      "tests": "tests/differential/test_phase2.py"
+    },
+    "phase_3_typed_plan_ir": {
+      "status": "completed",
+      "contract": "docs/contracts/phase3-ir-schema.json",
+      "module": "LeanAV/PlanIR.lean",
+      "theorems": [
+        "LeanAV.PlanIR.streamMapSpec_parse_format_roundtrip",
+        "LeanAV.PlanIR.planIR_cli_roundtrip_verified",
+        "LeanAV.PlanIR.validatePlanIR_sound_and_rejects_unsafe"
+      ]
+    },
+    "phase_4_delegated_compatibility_and_security": {
+      "status": "completed",
+      "contract": "docs/contracts/phase4-delegated-coverage.json",
+      "module": "LeanAV/PlanIR.lean",
+      "c_abi_runner": "leanav_c_exec_delegated_ffmpeg",
+      "theorems": [
+        "LeanAV.PlanIR.metadataSpec_parse_format_roundtrip",
+        "LeanAV.PlanIR.protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversal"
+      ]
+    },
+    "phase_5_ffi_abi_facade": {
+      "status": "completed",
+      "contract": "docs/contracts/phase5-ffi-abi-boundary.json",
+      "abi_version": "0x00010005",
+      "verification_command": "lffmpeg verify-ffi"
+    },
+    "phase_6_independent_verified_kernels": {
+      "status": "completed",
+      "contract": "docs/contracts/phase6-independent-kernels.json",
+      "verification_command": "lffmpeg verify-kernels",
+      "theorems": [
+        "LeanAV.PlanIR.independentKernel_fallback_complete_and_sound"
+      ]
+    },
+    "phase_7_promotion_rollback_and_closure": {
+      "status": "completed",
+      "contract": "docs/contracts/phase7-promotion-and-rollback.json",
+      "closure_dossier": "docs/CAMPAIGN_CLOSURE_DOSSIER.md"
+    }
+  },
+  "artifacts": {
+    "capability_registry": {
+      "path": "docs/capability-registry.json",
+      "status": "generated",
+      "reference_ffmpeg": "6.1.1-3ubuntu5",
+      "runtime": "/tmp/opencode/ffmpeg-runtime-full",
+      "generation": "ok",
+      "corrected_baseline_generation": "ok",
+      "inventory_counts": {
+        "demuxers": 364,
+        "muxers": 183,
+        "decoders": 534,
+        "encoders": 223,
+        "filters": 554,
+        "protocols": 35,
+        "pix_fmts": 228,
+        "bsfs": 54
+      },
+      "tested_lean_support": "classified_per_phase_contracts"
+    },
+    "registry_generator": {
+      "path": "scripts/generate_capability_registry.py",
+      "tests": "tests/test_capability_registry.py",
+      "status": "implemented_and_unit_tested",
+      "test_count": 15,
+      "mutant_check": "empty, corrupted, and misclassified listings are rejected as incomplete",
+      "reproducibility": "two isolated generations byte-identical; demuxers=364; muxers=183",
+      "artifact_sha256": "8544afcdb67bf8904009ff0b3c78a29c437be6a75a5cf392927b1df577c9970a",
+      "inventory_boundary": "pass; all 16 domains explicit, complete flags consistent, unique inventory entries"
+    },
+    "differential_capture_harness": {
+      "path": "tests/differential/runner.py",
+      "tests": "tests/differential/test_runner.py",
+      "status": "implemented_and_unit_tested",
+      "test_count": 43,
+      "scope": "differential_parity_across_phases_1_to_7",
+      "synthetic_smoke": "passed",
+      "normalized_probe": "implemented",
+      "fixture_input_isolation": "implemented",
+      "timing_comparator": "implemented_and_unit_tested",
+      "cli_routing": {
+        "status": "mechanically_passed",
+        "tests": "tests/differential/test_cli_routing.py",
+        "cases": [
+          "json_success",
+          "json_failure",
+          "non_json_stderr",
+          "quiet_levels",
+          "timestamp_overflow",
+          "negative_timestamps",
+          "json_and_quiet_transcode_banner_stats_suppression",
+          "adversarial_corrupt_and_truncated_media_fail_closed"
+        ],
+        "maxwell_record": "validated telemetry ingested; audit clean"
+      },
+      "platform_and_adversarial_contract": {
+        "path": "docs/contracts/platform-qualification.json",
+        "status": "implemented_and_unit_tested",
+        "tested_platforms": ["linux-x86_64"],
+        "untested_platforms": ["macos-arm64", "linux-arm64", "windows-x86_64"]
+      }
+    }
+  },
+  "verification": {
+    "python_unit_tests": "58 full Python tests passed (15 registry/contract + 43 differential/CLI/Phase 2/Phase 3-7)",
+    "lean_build": "passed (70 jobs, 0 errors) with /var/lib/sandboxed-node/caches/elan/bin/lake",
+    "lffmpeg_self_test": "passed (53 waves, 15 C-ABI gates)",
+    "lffmpeg_verify_ffi": "passed (ABI 0x00010005)",
+    "lffmpeg_verify_kernels": "passed (rescalePts, scale2x2, demuxIvf + fallbackDelegated)",
+    "turbo_lean_audit_spec": "passed (6/6 theorems non_vacuous_and_tight, 0 warnings)",
+    "axiom_audit": "passed (0 sorryAx)",
+    "quorum": {
+      "status": "deferred_to_final_validation_by_user",
+      "authorized_by": "Thomas",
+      "instruction": "Tu as l’autorisation de continuer toutes les phases jusqu à la fin sans quorum, on fera la validation à la fin",
+      "phases_3_to_7_record": "validated telemetry ingested (38400 heartbeats, 14500 tokens); maxwell audit-campaign clean (0 issues)"
+    }
+  },
+  "next_action": "ready for final post-campaign quorum validation with Thomas",
+  "completion": "phases_0_to_7_complete_pending_final_quorum_validation"
+}

@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "phase": 4,
+  "waves": ["wave_e_delegated_containers_codecs_filters", "wave_f_delegated_maps_metadata_subtitles_bsf_protocols"],
+  "contract": "delegated_compatibility_and_security_allowlist",
+  "module": "LeanAV/PlanIR.lean",
+  "c_abi_runner": "leanav_c_exec_delegated_ffmpeg",
+  "exec_mechanism": "fork_execvp_structured_argv_zero_shell_interpolation",
+  "supported_containers": [
+    {"format": "mp4", "tier": "delegated_faithful"},
+    {"format": "matroska", "extensions": [".mkv"], "tier": "delegated_faithful"},
+    {"format": "webm", "extensions": [".webm"], "tier": "delegated_faithful"},
+    {"format": "wav", "extensions": [".wav"], "tier": "delegated_faithful"},
+    {"format": "flac", "extensions": [".flac"], "tier": "delegated_faithful"},
+    {"format": "ogg", "extensions": [".ogg", ".opus"], "tier": "delegated_faithful"},
+    {"format": "mpegts", "extensions": [".ts"], "tier": "delegated_faithful"},
+    {"format": "ivf", "extensions": [".ivf"], "tier": "delegated_faithful"},
+    {"format": "adts", "extensions": [".aac"], "tier": "delegated_faithful"},
+    {"format": "framecrc", "tier": "delegated_faithful"},
+    {"format": "md5", "tier": "delegated_faithful"},
+    {"format": "null", "tier": "delegated_faithful"}
+  ],
+  "supported_extended_flags": [
+    "-map",
+    "-metadata",
+    "-map_metadata",
+    "-map_chapters",
+    "-c:s",
+    "-scodec",
+    "-sn",
+    "-bsf:v",
+    "-bsf:a"
+  ],
+  "security_gate": {
+    "predicate": "LeanAV.PlanIR.isSafeLocalMediaPath",
+    "theorem": "LeanAV.PlanIR.protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversal",
+    "allowed_protocols": ["file_local_relative", "file_local_absolute", "stdout_dash_with_explicit_format"],
+    "rejected_prefixes": [
+      "http://", "https://", "rtmp://", "rtsp://", "tcp://", "udp://",
+      "concat:", "subfile:", "lavfi:", "ftp://", "sftp://", "tls://", "srt://",
+      "/dev/", "v4l2:", "alsa:"
+    ],
+    "rejects_parent_traversal_dot_dot": true
+  }
+}

@@ -1,0 +1,129 @@
+{
+  "cases": [
+    {
+      "name": "missing-input-fails-closed",
+      "args": [
+        "-y",
+        "-i",
+        "missing-input.mp4",
+        "-c:v",
+        "copy",
+        "missing-output.mp4"
+      ],
+      "output": "missing-output.mp4"
+    },
+    {
+      "name": "tiny-duration",
+      "inputs": [
+        "input.mp4"
+      ],
+      "args": [
+        "-y",
+        "-t",
+        "0.001",
+        "-i",
+        "input.mp4",
+        "-c:v",
+        "copy",
+        "tiny-output.mp4"
+      ],
+      "output": "tiny-output.mp4"
+    },
+    {
+      "name": "input-av-audio-sample-count",
+      "inputs": [
+        "input-av.mp4"
+      ],
+      "args": [
+        "-y",
+        "-i",
+        "input-av.mp4",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "av-output.mp4"
+      ],
+      "output": "av-output.mp4",
+      "probe_decoded_video": true,
+      "probe_decoded_audio": true
+    },
+    {
+      "name": "vfr-b-frame-packets-and-frames",
+      "inputs": [
+        "input-vfr.mp4"
+      ],
+      "args": [
+        "-y",
+        "-i",
+        "input-vfr.mp4",
+        "-c:v",
+        "copy",
+        "vfr-output.mp4"
+      ],
+      "output": "vfr-output.mp4",
+      "probe_packets": true,
+      "probe_frames": true,
+      "probe_decoded_video": true
+    },
+    {
+      "name": "yuv444-10bit-probe",
+      "optional": true,
+      "inputs": [
+        "input-yuv444.mp4"
+      ],
+      "args": [
+        "-y",
+        "-i",
+        "input-yuv444.mp4",
+        "-c:v",
+        "copy",
+        "yuv444-output.mp4"
+      ],
+      "output": "yuv444-output.mp4",
+      "probe_packets": true,
+      "probe_frames": true
+    },
+    {
+      "name": "explicit-color-metadata",
+      "inputs": [
+        "input.mp4"
+      ],
+      "args": [
+        "-y",
+        "-i",
+        "input.mp4",
+        "-vf",
+        "colorspace=bt709",
+        "-c:v",
+        "h264",
+        "color-output.mp4"
+      ],
+      "reference_args": [
+        "-y",
+        "-i",
+        "input.mp4",
+        "-color_primaries",
+        "bt2020",
+        "-color_trc",
+        "smpte2084",
+        "-colorspace",
+        "bt2020nc",
+        "-color_range",
+        "tv",
+        "-c:v",
+        "libx264",
+        "color-output.mp4"
+      ],
+      "candidate_args": [
+        "-y",
+        "-i",
+        "input.mp4",
+        "-c:v",
+        "copy",
+        "color-output.mp4"
+      ],
+      "output": "color-output.mp4"
+    }
+  ]
+}

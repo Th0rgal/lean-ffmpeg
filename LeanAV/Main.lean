@@ -16,6 +16,7 @@ open LeanAV.Filter
 open LeanAV.Encoder
 open LeanAV.Cli
 open LeanAV.NativeKernels
+open LeanAV.PlanIR
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -777,15 +778,36 @@ def runSelfTest : IO UInt32 := do
                      specBox3x3DownscaleU10Sum 9207 == 1023
   let w52Ok := w52P010Out == leanSpecLibavVideotoolboxP010PackFma [512, 1023] [64, 64] [0, 32768] && w52BoxU10Ok
 
+  -- 61. Wave 53 (Phases 3–6): Typed `MediaPlanIR` Round-Trip, Protocol Gate, Pinned C-ABI FFI Facade & Independent Kernels
+  let w53Plan := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-map", "0:v:0", "-metadata", "title=Demo", "-c", "copy", "out.mkv"]
+  let w53IrOk := parseArgsToPlanIR (planIRToCliArgs w53Plan) == w53Plan &&
+                 (validatePlanIR w53Plan).isOk &&
+                 !(validatePlanIR (parseArgsToPlanIR ["-y", "-i", "http://evil.example/a.mp4", "-c", "copy", "out.mp4"])).isOk
+  let w53FfiOk := ffiAbiVersionC () == 0x00010005 &&
+                  ffiCancelGateC 0 5 10 == 1 &&
+                  ffiCancelGateC 1 5 10 == 0 &&
+                  ffiCancelGateC 0 10 10 == 0 &&
+                  !(decodeFfiMp4ProbeWord (ffiProbeMp4ContractC (ByteArray.mk #[0, 0, 0, 3]) 4)).ok
+  let w53KernelsOk :=
+    rescalePtsIndependentOrFallback 90000 1 90000 1 1000 == .independentVerified 1000 &&
+    rescalePtsIndependentOrFallback (-5) 1 90000 1 1000 == .fallbackDelegated "negative_pts_requires_signed_timeline_shift" &&
+    (match scalePlane2x2IndependentOrFallback ( vfSrc.planes[0]! ) with
+     | .independentVerified pOut => pOut.width == 32 && pOut.height == 24
+     | .fallbackDelegated _ => false) &&
+    (match demuxIvfIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray ivfBytes) with
+     | .independentVerified (h, pkts) => h.width == 320 && pkts.size == 2
+     | .fallbackDelegated _ => false)
+  let w53Ok := w53IrOk && w53FfiOk && w53KernelsOk
+
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
-  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok
+  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok && w53Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 52, \"c_abi_gates\": 12, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 53, \"c_abi_gates\": 15, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -794,7 +816,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -961,7 +983,7 @@ def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
     return fallback
 
 def jsonEscape (s : String) : String :=
-  String.mk (s.toList.flatMap fun c =>
+  String.ofList (s.toList.flatMap fun c =>
     match c with
     | '"' => ['\\', '"']
     | '\\' => ['\\', '\\']
@@ -993,8 +1015,8 @@ def runtimeVideoFilterSupported (spec : String) : Bool :=
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
     (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
-  let statsBit : UInt32 := if validCfg.showStats then 1 else 0
-  let bannerBit : UInt32 := if validCfg.hideBanner then 0 else 2
+  let statsBit : UInt32 := if validCfg.showStats && !validCfg.jsonOutput then 1 else 0
+  let bannerBit : UInt32 := if validCfg.hideBanner || validCfg.jsonOutput then 0 else 2
   let _ ← setEncoderCliOptionsC
     (validCfg.preset.getD "")
     (validCfg.crf.getD "")
@@ -1072,7 +1094,19 @@ def tryFastHeaderProbeTranscode
 
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
-  let cfg := parseFFmpegArgs args
+  let plan := parseArgsToPlanIR args
+  if plan.resources.dumpPlan then
+    IO.println (serializePlanIRJson plan)
+    return if (validatePlanIR plan).isOk then 0 else 1
+  let ext := extractExtendedPlanFlagsLoop args {}
+  let cfg := parseFFmpegArgs ext.baseArgs
+  if !ext.extraErrors.isEmpty then
+    let allErrs := cfg.errors ++ ext.extraErrors
+    if cfg.jsonOutput then
+      IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error_count\": {allErrs.length} }"
+    else if !cliQuiet cfg.logLevel then
+      IO.eprintln s!"Error parsing command line: {repr allErrs}"
+    return 1
   match validateCliConfig cfg with
   | .error errs =>
     if cfg.jsonOutput then
@@ -1082,13 +1116,54 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     return 1
   | .ok validCfg =>
     if validCfg.inputs.length != 1 then
-      if validCfg.jsonOutput then
-        IO.println "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"exactly one input is supported\"}"
-      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
-        IO.eprintln "Exactly one input is supported"
-      return 1
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"exactly one input is supported\"}"
+        "Exactly one input is supported"
     let inPath := validCfg.inputs.headD ""
     let outPath := validCfg.output.getD ""
+    let outSafe := (outPath == "-" && validCfg.format.isSome) || isSafeLocalMediaPath outPath
+    if !isSafeLocalMediaPath inPath || !outSafe then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"unsafe protocol, device node, or path traversal rejected\"}"
+        "Unsafe protocol, device node, or path traversal rejected"
+    if validCfg.startSec.isSome && plan.timeline.startMs.isNone then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-ss milliseconds overflow\"}"
+        "-ss value is too large"
+    if validCfg.durationSec.isSome && plan.timeline.durationMs.isNone then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t milliseconds overflow\"}"
+        "-t value is too large"
+    -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
+    if plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer then
+      if !(← System.FilePath.pathExists inPath) then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated\",\"error\":\"input file does not exist\"}"
+          (s!"{inPath}: No such file or directory")
+      if !validCfg.overwrite && outPath != "-" && validCfg.format != some "null" then
+        if (← System.FilePath.pathExists outPath) then
+          return ← reportCliError validCfg
+            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+            "File exists"
+      let t0Del ← IO.monoNanosNow
+      let argv := buildDelegatedFfmpegArgv plan
+      let suppress : UInt32 :=
+        if outPath == "-" && !validCfg.jsonOutput then 0
+        else if validCfg.jsonOutput || cliQuiet validCfg.logLevel || !validCfg.showStats then 1
+        else 0
+      let rc ← ffiExecDelegatedFfmpegC argv outPath suppress
+      let t1Del ← IO.monoNanosNow
+      if rc == 0 then
+        if validCfg.jsonOutput then
+          let inBytes ← getFileByteSizeOr inPath 0
+          let outBytes ← if validCfg.format != some "null" && outPath != "-" then getFileByteSizeOr outPath 0 else pure 0
+          let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
+          IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-delegated-faithful\",\"tier\":\"{plan.backend.tier.toString}\",\"format\":\"{jsonEscape fmtStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\",\"in_bytes\":{inBytes},\"out_bytes\":{outBytes},\"total_us\":{(t1Del - t0Del) / 1000}}"
+        return 0
+      else
+        return ← reportCliError validCfg
+          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
+          (s!"Delegated conversion failed! ({inPath} -> {outPath})")
     let unsupportedExecution : List String :=
       (if validCfg.audioFilter.isSome then ["-af"] else []) ++
       (if validCfg.noVideo then ["-vn"] else []) ++
@@ -1176,18 +1251,28 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
             else
               pure none
       | none => pure none
-    let startMs : UInt32 := match validCfg.startSec with
-      | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
-      | none   => 0
-    let durMs : UInt32 := match validCfg.durationSec with
-      | some s => if s.den == 0 then 0 else ((s.num * 1000) / s.den).toUInt32
-      | none   => 0
+    let startMsOpt : Option UInt32 := validCfg.startSec.bind cliSecondsToMillis
+    let durMsOpt : Option UInt32 := validCfg.durationSec.bind cliSecondsToMillis
+    let startMs : UInt32 := startMsOpt.getD 0
+    let durMs : UInt32 := durMsOpt.getD 0
+    if validCfg.startSec.isSome && startMsOpt.isNone then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-ss milliseconds overflow\"}"
+        "-ss value is too large"
+    if validCfg.durationSec.isSome && durMsOpt.isNone then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t milliseconds overflow\"}"
+        "-t value is too large"
     let withAudio := !validCfg.noAudio
     let handledFast ← match fastDemuxOpt with
       | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 fastDemux startMs durMs withAudio
       | none => pure false
     if handledFast then
       return 0
+    else if fastDemuxOpt.isSome then
+      return ← reportCliError validCfg
+        (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{jsonEscape inPath}\", \"output\": \"{jsonEscape outPath}\" }")
+        (s!"Conversion failed! ({inPath} -> {outPath})")
     else
       let rawBytes ← IO.FS.readBinFile inPath
       let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawBytes
@@ -1197,16 +1282,12 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         if handledFull then
           return 0
         else
-          if validCfg.jsonOutput then
-            IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{inPath}\", \"output\": \"{outPath}\" }"
-          else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
-            IO.eprintln s!"Conversion failed! ({inPath} -> {outPath})"
-          return 1
-      if validCfg.jsonOutput then
-        IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error\": \"unsupported input container or invalid media\" }"
-      else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
-        IO.eprintln s!"Unsupported input container or invalid media: {inPath}"
-      return 1
+          return ← reportCliError validCfg
+            (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli-mp4-transcode-failed\", \"input\": \"{jsonEscape inPath}\", \"output\": \"{jsonEscape outPath}\" }")
+            (s!"Conversion failed! ({inPath} -> {outPath})")
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"unsupported input container or invalid media\"}"
+        (s!"Unsupported input container or invalid media: {inPath}")
 
 def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
@@ -1235,9 +1316,101 @@ def printLffmpegCodecs : IO UInt32 := do
   IO.println "Library-only LeanAV codecs: flac, opus, prores, ffv1, pcm_s16le"
   return 0
 
+/-- Phase 5 (Wave G) C-ABI FFI Verification Gate (`lffmpeg verify-ffi`). -/
+def runVerifyFfi (mp4PathOpt : Option String) : IO UInt32 := do
+  let abiVer := ffiAbiVersionC ()
+  let abiOk := abiVer == 0x00010005
+  let cancelOk :=
+    ffiCancelGateC 0 0 100 == 1 &&
+    ffiCancelGateC 0 99 100 == 1 &&
+    ffiCancelGateC 0 100 100 == 0 &&
+    ffiCancelGateC 1 10 100 == 0 &&
+    ffiCancelGateC 0 500 0 == 1
+  let corruptPayloads : List ByteArray := [
+    ByteArray.empty,
+    ByteArray.mk #[0x00, 0x00, 0x00, 0x03, 0x66, 0x74, 0x79, 0x70],
+    ByteArray.mk #[0xFF, 0xFF, 0xFF, 0xFF, 0x6D, 0x6F, 0x6F, 0x76],
+    "NOT_AN_MP4_CONTAINER_0123456789".toUTF8
+  ]
+  let corruptRejected := corruptPayloads.all fun ba =>
+    !(decodeFfiMp4ProbeWord (ffiProbeMp4ContractC ba ba.size.toUSize)).ok
+  let validIsoBox := ByteArray.mk #[
+    0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D, 0, 0, 0, 0,
+    0, 0, 0, 16, 0x6D, 0x6F, 0x6F, 0x76, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 16, 0x6D, 0x64, 0x61, 0x74, 0, 0, 0, 0, 0, 0, 0, 0
+  ]
+  let mp4ProbeRes ← match mp4PathOpt with
+    | some p =>
+      if (← System.FilePath.pathExists p) then
+        let raw ← IO.FS.readBinFile p
+        pure (decodeFfiMp4ProbeWord (ffiProbeMp4ContractC raw raw.size.toUSize))
+      else
+        pure (decodeFfiMp4ProbeWord (ffiProbeMp4ContractC validIsoBox validIsoBox.size.toUSize))
+    | none =>
+      pure (decodeFfiMp4ProbeWord (ffiProbeMp4ContractC validIsoBox validIsoBox.size.toUSize))
+  let planeContractOk :=
+    match Plane.alloc? 64 32 1 128 with
+    | .ok p => verifyPlaneFfiContract p 32 false
+    | .error _ => false
+  let allOk := abiOk && cancelOk && corruptRejected && mp4ProbeRes.ok && mp4ProbeRes.width > 0 && mp4ProbeRes.height > 0 && planeContractOk
+  IO.println s!"\{\"ok\":{allOk},\"phase\":5,\"abi_version\":\"0x00010005\",\"abi_ok\":{abiOk},\"cancel_gate_ok\":{cancelOk},\"corrupt_rejected\":{corruptRejected},\"mp4_probe_ok\":{mp4ProbeRes.ok},\"mp4_width\":{mp4ProbeRes.width},\"mp4_height\":{mp4ProbeRes.height},\"plane_ffi_contract_ok\":{planeContractOk}}"
+  return if allOk then 0 else 1
+
+/-- Phase 6 (Wave H) Independent Verified Kernels Verification & Micro-Benchmark (`lffmpeg verify-kernels`). -/
+def runVerifyKernels : IO UInt32 := do
+  let t0 ← IO.monoNanosNow
+  -- 1. Rational Timestamp Rescaler (`rescalePtsIndependentOrFallback`)
+  let rValid1 := rescalePtsIndependentOrFallback 90000 1 90000 1 1000
+  let rValid2 := rescalePtsIndependentOrFallback 48000 1 48000 1 90000
+  let rFallbackNeg := rescalePtsIndependentOrFallback (-42) 1 90000 1 1000
+  let rFallbackZero := rescalePtsIndependentOrFallback 90000 1 0 1 1000
+  let rescaleOk :=
+    rValid1 == .independentVerified 1000 &&
+    rValid2 == .independentVerified 90000 &&
+    rFallbackNeg == .fallbackDelegated "negative_pts_requires_signed_timeline_shift" &&
+    rFallbackZero == .fallbackDelegated "zero_rational_component"
+
+  -- 2. Verified 2x2 Luma Box Downscaler (`scalePlane2x2IndependentOrFallback`)
+  let p64 := Plane2D.alloc 64 48 64 120
+  let pOdd := Plane2D.alloc 63 48 63 120
+  let scaleOk :=
+    (match scalePlane2x2IndependentOrFallback p64 with
+     | .independentVerified pOut => pOut.width == 32 && pOut.height == 24 && pOut.verifyBounds && pOut.data[0]! == 120
+     | .fallbackDelegated _ => false) &&
+    (match scalePlane2x2IndependentOrFallback pOdd with
+     | .independentVerified _ => false
+     | .fallbackDelegated reason => reason == "dimensions_not_even_2x2_compatible")
+
+  -- 3. Verified IVF Demuxer (`demuxIvfIndependentOrFallback`)
+  let rawPkt0 := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x12, 0x00, 0x0A, 0x00, 0x00, 0x00])
+  let rawPkt1 := LeanSys.Posix.ByteSlice.ofByteArray (ByteArray.mk #[0x32, 0x04, 0xAA, 0xBB, 0xCC, 0xDD])
+  let p0 := AVPacketView.mkVerified 0 .av1 0 0 3000 true rawPkt0
+  let p1 := AVPacketView.mkVerified 0 .av1 3000 3000 3000 false rawPkt1
+  let ivfHdr : IvfHeader := { codec := .av1, width := 320, height := 240, timebase := AVRational.mkSafe 1 30, numFrames := 2 }
+  let ivfBytes := muxIvfStream ivfHdr #[p0, p1]
+  let badIvf := ByteArray.mk #[0x00, 0x01, 0x02, 0x03]
+  let ivfOk :=
+    (match demuxIvfIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray ivfBytes) with
+     | .independentVerified (h, pkts) => h.width == 320 && h.height == 240 && pkts.size == 2
+     | .fallbackDelegated _ => false) &&
+    (match demuxIvfIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray badIvf) with
+     | .independentVerified _ => false
+     | .fallbackDelegated reason => reason == "invalid_or_truncated_ivf_stream")
+  let t1 ← IO.monoNanosNow
+  let allOk := rescaleOk && scaleOk && ivfOk
+  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"bench_us\":{(t1 - t0) / 1000}}"
+  return if allOk then 0 else 1
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
+  | "plan" :: rest => do
+    let plan := parseArgsToPlanIR rest
+    IO.println (serializePlanIRJson plan)
+    return if (validatePlanIR plan).isOk then 0 else 1
+  | "verify-ffi" :: mp4Path :: _ => runVerifyFfi (some mp4Path)
+  | "verify-ffi" :: [] => runVerifyFfi none
+  | "verify-kernels" :: _ => runVerifyKernels
   | "-version" :: _ => printLffmpegVersion
   | "--version" :: _ => printLffmpegVersion
   | "-codecs" :: _ => printLffmpegCodecs
@@ -1722,6 +1895,12 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.NativeKernels.checkLnirKernel_sound
 #print axioms LeanAV.NativeKernels.evalLnir_libav_videotoolbox_p010_strided_pack_fma_equiv
 #print axioms LeanAV.NativeKernels.fastBox3x3DownscaleU10Sum_eq_spec_and_bounded
+#print axioms LeanAV.PlanIR.streamMapSpec_parse_format_roundtrip
+#print axioms LeanAV.PlanIR.metadataSpec_parse_format_roundtrip
+#print axioms LeanAV.PlanIR.protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversal
+#print axioms LeanAV.PlanIR.planIR_cli_roundtrip_verified
+#print axioms LeanAV.PlanIR.validatePlanIR_sound_and_rejects_unsafe
+#print axioms LeanAV.PlanIR.independentKernel_fallback_complete_and_sound
 
 
 

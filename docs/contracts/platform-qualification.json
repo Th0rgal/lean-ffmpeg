@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "contract": "platform_qualification_and_adversarial_corpus",
+  "plan_reference": "docs/FFMPEG_PARITY_MAXWELL_PLAN.md",
+  "required_platforms": [
+    "linux-x86_64",
+    "macos-arm64",
+    "linux-arm64",
+    "windows-x86_64"
+  ],
+  "platforms": {
+    "linux-x86_64": {
+      "status": "tested_local",
+      "system": "Linux",
+      "machine": "x86_64",
+      "reference_ffmpeg": "6.1.1-3ubuntu5",
+      "lean_toolchain": "leanprover/lean4:v4.31.0",
+      "verified_gates": [
+        "lake_build",
+        "lffmpeg_self_test",
+        "axiom_audit",
+        "capability_registry_reproducibility",
+        "differential_runner_bounds_and_rlimits",
+        "timing_and_phase2_corpus",
+        "cli_routing_and_adversarial_media_fail_closed"
+      ]
+    },
+    "macos-arm64": {
+      "status": "untested",
+      "system": "Darwin",
+      "machine": "arm64",
+      "blocker": "no macOS ARM64 execution environment attached to this workspace",
+      "verified_gates": []
+    },
+    "linux-arm64": {
+      "status": "untested",
+      "system": "Linux",
+      "machine": "aarch64",
+      "blocker": "no Linux ARM64 execution environment attached to this workspace",
+      "verified_gates": []
+    },
+    "windows-x86_64": {
+      "status": "untested",
+      "system": "Windows",
+      "machine": "AMD64",
+      "blocker": "no Windows x86-64 execution environment attached to this workspace",
+      "verified_gates": []
+    }
+  },
+  "adversarial_media_corpus": {
+    "cases": [
+      "empty_input_file",
+      "non_mp4_garbage_bytes",
+      "truncated_ftyp_header",
+      "invalid_box_size_below_header",
+      "overflow_box_size_u32_max",
+      "truncated_moov_atom",
+      "faststart_truncated_mdat_transcode"
+    ],
+    "invariants": [
+      "nonzero_exit_on_corrupt_or_truncated_input",
+      "no_partial_output_artifact_on_failure",
+      "single_json_object_on_stdout_when_json_requested",
+      "zero_stderr_when_quiet_or_json_requested"
+    ]
+  },
+  "cross_platform_promotion": {
+    "status": "blocked_pending_untested_platforms_and_quorum",
+    "untested_platforms_never_claimed_supported": true
+  }
+}

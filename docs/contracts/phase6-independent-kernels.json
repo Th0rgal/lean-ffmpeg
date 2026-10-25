@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "phase": 6,
+  "wave": "wave_h_bounded_independent_verified_kernels",
+  "contract": "independent_verified_kernels_with_explicit_fallback",
+  "verification_command": "lffmpeg verify-kernels",
+  "kernels": [
+    {
+      "id": "rational_timestamp_rescaler",
+      "entry_point": "LeanAV.PlanIR.rescalePtsIndependentOrFallback",
+      "underlying_spec": "LeanAV.Core.AVRational.rescalePtsExactNat",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Core.rescalePtsExactNat_monotone",
+        "LeanAV.Core.rescalePtsExactNat_id",
+        "LeanAV.Core.rescaleTimestampChecked_exact_and_bounded",
+        "LeanAV.PlanIR.independentKernel_fallback_complete_and_sound"
+      ],
+      "fallback_conditions": [
+        "negative_pts_requires_signed_timeline_shift",
+        "zero_rational_component",
+        "rational_product_exceeds_certified_bound"
+      ]
+    },
+    {
+      "id": "luma_2x2_box_downscaler",
+      "entry_point": "LeanAV.PlanIR.scalePlane2x2IndependentOrFallback",
+      "underlying_spec": "LeanAV.Scale.scalePlaneDown2x2Fast",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Scale.scalePlaneDown2x2Fast_eq_fusedEq_identity",
+        "LeanAV.Scale.scalePlaneDown2x2Simd_eq_fast_and_dims",
+        "LeanAV.NativeKernels.fastBox2x2DownscalePixel_eq_spec"
+      ],
+      "fallback_conditions": [
+        "plane_bounds_violation",
+        "dimensions_not_even_2x2_compatible"
+      ]
+    },
+    {
+      "id": "ivf_container_demuxer",
+      "entry_point": "LeanAV.PlanIR.demuxIvfIndependentOrFallback",
+      "underlying_spec": "LeanAV.Format.demuxIvfStream",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Core.plane2D_verifyBounds_sound"
+      ],
+      "fallback_conditions": [
+        "invalid_or_truncated_ivf_stream",
+        "ivf_packet_integrity_or_dimension_failure"
+      ]
+    }
+  ]
+}

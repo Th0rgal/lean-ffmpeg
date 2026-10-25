@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "phase": 7,
+  "contract": "progressive_promotion_and_rollback",
+  "tier_hierarchy": [
+    "untested",
+    "unsupported",
+    "approximate",
+    "translated_partial",
+    "delegated_faithful",
+    "independent_tested",
+    "independent_verified"
+  ],
+  "promotion_requirements": {
+    "delegated_faithful": [
+      "typed_plan_ir_lowering",
+      "differential_oracle_parity_against_pinned_ffmpeg",
+      "adversarial_fail_closed_without_partial_artifact"
+    ],
+    "independent_tested": [
+      "independent_specification",
+      "differential_oracle_parity",
+      "adversarial_corpus_pass",
+      "explicit_fallback_to_delegated_on_out_of_domain"
+    ],
+    "independent_verified": [
+      "zero_sorryAx_formal_proof",
+      "turbo_lean_audit_spec_zero_issues",
+      "independent_tested_requirements_satisfied"
+    ]
+  },
+  "rollback_policy": {
+    "trigger_conditions": [
+      "differential_oracle_regression",
+      "turbo_lean_audit_spec_failure",
+      "ffi_bounds_or_sanitizer_violation",
+      "performance_regression_above_threshold"
+    ],
+    "automated_fallback_transition": "KernelExecutionResult.fallbackDelegated -> BackendTier.delegatedFaithful",
+    "registry_demotion_rule": "immediate_demotion_to_delegated_faithful_or_unsupported"
+  }
+}

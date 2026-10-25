@@ -1,0 +1,80 @@
+{
+  "cases": [
+    {
+      "name": "seek-and-trim",
+      "input": "input.mp4",
+      "args": [
+        "-ss",
+        "0.25",
+        "-t",
+        "0.75",
+        "-i",
+        "input.mp4",
+        "-c:v",
+        "h264",
+        "timing.mp4"
+      ],
+      "output": "timing.mp4",
+      "probe_packets": true,
+      "probe_frames": true
+    },
+    {
+      "name": "input-seek",
+      "inputs": [
+        "input.mp4"
+      ],
+      "args": [
+        "-i",
+        "input.mp4",
+        "-ss",
+        "0.5",
+        "-t",
+        "0.5",
+        "-c:v",
+        "h264",
+        "timing.mp4"
+      ],
+      "output": "timing.mp4",
+      "probe_packets": true,
+      "probe_frames": true
+    },
+    {
+      "name": "rate-change",
+      "input": "input.mp4",
+      "args": [
+        "-i",
+        "input.mp4",
+        "-t",
+        "1",
+        "-r",
+        "15",
+        "-c:v",
+        "h264",
+        "timing.mp4"
+      ],
+      "output": "timing.mp4",
+      "probe_packets": true,
+      "probe_frames": true
+    },
+    {
+      "name": "audio-input-seek",
+      "inputs": [
+        "input-av.mp4"
+      ],
+      "args": [
+        "-i",
+        "input-av.mp4",
+        "-ss",
+        "0.5",
+        "-t",
+        "0.5",
+        "-c:v",
+        "h264",
+        "timing-av.mp4"
+      ],
+      "output": "timing-av.mp4",
+      "probe_packets": true,
+      "probe_frames": true
+    }
+  ]
+}

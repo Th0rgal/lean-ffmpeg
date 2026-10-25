@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "contract": "timing_seek_semantics",
+  "scope": {
+    "tool": "lffmpeg",
+    "operation": "input_side_ss_transcode",
+    "classification": "translated_partial"
+  },
+  "provenance": {
+    "reference": {
+      "runtime": "ffmpeg 6.1.1-3ubuntu5",
+      "binary_sha256": "db4c30c7242aa8325cf1bd99bb2336046e2152bc5e6c0ff6de54719378accc54"
+    },
+    "candidate": {
+      "binary": ".lake/build/bin/lffmpeg",
+      "binary_sha256": "9ee5fab9e3d9b7980745120cb5c403faf2c7c68f86e6c9dd06fbb1cd5d194f3c"
+    },
+    "fixture": {
+      "path": "tests/differential/fixtures/timing.json",
+      "sha256": "2aaa2f7c038d13a9cf801cc7f232c5f8c90a980315469a8446dea4a52ad5ad84",
+      "cases": ["seek-and-trim", "input-seek", "rate-change"]
+    }
+  },
+  "expected_matched_fields": [
+    "duration",
+    "frame_rate",
+    "frame_count"
+  ],
+  "known_divergence_fields": [
+    {
+      "field": "start_time",
+      "case": "seek-and-trim",
+      "reference": 0.033008,
+      "candidate": 0.0
+    },
+    {
+      "field": "packet_pts_dts_offset",
+      "case": "seek-and-trim",
+      "status": "divergent"
+    },
+    {
+      "field": "frame_pts_dts_offset",
+      "case": "seek-and-trim",
+      "status": "divergent"
+    },
+    {
+      "field": "color_metadata",
+      "cases": ["seek-and-trim", "input-seek", "rate-change"],
+      "status": "candidate_populated_reference_null"
+    },
+    {
+      "field": "output_bytes_media_fidelity",
+      "status": "not_compared"
+    }
+  ],
+  "promotion": {
+    "status": "blocked_pending_quorum",
+    "required_quorum": ["fable", "astra", "gemini"],
+    "local_review": "approve_with_limits"
+  }
+}

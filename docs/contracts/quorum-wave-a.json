@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "contract": "wave_a_reinforced_quorum",
+  "scope": {
+    "campaign": "lean_ffmpeg_parity_wave_a_baseline",
+    "artifacts": [
+      "docs/capability-registry.json",
+      "docs/contracts/platform-qualification.json",
+      "docs/contracts/phase3-ir-schema.json",
+      "docs/contracts/phase4-delegated-coverage.json",
+      "docs/contracts/phase5-ffi-abi-boundary.json",
+      "docs/contracts/phase6-independent-kernels.json",
+      "docs/contracts/phase7-promotion-and-rollback.json",
+      "tests/differential/runner.py",
+      "tests/differential/test_runner.py",
+      "tests/differential/test_cli_routing.py",
+      "tests/differential/test_phase2.py",
+      "tests/differential/test_phase3_to_7.py",
+      "docs/wave-a-state.json",
+      "docs/CAMPAIGN_CLOSURE_DOSSIER.md"
+    ]
+  },
+  "required_reviewers": ["fable", "astra", "gemini"],
+  "required_questions": [
+    "specification_non_vacuous_and_falsifiable",
+    "evidence_measures_contract",
+    "missing_risks",
+    "architecture_recommendation",
+    "minimal_falsifying_experiment",
+    "promotion_verdict"
+  ],
+  "allowed_verdicts": ["approve", "approve_with_limits", "reject"],
+  "promotion_rule": {
+    "required_convergent_reviews": 3,
+    "alternative_with_experiment": false,
+    "persistent_disagreement": "block_and_create_maxwell_branch"
+  },
+  "review_status": {
+    "fable": {"status": "deferred_to_final_validation_by_user", "verdict": null},
+    "astra": {"status": "deferred_to_final_validation_by_user", "verdict": null},
+    "gemini": {"status": "deferred_to_final_validation_by_user", "verdict": null}
+  },
+  "user_deferral_authorization": {
+    "authorized_by": "Thomas",
+    "instruction": "Tu as l’autorisation de continuer toutes les phases jusqu à la fin sans quorum, on fera la validation à la fin",
+    "phase_progression_unblocked": true,
+    "final_quorum_validation_timing": "end_of_campaign"
+  },
+  "promotion": {
+    "status": "blocked_pending_three_model_quorum",
+    "reason": "external reviewers deferred to end-of-campaign validation per explicit user authorization",
+    "local_review_does_not_substitute": true
+  }
+}

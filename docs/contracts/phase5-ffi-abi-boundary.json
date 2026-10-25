@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "phase": 5,
+  "wave": "wave_g_ffi_facade_and_resource_safety",
+  "contract": "c_abi_ffi_boundary_and_cancellation",
+  "abi_version": "0x00010005",
+  "verification_command": "lffmpeg verify-ffi",
+  "c_symbols": [
+    {
+      "symbol": "leanav_c_ffi_abi_version",
+      "lean_binding": "LeanAV.PlanIR.ffiAbiVersionC",
+      "ownership": "stateless_scalar",
+      "Allocation": "zero"
+    },
+    {
+      "symbol": "leanav_c_ffi_probe_mp4_contract",
+      "lean_binding": "LeanAV.PlanIR.ffiProbeMp4ContractC",
+      "ownership": "borrowed_byte_array_read_only",
+      "allocation": "zero",
+      "bounds_checked": true,
+      "max_boxes_scanned": 256
+    },
+    {
+      "symbol": "leanav_c_ffi_cancel_gate",
+      "lean_binding": "LeanAV.PlanIR.ffiCancelGateC",
+      "ownership": "stateless_seq_cst_fence",
+      "spec": "LeanAV.PlanIR.specFfiCancelGate"
+    },
+    {
+      "symbol": "leanav_c_verify_plane_ffi_contract",
+      "lean_binding": "LeanAV.Encoder.verifyPlaneFfiContractC",
+      "ownership": "borrowed_byte_array_stride64_tail64_checked",
+      "bounds_checked": true
+    },
+    {
+      "symbol": "leanav_c_exec_delegated_ffmpeg",
+      "lean_binding": "LeanAV.PlanIR.ffiExecDelegatedFfmpegC",
+      "ownership": "borrowed_argv_array_and_output_path",
+      "unlinks_partial_artifact_on_error": true
+    }
+  ]
+}

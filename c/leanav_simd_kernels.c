@@ -3655,6 +3655,7 @@ static int leanav_libav_stream_copy(
     if (avformat_write_header(ofmt, &mux_opts) < 0) {
         av_dict_free(&mux_opts);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        unlink(out_path);
         avformat_free_context(ofmt);
         avformat_close_input(&ifmt);
         return -1;
@@ -3701,6 +3702,7 @@ static int leanav_libav_stream_copy(
     if (pkt) av_packet_free(&pkt);
     if (rc == 0 && av_write_trailer(ofmt) < 0) rc = -1;
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+    if (rc != 0) unlink(out_path);
     avformat_free_context(ofmt);
     avformat_close_input(&ifmt);
     return rc;
@@ -4653,6 +4655,7 @@ static uint64_t leanav_libav_transcode_pixel(
     if (avformat_write_header(ofmt, &mux_opts) < 0) {
         av_dict_free(&mux_opts);
         if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        unlink(out_path);
         avformat_free_context(ofmt);
         if (afifo) av_audio_fifo_free(afifo);
         if (swr) swr_free(&swr);
@@ -5323,6 +5326,7 @@ static uint64_t leanav_libav_transcode_pixel(
             (unsigned long long)no_free_samples);
     }
     if (frames_done == 0 || trailer_rc < 0) {
+        unlink(out_path);
         if (g_ui_show_stats) fprintf(stderr, "\n");
         return 0;
     }
@@ -5412,7 +5416,10 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         }
         int rc = system(copy_cmd);
 #endif
-        if (rc != 0) return 0;
+        if (rc != 0) {
+            unlink(out_path);
+            return 0;
+        }
         g_last_max_block_sad_16x16 = 0;
         g_last_psnr_db_x10 = 480;
         g_last_dist_lt_black = 1;
@@ -5521,8 +5528,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     char dec_cmd[8192];
     snprintf(dec_cmd, sizeof(dec_cmd),
-        "%s -v error -nostdin -hwaccel auto -threads 0 %s-i %s %s-fps_mode passthrough -an -sn -dn -f rawvideo -pix_fmt %s - 2>/dev/null",
-        ffmpeg_bin, ss_arg, q_in, t_arg, raw_pix_fmt);
+        "%s -v error -nostdin -hwaccel auto -threads 0 %s%s-i %s -fps_mode passthrough -an -sn -dn -f rawvideo -pix_fmt %s - 2>/dev/null",
+        ffmpeg_bin, ss_arg, t_arg, q_in, raw_pix_fmt);
 
     /* Audio: if filter_flags bit 3 (8) requests 6ch->2ch stereo AAC downmix, encode `-ac 2 -c:a aac`, else `-c:a aac -b:a 128k` */
     char a_enc_args[256];
@@ -5539,10 +5546,29 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     uint32_t fps_num = 24000u, fps_den = 1001u;
     leanav_probe_input_fps_rational(in_path, q_in, &fps_num, &fps_den);
     char fps_str[64];
+    uint32_t output_fps_num = fps_num;
+    uint32_t output_fps_den = fps_den;
     if (g_enc_fps[0] != '\0') {
         snprintf(fps_str, sizeof(fps_str), "%s", g_enc_fps);
+        unsigned int parsed_num = 0, parsed_den = 1;
+        if (sscanf(g_enc_fps, "%u/%u", &parsed_num, &parsed_den) == 2 && parsed_num > 0 && parsed_den > 0) {
+            output_fps_num = parsed_num;
+            output_fps_den = parsed_den;
+        } else {
+            double parsed_rate = strtod(g_enc_fps, NULL);
+            if (parsed_rate > 1.0 && parsed_rate < 480.0) {
+                output_fps_num = (uint32_t)(parsed_rate * 1000.0 + 0.5);
+                output_fps_den = 1000u;
+            }
+        }
     } else {
         snprintf(fps_str, sizeof(fps_str), "%u/%u", fps_num, fps_den);
+    }
+    uint64_t output_frame_limit = 0;
+    if (dur_ms_u32 > 0 && output_fps_num > 0 && output_fps_den > 0) {
+        uint64_t scaled_duration = (uint64_t)dur_ms_u32 * (uint64_t)output_fps_num;
+        uint64_t frame_den = 1000ULL * (uint64_t)output_fps_den;
+        output_frame_limit = (scaled_duration + frame_den - 1ULL) / frame_den;
     }
 
     leanav_media_info_t fb_info;
@@ -5558,15 +5584,15 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if (with_audio_u32) {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
-            "%s-i %s %s-map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
+            "%s%s-i %s -map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
             "%s %s%s %s -moov_size 262144 %s 2>/dev/null",
-            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
+            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, t_arg, q_in, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s %s%s -moov_size 262144 %s 2>/dev/null",
-            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
+            "%s%s %s%s -moov_size 262144 %s 2>/dev/null",
+            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");
@@ -5616,6 +5642,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
             got += r;
         }
         if (got < src_frame_sz) break;
+        if (output_frame_limit > 0 && frames_done >= output_frame_limit) break;
 
         if (!enc_fp) {
             enc_fp = popen(enc_cmd, "w");
@@ -5756,6 +5783,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     }
 
     if (frames_done == 0 || enc_rc != 0) {
+        if (enc_fp) unlink(out_path);
         if (g_ui_show_stats) fprintf(stderr, "\n");
         return 0;
     }
@@ -5816,5 +5844,225 @@ LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
     if (actual_cap < req_cap) return 0u;
     if (require_exclusive != 0u && !lean_is_exclusive((lean_object *)ba)) return 0u;
     return 1u;
+}
+
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static const char *leanav_resolve_ffmpeg_exec_path(void) {
+    const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
+    if (env_bin && env_bin[0] != '\0' && access(env_bin, X_OK) == 0) return env_bin;
+    if (access("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg", X_OK) == 0) {
+        return "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg";
+    }
+    if (access("/tmp/opencode/ffmpeg_build/ffmpeg", X_OK) == 0) {
+        return "/tmp/opencode/ffmpeg_build/ffmpeg";
+    }
+    return "ffmpeg";
+}
+
+/*
+ * Phase 5 (Wave G): Pinned FFI ABI Version (`0x00010005`).
+ */
+LEAN_EXPORT uint32_t leanav_c_ffi_abi_version(lean_obj_arg unit) {
+    (void)unit;
+    return 0x00010005u;
+}
+
+/*
+ * Phase 5 (Wave G): Bounded, Zero-Allocation MP4 Header Probe FFI Facade (`leanav_c_ffi_probe_mp4_contract`):
+ * Borrows `ba` (`@& ByteArray`, read-only ownership) and inspects at most `min(lean_sarray_size(ba), max_read_bytes)`
+ * bytes without heap allocation. Verifies top-level box bounds (`raw_box_len >= hdr_len` and `pos + raw_box_len <= cap`),
+ * requires both `ftyp` and `moov`, and extracts `(width, height, timescale)` from `tkhd`/`mdhd`.
+ * Returns `(1ULL << 63) | ((uint64_t)width << 32) | ((uint64_t)height << 16) | (uint64_t)(timescale & 0xFFFFu)` on success,
+ * or `0ULL` on any bounds/format violation.
+ */
+static void leanav_ffi_scan_mp4_children(
+    const uint8_t *buf, size_t len, int depth,
+    uint32_t *out_w, uint32_t *out_h, uint32_t *out_ts
+) {
+    if (depth <= 0 || len < 8) return;
+    size_t pos = 0;
+    int fuel = 128;
+    while (pos + 8 <= len && fuel-- > 0) {
+        uint32_t sz32 = leanav_rd_u32be(buf + pos);
+        const uint8_t *fcc = buf + pos + 4;
+        size_t box_len = sz32;
+        size_t hdr_len = 8;
+        if (sz32 == 1) {
+            if (pos + 16 > len) return;
+            uint64_t sz64 = ((uint64_t)leanav_rd_u32be(buf + pos + 8) << 32) | (uint64_t)leanav_rd_u32be(buf + pos + 12);
+            if (sz64 < 16 || sz64 > len - pos) return;
+            box_len = (size_t)sz64;
+            hdr_len = 16;
+        } else if (sz32 == 0) {
+            box_len = len - pos;
+        } else if (box_len < 8 || box_len > len - pos) {
+            return;
+        }
+        const uint8_t *body = buf + pos + hdr_len;
+        size_t body_len = box_len - hdr_len;
+        if (memcmp(fcc, "moov", 4) == 0 || memcmp(fcc, "trak", 4) == 0 ||
+            memcmp(fcc, "mdia", 4) == 0 || memcmp(fcc, "minf", 4) == 0 ||
+            memcmp(fcc, "stbl", 4) == 0) {
+            leanav_ffi_scan_mp4_children(body, body_len, depth - 1, out_w, out_h, out_ts);
+        } else if (memcmp(fcc, "tkhd", 4) == 0 && body_len >= 84) {
+            uint8_t ver = body[0];
+            size_t w_off = (ver == 1 && body_len >= 96) ? 88 : 76;
+            if (w_off + 8 <= body_len) {
+                uint32_t w16 = leanav_rd_u32be(body + w_off) >> 16;
+                uint32_t h16 = leanav_rd_u32be(body + w_off + 4) >> 16;
+                if (*out_w == 0 && w16 > 0 && h16 > 0) {
+                    *out_w = w16;
+                    *out_h = h16;
+                }
+            }
+        } else if (memcmp(fcc, "mdhd", 4) == 0 && body_len >= 20) {
+            uint8_t ver = body[0];
+            size_t ts_off = (ver == 1 && body_len >= 24) ? 20 : 12;
+            if (ts_off + 4 <= body_len) {
+                uint32_t ts = leanav_rd_u32be(body + ts_off);
+                if (*out_ts == 0 && ts > 0) *out_ts = ts;
+            }
+        }
+        pos += box_len;
+    }
+}
+
+LEAN_EXPORT uint64_t leanav_c_ffi_probe_mp4_contract(
+    b_lean_obj_arg ba,
+    size_t max_read_bytes
+) {
+    if (max_read_bytes < 32) return 0ULL;
+    size_t actual_size = lean_sarray_size(ba);
+    if (actual_size < 32) return 0ULL;
+    size_t cap = (actual_size < max_read_bytes) ? actual_size : max_read_bytes;
+    const uint8_t *buf = lean_sarray_cptr(ba);
+
+    size_t pos = 0;
+    int saw_ftyp = 0;
+    int saw_moov = 0;
+    uint32_t width = 0, height = 0, timescale = 0;
+    int fuel = 64;
+    while (pos + 8 <= cap && fuel-- > 0) {
+        uint32_t sz32 = leanav_rd_u32be(buf + pos);
+        const uint8_t *fcc = buf + pos + 4;
+        size_t box_len = sz32;
+        size_t hdr_len = 8;
+        if (sz32 == 1) {
+            if (pos + 16 > cap) return 0ULL;
+            uint64_t sz64 = ((uint64_t)leanav_rd_u32be(buf + pos + 8) << 32) | (uint64_t)leanav_rd_u32be(buf + pos + 12);
+            if (sz64 < 16 || sz64 > cap - pos) return 0ULL;
+            box_len = (size_t)sz64;
+            hdr_len = 16;
+        } else if (sz32 == 0) {
+            return 0ULL;
+        } else if (box_len < 8) {
+            return 0ULL;
+        } else if (box_len > cap - pos) {
+            if (memcmp(fcc, "mdat", 4) == 0 && saw_ftyp && saw_moov && box_len <= actual_size - pos) {
+                break;
+            }
+            return 0ULL;
+        }
+        if (memcmp(fcc, "ftyp", 4) == 0) {
+            saw_ftyp = 1;
+        } else if (memcmp(fcc, "moov", 4) == 0) {
+            saw_moov = 1;
+            leanav_ffi_scan_mp4_children(buf + pos + hdr_len, box_len - hdr_len, 6, &width, &height, &timescale);
+        }
+        pos += box_len;
+    }
+    if (!saw_ftyp || !saw_moov || width == 0 || height == 0 || width > 65535u || height > 65535u) {
+        return 0ULL;
+    }
+    uint32_t ts16 = (timescale > 0 && timescale <= 65535u) ? timescale : 15360u;
+    return (1ULL << 63) | ((uint64_t)width << 32) | ((uint64_t)height << 16) | (uint64_t)ts16;
+}
+
+/*
+ * Phase 5 (Wave G): Cooperative/Preemptive Cancellation & Frame Budget Gate (`leanav_c_ffi_cancel_gate`):
+ * Enforces sequential consistency fence and returns `1u` iff execution may proceed (`cancel_flag == 0`
+ * and `(max_frames == 0 || frames_done < max_frames)`), or `0u` to abort immediately.
+ */
+LEAN_EXPORT uint32_t leanav_c_ffi_cancel_gate(
+    uint32_t cancel_flag,
+    uint32_t frames_done,
+    uint32_t max_frames
+) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (cancel_flag != 0u) return 0u;
+    if (max_frames > 0u && frames_done >= max_frames) return 0u;
+    return 1u;
+}
+
+/*
+ * Phase 4 (Waves E/F): Structured-Argv Delegated Execution (`leanav_c_exec_delegated_ffmpeg`):
+ * Executes the reference FFmpeg binary via `fork()` + `execvp()` with a structured `Array String`
+ * (zero shell interpolation), redirecting stdin from `/dev/null` and optionally suppressing stderr/stdout.
+ * If the child exits nonzero and `out_path` is a non-empty regular file path (`!= "-"`), unlinks `out_path`.
+ */
+LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
+    b_lean_obj_arg argv_arr,
+    b_lean_obj_arg out_path_str,
+    uint32_t suppress_output
+) {
+    size_t n = lean_array_size(argv_arr);
+    if (n > 256) return 1u;
+    const char *ffmpeg_bin = leanav_resolve_ffmpeg_exec_path();
+    const char *out_path = lean_string_cstr(out_path_str);
+
+    const char **c_argv = (const char **)calloc(n + 2, sizeof(char *));
+    if (!c_argv) return 1u;
+    c_argv[0] = ffmpeg_bin;
+    for (size_t i = 0; i < n; i++) {
+        lean_object *elem = lean_array_get_core(argv_arr, i);
+        c_argv[i + 1] = lean_string_cstr(elem);
+    }
+    c_argv[n + 1] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(c_argv);
+        return 1u;
+    }
+    if (pid == 0) {
+        if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
+            const char *old_ld = getenv("LD_LIBRARY_PATH");
+            char ld_buf[4096];
+            if (old_ld && old_ld[0] != '\0') {
+                snprintf(ld_buf, sizeof(ld_buf),
+                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
+                    old_ld);
+            } else {
+                snprintf(ld_buf, sizeof(ld_buf),
+                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
+            }
+            setenv("LD_LIBRARY_PATH", ld_buf, 1);
+        }
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (suppress_output != 0u) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+            }
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        execvp(ffmpeg_bin, (char *const *)c_argv);
+        _exit(127);
+    }
+    free(c_argv);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return 1u;
+    }
+    int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
+    if (!ok && out_path && out_path[0] != '\0' && strcmp(out_path, "-") != 0) {
+        unlink(out_path);
+    }
+    return ok ? 0u : 1u;
 }
 
