@@ -54,8 +54,8 @@ lake env lean scripts/check_axioms.lean
 for f in LeanAV/*.lean; do turbo-lean --json audit-spec "$f"; done
 
 # Validate the 12 LNIR_WIRE_V1 kernels via translation validation and certificate checking
-turbo-lean native-validate-tv c/leanav_lnir_kernels.lnir --samples 64
-turbo-lean native-verify-certs c/leanav_lnir_kernels.lnir
+lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
+lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
 # Run the Python unit and differential test suites (59 tests: 15 unit + 44 differential)
 python3 -m unittest discover -s tests -p "test_*.py"
