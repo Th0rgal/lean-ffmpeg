@@ -80,7 +80,7 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 #include <arm_neon.h>
 #endif
 
-#if defined(__has_include) && defined(__APPLE__)
+#if defined(LEANAV_ENABLE_LIBAV) && defined(__has_include)
 #if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>) && __has_include(<libswresample/swresample.h>)
 #define LEANAV_HAS_LIBAV 1
 #include <libavformat/avformat.h>
@@ -6101,4 +6101,325 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     if (WIFSIGNALED(status)) return (uint32_t)(128 + WTERMSIG(status));
     return 1u;
 }
+
+/* ============================================================================
+ * C-ABI Runtime Bridge to `lean-native-core`-Compiled LNIR Kernels (`c/leanav_lnir_kernels.h`)
+ * ============================================================================
+ * Layout of `lean_native_sarray_u64` expected by `lean-native-core` LLVM IR:
+ *   offset  0 (i32): m_rc       (1 = exclusive ownership, fast-path in-place)
+ *   offset  8 (i64): m_size     (number of 64-bit elements)
+ *   offset 16 (i64): m_capacity (capacity in 64-bit elements)
+ *   offset 24 (i64): m_data[m_size]
+ */
+#include "leanav_lnir_kernels.h"
+
+static uint64_t *leanav_lnir_alloc_sarray_from_lean(b_lean_obj_arg arr, size_t *out_len) {
+    size_t n = lean_array_size(arr);
+    if (out_len) *out_len = n;
+    uint64_t *buf = (uint64_t *)calloc(3 + (n > 0 ? n : 1), sizeof(uint64_t));
+    if (!buf) return NULL;
+    *((int32_t *)&buf[0]) = 1; /* m_rc = 1 (exclusive) */
+    buf[1] = (uint64_t)n;      /* m_size */
+    buf[2] = (uint64_t)n;      /* m_capacity */
+    for (size_t i = 0; i < n; i++) {
+        lean_object *elem = lean_array_get_core(arr, i);
+        buf[3 + i] = lean_unbox_uint64(elem);
+    }
+    return buf;
+}
+
+static uint64_t *leanav_lnir_alloc_sarray_raw(const int64_t *src, size_t n) {
+    uint64_t *buf = (uint64_t *)calloc(3 + (n > 0 ? n : 1), sizeof(uint64_t));
+    if (!buf) return NULL;
+    *((int32_t *)&buf[0]) = 1; /* m_rc = 1 (exclusive) */
+    buf[1] = (uint64_t)n;      /* m_size */
+    buf[2] = (uint64_t)n;      /* m_capacity */
+    for (size_t i = 0; i < n; i++) {
+        buf[3 + i] = (uint64_t)src[i];
+    }
+    return buf;
+}
+
+static lean_obj_res leanav_lnir_sarray_to_lean_array(const uint64_t *sarr, size_t fallback_n) {
+    size_t n = sarr ? (size_t)sarr[1] : fallback_n;
+    lean_object *res = lean_alloc_array(n, n);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t v = sarr ? sarr[3 + i] : 0ULL;
+        lean_array_set_core(res, i, lean_box_uint64(v));
+    }
+    return res;
+}
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_h264_idct_tuple_sroa(uint64_t blocks, uint64_t dc_init) {
+    return h264_idct_tuple_accum_sroa(blocks, dc_init);
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias(
+    b_lean_obj_arg xs_arr,
+    uint64_t gain,
+    uint64_t bias
+) {
+    size_t n = 0;
+    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &n);
+    if (!in0) return lean_alloc_array(0, 0);
+    uint64_t *out = (uint64_t *)swscale_luma_gain_bias_simd(in0, gain, bias);
+    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
+    if (out && out != in0) free(out);
+    free(in0);
+    return res;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_opus_celt_saxpy(
+    b_lean_obj_arg xs_arr,
+    b_lean_obj_arg ys_arr
+) {
+    size_t nx = 0, ny = 0;
+    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
+    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
+    if (!in0 || !in1) {
+        free(in0);
+        free(in1);
+        return lean_alloc_array(0, 0);
+    }
+    size_t n = (nx < ny) ? nx : ny;
+    in0[1] = (uint64_t)n;
+    in1[1] = (uint64_t)n;
+    uint64_t *out = (uint64_t *)opus_celt_pvq_mix_saxpy_gpu(in0, in1);
+    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
+    if (out && out != in0) free(out);
+    free(in0);
+    free(in1);
+    return res;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_av1_wiener_3tap(
+    b_lean_obj_arg xs_arr,
+    b_lean_obj_arg ys_arr,
+    b_lean_obj_arg zs_arr
+) {
+    size_t nx = 0, ny = 0, nz = 0;
+    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
+    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
+    uint64_t *in2 = leanav_lnir_alloc_sarray_from_lean(zs_arr, &nz);
+    if (!in0 || !in1 || !in2) {
+        free(in0);
+        free(in1);
+        free(in2);
+        return lean_alloc_array(0, 0);
+    }
+    size_t n = nx;
+    if (ny < n) n = ny;
+    if (nz < n) n = nz;
+    in0[1] = (uint64_t)n;
+    in1[1] = (uint64_t)n;
+    in2[1] = (uint64_t)n;
+    uint64_t *out = (uint64_t *)av1_wiener_3tap_sym_gpu(in0, in1, in2);
+    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
+    if (out && out != in0) free(out);
+    free(in0);
+    free(in1);
+    free(in2);
+    return res;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_av1_cdef_fma(
+    b_lean_obj_arg xs_arr,
+    b_lean_obj_arg ys_arr,
+    b_lean_obj_arg zs_arr
+) {
+    size_t nx = 0, ny = 0, nz = 0;
+    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
+    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
+    uint64_t *in2 = leanav_lnir_alloc_sarray_from_lean(zs_arr, &nz);
+    if (!in0 || !in1 || !in2) {
+        free(in0);
+        free(in1);
+        free(in2);
+        return lean_alloc_array(0, 0);
+    }
+    size_t n = nx;
+    if (ny < n) n = ny;
+    if (nz < n) n = nz;
+    in0[1] = (uint64_t)n;
+    in1[1] = (uint64_t)n;
+    in2[1] = (uint64_t)n;
+    uint64_t *out = (uint64_t *)av1_cdef_fma_blend_gpu(in0, in1, in2);
+    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
+    if (out && out != in0) free(out);
+    free(in0);
+    free(in1);
+    free(in2);
+    return res;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_pq10_studio_clamp(
+    b_lean_obj_arg xs_arr
+) {
+    size_t n = 0;
+    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &n);
+    if (!in0) return lean_alloc_array(0, 0);
+    uint64_t *out = (uint64_t *)pq10_studio_clamp_select_simd(in0);
+    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
+    if (out && out != in0) free(out);
+    free(in0);
+    return res;
+}
+
+/*
+ * Execute all 12 `lean-native-core`-compiled LNIR DSP kernels (`c/leanav_lnir_kernels.h`)
+ * on adversarial 8-lane vectors and verify bit-exact equality against reference semantics.
+ */
+LEAN_EXPORT uint32_t leanav_c_verify_compiled_lnir_suite(lean_obj_arg unit_arg) {
+    (void)unit_arg;
+    const size_t N = 8;
+    const int64_t vA[8] = { 0, 16, 63, 64, 128, 512, 940, 1023 };
+    const int64_t vB[8] = { 3, -5, 10, 20, -15, 7, 4, 2 };
+    const int64_t vC[8] = { 100, 200, 50, -30, 12, 0, 64, 999 };
+    int ok = 1;
+
+    /* 1. swscale_luma_gain_bias_simd */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *out = (uint64_t *)swscale_luma_gain_bias_simd(b0, 5ULL, (uint64_t)(-12LL));
+        for (size_t i = 0; i < N; i++) {
+            int64_t exp = vA[i] * 5 - 12;
+            if ((int64_t)out[3 + i] != exp) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+    }
+    /* 2. flac_lpc_autocorr_dot_simd (tests C_inc + K_dot + C_dec COW path) */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *out = (uint64_t *)flac_lpc_autocorr_dot_simd(b0, b1);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] * vB[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+    }
+    /* 3. opus_celt_pvq_mix_saxpy_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *out = (uint64_t *)opus_celt_pvq_mix_saxpy_gpu(b0, b1);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != 4 * vA[i] + vB[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+    }
+    /* 4. av1_wiener_3tap_sym_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *b2 = leanav_lnir_alloc_sarray_raw(vC, N);
+        uint64_t *out = (uint64_t *)av1_wiener_3tap_sym_gpu(b0, b1, b2);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != 3 * vA[i] + 10 * vB[i] + 3 * vC[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+        free(b2);
+    }
+    /* 5. av1_cdef_fma_blend_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *b2 = leanav_lnir_alloc_sarray_raw(vC, N);
+        uint64_t *out = (uint64_t *)av1_cdef_fma_blend_gpu(b0, b1, b2);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] * vB[i] + vC[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+        free(b2);
+    }
+    /* 6. h264_idct_tuple_accum_sroa */
+    {
+        uint64_t got = h264_idct_tuple_accum_sroa(16ULL, 7ULL);
+        uint64_t exp = 7ULL;
+        for (uint64_t i = 0; i < 16ULL; i++) {
+            exp = (exp + i) + (i * 2ULL);
+        }
+        if (got != exp) ok = 0;
+    }
+    /* 7. bframe_bipred_blend_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vC, N);
+        uint64_t *out = (uint64_t *)bframe_bipred_blend_gpu(b0, b1);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] + vC[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+    }
+    /* 8. hevc_sao_band_offset_add_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *out = (uint64_t *)hevc_sao_band_offset_add_gpu(b0, b1);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] + vB[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+    }
+    /* 9. aac_imdct_window_mul_gpu */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
+        uint64_t *out = (uint64_t *)aac_imdct_window_mul_gpu(b0, b1);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] * vB[i]) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+        free(b1);
+    }
+    /* 10. prores_qscale_map_simd */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *out = (uint64_t *)prores_qscale_map_simd(b0);
+        for (size_t i = 0; i < N; i++) {
+            if ((int64_t)out[3 + i] != vA[i] * 16 + 8) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+    }
+    /* 11. boxblur_div9_recip_shift_simd */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *out = (uint64_t *)boxblur_div9_recip_shift_simd(b0);
+        for (size_t i = 0; i < N; i++) {
+            uint64_t u = (uint64_t)vA[i];
+            uint64_t exp = ((u + 4ULL) * 7282ULL) >> 16;
+            if (out[3 + i] != exp || exp != (u + 4ULL) / 9ULL) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+    }
+    /* 12. pq10_studio_clamp_select_simd */
+    {
+        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
+        uint64_t *out = (uint64_t *)pq10_studio_clamp_select_simd(b0);
+        for (size_t i = 0; i < N; i++) {
+            uint64_t u = (uint64_t)vA[i];
+            uint64_t exp = (u < 64ULL) ? 64ULL : ((u > 940ULL) ? 940ULL : u);
+            if (out[3 + i] != exp) ok = 0;
+        }
+        if (out != b0) free(out);
+        free(b0);
+    }
+    return ok ? 1u : 0u;
+}
+
 

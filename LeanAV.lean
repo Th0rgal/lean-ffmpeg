@@ -1,7 +1,7 @@
 /-
-  LeanAV: Verified & Super-Optimized Lean 4 Multimedia Engine
+  LeanAV: Verified Lean 4 Multimedia Engine (`lffmpeg`)
   Built on `LeanSys` (`Posix`, `Hash`, `Codec`, `Store`, `Mmap`, `Lsm`, `Http`, `Reactor`, `Sandbox`),
-  audited by `turbo-lean`, and super-optimized for CPU SIMD (`AVX2`/`NEON`) & GPU (`CUDA PTX`/`Metal`) via `lean-native`.
+  audited by `turbo-lean`, and linked with `lean-native-core` C-ABI DSP kernels (`libleanav_dsp.a`).
 -/
 import LeanAV.Spec
 import LeanAV.Core
@@ -16,12 +16,4 @@ import LeanAV.Filter
 import LeanAV.Encoder
 import LeanAV.Cli
 import LeanAV.NativeKernels
-import LeanAV.HdrColrFidelity
-import LeanAV.HdrStaticFidelity
-import LeanAV.Sad16x16Bound
-import LeanAV.Scale2x2Arithmetic
-import LeanAV.Scale2x2Checksum
-import LeanAV.StridedScale2x2
-import LeanAV.StridedSimdBound
-import LeanAV.StridedSimdConcrete
 import LeanAV.PlanIR

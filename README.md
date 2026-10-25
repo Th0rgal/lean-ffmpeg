@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Implémentation formellement vérifiée en **Lean 4** (`v4.31.0`) d'un pipeline multimédia et d'une façade CLI compatible `ffmpeg` (`lffmpeg`), compilée vers C natif / SIMD / GPU (`LNIR_WIRE_V1`) avec **`0 sorryAx`** et auditée par l'oracle Zero-Trust **`turbo-lean`**.
+Implémentation formellement vérifiée en **Lean 4** (`v4.31.0`) d'un pipeline multimédia et d'une façade CLI compatible `ffmpeg` (`lffmpeg`), couplant des noyaux **LeanNative (`LNIR_WIRE_V1`)** compilés via LLVM 18 (`leanav_lnir_x86_64.ll` / `leanav_lnir_arm64.ll`) et des noyaux C-ABI SIMD (`AVX2` / `NEON`) dans `libleanav_dsp.a`, avec **`0 sorryAx`** et **`202 / 202` spécifications formelles `non_vacuous_and_tight`** auditées par l'oracle Zero-Trust **`turbo-lean`**.
 
 ---
 
@@ -10,18 +10,18 @@ Chaque requête CLI est analysée dans une représentation intermédiaire typée
 
 | Niveau | Rôle | Exemples |
 | :--- | :--- | :--- |
-| **`independent_verified`** | Noyaux Lean 4 + C-ABI SIMD prouvés sans dépendance FFmpeg, avec repli explicite (`fallbackDelegated`) | Downscale 2×2 / 3:2 (`scale`), prédicteur/décodeur LPC FLAC Ordre-4, CDEF/Wiener AV1, SAO HEVC, démux/mux MP4 & IVF natifs, arithmétique exacte `AVRational` |
-| **`translated_partial`** | Orchestration C-ABI directe (`libavformat` / `libavcodec` / `libswscale`) vérifiée par portes C-ABI | Transcodage MP4 (`h264`, `hevc`, `av1`, `aac`, `-ss`, `-t`, `-vf scale/crop/boxblur/unsharp/eq`), probe JSON |
+| **`independent_verified`** | Noyaux Lean 4 + LNIR (`lean-native-core`) + C-ABI SIMD prouvés sans dépendance FFmpeg, avec repli explicite (`fallbackDelegated`) | Downscale 2×2 / 3:2 (`scale`), prédicteur/décodeur LPC FLAC Ordre-4, CDEF/Wiener AV1, SAO HEVC, démux/mux MP4 & IVF natifs, arithmétique exacte `AVRational` |
+| **`translated_partial`** | Orchestration C-ABI directe (`libavformat` / `libavcodec` / `libswresample`) vérifiée par portes C-ABI (ou repli subprocess structuré si `libav*-dev` est absent) | Transcodage MP4 (`h264`, `hevc`, `av1`, `aac`, `-ss`, `-t`, `-vf scale/colorspace=bt709/tonemap`), probe JSON |
 | **`delegated_faithful`** | Exécution structurée `fork`/`execvp` (sans interpolation shell) vers `ffmpeg` | Conteneurs `.mkv`, `.webm`, `.mov`, `.wav`, `.flac`, `.ogg`, `.ts`, `.avi`, `.ast`, `-map`, `-metadata`, `-disposition`, `-bsf`, `-filter_complex` |
 | **`unsupported`** | Rejet déterministe avec diagnostic explicite et zéro fichier partiel | Protocoles non sûrs (`http://`, `rtsp://`, `pipe:`, `/dev/*`, `..`), combinaisons invalides (`-c:v copy -vf ...`) |
 
 ---
 
-## Parité Différentielle & FATE Vérifiée face à `ffmpeg 6.1.1` (`445` tests)
+## Parité Différentielle & FATE Vérifiée face à `ffmpeg 6.1.1`
 
 | Suite de Vérification | Périmètre | Résultat Vérifié | Détails |
 | :--- | :--- | :---: | :--- |
-| **Suite #0 (`tests/`)** | **59 tests** unitaires & différentiels Python + auto-tests C-ABI | **`59 / 59` (`100%`)** | `15/15` unitaires + `44/44` différentiels + `53/53` waves `self-test` + `15/15` portes C-ABI |
+| **Suite #0 (`tests/`)** | **59 tests** unitaires & différentiels Python + auto-tests C-ABI / LNIR | **`59 / 59` (`100%`)** | `15/15` unitaires (`tests/`) + `44/44` différentiels (`tests/differential/`) + `53/53` waves `self-test` + `12/12` noyaux LNIR compilés exécutés via FFI |
 | **Suite #1 (`bench.py`)** | **120 cas** : conteneurs, `-map`, métadonnées, chapitres, dispositions, BSFs, sous-titres, multi-input & timeline | **`119 / 120` (`99.2%`)** | `111 MATCH` bit-exact + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cas** : codecs vidéo/audio, `-vf` / `-af`, `pix_fmt`, contrôle de débit (`-crf`, `-b:v`, `-qp`) & découpe temporelle | **`79 / 79` (`100%`)** | `79/79` codes retour identiques, `79/79` signatures `ffprobe` identiques (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 tests FATE officiels FFmpeg** (`fate-lavf-*` + `fate-ffmpeg-*`) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` sorties identiques** | `100%` des `129` tests FATE passés par `ffmpeg 6.1.1` passent avec `lffmpeg`, `0/187` rejet CLI, `186/186` sorties non-vides identiques bit-à-bit |
@@ -30,38 +30,47 @@ Chaque requête CLI est analysée dans une représentation intermédiaire typée
 
 ## Spécifications Formelles Déclaratives (`AVGateSpec`) & Audit Zero-Trust (`turbo-lean`)
 
-Chaque porte de sécurité et de conformité implémente la méta-spécification [`AVGateSpec`](LeanAV/Spec.lean) reliant une porte exécutable C-ABI (`UInt8`) à un prédicat déclaratif `Prop` indépendant (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`) :
+Chaque porte de sécurité et de conformité implémente la méta-spécification [`AVGateSpec`](LeanAV/Spec.lean) reliant une porte exécutable C-ABI (`UInt8`) à un prédicat déclaratif `Prop` indépendant (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`). L'intégralité des **15 modules** `LeanAV/*.lean` passe l'audit `turbo-lean --json audit-spec` (`69a8d19`) :
 
-| Module Audité (`turbo-lean --json audit-spec`) | Spécifications `non_vacuous_and_tight` | `vacuous` | `trivial` | `sorryAx` | Temps |
-| :--- | :---: | :---: | :---: | :---: | ---: |
-| `LeanAV/Spec.lean` (9 portes `AVGateSpec` + 5 lois) | **`23 / 23` (`100%`)** | `0` | `0` | `0` | `10.4 ms` |
-| `LeanAV/Domain.lean` (`FFmpegAcceptanceSafe` + pistes) | **`8 / 8` (`100%`)** | `0` | `0` | `0` | `8.9 ms` |
-| `LeanAV/PlanIR.lean` (`MediaPlanIR` + sécurité + FFI) | **`11 / 11` (`100%`)** | `0` | `0` | `0` | `10.0 ms` |
-| `LeanAV/NativeKernels.lean` (50 waves `LNIR_WIRE_V1`) | **`19 / 19` (`100%`)** | `0` | `0` | `0` | `9.7 ms` |
-| `LeanAV/Format.lean` (ISOBMFF / MP4 / FLAC / ADTS / Opus) | **`45 / 45` (`100%`)** | `0` | `0` | `0` | `14.5 ms` |
-| `LeanAV/Scale.lean` & `LeanAV/Filter.lean` | **`12 / 12` (`100%`)** | `0` | `0` | `0` | `12.5 ms` |
+| Module Audité (`turbo-lean --json audit-spec`) | Spécifications `non_vacuous_and_tight` | `vacuous` | `trivial` | `shadowed` | `sorryAx` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `LeanAV/Format.lean` (ISOBMFF / MP4 / CMAF / HDR10 / CENC) | **`47 / 47` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Video.lean` (H.264 / HEVC / AV1 / ProRes / FFV1 / DPB) | **`27 / 27` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Spec.lean` (9 portes `AVGateSpec` + 5 lois de conservation) | **`23 / 23` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/NativeKernels.lean` (12 noyaux distincts `LNIR_WIRE_V1` + TV) | **`19 / 19` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Bitstream.lean` (Exp-Golomb / Rice / CABAC / MSAC / `BitM`) | **`13 / 13` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Audio.lean` (FLAC LPC & Rice / AAC ADTS & ASC / Opus) | **`12 / 12` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Scale.lean` (Downscale 2×2 / 3×3 / Bicubic / BT.2020 PQ10) | **`12 / 12` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Core.lean` (`AVRational` / `Plane` SIMD / `rescaleTimestamp`) | **`11 / 11` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/PlanIR.lean` (`MediaPlanIR` + sécurité protocolaire + FFI) | **`11 / 11` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Domain.lean` (`FFmpegAcceptanceSafe` + élagage de pistes) | **`8 / 8` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Encoder.lean` (DMA zero-copy / tuiles disjointes / RDO) | **`8 / 8` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Cli.lean` (`CliConfig` fail-closed + fractions de secondes) | **`6 / 6` (`100%`)** | `0` | `0` | `0` | `0` |
+| `LeanAV/Filter.lean` (`evalFusedLumaPoint` + BoxBlur + Flip + Denoise) | **`5 / 5` (`100%`)** | `0` | `0` | `0` | `0` |
+| **Total (`15 / 15` modules `LeanAV/*.lean`)** | **`202 / 202` (`100%`)** | **`0`** | **`0`** | **`0`** | **`0`** |
 
 ---
 
 ## Compilation & Vérification
 
 ```bash
-# Compiler le projet et les preuves formelles (70 cibles Lake, 0 sorryAx)
+# Compiler le projet, les noyaux SIMD C-ABI (-mavx2 -mfma / NEON) et les 12 noyaux LNIR LLVM (0 sorryAx)
 lake build
 
-# Exécuter les 53 vagues d'auto-tests formels et les 15 portes C-ABI
+# Exécuter les 53 vagues d'auto-tests formels et les portes C-ABI / LNIR
 ./.lake/build/bin/lffmpeg self-test
-
-# Vérifier les contrats C-ABI et les noyaux indépendants avec repli prouvé
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Auditer les spécifications formelles avec turbo-lean (0 vacuous, 0 trivial)
-turbo-lean --json audit-spec LeanAV/Spec.lean
+# Vérifier l'absence totale de sorryAx / axiomes non standards sur toutes les déclarations LeanAV.*
+lake env lean scripts/check_axioms.lean
 
-# Suite de tests unitaires et différentiels Python (59 tests)
+# Auditer les 15 modules formels avec turbo-lean (202/202 tight, 0 vacuous, 0 trivial)
+for f in LeanAV/*.lean; do turbo-lean --json audit-spec "$f"; done
+
+# Suite complète de tests unitaires et différentiels Python (59 tests : 15 + 44)
 python3 -m unittest discover -s tests -p "test_*.py"
-python3 -m unittest discover -s tests/differential -p "test_phase*.py"
+python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```
 
 ---
@@ -97,7 +106,9 @@ Mesures effectuées sur Linux x86\_64 (médiane sur 7 exécutions après warmup)
 
 ## Structure du Dépôt
 
-- `LeanAV/` : Spécifications déclaratives et théorèmes universels (`0 sorryAx`, `118/118` specs `non_vacuous_and_tight`) — `Spec.lean`, `Domain.lean`, `Core.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `Main.lean`.
-- `c/leanav_simd_kernels.c` : Noyaux SIMD C-ABI (`AVX2` / `NEON`), façade `libavformat`/`libavcodec`/`libswscale` et exécution déléguée `execvp` sans shell.
-- `tests/` : Suite de tests unitaires et différentiels (`59` tests Python) face à `ffmpeg`/`ffprobe`.
+- `LeanAV/` : 15 modules formels (`0 sorryAx`, `202/202` specs `non_vacuous_and_tight`) — `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`.
+- `c/` :
+  - `c/leanav_simd_kernels.c` : Noyaux SIMD C-ABI (`AVX2` / `NEON`), pont C-ABI vers les 12 noyaux LNIR compilés, façade `libavformat`/`libavcodec`/`libswresample` et exécution déléguée `execvp` sans shell.
+  - `c/leanav_lnir_kernels.lnir`, `c/leanav_lnir_kernels.h`, `c/leanav_lnir_x86_64.ll`, `c/leanav_lnir_arm64.ll` : 12 noyaux DSP `LNIR_WIRE_V1` validés (`validate-tv` + `verify-certs`) et abaissés en LLVM 18 IR par `lean-native-core`, compilés et liés dans `libleanav_dsp.a`.
+- `tests/` : Suite de tests unitaires (`15` tests) et différentiels (`44` tests) face à `ffmpeg`/`ffprobe`.
 - `docs/` : Plan Maxwell (`FFMPEG_PARITY_MAXWELL_PLAN.md`), registre de capacités (`capability-registry.json`), contrats (`docs/contracts/`) et dossier de clôture (`CAMPAIGN_CLOSURE_DOSSIER.md`).

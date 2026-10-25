@@ -1748,23 +1748,29 @@ def xorResidualBytesRef (a b : ByteArray) (n : Nat) : ByteArray :=
       (aList.getD i 0) ^^^ (bList.getD i 0))
   { data := outList.toArray }
 
-/-- Fast flat-`ByteArray` B-frame bi-predictive plane kernel (`mcBiPredBytesSimd`). -/
-def mcBiPredBytesSimd (l0 l1 : ByteArray) (nBytes : Nat) : ByteArray := Id.run do
-  let mut out := ByteArray.emptyWithCapacity nBytes
+/-- Fast flat-`ByteArray` B-frame bi-predictive plane kernel (`mcBiPredBytesSimd`),
+    backed at runtime by AVX2/NEON `leanav_c_mc_bipred_plane`. -/
+@[extern "leanav_c_mc_bipred_plane"]
+def mcBiPredBytesSimd (l0 : @& ByteArray) (l1 : @& ByteArray) (nBytes : USize) : ByteArray := Id.run do
+  let n := nBytes.toNat
+  let mut out := ByteArray.emptyWithCapacity n
   let cap0 := l0.size
   let cap1 := l1.size
-  for i in [:nBytes] do
+  for i in [:n] do
     let b0 : UInt16 := if i < cap0 then (l0.get! i).toUInt16 else 0
     let b1 : UInt16 := if i < cap1 then (l1.get! i).toUInt16 else 0
     out := out.push (((b0 + b1 + 1) >>> 1).toUInt8)
   return out
 
-/-- Fast flat-`ByteArray` inter-frame residual plane kernel (`xorResidualBytesSimd`). -/
-def xorResidualBytesSimd (a b : ByteArray) (nBytes : Nat) : ByteArray := Id.run do
-  let mut out := ByteArray.emptyWithCapacity nBytes
+/-- Fast flat-`ByteArray` inter-frame residual plane kernel (`xorResidualBytesSimd`),
+    backed at runtime by AVX2/NEON `leanav_c_xor_residual_plane`. -/
+@[extern "leanav_c_xor_residual_plane"]
+def xorResidualBytesSimd (a : @& ByteArray) (b : @& ByteArray) (nBytes : USize) : ByteArray := Id.run do
+  let n := nBytes.toNat
+  let mut out := ByteArray.emptyWithCapacity n
   let capA := a.size
   let capB := b.size
-  for i in [:nBytes] do
+  for i in [:n] do
     let ba := if i < capA then a.get! i else 0
     let bb := if i < capB then b.get! i else 0
     out := out.push (ba ^^^ bb)
@@ -1793,7 +1799,7 @@ def reconstructInterResidualPlaneRef (pred residual : Plane2D) : Plane2D :=
 def mcBiPredPlaneSimd (refL0 refL1 : Plane2D) : Plane2D :=
   let w := refL0.width
   let h := refL0.height
-  let n := w * h
+  let n := (w * h).toUSize
   { data := mcBiPredBytesSimd refL0.data refL1.data n, width := w, height := h, stride := w }
 
 /-- Fast zero-boxing inter-frame P/B residual encoder (`encodeInterResidualPlaneSimd`: `residual = src ^^^ pred`). -/
@@ -1801,7 +1807,7 @@ def mcBiPredPlaneSimd (refL0 refL1 : Plane2D) : Plane2D :=
 def encodeInterResidualPlaneSimd (src pred : Plane2D) : Plane2D :=
   let w := src.width
   let h := src.height
-  let n := w * h
+  let n := (w * h).toUSize
   { data := xorResidualBytesSimd src.data pred.data n, width := w, height := h, stride := w }
 
 /-- Fast zero-boxing inter-frame P/B residual reconstructor (`reconstructInterResidualPlaneSimd`: `recon = pred ^^^ residual`). -/
@@ -1809,7 +1815,7 @@ def encodeInterResidualPlaneSimd (src pred : Plane2D) : Plane2D :=
 def reconstructInterResidualPlaneSimd (pred residual : Plane2D) : Plane2D :=
   let w := pred.width
   let h := pred.height
-  let n := w * h
+  let n := (w * h).toUSize
   { data := xorResidualBytesSimd pred.data residual.data n, width := w, height := h, stride := w }
 
 set_option maxRecDepth 200000 in

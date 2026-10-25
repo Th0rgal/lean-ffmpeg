@@ -16,10 +16,10 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
           "$HOME/.elan/bin/lean" --version
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: Install FFmpeg runtime
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg runtime and libav headers
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libswresample-dev libavutil-dev clang
       - name: Turbo Lean incremental build
-        uses: Th0rgal/turbo-lean@f4887f20fed88a4945b607fafc249e1d39af4ddf
+        uses: Th0rgal/turbo-lean@69a8d1929170dd3510f864c342fcec0d1c390f5e
         with:
           project-dir: "."
           command: build
@@ -27,13 +27,18 @@ jobs:
           mode: trusted
       - name: Build
         run: lake build
-      - name: Zero-Trust Spec Audit (turbo-lean)
+      - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
         run: |
-          turbo-lean --json audit-spec LeanAV/Spec.lean
-          turbo-lean --json audit-spec LeanAV/Domain.lean
-          turbo-lean --json audit-spec LeanAV/PlanIR.lean
-          turbo-lean --json audit-spec LeanAV/NativeKernels.lean
-      - name: Self-test & C-ABI / Kernel Verification
+          python3 - <<'PY'
+          import glob, json, subprocess, sys
+          for path in sorted(glob.glob("LeanAV/*.lean")):
+              res = subprocess.run(["turbo-lean", "--json", "audit-spec", path], capture_output=True, text=True, check=True)
+              data = json.loads(res.stdout)
+              print(f"{path}: audited={data['total_specs_audited']} tight={data['tight_specs']} vacuous={data['vacuous_specs']} trivial={data['trivial_specs']}")
+              if not data.get("ok") or data.get("vacuous_specs", 0) != 0 or data.get("trivial_specs", 0) != 0:
+                  sys.exit(1)
+          PY
+      - name: Self-test & C-ABI / LNIR Kernel Verification
         run: |
           .lake/build/bin/lffmpeg self-test
           .lake/build/bin/lffmpeg verify-ffi
@@ -43,8 +48,7 @@ jobs:
       - name: Unit & Differential Test Suite
         run: |
           python3 -m unittest discover -s tests -p "test_*.py"
-          python3 -m unittest discover -s tests/differential -p "test_phase*.py"
-          python3 -m unittest discover -s tests/differential -p "test_quorum*.py"
+          python3 -m unittest discover -s tests/differential -p "test_*.py"
       - name: CLI smoke tests
         run: |
           set +e
@@ -82,3 +86,9 @@ jobs:
       - run: .lake/build/bin/lffmpeg self-test
       - run: .lake/build/bin/lffmpeg verify-ffi
       - run: .lake/build/bin/lffmpeg verify-kernels
+      - name: Axiom audit
+        run: lake env lean scripts/check_axioms.lean
+      - name: Unit & Differential Test Suite
+        run: |
+          python3 -m unittest discover -s tests -p "test_*.py"
+          python3 -m unittest discover -s tests/differential -p "test_*.py"

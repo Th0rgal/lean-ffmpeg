@@ -791,4 +791,56 @@ theorem pq10Tonemap_and_bicubic2x2_verified :
     evalBicubic4TapMidpoint 10 120 140 250 = 130 := by
   decide
 
+/-! ## 8. Consolidated 2x2 Box-Scale, Strided SIMD Bounds, and 16x16 SAD Proofs -/
+
+theorem sad16x16_u8_bound (pixels : List (Fin 256 × Fin 256))
+    (hSize : pixels.length = 256) :
+    (pixels.map (fun p => (p.1.val - p.2.val) + (p.2.val - p.1.val))).sum ≤ 65280 := by
+  have bound (xs : List (Fin 256 × Fin 256)) :
+      (xs.map (fun p => (p.1.val - p.2.val) + (p.2.val - p.1.val))).sum ≤ xs.length * 255 := by
+    induction xs with
+    | nil => simp
+    | cons p ps ih =>
+      have ha := p.1.isLt
+      have hb := p.2.isLt
+      have hd : (p.1.val - p.2.val) + (p.2.val - p.1.val) ≤ 255 := by omega
+      simp only [List.map_cons, List.sum_cons, List.length_cons]
+      omega
+  have h := bound pixels
+  rw [hSize] at h
+  exact h
+
+theorem scale2x2_rounded_sum_shift_eq_box (s : Nat) :
+    (s + 2) >>> 2 = (s + 2) / 4 := by
+  rw [Nat.shiftRight_eq_div_pow]
+
+def stridedScale2x2Pixel (src : Nat → Fin 256) (stride x y : Nat) : Nat :=
+  ((src ((2 * y) * stride + 2 * x)).val +
+    (src ((2 * y) * stride + 2 * x + 1)).val +
+    (src ((2 * y) * stride + stride + 2 * x)).val +
+    (src ((2 * y) * stride + stride + 2 * x + 1)).val + 2) >>> 2
+
+def exactBox2x2Pixel (src : Nat → Fin 256) (stride x y : Nat) : Nat :=
+  ((src ((2 * y) * stride + 2 * x)).val +
+    (src ((2 * y) * stride + 2 * x + 1)).val +
+    (src ((2 * y + 1) * stride + 2 * x)).val +
+    (src ((2 * y + 1) * stride + 2 * x + 1)).val + 2) / 4
+
+theorem strided_scale2x2_pixel_eq_exact_box (src : Nat → Fin 256) (stride x y : Nat) :
+    stridedScale2x2Pixel src stride x y = exactBox2x2Pixel src stride x y := by
+  unfold stridedScale2x2Pixel exactBox2x2Pixel
+  rw [Nat.add_mul, Nat.one_mul, Nat.shiftRight_eq_div_pow]
+
+theorem strided_simd_load_bound (rowBase stride cap offset vecBytes : Nat) :
+    rowBase + stride ≤ cap →
+    offset + vecBytes ≤ stride →
+    rowBase + offset + vecBytes ≤ cap := by
+  omega
+
+theorem luma_4k_simd_load_bound (dx dy : Nat)
+    (hx : dx + 32 ≤ 1920) (hy : dy < 1080) :
+    (dy * 2) * 3840 + dx * 2 + 64 ≤ 8294400 ∧
+    (dy * 2 + 1) * 3840 + dx * 2 + 64 ≤ 8294400 := by
+  omega
+
 end LeanAV.Scale

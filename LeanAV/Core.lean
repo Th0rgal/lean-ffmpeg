@@ -410,12 +410,12 @@ theorem rescalePtsExactNat_monotone (pts1 pts2 bqNum bqDen cqNum cqDen : Nat) (h
   unfold AVRational.rescalePtsExactNat rescaleFloor
   exact Nat.div_le_div_right (Nat.mul_le_mul_right (bqNum * cqDen) h)
 
-/-- Theorem: `rescalePtsExactNat` is the exact identity on `pts` when source and destination timebases are equal (`num > 0, den > 0`). -/
-theorem rescalePtsExactNat_id (pts num den : Nat) (hNum : 0 < num) (hDen : 0 < den) :
-    AVRational.rescalePtsExactNat pts num den num den = pts := by
+/-- Theorem: `rescalePtsExactNat` is the exact identity on `pts` when timebases match (`tbNum, tbDen > 0`). -/
+theorem rescalePtsExactNat_id (tbNum tbDen pts : Nat) (hNum : 0 < tbNum) (hDen : 0 < tbDen) :
+    AVRational.rescalePtsExactNat pts tbNum tbDen tbNum tbDen = pts := by
   unfold AVRational.rescalePtsExactNat rescaleFloor
-  have hPos : 0 < den * num := Nat.mul_pos hDen hNum
-  have hComm : num * den = den * num := Nat.mul_comm num den
+  have hPos : 0 < tbDen * tbNum := Nat.mul_pos hDen hNum
+  have hComm : tbNum * tbDen = tbDen * tbNum := Nat.mul_comm tbNum tbDen
   rw [hComm]
   exact Nat.mul_div_cancel pts hPos
 
@@ -491,8 +491,9 @@ structure Plane where
 namespace Plane
 
 /-- Universal helper lemma: if `y < h`, then `y * stride + stride ≤ stride * h`. -/
-theorem row_end_le_total (stride y h : Nat) (hy : y < h) :
-    y * stride + stride ≤ stride * h := by
+theorem row_end_le_total (y h stride : Nat) :
+    y < h → y * stride + stride ≤ stride * h := by
+  intro hy
   have hy1 : y + 1 ≤ h := hy
   have hmul : (y + 1) * stride ≤ h * stride := Nat.mul_le_mul_right stride hy1
   have hcomm : h * stride = stride * h := Nat.mul_comm h stride
@@ -514,7 +515,7 @@ theorem addr_lt (p : Plane) {x y : Nat} (hx : x < p.w) (hy : y < p.h) :
     Nat.mul_le_mul_right p.bytesPerSample hx1
   have hdistX : (x + 1) * p.bytesPerSample = x * p.bytesPerSample + p.bytesPerSample := by
     rw [Nat.add_mul, Nat.one_mul]
-  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total p.stride y p.h hy
+  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total y p.h p.stride hy
   have hWs := p.h_ws
   have hFit := p.h_fit
   have hBps := p.h_pos.2.2
@@ -531,7 +532,7 @@ theorem simd_load_safe (p : Plane) {x y vecBytes : Nat}
     (hx : x < p.w) (hy : y < p.h) (hVec : vecBytes ≤ 64) :
     y * p.stride + x * p.bytesPerSample + vecBytes ≤ p.data.size := by
   have hAddr := p.addr_lt hx hy
-  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total p.stride y p.h hy
+  have hRow : y * p.stride + p.stride ≤ p.stride * p.h := row_end_le_total y p.h p.stride hy
   have hx1 : x + 1 ≤ p.w := hx
   have hmulX : (x + 1) * p.bytesPerSample ≤ p.w * p.bytesPerSample :=
     Nat.mul_le_mul_right p.bytesPerSample hx1
@@ -726,9 +727,9 @@ def rescaleTimestampChecked (ts : Timestamp) (bq cq : PosRational)
   rescaled timestamp `q = divRoundNat (pts * b) c .zero` satisfies the exact inequality:
   `q * c ≤ pts * b ∧ pts * b < (q + 1) * c` (error strictly less than `1` destination tick, with zero silent saturation).
 -/
-theorem divRoundNat_zero_error_lt_one_tick (pts b c : Nat) (hc : 0 < c) :
-    let q := divRoundNat (pts * b) c .zero
-    q * c ≤ pts * b ∧ pts * b < (q + 1) * c := by
+theorem divRoundNat_zero_error_lt_one_tick (c pts b : Nat) (hc : 0 < c) :
+    divRoundNat (pts * b) c .zero * c ≤ pts * b ∧
+    pts * b < (divRoundNat (pts * b) c .zero + 1) * c := by
   dsimp [divRoundNat]
   have hMod : (pts * b) % c < c := Nat.mod_lt (pts * b) hc
   have hDivMod : c * ((pts * b) / c) + (pts * b) % c = pts * b := Nat.div_add_mod (pts * b) c
@@ -744,12 +745,11 @@ theorem divRoundNat_zero_error_lt_one_tick (pts b c : Nat) (hc : 0 < c) :
   and the explicit two-sided half-tick absolute-error bound:
   `2 * (q * c) ≤ 2 * (pts * b) + c ∧ 2 * (pts * b) < 2 * (q * c) + c` (i.e., `2 * |q * c - pts * b| ≤ c`).
 -/
-theorem divRoundNat_nearInf_error_bound (pts b c : Nat) (hc : 0 < c) :
-    let q := divRoundNat (pts * b) c .nearInf
-    q * c ≤ pts * b + c / 2 ∧
-    pts * b + c / 2 < (q + 1) * c ∧
-    2 * (q * c) ≤ 2 * (pts * b) + c ∧
-    2 * (pts * b) < 2 * (q * c) + c := by
+theorem divRoundNat_nearInf_error_bound (c pts b : Nat) (hc : 0 < c) :
+    divRoundNat (pts * b) c .nearInf * c ≤ pts * b + c / 2 ∧
+    pts * b + c / 2 < (divRoundNat (pts * b) c .nearInf + 1) * c ∧
+    2 * (divRoundNat (pts * b) c .nearInf * c) ≤ 2 * (pts * b) + c ∧
+    2 * (pts * b) < 2 * (divRoundNat (pts * b) c .nearInf * c) + c := by
   dsimp [divRoundNat]
   have hMod : (pts * b + c / 2) % c < c := Nat.mod_lt (pts * b + c / 2) hc
   have hDivMod : c * ((pts * b + c / 2) / c) + (pts * b + c / 2) % c = pts * b + c / 2 :=

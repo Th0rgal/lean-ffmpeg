@@ -366,11 +366,11 @@ def runSelfTest : IO UInt32 := do
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1B) false == .bFrame
 
-  -- 22. Wave 14: 15-Kernel LNIR Wire (`lanczos_4tap_downscale_fma_gpu`) & 4-Tap Lanczos Normalization Gate
+  -- 22. Wave 14: 12-Kernel Distinct LNIR Wire & 4-Tap Lanczos Normalization Gate
   let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
     evalLnirKernel .fmaBlend [360, 200] [9, 9] [-360, -200] == [2880, 1600]
   let w14Tokens := emitLeanAvLnirWire.splitOn "|"
-  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "52"
+  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "12"
 
   -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
   let w15ShI : HevcSliceSegmentHeaderView := {
@@ -772,11 +772,13 @@ def runSelfTest : IO UInt32 := do
   let w51LnirOk := checkLnirKernel w51LnirDesc && !(checkLnirKernel w51LnirBadAlias) && !(checkLnirKernel w51LnirBadTail)
   let w51Ok := w51PlaneOk && w51BombRejected && w51SliceOk && w51SliceOverflowRejected && w51TimeOk && w51DpbAndCtxOk && w51LnirOk
 
-  -- 60. Wave 52: In-Process `libavcodec`/`VideoToolbox` 10-Bit `P010LE` Strided Pack FMA & 10-Bit 3x3 Reciprocal Scaling Gate
+  -- 60. Wave 52: In-Process `lean-native-core`-Compiled 12-Kernel LNIR C-ABI Suite & 10-Bit 3x3 Reciprocal Scaling Gate
   let w52P010Out := evalLnirKernel .fmaBlend [512, 1023] [64, 64] [0, 32768]
   let w52BoxU10Ok := fastBox3x3DownscaleU10Sum 9207 == specBox3x3DownscaleU10Sum 9207 &&
                      specBox3x3DownscaleU10Sum 9207 == 1023
-  let w52Ok := w52P010Out == leanSpecLibavVideotoolboxP010PackFma [512, 1023] [64, 64] [0, 32768] && w52BoxU10Ok
+  let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
+               w52BoxU10Ok &&
+               verifyCompiledLnirSuiteC () == 1
 
   -- 61. Wave 53 (Phases 3–6): Typed `MediaPlanIR` Round-Trip, Protocol Gate, Pinned C-ABI FFI Facade & Independent Kernels
   let w53Plan := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-map", "0:v:0", "-metadata", "title=Demo", "-c", "copy", "out.mkv"]
@@ -1388,9 +1390,30 @@ def runVerifyKernels : IO UInt32 := do
     (match demuxIvfIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray badIvf) with
      | .independentVerified _ => false
      | .fallbackDelegated reason => reason == "invalid_or_truncated_ivf_stream")
+
+  -- 4. Runtime execution of `lean-native-core`-compiled LNIR machine code (`c/leanav_lnir_x86_64.ll` / `arm64.ll`)
+  --    verified bit-for-bit against formal `evalLnirKernel` and `leanSpecH264IdctTupleAccumSroa`
+  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1
+  let lnirSroaOk  := execLnirH264IdctTupleSroaC 16 7 == leanSpecH264IdctTupleAccumSroa 16 7
+  let vX : List Int64 := [0, 16, 63, 64, 128, 512, 940, 1023]
+  let vY : List Int64 := [3, -5, 10, 20, -15, 7, 4, 2]
+  let vZ : List Int64 := [100, 200, 50, -30, 12, 0, 64, 999]
+  let lnirSwscaleOk :=
+    (execLnirSwscaleGainBiasC vX.toArray 5 (-12)).toList == evalLnirKernel (.gainBias 5 (-12)) vX [] []
+  let lnirSaxpyOk :=
+    (execLnirOpusCeltSaxpyC vX.toArray vY.toArray).toList == evalLnirKernel (.saxpy 4) vX vY []
+  let lnirWienerOk :=
+    (execLnirAv1Wiener3TapC vX.toArray vY.toArray vZ.toArray).toList == evalLnirKernel .wiener3TapSym vX vY vZ
+  let lnirCdefOk :=
+    (execLnirAv1CdefFmaC vX.toArray vY.toArray vZ.toArray).toList == evalLnirKernel .fmaBlend vX vY vZ
+  let lnirClampOk :=
+    (execLnirPq10StudioClampC vX.toArray).toList == evalLnirKernel .pq10StudioClamp vX [] []
+  let lnirCompiledOk :=
+    lnirSuiteOk && lnirSroaOk && lnirSwscaleOk && lnirSaxpyOk && lnirWienerOk && lnirCdefOk && lnirClampOk
+
   let t1 ← IO.monoNanosNow
-  let allOk := rescaleOk && scaleOk && ivfOk
-  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"bench_us\":{(t1 - t0) / 1000}}"
+  let allOk := rescaleOk && scaleOk && ivfOk && lnirCompiledOk
+  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"bench_us\":{(t1 - t0) / 1000}}"
   return if allOk then 0 else 1
 
 def main (args : List String) : IO UInt32 := do
@@ -1719,16 +1742,22 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.dpb_inter_frame_chain_verified
 
 #print axioms LeanAV.NativeKernels.evalLnir_swscale_gain_bias_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_flac_lpc_dot_equiv
 #print axioms LeanAV.NativeKernels.evalLnir_opus_celt_saxpy_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_av1_wiener_3tap_sym_equiv
 #print axioms LeanAV.NativeKernels.evalLnir_av1_cdef_fma_equiv
-#print axioms LeanAV.NativeKernels.evalLnir_stencil3Tap_length_universal
+#print axioms LeanAV.NativeKernels.evalLnir_bframe_bipred_blend_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_hevc_sao_band_offset_add_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_aac_imdct_window_mul_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_prores_qscale_map_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_boxblur_div9_recip_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_pq10_studio_clamp_equiv
 #print axioms LeanAV.NativeKernels.lnirKernelAst_wire_tokens_match
 #print axioms LeanAV.Audio.opusCeltPvqNormalizeBandQ15_length_universal
 #print axioms LeanAV.Audio.aacScaleFactorHuffman_roundtrip
 #print axioms LeanAV.Encoder.checkedPlaneFootprint_sound
 #print axioms LeanAV.Encoder.typedDmaSurface_bounds_safe
 
-#print axioms LeanAV.NativeKernels.evalLnir_nv12_downscale_2x2_fused_equiv
 #print axioms LeanAV.NativeKernels.fastBox2x2DownscalePixel_eq_spec
 #print axioms LeanAV.NativeKernels.specBox2x2DownscalePixel_idempotent_const
 #print axioms LeanAV.NativeKernels.specBox2x2DownscalePixel_bounds_u8
@@ -1750,7 +1779,6 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Filter.filterPlanePointAndBoxBlur3x3Fast_eq_sequential
 #print axioms LeanAV.Filter.filterPlaneHFlip_and_VFlip_involutive
 #print axioms LeanAV.Filter.hflipRowList_involutive
-#print axioms LeanAV.NativeKernels.evalLnir_bt709_chroma_luma_fma_equiv
 #print axioms LeanAV.NativeKernels.fastBoxBlurDiv9_eq_spec
 #print axioms LeanAV.Encoder.partitionPlaneRows_1080p_16tiles_covers
 #print axioms LeanAV.Audio.flacCrc8_and_Crc16_self_check_verified
@@ -1765,8 +1793,6 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Scale.scalePlaneDown2x2Simd_eq_fast_and_dims
 #print axioms LeanAV.Video.bframe_bipred_inter_residual_roundtrip_exact
 #print axioms LeanAV.Encoder.transcodeAvcc4kTo1080pPacket_preserves_ipb_framing
-#print axioms LeanAV.NativeKernels.evalLnir_bframe_bipred_blend_equiv
-#print axioms LeanAV.NativeKernels.evalLnir_ipb_4k_to_1080p_residual_fma_equiv
 #print axioms LeanAV.Spec.avcc1080pIpbPacketGateSpec
 #print axioms LeanAV.Format.muxIsoMp4Track_demux_roundtrip_ipb
 #print axioms LeanAV.Video.h264SliceHeaderRbsp_encode_decode_roundtrip
@@ -1775,81 +1801,44 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Format.muxIsoAvStblSpec_demux_roundtrip_verified
 #print axioms LeanAV.Format.codecConfig1080p_headers_verified
 #print axioms LeanAV.Format.encodeLeb128Fixed4_decode_and_classify_verified
-#print axioms LeanAV.NativeKernels.evalLnir_lanczos_4tap_downscale_fma_equiv
 #print axioms LeanAV.NativeKernels.specLanczos4TapNormalizedPixel_idempotent_const
 #print axioms LeanAV.Format.encodeLeb128Fixed4_universal_28bit_roundtrip
 #print axioms LeanAV.Video.hevcSliceSegmentHeader_encode_decode_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_sao_edge_offset_fma_equiv
 #print axioms LeanAV.Video.av1FrameHeader_encode_decode_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_loop_restoration_sgrproj_fma_equiv
 #print axioms LeanAV.Audio.aacAudioSpecificConfig_encode_decode_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_aac_imdct_window_overlap_fma_equiv
 #print axioms LeanAV.Audio.opusIdHeader_encode_decode_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_opus_celt_comb_filter_fma_equiv
 #print axioms LeanAV.Format.ctts_bframe_pts_dts_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_idct4x4_butterfly_fma_equiv
 #print axioms LeanAV.Format.stss_keyframe_index_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_strong_deblock_boundary_fma_equiv
 #print axioms LeanAV.Format.stts_dts_delta_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_convolve_8tap_subpel_fma_equiv
 #print axioms LeanAV.Format.stsc_chunk_sample_map_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_prores_idct8x8_col_butterfly_fma_equiv
 #print axioms LeanAV.Format.stsz_stco_sample_offset_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_flac_lpc_residual_restore_fma_equiv
 #print axioms LeanAV.Format.elst_bframe_timeline_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_ffv1_median_grad_pred_fma_equiv
 #print axioms LeanAV.Format.co64_sdtp_ipb_dependency_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_chroma_interp_4tap_fma_equiv
 #print axioms LeanAV.Format.tfdt_trun_fmp4_fragment_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_cabac_ctx_lps_range_fma_equiv
 #print axioms LeanAV.Format.sidx_cmaf_segment_index_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_wiener_filter_7tap_sym_fma_equiv
 #print axioms LeanAV.Format.mfhd_prft_live_cmaf_sync_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_opus_silk_lpc_inv_pred_gain_fma_equiv
 #print axioms LeanAV.Format.tfhd_fragment_defaults_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_aac_mdct_pre_twiddle_fma_equiv
 #print axioms LeanAV.Format.mehd_trex_cmaf_init_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_vp9_loopfilter_edge_limit_fma_equiv
 #print axioms LeanAV.Format.dref_self_contained_cmaf_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_deblock_beta_tc_fma_equiv
 #print axioms LeanAV.Format.vmhd_smhd_iso639_media_header_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_alf_7x7_diamond_tap_fma_equiv
 #print axioms LeanAV.Format.pasp_clap_display_geometry_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_cfl_chroma_from_luma_fma_equiv
 #print axioms LeanAV.Format.colr_nclx_colour_metadata_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_weighted_bipred_luma_fma_equiv
 #print axioms LeanAV.Format.mdcv_clli_hdr10_static_metadata_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_obmc_overlapped_block_mc_fma_equiv
 #print axioms LeanAV.Format.mvhd_tkhd_timeline_matrix_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_weighted_pred_uni_luma_fma_equiv
 #print axioms LeanAV.Format.ftyp_styp_brand_compat_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_vp9_convolve8_horiz_subpel_fma_equiv
 #print axioms LeanAV.Format.hdlr_media_handler_utf8_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_warp_affine_horz_4tap_fma_equiv
 #print axioms LeanAV.Format.mdhd_media_header_timescale_lang_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_sao_band_offset_4class_fma_equiv
 #print axioms LeanAV.Format.sthd_nmhd_media_header_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_opus_celt_pitch_xcorr_lag_fma_equiv
 #print axioms LeanAV.Format.sbgp_sgpd_roll_rap_recovery_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_aac_tns_ar_lattice_filter_fma_equiv
 #print axioms LeanAV.Format.emsg_v1_dash_cmaf_inband_event_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_palette_color_index_map_fma_equiv
 #print axioms LeanAV.Format.subs_v1_tile_nalu_subsample_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_chroma_mc_bilinear_2x2_fma_equiv
 #print axioms LeanAV.Format.saiz_saio_cenc_aux_offset_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_deblock_tc_clip_blend_fma_equiv
 #print axioms LeanAV.Format.tenc_v1_cbcs_cenc_pattern_kid_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_av1_cdf_prob_update_rate_fma_equiv
 #print axioms LeanAV.Format.pssh_v1_widevine_fairplay_systemid_kid_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_opus_silk_pitch_ltp_tap_fma_equiv
 #print axioms LeanAV.Format.sinf_frma_schm_cenc_cbcs_scheme_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_aac_sbr_hf_gen_chirp_fma_equiv
 #print axioms LeanAV.Format.senc_subsample_iv_clear_protected_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_vp9_tx_iadst4_butterfly_fma_equiv
 #print axioms LeanAV.Format.mfra_tfra_mfro_random_access_seek_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_h264_cabac_mps_renorm_fma_equiv
 #print axioms LeanAV.Format.udta_meta_ilst_container_metadata_roundtrip
-#print axioms LeanAV.NativeKernels.evalLnir_hevc_cabac_bypass_bin_accum_fma_equiv
 #print axioms LeanAV.Spec.visualFidelityGateSpec
 #print axioms LeanAV.Spec.verifyVisualFidelity_rejects_black_and_decode_errors
 #print axioms LeanAV.Spec.mp4ContainerSyncGateSpec
@@ -1885,7 +1874,6 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.activateCtx_coherent
 #print axioms LeanAV.Video.DpbState.step_preserves_inv
 #print axioms LeanAV.NativeKernels.checkLnirKernel_sound
-#print axioms LeanAV.NativeKernels.evalLnir_libav_videotoolbox_p010_strided_pack_fma_equiv
 #print axioms LeanAV.NativeKernels.fastBox3x3DownscaleU10Sum_eq_spec_and_bounded
 #print axioms LeanAV.PlanIR.streamMapSpec_parse_format_roundtrip
 #print axioms LeanAV.PlanIR.streamKind_roundtrip_universal
