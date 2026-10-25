@@ -3673,6 +3673,16 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
  */
 #include "leanav_lnir_kernels.h"
 
+static inline lean_obj_res leanav_clone_ba(lean_obj_arg ba) {
+    size_t sz = lean_sarray_size(ba);
+    lean_object *out = lean_alloc_sarray(1, sz, sz);
+    if (sz > 0) {
+        memcpy(lean_sarray_cptr(out), lean_sarray_cptr(ba), sz);
+    }
+    lean_dec(ba);
+    return out;
+}
+
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_unary_ba(
     uint32_t kernel_id,
     lean_obj_arg ba0,
@@ -3684,7 +3694,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_unary_ba(
         return ba0;
     }
     if (!lean_is_exclusive(ba0)) {
-        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
+        ba0 = leanav_clone_ba(ba0);
     }
     lean_sarray_object *s0 = lean_to_sarray(ba0);
     size_t byte_sz = s0->m_size;
@@ -3715,7 +3725,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_binary_ba(
         return lean_alloc_sarray(1, 0, 0);
     }
     if (!lean_is_exclusive(ba0) || (const void *)ba0 == (const void *)ba1) {
-        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
+        ba0 = leanav_clone_ba(ba0);
     }
     lean_sarray_object *s0 = lean_to_sarray(ba0);
     s0->m_size = n_lanes;
@@ -3749,13 +3759,13 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
         return lean_alloc_sarray(1, 0, 0);
     }
     if (!lean_is_exclusive(ba0) || (const void *)ba0 == (const void *)ba1 || (const void *)ba0 == (const void *)ba2) {
-        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
+        ba0 = leanav_clone_ba(ba0);
     }
     lean_object *ba2_eff = (lean_object *)ba2;
     int copied_ba2 = 0;
     if ((const void *)ba1 == (const void *)ba2) {
         lean_inc(ba2_eff);
-        ba2_eff = lean_copy_sarray(ba2_eff, lean_sarray_capacity(ba2_eff));
+        ba2_eff = leanav_clone_ba(ba2_eff);
         copied_ba2 = 1;
     }
     lean_sarray_object *s0 = lean_to_sarray(ba0);
