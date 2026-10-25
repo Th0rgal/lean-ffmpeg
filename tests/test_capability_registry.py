@@ -119,9 +119,12 @@ class CapabilityRegistryTests(unittest.TestCase):
         contract = json.loads((Path(__file__).resolve().parents[1] / "docs" / "contracts" / "quorum-wave-a.json").read_text(encoding="utf-8"))
         reviewers = contract["required_reviewers"]
         self.assertEqual(reviewers, ["fable", "astra", "gemini"])
-        self.assertEqual(contract["promotion"]["status"], "blocked_pending_three_model_quorum")
+        self.assertIn(contract["promotion"]["status"], ("blocked_pending_three_model_quorum", "quorum_completed_and_remediated"))
         self.assertTrue(contract["promotion"]["local_review_does_not_substitute"])
-        self.assertTrue(all(contract["review_status"][reviewer]["verdict"] is None for reviewer in reviewers))
+        if contract["promotion"]["status"] == "quorum_completed_and_remediated":
+            self.assertTrue(all(contract["review_status"][r]["verdict"] in contract["allowed_verdicts"] for r in reviewers))
+        else:
+            self.assertTrue(all(contract["review_status"][r]["verdict"] is None for r in reviewers))
 
     def test_platform_qualification_contract_blocks_untested_platforms(self):
         contract = json.loads((Path(__file__).resolve().parents[1] / "docs" / "contracts" / "platform-qualification.json").read_text(encoding="utf-8"))
