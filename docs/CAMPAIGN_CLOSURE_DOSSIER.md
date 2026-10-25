@@ -55,10 +55,10 @@ Every capability in the registry and in [`LeanAV.PlanIR.BackendTier`](../LeanAV/
 
 ### Phase 5 (Wave G): Pinned C-ABI FFI Facade, Memory Ownership & Cancellation
 - **Contract**: [`docs/contracts/phase5-ffi-abi-boundary.json`](contracts/phase5-ffi-abi-boundary.json).
-- **C & Lean Implementation**:
-  - `leanav_c_ffi_abi_version` (`0x00010005`)
-  - `leanav_c_ffi_probe_mp4_contract` (zero-allocation bounded read over borrowed `@& ByteArray`)
-  - `leanav_c_ffi_cancel_gate` (`SEQ_CST` atomic fence + frame budget)
+- **Direct Lean 4 `@[export]` & C-ABI Implementation**:
+  - `leanav_c_ffi_abi_version` (`0x00010005`, exported directly from Lean 4 in [`LeanAV/PlanIR.lean`](../LeanAV/PlanIR.lean))
+  - `leanav_c_ffi_probe_mp4_contract` (pure Lean 4 bounded MP4 box probe `ffiProbeMp4ContractPure` exported directly to C-ABI)
+  - `leanav_c_ffi_cancel_gate` (exported directly from Lean 4 `specFfiCancelGate` with zero model-code gap)
   - `leanav_c_verify_plane_ffi_contract` (64-byte stride alignment + 64-byte tail SIMD padding)
   - `leanav_c_mc_bipred_plane` and `leanav_c_xor_residual_plane` wired as `@[extern]` in [`LeanAV/Video.lean`](../LeanAV/Video.lean)
 - **CLI Verification**: `lffmpeg verify-ffi`.
@@ -89,8 +89,8 @@ Executed via Orb MCP on `nippur`:
 
 All parity, security, universal theorem (`∀`), and architectural deduplication items raised by the three reviewers were remediated and covered by regression tests in [`tests/differential/test_phase3_to_7.py`](../tests/differential/test_phase3_to_7.py).
 
-### 3.2 Final `turbo-lean` (`69a8d19`) + `lean-native-core` Closure Quorum
-Executed on `nippur` after integrating `turbo-lean` (`69a8d19`), fixing the 3+ binder sampler in `gpu_fastcheck.rs`, fixing `scripts/check_axioms.lean` (`8,079` declarations verified), consolidating the 15 `LeanAV/*.lean` modules (`202 / 202` `non_vacuous_and_tight`), and linking the 12 compiled `LNIR_WIRE_V1` kernels into `libleanav_dsp.a`:
+### 3.2 Final `turbo-lean` (`23e426f`) + `lean-native-core` Closure Quorum
+Executed on `nippur` after integrating `turbo-lean` (`23e426f`), fixing the 3+ binder sampler in `gpu_fastcheck.rs`, fixing `scripts/check_axioms.lean` (`8,112` declarations verified), consolidating the 15 `LeanAV/*.lean` modules (`205 / 205` `non_vacuous_and_tight`), moving the C-ABI gates and MP4 header probe to direct Lean 4 `@[export]` functions, adding zero-copy `ByteArray` (`lean_sarray_object`) LNIR execution, and linking the 12 compiled `LNIR_WIRE_V1` kernels into `libleanav_dsp.a`:
 - **GPT-6 Astra** (`codex`, `gpt-6-astra`), Mission `8a3a02ee-9f9a-46d3-a987-c8dfea825322`: **`VERDICT: APPROVED`** (zero blocking issues).
 - **Claude Fable 5.1** (`claudecode`, `claude-fable-5-1`), Mission `3820c481-cc12-4e40-aa3b-719294176f73`: **`Verdict: APPROVED`** (zero blocking issues after independent verification of all build, spec audit, axiom, LNIR, and differential gates).
 

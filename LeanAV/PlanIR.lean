@@ -1283,27 +1283,144 @@ def buildDelegatedFfmpegArgv (plan : MediaPlanIR) (passthroughArgs : List String
       (if plan.resources.jsonOutput && !hasLogLevel then ["-v", "error"] else [])
     (pre ++ passthroughArgs).toArray
 
-/-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract -/
-
-/-- Pinned Phase 5 C-ABI version (`0x00010005`). -/
-@[extern "leanav_c_ffi_abi_version"]
-opaque ffiAbiVersionC : Unit → UInt32
-
-/-- Bounded, zero-allocation C-ABI MP4 header probe over borrowed `@& ByteArray`. -/
-@[extern "leanav_c_ffi_probe_mp4_contract"]
-opaque ffiProbeMp4ContractC : (@& ByteArray) → USize → UInt64
-
-/-- Sequential-consistency atomic cancellation & frame-budget gate in C-ABI. -/
-@[extern "leanav_c_ffi_cancel_gate"]
-opaque ffiCancelGateC : UInt32 → UInt32 → UInt32 → UInt32
-
-/-- Structured-argv `fork` + `execvp` delegated FFmpeg runner in C-ABI (zero shell interpolation). -/
-@[extern "leanav_c_exec_delegated_ffmpeg"]
-opaque ffiExecDelegatedFfmpegC : (@& Array String) → (@& String) → UInt32 → BaseIO UInt32
+/-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract (Direct Lean 4 `@[export]`) -/
 
 /-- Pure specification of the Phase 5 cancellation & frame budget gate. -/
 def specFfiCancelGate (cancelFlag framesDone maxFrames : UInt32) : Bool :=
   cancelFlag == 0 && (maxFrames == 0 || framesDone < maxFrames)
+
+/-- Pinned Phase 5 C-ABI version (`0x00010005`), exported directly from Lean 4 to C-ABI. -/
+@[export leanav_c_ffi_abi_version]
+def ffiAbiVersionC (_ : Unit) : UInt32 :=
+  0x00010005
+
+/-- Cooperative/preemptive cancellation & frame-budget gate, exported directly from Lean 4 to C-ABI. -/
+@[export leanav_c_ffi_cancel_gate]
+def ffiCancelGateC (cancelFlag framesDone maxFrames : UInt32) : UInt32 :=
+  if specFfiCancelGate cancelFlag framesDone maxFrames then 1 else 0
+
+/-- Read a big-endian 32-bit unsigned integer from `ba` at byte offset `pos`. -/
+def rdMp4U32Be (ba : ByteArray) (pos : Nat) : Nat :=
+  if pos + 4 <= ba.size then
+    (ba[pos]!.toNat <<< 24) ||| (ba[pos + 1]!.toNat <<< 16) |||
+    (ba[pos + 2]!.toNat <<< 8) ||| ba[pos + 3]!.toNat
+  else 0
+
+/-- Bounded recursive MP4 child box scanner in pure Lean 4 (`moov`/`trak`/`mdia`/`minf`/`stbl`/`tkhd`/`mdhd`). -/
+def scanMp4ChildrenPure (ba : ByteArray) (start len : Nat) : Nat → Nat → Nat → Nat → Nat × Nat × Nat
+  | 0, w, h, ts => (w, h, ts)
+  | depth + 1, wInit, hInit, tsInit =>
+    if len < 8 then (wInit, hInit, tsInit)
+    else
+      let rec loop (fuel : Nat) (pos w h ts : Nat) : Nat × Nat × Nat :=
+        match fuel with
+        | 0 => (w, h, ts)
+        | fuel' + 1 =>
+          if pos + 8 > len then (w, h, ts)
+          else
+            let absPos := start + pos
+            let sz32 := rdMp4U32Be ba absPos
+            let fcc := rdMp4U32Be ba (absPos + 4)
+            let (validHdr, boxLen, hdrLen) :=
+              if sz32 == 1 then
+                if pos + 16 > len then (false, 0, 16)
+                else
+                  let sz64 := (rdMp4U32Be ba (absPos + 8) <<< 32) ||| rdMp4U32Be ba (absPos + 12)
+                  if sz64 < 16 || sz64 > len - pos then (false, 0, 16)
+                  else (true, sz64, 16)
+              else if sz32 == 0 then
+                (true, len - pos, 8)
+              else if sz32 < 8 || sz32 > len - pos then
+                (false, 0, 8)
+              else
+                (true, sz32, 8)
+            if !validHdr then (w, h, ts)
+            else
+              let bodyStart := absPos + hdrLen
+              let bodyLen := boxLen - hdrLen
+              let (w', h', ts') :=
+                if fcc == 0x6D6F6F76 || fcc == 0x7472616B || fcc == 0x6D646961 ||
+                   fcc == 0x6D696E66 || fcc == 0x7374626C then
+                  scanMp4ChildrenPure ba bodyStart bodyLen depth w h ts
+                else if fcc == 0x746B6864 && bodyLen >= 84 then
+                  let ver := if bodyStart < ba.size then ba[bodyStart]!.toNat else 0
+                  let wOff := if ver == 1 && bodyLen >= 96 then 88 else 76
+                  if wOff + 8 <= bodyLen then
+                    let w16 := rdMp4U32Be ba (bodyStart + wOff) >>> 16
+                    let h16 := rdMp4U32Be ba (bodyStart + wOff + 4) >>> 16
+                    if w == 0 && w16 > 0 && h16 > 0 then (w16, h16, ts) else (w, h, ts)
+                  else (w, h, ts)
+                else if fcc == 0x6D646864 && bodyLen >= 20 then
+                  let ver := if bodyStart < ba.size then ba[bodyStart]!.toNat else 0
+                  let tsOff := if ver == 1 && bodyLen >= 24 then 20 else 12
+                  if tsOff + 4 <= bodyLen then
+                    let tsVal := rdMp4U32Be ba (bodyStart + tsOff)
+                    if ts == 0 && tsVal > 0 then (w, h, tsVal) else (w, h, ts)
+                  else (w, h, ts)
+                else (w, h, ts)
+              loop fuel' (pos + boxLen) w' h' ts'
+      loop 128 0 wInit hInit tsInit
+
+/-- Pure Lean 4 bounded MP4 header contract probe over `ByteArray` (zero C pointer arithmetic). -/
+def ffiProbeMp4ContractPure (ba : ByteArray) (maxRead : Nat) : UInt64 :=
+  if maxRead < 32 || ba.size < 32 then 0
+  else
+    let actualSize := ba.size
+    let cap := Nat.min actualSize maxRead
+    let rec topLoop (fuel : Nat) (pos : Nat) (sawFtyp sawMoov : Bool) (w h ts : Nat) : Bool × Bool × Nat × Nat × Nat :=
+      match fuel with
+      | 0 => (sawFtyp, sawMoov, w, h, ts)
+      | fuel' + 1 =>
+        if pos + 8 > cap then (sawFtyp, sawMoov, w, h, ts)
+        else
+          let sz32 := rdMp4U32Be ba pos
+          let fcc := rdMp4U32Be ba (pos + 4)
+          if sz32 == 1 then
+            if pos + 16 > cap then (false, false, 0, 0, 0)
+            else
+              let sz64 := (rdMp4U32Be ba (pos + 8) <<< 32) ||| rdMp4U32Be ba (pos + 12)
+              if sz64 < 16 || sz64 > cap - pos then (false, false, 0, 0, 0)
+              else
+                let sawFtyp' := sawFtyp || fcc == 0x66747970
+                let (sawMoov', w', h', ts') :=
+                  if fcc == 0x6D6F6F76 then
+                    let (w1, h1, ts1) := scanMp4ChildrenPure ba (pos + 16) (sz64 - 16) 6 w h ts
+                    (true, w1, h1, ts1)
+                  else (sawMoov, w, h, ts)
+                topLoop fuel' (pos + sz64) sawFtyp' sawMoov' w' h' ts'
+          else if sz32 < 8 then
+            (false, false, 0, 0, 0)
+          else if sz32 > cap - pos then
+            if fcc == 0x6D646174 && sawFtyp && sawMoov && sz32 <= actualSize - pos then
+              (sawFtyp, sawMoov, w, h, ts)
+            else
+              (false, false, 0, 0, 0)
+          else
+            let sawFtyp' := sawFtyp || fcc == 0x66747970
+            let (sawMoov', w', h', ts') :=
+              if fcc == 0x6D6F6F76 then
+                let (w1, h1, ts1) := scanMp4ChildrenPure ba (pos + 8) (sz32 - 8) 6 w h ts
+                (true, w1, h1, ts1)
+              else (sawMoov, w, h, ts)
+            topLoop fuel' (pos + sz32) sawFtyp' sawMoov' w' h' ts'
+    let (sawFtyp, sawMoov, width, height, timescale) := topLoop 64 0 false false 0 0 0
+    if !sawFtyp || !sawMoov || width == 0 || height == 0 || width > 65535 || height > 65535 then 0
+    else
+      let ts16 := if timescale > 0 && timescale <= 65535 then timescale else 15360
+      ((1 : UInt64) <<< 63) ||| (width.toUInt64 <<< 32) ||| (height.toUInt64 <<< 16) ||| ts16.toUInt64
+
+/-- Bounded, zero-allocation MP4 header probe exported directly from Lean 4 to C-ABI. -/
+@[export leanav_c_ffi_probe_mp4_contract]
+def ffiProbeMp4ContractC (ba : ByteArray) (maxReadBytes : USize) : UInt64 :=
+  ffiProbeMp4ContractPure ba maxReadBytes.toNat
+
+/-- Shell-free `execvp` argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
+def verifyExecArgvHygiene (argv : List String) : Bool :=
+  !argv.isEmpty && argv.all (fun tok => !tok.isEmpty && !(tok.contains '\x00'))
+
+/-- Structured-argv `fork` + `execvp` delegated FFmpeg runner in C-ABI (zero shell interpolation). -/
+@[extern "leanav_c_exec_delegated_ffmpeg"]
+opaque ffiExecDelegatedFfmpegC : (@& Array String) → (@& String) → UInt32 → BaseIO UInt32
 
 /-- Decoded result of `ffiProbeMp4ContractC`. -/
 structure FfiMp4ProbeResult where
@@ -1528,5 +1645,29 @@ theorem independentKernel_fallback_complete_and_sound :
     rescalePtsIndependentOrFallback (-1) 1 90000 1 1000 = .fallbackDelegated "negative_pts_requires_signed_timeline_shift" ∧
     rescalePtsIndependentOrFallback 90000 1 0 1 1000 = .fallbackDelegated "zero_rational_component" := by
   decide
+
+/--
+  Universal Theorem: If `verifyExecArgvHygiene argv = true`, every token `tok ∈ argv`
+  is non-empty (`tok.isEmpty = false`) and free of embedded NUL bytes (`tok.contains '\x00' = false`).
+-/
+theorem verifyExecArgvHygiene_rejects_empty_and_nul_universal (argv : List String) (tok : String)
+    (hMem : tok ∈ argv) (hOk : verifyExecArgvHygiene argv = true) :
+    tok.isEmpty = false ∧ tok.contains '\x00' = false := by
+  unfold verifyExecArgvHygiene at hOk
+  simp only [Bool.and_eq_true, Bool.not_eq_true', List.all_eq_true] at hOk
+  exact hOk.2 tok hMem
+
+/--
+  Universal Theorem: `ffiProbeMp4ContractPure` rejects any buffer or read budget shorter than 32 bytes.
+-/
+theorem ffiProbeMp4ContractPure_rejects_short_universal (ba : ByteArray) (maxRead : Nat)
+    (hShort : maxRead < 32 ∨ ba.size < 32) :
+    ffiProbeMp4ContractPure ba maxRead = 0 := by
+  unfold ffiProbeMp4ContractPure
+  have hCond : (maxRead < 32 || ba.size < 32) = true := by
+    cases hShort with
+    | inl h1 => simp [h1]
+    | inr h2 => simp [h2]
+  simp [hCond]
 
 end LeanAV.PlanIR

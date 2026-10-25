@@ -80,23 +80,6 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 #include <arm_neon.h>
 #endif
 
-#if defined(LEANAV_ENABLE_LIBAV) && defined(__has_include)
-#if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>) && __has_include(<libswresample/swresample.h>)
-#include <libavcodec/version.h>
-#if LIBAVCODEC_VERSION_MAJOR >= 59
-#define LEANAV_HAS_LIBAV 1
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libswresample/swresample.h>
-#include <libavutil/opt.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/pixdesc.h>
-#include <libavutil/audio_fifo.h>
-#endif
-#endif
-#endif
 
 #ifndef FF_THREAD_FRAME
 #define FF_THREAD_FRAME 1
@@ -1477,40 +1460,6 @@ LEAN_EXPORT uint64_t leanav_c_measure_planes_acceptance(
     return (((uint64_t)(dist_ok & 1u)) << 40) | (psnr_c << 24) | sad_c;
 }
 
-LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
-    b_lean_obj_arg in_path_str,
-    b_lean_obj_arg out_path_str,
-    uint32_t src_w_u32,
-    uint32_t src_h_u32,
-    uint32_t dst_w_u32,
-    uint32_t dst_h_u32,
-    uint32_t start_ms_u32,
-    uint32_t dur_ms_u32,
-    uint32_t codec_id_u32,
-    uint32_t with_audio_u32,
-    uint32_t filter_flags_u32
-);
-
-LEAN_EXPORT uint64_t leanav_c_transcode_mp4_2x2_simd_verified(
-    b_lean_obj_arg in_path_str,
-    b_lean_obj_arg out_path_str,
-    uint32_t src_w_u32,
-    uint32_t src_h_u32,
-    uint32_t codec_id_u32,
-    uint32_t with_audio_u32
-) {
-    size_t src_w = (size_t)src_w_u32;
-    size_t src_h = (size_t)src_h_u32;
-    if (src_w < 4 || src_h < 4 || (src_w & 3) != 0 || (src_h & 3) != 0) {
-        return 0;
-    }
-    return leanav_c_transcode_mp4_general_verified(
-        in_path_str, out_path_str,
-        src_w_u32, src_h_u32,
-        src_w_u32 >> 1, src_h_u32 >> 1,
-        0, 0, codec_id_u32, with_audio_u32, 0);
-}
-
 /*
  * Downscale a single planar 2D plane (`src_w x src_h`) 3x3 (e.g. 4K 3840x2160 -> 720p 1280x720)
  * using exact reciprocal multiply `((sum9 + 4) * 7282) >> 16`.
@@ -1938,10 +1887,6 @@ static inline uint8_t leanav_tonemap_pq10_to_bt709_u8(uint16_t y10) {
     return (uint8_t)(16u + y_off);
 }
 
-LEAN_EXPORT uint8_t leanav_c_tonemap_pq10_to_bt709_u8(uint16_t y10) {
-    return leanav_tonemap_pq10_to_bt709_u8(y10);
-}
-
 /*
  * BT.2020 -> BT.709 Q10 Chroma Re-matrixing + Optional Luma Contrast/Brightness LUT (`filter_flags`):
  * - bit 0 (1): apply BT.2020 -> BT.709 chroma cross-matrix on U/V planes
@@ -2088,15 +2033,11 @@ static void leanav_apply_pixel_filters_raw(
 }
 
 static int leanav_has_encoder_cached(const char *enc_name) {
-#if defined(LEANAV_HAS_LIBAV)
-    return avcodec_find_encoder_by_name(enc_name) != NULL ? 1 : 0;
-#else
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "%s -hide_banner -encoders 2>/dev/null | grep -q ' %s '",
         leanav_ffmpeg_bin_cmd(), enc_name);
     return system(cmd) == 0;
-#endif
 }
 
 /*
@@ -2557,34 +2498,6 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
         }
         fclose(fp);
     }
-#if defined(LEANAV_HAS_LIBAV)
-    (void)q_in;
-    av_log_set_level(AV_LOG_ERROR);
-    AVFormatContext *fmt_ctx = NULL;
-    if (avformat_open_input(&fmt_ctx, in_path, NULL, NULL) == 0 && fmt_ctx != NULL) {
-        if (avformat_find_stream_info(fmt_ctx, NULL) >= 0) {
-            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-                AVCodecParameters *par = fmt_ctx->streams[i]->codecpar;
-                if (par && par->codec_type == AVMEDIA_TYPE_VIDEO) {
-                    if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
-                        avformat_close_input(&fmt_ctx);
-                        return 2;
-                    }
-                    if (par->color_primaries == AVCOL_PRI_BT2020 ||
-                        par->color_trc == AVCOL_TRC_SMPTE2084 ||
-                        par->color_space == AVCOL_SPC_BT2020_NCL ||
-                        par->color_space == AVCOL_SPC_BT2020_CL) {
-                        avformat_close_input(&fmt_ctx);
-                        return 1;
-                    }
-                    break;
-                }
-            }
-        }
-        avformat_close_input(&fmt_ctx);
-    }
-    return 0;
-#else
     char probe_cmd[4096];
     snprintf(probe_cmd, sizeof(probe_cmd),
         "%s -v error -select_streams v:0 "
@@ -2599,7 +2512,6 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
     if (strstr(out, "arib-std-b67") != NULL) return 2;
     if (strstr(out, "bt2020") != NULL || strstr(out, "smpte2084") != NULL) return 1;
     return 0;
-#endif
 }
 
 static char g_enc_preset[64]  = "";
@@ -3078,28 +2990,6 @@ static void leanav_probe_input_fps_rational(
         }
         fclose(fp);
     }
-#if defined(LEANAV_HAS_LIBAV)
-    (void)q_in;
-    av_log_set_level(AV_LOG_ERROR);
-    AVFormatContext *fmt_ctx = NULL;
-    if (avformat_open_input(&fmt_ctx, in_path, NULL, NULL) == 0 && fmt_ctx != NULL) {
-        if (avformat_find_stream_info(fmt_ctx, NULL) >= 0) {
-            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-                AVStream *st = fmt_ctx->streams[i];
-                if (st && st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                    AVRational fr = st->r_frame_rate;
-                    if (fr.num <= 0 || fr.den <= 0) fr = st->avg_frame_rate;
-                    if (fr.num > 0 && fr.den > 0) {
-                        *out_fps_num = (uint32_t)fr.num;
-                        *out_fps_den = (uint32_t)fr.den;
-                    }
-                    break;
-                }
-            }
-        }
-        avformat_close_input(&fmt_ctx);
-    }
-#else
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
         "%s -v error -select_streams v:0 "
@@ -3116,2263 +3006,93 @@ static void leanav_probe_input_fps_rational(
         *out_fps_num = num;
         *out_fps_den = den;
     }
-#endif
 }
 
-#if defined(LEANAV_HAS_LIBAV)
 
-static int64_t leanav_parse_bitrate(const char *s, int64_t fallback) {
-    if (!s || s[0] == '\0') return fallback;
-    char *end = NULL;
-    double v = strtod(s, &end);
-    if (end == s || v <= 0.0) return fallback;
-    if (*end == 'k' || *end == 'K') v *= 1000.0;
-    else if (*end == 'm' || *end == 'M') v *= 1000000.0;
-    if (v > 2000000000.0) v = 2000000000.0;
-    return (int64_t)v;
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static const char *leanav_resolve_ffmpeg_exec_path(void) {
+    const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
+    if (env_bin && env_bin[0] != '\0' && access(env_bin, X_OK) == 0) return env_bin;
+    if (access("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg", X_OK) == 0) {
+        return "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg";
+    }
+    if (access("/tmp/opencode/ffmpeg_build/ffmpeg", X_OK) == 0) {
+        return "/tmp/opencode/ffmpeg_build/ffmpeg";
+    }
+    if (access("/opt/homebrew/bin/ffmpeg", X_OK) == 0) {
+        return "/opt/homebrew/bin/ffmpeg";
+    }
+    if (access("/usr/bin/ffmpeg", X_OK) == 0) {
+        return "/usr/bin/ffmpeg";
+    }
+    if (access("/usr/local/bin/ffmpeg", X_OK) == 0) {
+        return "/usr/local/bin/ffmpeg";
+    }
+    return "ffmpeg";
 }
 
-static int leanav_parse_crf_q(const char *s, int fallback) {
-    if (!s || s[0] == '\0') return fallback;
-    double v = strtod(s, NULL);
-    if (v < 0.0) v = 0.0;
-    if (v > 51.0) v = 51.0;
-    return (int)(v + 0.5);
-}
-
-static enum AVCodecID leanav_codec_id_from_u32(uint32_t codec_id_u32) {
-    if (codec_id_u32 == 2) return AV_CODEC_ID_HEVC;
-    if (codec_id_u32 == 3) return AV_CODEC_ID_AV1;
-    return AV_CODEC_ID_H264;
-}
-
-static const char *leanav_encoder_name_for(uint32_t codec_id_u32, int leanav_has_vt_h264, int leanav_has_vt_hevc, int leanav_has_nvenc_h264, int leanav_has_nvenc_hevc) {
-    if (codec_id_u32 == 1 && leanav_has_vt_h264) return "h264_videotoolbox";
-    if (codec_id_u32 == 1 && leanav_has_nvenc_h264) return "h264_nvenc";
-    if (codec_id_u32 == 2 && leanav_has_vt_hevc) return "hevc_videotoolbox";
-    if (codec_id_u32 == 2 && leanav_has_nvenc_hevc) return "hevc_nvenc";
-    if (codec_id_u32 == 2) return "libx265";
-    if (codec_id_u32 == 3) return "libsvtav1";
-    return "libx264";
-}
-
-static int leanav_open_encoder(
-    AVCodecContext **enc_ctx_out,
-    const char *enc_name,
-    enum AVCodecID codec_id,
-    int dst_w, int dst_h,
-    int fps_num, int fps_den,
-    int is_10bit,
-    int hdr_cs,
-    int64_t bit_rate,
-    int crf_q
+static uint32_t leanav_exec_ffmpeg_argv(
+    const char *const *c_argv,
+    const char *out_path,
+    uint32_t suppress_output
 ) {
-    const AVCodec *enc = avcodec_find_encoder_by_name(enc_name);
-    if (!enc) enc = avcodec_find_encoder(codec_id);
-    if (!enc) return -1;
-    AVCodecContext *ctx = avcodec_alloc_context3(enc);
-    if (!ctx) return -1;
-    ctx->width = dst_w;
-    ctx->height = dst_h;
-    ctx->time_base = (AVRational){ fps_den, fps_num };
-    ctx->framerate = (AVRational){ fps_num, fps_den };
-    ctx->gop_size = fps_num / (fps_den > 0 ? fps_den : 1);
-    if (ctx->gop_size < 1) ctx->gop_size = 12;
-    ctx->max_b_frames = 0;
-    ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    ctx->pix_fmt = is_10bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
-    if (is_10bit && strstr(enc_name, "videotoolbox") != NULL) {
-        enc = avcodec_find_encoder_by_name(codec_id == AV_CODEC_ID_HEVC ? "libx265" : "libx264");
-        if (enc) {
-            avcodec_free_context(&ctx);
-            ctx = avcodec_alloc_context3(enc);
-            if (!ctx) return -1;
-            ctx->width = dst_w;
-            ctx->height = dst_h;
-            ctx->time_base = (AVRational){ fps_den, fps_num };
-            ctx->framerate = (AVRational){ fps_num, fps_den };
-            ctx->gop_size = fps_num / (fps_den > 0 ? fps_den : 1);
-            if (ctx->gop_size < 1) ctx->gop_size = 12;
-            ctx->max_b_frames = 0;
-            ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            ctx->pix_fmt = AV_PIX_FMT_YUV420P10LE;
-            ctx->bit_rate = bit_rate > 0 ? bit_rate : 6000000;
-            enc_name = enc->name;
-        }
-    }
-    ctx->bit_rate = bit_rate > 0 ? bit_rate : 6000000;
-    if (hdr_cs == 1) {
-        ctx->color_primaries = AVCOL_PRI_BT2020;
-        ctx->color_trc = AVCOL_TRC_SMPTE2084;
-        ctx->colorspace = AVCOL_SPC_BT2020_NCL;
-        ctx->color_range = AVCOL_RANGE_MPEG;
-    } else if (hdr_cs == 2) {
-        ctx->color_primaries = AVCOL_PRI_BT2020;
-        ctx->color_trc = AVCOL_TRC_ARIB_STD_B67;
-        ctx->colorspace = AVCOL_SPC_BT2020_NCL;
-        ctx->color_range = AVCOL_RANGE_MPEG;
-    } else {
-        ctx->color_primaries = AVCOL_PRI_BT709;
-        ctx->color_trc = AVCOL_TRC_BT709;
-        ctx->colorspace = AVCOL_SPC_BT709;
-        ctx->color_range = AVCOL_RANGE_MPEG;
-    }
-    if (strcmp(enc_name, "libx264") == 0 || strcmp(enc_name, "libx265") == 0) {
-        const char *preset = (g_enc_preset[0] != '\0') ? g_enc_preset : "veryfast";
-        av_opt_set(ctx->priv_data, "preset", preset, 0);
-        int encoder_threads = -1;
-        const char *encoder_threads_env = getenv("LEANAV_ENCODER_THREADS");
-        if (encoder_threads_env && *encoder_threads_env) {
-            char *end = NULL;
-            long parsed = strtol(encoder_threads_env, &end, 10);
-            if (end != encoder_threads_env && *end == '\0' && parsed >= 0 && parsed <= 256) encoder_threads = (int)parsed;
-        }
-        if (encoder_threads >= 0) ctx->thread_count = encoder_threads;
-        av_opt_set_int(ctx->priv_data, "threads", 4, 0);
-        char crf_buf[32];
-        snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
-        av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
-        if (strcmp(enc_name, "libx264") == 0) av_opt_set(ctx->priv_data, "tune", "ssim", 0);
-    } else if (strcmp(enc_name, "libsvtav1") == 0) {
-        av_opt_set(ctx->priv_data, "preset", (g_enc_preset[0] != '\0') ? g_enc_preset : "12", 0);
-        char crf_buf[32];
-        snprintf(crf_buf, sizeof(crf_buf), "%d", crf_q);
-        av_opt_set(ctx->priv_data, "crf", crf_buf, 0);
-    } else if (strstr(enc_name, "videotoolbox") != NULL) {
-        av_opt_set_int(ctx->priv_data, "realtime", 1, 0);
-        av_opt_set_int(ctx->priv_data, "allow_sw", 1, 0);
-    } else if (strstr(enc_name, "nvenc") != NULL) {
-        av_opt_set(ctx->priv_data, "preset", "p1", 0);
-        char cq_buf[32];
-        snprintf(cq_buf, sizeof(cq_buf), "%d", crf_q);
-        av_opt_set(ctx->priv_data, "cq", cq_buf, 0);
-    }
-    if (avcodec_open2(ctx, enc, NULL) < 0) {
-        avcodec_free_context(&ctx);
-        return -1;
-    }
-    *enc_ctx_out = ctx;
-    return 0;
-}
+    const char *ffmpeg_bin = c_argv[0];
+    int is_special_out = (!out_path || out_path[0] == '\0' ||
+                          strcmp(out_path, "-") == 0 ||
+                          strcmp(out_path, "/dev/null") == 0 ||
+                          strncmp(out_path, "pipe:", 5) == 0 ||
+                          strncmp(out_path, "md5:", 4) == 0);
+    int existed_before = (!is_special_out && access(out_path, F_OK) == 0) ? 1 : 0;
 
-static int leanav_open_audio_encoder(AVCodecContext **aenc_out, int sample_rate, int channels, int64_t bit_rate) {
-    const AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    if (!enc) return -1;
-    AVCodecContext *ctx = avcodec_alloc_context3(enc);
-    if (!ctx) return -1;
-    ctx->sample_rate = sample_rate > 0 ? sample_rate : 48000;
-    av_channel_layout_default(&ctx->ch_layout, channels > 0 ? channels : 2);
-    ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    ctx->bit_rate = bit_rate > 0 ? bit_rate : 128000;
-    ctx->time_base = (AVRational){ 1, ctx->sample_rate };
-    if (avcodec_open2(ctx, enc, NULL) < 0) {
-        avcodec_free_context(&ctx);
-        return -1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 1u;
     }
-    *aenc_out = ctx;
-    return 0;
-}
-
-static void leanav_drain_audio_fifo(
-    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, AVFormatContext *ofmt,
-    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes,
-    AVFrame *ef, AVPacket *ap
-) {
-    (void)a_ch;
-    if (!fifo || !aenc || !oas || !ofmt || !ef || !ap) return;
-    int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
-    if (av_audio_fifo_size(fifo) < frame_sz && !(flush_all && av_audio_fifo_size(fifo) > 0)) return;
-    while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
-        int nb = av_audio_fifo_size(fifo);
-        if (nb > frame_sz) nb = frame_sz;
-        if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
-            av_frame_unref(ef);
-            ef->nb_samples = frame_sz;
-            ef->format = aenc->sample_fmt;
-            ef->sample_rate = aenc->sample_rate;
-            av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
-            if (av_frame_get_buffer(ef, 0) < 0) {
-                break;
+    if (pid == 0) {
+        if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
+            const char *old_ld = getenv("LD_LIBRARY_PATH");
+            char ld_buf[4096];
+            if (old_ld && old_ld[0] != '\0') {
+                snprintf(ld_buf, sizeof(ld_buf),
+                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
+                    old_ld);
+            } else {
+                snprintf(ld_buf, sizeof(ld_buf),
+                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
             }
+            setenv("LD_LIBRARY_PATH", ld_buf, 1);
         }
-        ef->nb_samples = nb;
-        ef->pts = *next_a_pts;
-        if (av_audio_fifo_read(fifo, (void **)ef->extended_data, nb) < nb) {
-            break;
-        }
-        *next_a_pts += nb;
-        if (avcodec_send_frame(aenc, ef) >= 0) {
-            while (avcodec_receive_packet(aenc, ap) >= 0) {
-                if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
-                ap->stream_index = oas->index;
-                av_packet_rescale_ts(ap, aenc->time_base, oas->time_base);
-                av_interleaved_write_frame(ofmt, ap);
-                av_packet_unref(ap);
-            }
-        }
-        if (!flush_all && av_audio_fifo_size(fifo) < frame_sz) break;
-    }
-}
-
-#define LEANAV_APKT_QUEUE 8192
-
-typedef struct {
-    AVPacket *q[LEANAV_APKT_QUEUE];
-    int head, tail, count;
-    pthread_mutex_t mu;
-    pthread_cond_t has_room, has_pkt;
-    int closed;
-} leanav_apkt_queue_t;
-
-static void leanav_apkt_push(leanav_apkt_queue_t *q, AVPacket *p) {
-    if (!p) return;
-    pthread_mutex_lock(&q->mu);
-    while (q->count == LEANAV_APKT_QUEUE && !q->closed) pthread_cond_wait(&q->has_room, &q->mu);
-    if (!q->closed) {
-        int was_empty = (q->count == 0);
-        q->q[q->tail] = p;
-        q->tail = (q->tail + 1) % LEANAV_APKT_QUEUE;
-        q->count++;
-        if (was_empty) pthread_cond_signal(&q->has_pkt);
-    } else {
-        av_packet_free(&p);
-    }
-    pthread_mutex_unlock(&q->mu);
-}
-
-typedef struct {
-    leanav_apkt_queue_t in, out;
-    AVCodecContext *adec, *aenc;
-    SwrContext *swr;
-    AVAudioFifo *afifo;
-    AVStream *oas;
-    int a_ch;
-    uint64_t audio_bytes;
-} leanav_audio_job_t;
-
-static void leanav_drain_audio_fifo_to_queue(
-    AVAudioFifo *fifo, AVCodecContext *aenc, AVStream *oas, leanav_apkt_queue_t *out_q,
-    int a_ch, int64_t *next_a_pts, int flush_all, uint64_t *audio_bytes,
-    AVFrame *ef, AVPacket *ap
-) {
-    (void)a_ch;
-    if (!fifo || !aenc || !out_q || !ef || !ap) return;
-    int frame_sz = aenc->frame_size > 0 ? aenc->frame_size : 1024;
-    if (av_audio_fifo_size(fifo) < frame_sz && !(flush_all && av_audio_fifo_size(fifo) > 0)) return;
-    while (av_audio_fifo_size(fifo) >= frame_sz || (flush_all && av_audio_fifo_size(fifo) > 0)) {
-        int nb = av_audio_fifo_size(fifo);
-        if (nb > frame_sz) nb = frame_sz;
-        if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
-            av_frame_unref(ef);
-            ef->nb_samples = frame_sz;
-            ef->format = aenc->sample_fmt;
-            ef->sample_rate = aenc->sample_rate;
-            av_channel_layout_copy(&ef->ch_layout, &aenc->ch_layout);
-            if (av_frame_get_buffer(ef, 0) < 0) {
-                break;
-            }
-        }
-        ef->nb_samples = nb;
-        ef->pts = *next_a_pts;
-        if (av_audio_fifo_read(fifo, (void **)ef->extended_data, nb) < nb) {
-            break;
-        }
-        *next_a_pts += nb;
-        if (avcodec_send_frame(aenc, ef) >= 0) {
-            while (avcodec_receive_packet(aenc, ap) >= 0) {
-                if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
-                ap->stream_index = oas ? oas->index : 1;
-                av_packet_rescale_ts(ap, aenc->time_base, oas ? oas->time_base : aenc->time_base);
-                AVPacket *kept = av_packet_alloc();
-                if (kept) {
-                    av_packet_move_ref(kept, ap);
-                    leanav_apkt_push(out_q, kept);
-                } else {
-                    av_packet_unref(ap);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (suppress_output != 0u) {
+                if (!out_path || (strcmp(out_path, "-") != 0 && strcmp(out_path, "md5:") != 0 && strncmp(out_path, "pipe:", 5) != 0)) {
+                    dup2(devnull, STDOUT_FILENO);
                 }
+                dup2(devnull, STDERR_FILENO);
             }
+            if (devnull > STDERR_FILENO) close(devnull);
         }
-        if (!flush_all && av_audio_fifo_size(fifo) < frame_sz) break;
+        execvp(ffmpeg_bin, (char *const *)c_argv);
+        _exit(127);
     }
-}
-
-static void leanav_collect_encoded_audio(
-    AVCodecContext *aenc, AVStream *oas, leanav_apkt_queue_t *out_q,
-    uint64_t *audio_bytes, AVPacket *ap
-) {
-    while (avcodec_receive_packet(aenc, ap) >= 0) {
-        if (audio_bytes && ap->size > 0) *audio_bytes += (uint64_t)ap->size;
-        ap->stream_index = oas ? oas->index : 1;
-        av_packet_rescale_ts(ap, aenc->time_base, oas ? oas->time_base : aenc->time_base);
-        AVPacket *kept = av_packet_alloc();
-        if (kept) {
-            av_packet_move_ref(kept, ap);
-            leanav_apkt_push(out_q, kept);
-        } else {
-            av_packet_unref(ap);
-        }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return 1u;
     }
-}
-
-static void *leanav_audio_worker(void *arg) {
-    leanav_audio_job_t *j = (leanav_audio_job_t *)arg;
-    int64_t next_a_pts = 0;
-    AVFrame *af = av_frame_alloc();
-    AVFrame *ef = av_frame_alloc();
-    AVPacket *ap = av_packet_alloc();
-    uint8_t **swr_out_buf = NULL;
-    int swr_out_cap = 0;
-    int swr_linesize = 0;
-    int frame_sz = (j->aenc && j->aenc->frame_size > 0) ? j->aenc->frame_size : 1024;
-    int same_sr = (j->adec && j->aenc && j->adec->sample_rate == j->aenc->sample_rate) ? 1 : 0;
-    for (;;) {
-        AVPacket *in_batch[64];
-        int in_n = 0;
-        pthread_mutex_lock(&j->in.mu);
-        while (j->in.count == 0 && !j->in.closed) pthread_cond_wait(&j->in.has_pkt, &j->in.mu);
-        if (j->in.count == 0 && j->in.closed) { pthread_mutex_unlock(&j->in.mu); break; }
-        int was_full = (j->in.count == LEANAV_APKT_QUEUE);
-        while (j->in.count > 0 && in_n < 64) {
-            in_batch[in_n++] = j->in.q[j->in.head];
-            j->in.q[j->in.head] = NULL;
-            j->in.head = (j->in.head + 1) % LEANAV_APKT_QUEUE;
-            j->in.count--;
-        }
-        if (was_full) pthread_cond_broadcast(&j->in.has_room);
-        pthread_mutex_unlock(&j->in.mu);
-        for (int bi = 0; bi < in_n; bi++) {
-            AVPacket *p = in_batch[bi];
-            if (af && ef && ap && avcodec_send_packet(j->adec, p) >= 0) {
-                while (avcodec_receive_frame(j->adec, af) >= 0) {
-                    if (!j->swr && af->nb_samples > 0) {
-                        if (av_audio_fifo_size(j->afifo) == 0 && af->nb_samples == frame_sz) {
-                            af->pts = next_a_pts;
-                            next_a_pts += frame_sz;
-                            if (avcodec_send_frame(j->aenc, af) >= 0) {
-                                leanav_collect_encoded_audio(j->aenc, j->oas, &j->out, &j->audio_bytes, ap);
-                            }
-                        } else {
-                            av_audio_fifo_write(j->afifo, (void **)af->extended_data, af->nb_samples);
-                            leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
-                        }
-                    } else if (j->swr) {
-                        if (same_sr && av_audio_fifo_size(j->afifo) == 0 && af->nb_samples == frame_sz &&
-                            swr_get_delay(j->swr, j->adec->sample_rate) == 0) {
-                            if (!ef->buf[0] || av_frame_make_writable(ef) < 0) {
-                                av_frame_unref(ef);
-                                ef->nb_samples = frame_sz;
-                                ef->format = j->aenc->sample_fmt;
-                                ef->sample_rate = j->aenc->sample_rate;
-                                av_channel_layout_copy(&ef->ch_layout, &j->aenc->ch_layout);
-                                av_frame_get_buffer(ef, 0);
-                            }
-                            if (ef->buf[0]) {
-                                int converted = swr_convert(j->swr, ef->extended_data, frame_sz, (const uint8_t **)af->extended_data, frame_sz);
-                                if (converted == frame_sz) {
-                                    ef->nb_samples = frame_sz;
-                                    ef->pts = next_a_pts;
-                                    next_a_pts += frame_sz;
-                                    if (avcodec_send_frame(j->aenc, ef) >= 0) {
-                                        leanav_collect_encoded_audio(j->aenc, j->oas, &j->out, &j->audio_bytes, ap);
-                                    }
-                                } else if (converted > 0) {
-                                    av_audio_fifo_write(j->afifo, (void **)ef->extended_data, converted);
-                                    leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
-                                }
-                            }
-                        } else {
-                            int out_samples = (int)av_rescale_rnd(
-                                swr_get_delay(j->swr, j->adec->sample_rate) + af->nb_samples,
-                                j->aenc->sample_rate, j->adec->sample_rate, AV_ROUND_UP);
-                            if (out_samples > swr_out_cap) {
-                                if (swr_out_buf) {
-                                    av_freep(&swr_out_buf[0]);
-                                    av_freep(&swr_out_buf);
-                                }
-                                swr_out_cap = 0;
-                                int cap = out_samples < 4096 ? 4096 : out_samples * 2;
-                                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, j->a_ch, cap, j->aenc->sample_fmt, 0) >= 0) {
-                                    swr_out_cap = cap;
-                                }
-                            }
-                            if (swr_out_buf && swr_out_cap >= out_samples) {
-                                int converted = swr_convert(j->swr, swr_out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
-                                if (converted > 0) {
-                                    av_audio_fifo_write(j->afifo, (void **)swr_out_buf, converted);
-                                    leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 0, &j->audio_bytes, ef, ap);
-                                }
-                            }
-                        }
-                    }
-                    av_frame_unref(af);
-                }
-            }
-            av_packet_free(&p);
-        }
-    }
-    int delay = j->swr ? swr_get_delay(j->swr, j->aenc->sample_rate) : 0;
-    if (delay > 0) {
-        int need = delay + 32;
-        if (need > swr_out_cap) {
-            if (swr_out_buf) {
-                av_freep(&swr_out_buf[0]);
-                av_freep(&swr_out_buf);
-            }
-            swr_out_cap = 0;
-            if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, j->a_ch, need, j->aenc->sample_fmt, 0) >= 0) {
-                swr_out_cap = need;
-            }
-        }
-        if (swr_out_buf && swr_out_cap >= need) {
-            int converted = swr_convert(j->swr, swr_out_buf, need, NULL, 0);
-            if (converted > 0) av_audio_fifo_write(j->afifo, (void **)swr_out_buf, converted);
-        }
-    }
-    if (ef && ap) {
-        leanav_drain_audio_fifo_to_queue(j->afifo, j->aenc, j->oas, &j->out, j->a_ch, &next_a_pts, 1, &j->audio_bytes, ef, ap);
-    }
-    avcodec_send_frame(j->aenc, NULL);
-    while (ap && avcodec_receive_packet(j->aenc, ap) >= 0) {
-        if (ap->size > 0) j->audio_bytes += (uint64_t)ap->size;
-        ap->stream_index = j->oas ? j->oas->index : 1;
-        av_packet_rescale_ts(ap, j->aenc->time_base, j->oas ? j->oas->time_base : j->aenc->time_base);
-        AVPacket *kept = av_packet_alloc();
-        if (kept) {
-            av_packet_move_ref(kept, ap);
-            leanav_apkt_push(&j->out, kept);
-        } else {
-            av_packet_unref(ap);
-        }
-    }
-    if (swr_out_buf) {
-        av_freep(&swr_out_buf[0]);
-        av_freep(&swr_out_buf);
-    }
-    if (ap) av_packet_free(&ap);
-    if (ef) av_frame_free(&ef);
-    if (af) av_frame_free(&af);
-    pthread_mutex_lock(&j->out.mu);
-    j->out.closed = 1;
-    pthread_cond_signal(&j->out.has_pkt);
-    pthread_mutex_unlock(&j->out.mu);
-    return NULL;
-}
-
-static void leanav_audio_flush_packets(leanav_audio_job_t *j, AVFormatContext *ofmt) {
-    if (!j || !ofmt) return;
-    if (*(volatile const int *)&j->out.count <= 0) return;
-    AVPacket *batch[64];
-    for (;;) {
-        int n = 0;
-        pthread_mutex_lock(&j->out.mu);
-        int was_full = (j->out.count == LEANAV_APKT_QUEUE);
-        while (j->out.count > 0 && n < 64) {
-            batch[n++] = j->out.q[j->out.head];
-            j->out.q[j->out.head] = NULL;
-            j->out.head = (j->out.head + 1) % LEANAV_APKT_QUEUE;
-            j->out.count--;
-        }
-        if (was_full) pthread_cond_broadcast(&j->out.has_room);
-        pthread_mutex_unlock(&j->out.mu);
-        if (n == 0) break;
-        for (int i = 0; i < n; i++) {
-            av_interleaved_write_frame(ofmt, batch[i]);
-            av_packet_free(&batch[i]);
-        }
-        if (n < 64) break;
-    }
-}
-
-static int leanav_libav_stream_copy(
-    const char *in_path, const char *out_path,
-    uint32_t start_ms, uint32_t dur_ms, int with_audio
-) {
-    av_log_set_level(AV_LOG_ERROR);
-    AVFormatContext *ifmt = NULL;
-    if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return -1;
-    int v_idx = -1, a_idx = -1;
-    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-        enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
-        if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
-        else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
-    }
-    int need_stream_info = 1;
-    if (v_idx >= 0) {
-        AVStream *st_v = ifmt->streams[v_idx];
-        int v_ok = st_v->codecpar &&
-                   st_v->codecpar->codec_id != AV_CODEC_ID_NONE &&
-                   st_v->codecpar->width > 0 &&
-                   st_v->codecpar->height > 0 &&
-                   st_v->codecpar->extradata_size > 0;
-        int a_ok = 1;
-        if (with_audio && a_idx >= 0) {
-            AVStream *st_a = ifmt->streams[a_idx];
-            a_ok = st_a->codecpar &&
-                   st_a->codecpar->codec_id != AV_CODEC_ID_NONE &&
-                   st_a->codecpar->sample_rate > 0 &&
-                   st_a->codecpar->ch_layout.nb_channels > 0;
-        }
-        if (v_ok && a_ok) need_stream_info = 0;
-    }
-    if (need_stream_info) {
-        if (avformat_find_stream_info(ifmt, NULL) < 0) {
-            avformat_close_input(&ifmt);
-            return -1;
-        }
-        v_idx = -1; a_idx = -1;
-        for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-            enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
-            if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
-            else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
-        }
-    }
-    if (v_idx < 0) {
-        avformat_close_input(&ifmt);
-        return -1;
-    }
-    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-        if ((int)i != v_idx && (int)i != a_idx) {
-            ifmt->streams[i]->discard = AVDISCARD_ALL;
-        }
-    }
-    AVFormatContext *ofmt = NULL;
-    if (avformat_alloc_output_context2(&ofmt, NULL, "mp4", out_path) < 0 || !ofmt) {
-        avformat_close_input(&ifmt);
-        return -1;
-    }
-    int map_in[64];
-    int map_n = 0;
-    int in_indices[2];
-    int n_in = 0;
-    in_indices[n_in++] = v_idx;
-    if (a_idx >= 0) in_indices[n_in++] = a_idx;
-    for (int k = 0; k < n_in && map_n < 64; k++) {
-        AVStream *ist = ifmt->streams[in_indices[k]];
-        AVStream *ost = avformat_new_stream(ofmt, NULL);
-        if (!ost) break;
-        if (avcodec_parameters_copy(ost->codecpar, ist->codecpar) < 0) break;
-        ost->codecpar->codec_tag = 0;
-        ost->time_base = ist->time_base;
-        map_in[map_n++] = in_indices[k];
-    }
-    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE) < 0) {
-            avformat_free_context(ofmt);
-            avformat_close_input(&ifmt);
-            return -1;
-        }
-    }
-    AVDictionary *mux_opts = NULL;
-    {
-        int64_t est_dur_s = 60;
-        if (dur_ms > 0) est_dur_s = (int64_t)(dur_ms / 1000) + 10;
-        else if (ifmt->duration > 0) est_dur_s = (ifmt->duration / AV_TIME_BASE) + 10;
-        int64_t moov_reserve = 262144;
-        if (est_dur_s * 1024 > moov_reserve) moov_reserve = est_dur_s * 1024;
-        av_dict_set_int(&mux_opts, "moov_size", moov_reserve, 0);
-    }
-    if (avformat_write_header(ofmt, &mux_opts) < 0) {
-        av_dict_free(&mux_opts);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+    int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
+    if (!ok && !is_special_out && !existed_before && suppress_output != 0u) {
         unlink(out_path);
-        avformat_free_context(ofmt);
-        avformat_close_input(&ifmt);
-        return -1;
     }
-    av_dict_free(&mux_opts);
-    int64_t start_ts = AV_NOPTS_VALUE;
-    int64_t end_ts = AV_NOPTS_VALUE;
-    AVStream *vst = ifmt->streams[v_idx];
-    if (start_ms > 0) {
-        start_ts = av_rescale_q((int64_t)start_ms, (AVRational){1, 1000}, vst->time_base);
-        avformat_seek_file(ifmt, v_idx, INT64_MIN, start_ts, start_ts, 0);
-    }
-    if (dur_ms > 0) {
-        int64_t dur_ts = av_rescale_q((int64_t)dur_ms, (AVRational){1, 1000}, vst->time_base);
-        end_ts = (start_ts == AV_NOPTS_VALUE ? 0 : start_ts) + dur_ts;
-    }
-    AVPacket *pkt = av_packet_alloc();
-    int rc = 0;
-    if (!pkt) rc = -1;
-    while (rc == 0 && av_read_frame(ifmt, pkt) >= 0) {
-        int out_si = -1;
-        for (int k = 0; k < map_n; k++) {
-            if (pkt->stream_index == map_in[k]) { out_si = k; break; }
-        }
-        if (out_si < 0) {
-            av_packet_unref(pkt);
-            continue;
-        }
-        AVStream *ist = ifmt->streams[pkt->stream_index];
-        if (end_ts != AV_NOPTS_VALUE && pkt->stream_index == v_idx && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= end_ts) {
-            av_packet_unref(pkt);
-            break;
-        }
-        if (start_ts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
-            pkt->pts -= start_ts;
-            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= start_ts;
-        }
-        pkt->stream_index = out_si;
-        pkt->pos = -1;
-        av_packet_rescale_ts(pkt, ist->time_base, ofmt->streams[out_si]->time_base);
-        if (av_interleaved_write_frame(ofmt, pkt) < 0) rc = -1;
-        av_packet_unref(pkt);
-    }
-    if (pkt) av_packet_free(&pkt);
-    if (rc == 0 && av_write_trailer(ofmt) < 0) rc = -1;
-    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-    if (rc != 0) unlink(out_path);
-    avformat_free_context(ofmt);
-    avformat_close_input(&ifmt);
-    return rc;
+    if (ok) return 0u;
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return (uint32_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return (uint32_t)(128 + WTERMSIG(status));
+    return 1u;
 }
-
-static int leanav_copy_plane_to_dst(
-    const uint8_t *src, int src_stride, int src_w, int src_h, int src_bps,
-    uint8_t *dst, int dst_stride, int dst_w, int dst_h,
-    leanav_bilinear_tabs_t *tabs, int dst_is_10bit
-) {
-    /* Fast zero-allocation strided paths for 1x1 copy, 2x2 and 3x3 SIMD downscale */
-    if (src_bps == 1 && !dst_is_10bit) {
-        if (src_w == dst_w && src_h == dst_h) {
-            for (int y = 0; y < dst_h; y++) {
-                memcpy(dst + (size_t)y * (size_t)dst_stride, src + (size_t)y * (size_t)src_stride, (size_t)dst_w);
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-            leanav_scale_plane_2x2_strided(src, src_stride, src_w, src_h, dst, dst_stride);
-            return 0;
-        }
-        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-            leanav_scale_plane_3x3_strided(src, src_stride, src_w, src_h, dst, dst_stride);
-            return 0;
-        }
-        if (src_w * 2 == dst_w * 3 && src_h * 2 == dst_h * 3 && (dst_w & 1) == 0 && (dst_h & 1) == 0) {
-            leanav_scale_plane_3to2_strided(src, src_stride, (size_t)src_w, (size_t)src_h, dst, dst_stride, (size_t)dst_w, (size_t)dst_h);
-            return 0;
-        }
-        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                uint32_t sy0 = tabs->sy0[dy];
-                uint32_t sy1 = tabs->sy1[dy];
-                uint32_t fy  = tabs->fy[dy];
-                uint32_t ify = 256u - fy;
-                const uint8_t *row0 = src + (size_t)sy0 * (size_t)src_stride;
-                const uint8_t *row1 = src + (size_t)sy1 * (size_t)src_stride;
-                uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
-                for (int dx = 0; dx < dst_w; dx++) {
-                    uint32_t sx0 = tabs->sx0[dx];
-                    uint32_t sx1 = tabs->sx1[dx];
-                    uint32_t fx  = tabs->fx[dx];
-                    uint32_t ifx = 256u - fx;
-                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
-                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
-                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
-                    out_row[dx] = (uint8_t)(val > 255u ? 255u : val);
-                }
-            }
-            return 0;
-        }
-        return -1;
-    }
-    if (src_bps == 2 && dst_is_10bit) {
-        if (src_w == dst_w && src_h == dst_h) {
-            for (int y = 0; y < dst_h; y++) {
-                memcpy(dst + (size_t)y * (size_t)dst_stride, src + (size_t)y * (size_t)src_stride, (size_t)dst_w * 2u);
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-            leanav_scale_plane_2x2_u16_strided(src, src_stride, src_w, src_h, dst, dst_stride);
-            return 0;
-        }
-        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-            leanav_scale_plane_3x3_u16_strided(src, src_stride, src_w, src_h, dst, dst_stride);
-            return 0;
-        }
-        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                uint32_t sy0 = tabs->sy0[dy];
-                uint32_t sy1 = tabs->sy1[dy];
-                uint32_t fy  = tabs->fy[dy];
-                uint32_t ify = 256u - fy;
-                const uint16_t *row0 = (const uint16_t *)(src + (size_t)sy0 * (size_t)src_stride);
-                const uint16_t *row1 = (const uint16_t *)(src + (size_t)sy1 * (size_t)src_stride);
-                uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
-                for (int dx = 0; dx < dst_w; dx++) {
-                    uint32_t sx0 = tabs->sx0[dx];
-                    uint32_t sx1 = tabs->sx1[dx];
-                    uint32_t fx  = tabs->fx[dx];
-                    uint32_t ifx = 256u - fx;
-                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
-                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
-                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
-                    out_row[dx] = (uint16_t)(val > 1023u ? 1023u : val);
-                }
-            }
-            return 0;
-        }
-        return -1;
-    }
-    if (src_bps == 2 && !dst_is_10bit) {
-        if (src_w == dst_w && src_h == dst_h) {
-            for (int y = 0; y < dst_h; y++) {
-                uint8_t *row_d = dst + (size_t)y * (size_t)dst_stride;
-                const uint16_t *row_s = (const uint16_t *)(src + (size_t)y * (size_t)src_stride);
-                int x = 0;
-#if defined(__AVX2__)
-                const __m256i bias2 = _mm256_set1_epi16(2);
-                for (; x + 32 <= dst_w; x += 32) {
-                    __m256i s0 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i *)(row_s + x)), bias2), 2);
-                    __m256i s1 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_loadu_si256((const __m256i *)(row_s + x + 16)), bias2), 2);
-                    __m256i packed = _mm256_packus_epi16(s0, s1);
-                    _mm256_storeu_si256((__m256i *)(row_d + x), _mm256_permute4x64_epi64(packed, 0xD8));
-                }
-#elif defined(__SSE2__)
-                const __m128i bias2 = _mm_set1_epi16(2);
-                for (; x + 16 <= dst_w; x += 16) {
-                    __m128i s0 = _mm_srli_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i *)(row_s + x)), bias2), 2);
-                    __m128i s1 = _mm_srli_epi16(_mm_add_epi16(_mm_loadu_si128((const __m128i *)(row_s + x + 8)), bias2), 2);
-                    _mm_storeu_si128((__m128i *)(row_d + x), _mm_packus_epi16(s0, s1));
-                }
-#elif defined(__ARM_NEON)
-                for (; x + 16 <= dst_w; x += 16) {
-                    uint8x8_t d0 = vqshrun_n_s16(vreinterpretq_s16_u16(vaddq_u16(vld1q_u16(row_s + x), vdupq_n_u16(2))), 2);
-                    uint8x8_t d1 = vqshrun_n_s16(vreinterpretq_s16_u16(vaddq_u16(vld1q_u16(row_s + x + 8), vdupq_n_u16(2))), 2);
-                    vst1q_u8(row_d + x, vcombine_u8(d0, d1));
-                }
-#endif
-                for (; x < dst_w; x++) row_d[x] = (uint8_t)((row_s[x] + 2u) >> 2);
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                const uint16_t *r0 = (const uint16_t *)(src + (size_t)(dy * 2) * (size_t)src_stride);
-                const uint16_t *r1 = (const uint16_t *)(src + (size_t)(dy * 2 + 1) * (size_t)src_stride);
-                uint8_t *row_d = dst + (size_t)dy * (size_t)dst_stride;
-                int dx = 0;
-#if defined(__AVX2__)
-                const __m256i ones = _mm256_set1_epi16(1);
-                const __m256i bias2_32 = _mm256_set1_epi32(2);
-                const __m256i bias2_16 = _mm256_set1_epi16(2);
-                for (; dx + 16 <= dst_w; dx += 16) {
-                    __m256i r0a = _mm256_loadu_si256((const __m256i *)(r0 + dx * 2));
-                    __m256i r0b = _mm256_loadu_si256((const __m256i *)(r0 + dx * 2 + 16));
-                    __m256i r1a = _mm256_loadu_si256((const __m256i *)(r1 + dx * 2));
-                    __m256i r1b = _mm256_loadu_si256((const __m256i *)(r1 + dx * 2 + 16));
-                    __m256i avg_a = _mm256_srli_epi32(_mm256_add_epi32(_mm256_madd_epi16(_mm256_add_epi16(r0a, r1a), ones), bias2_32), 2);
-                    __m256i avg_b = _mm256_srli_epi32(_mm256_add_epi32(_mm256_madd_epi16(_mm256_add_epi16(r0b, r1b), ones), bias2_32), 2);
-                    __m256i u16_p = _mm256_permute4x64_epi64(_mm256_packs_epi32(avg_a, avg_b), 0xD8);
-                    __m256i u8_16 = _mm256_srli_epi16(_mm256_add_epi16(u16_p, bias2_16), 2);
-                    __m128i lo = _mm256_castsi256_si128(u8_16);
-                    __m128i hi = _mm256_extracti128_si256(u8_16, 1);
-                    _mm_storeu_si128((__m128i *)(row_d + dx), _mm_packus_epi16(lo, hi));
-                }
-#elif defined(__SSE2__)
-                const __m128i ones = _mm_set1_epi16(1);
-                const __m128i bias2_32 = _mm_set1_epi32(2);
-                const __m128i bias2_16 = _mm_set1_epi16(2);
-                for (; dx + 16 <= dst_w; dx += 16) {
-                    __m128i r0a = _mm_loadu_si128((const __m128i *)(r0 + dx * 2));
-                    __m128i r0b = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 8));
-                    __m128i r0c = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 16));
-                    __m128i r0d = _mm_loadu_si128((const __m128i *)(r0 + dx * 2 + 24));
-                    __m128i r1a = _mm_loadu_si128((const __m128i *)(r1 + dx * 2));
-                    __m128i r1b = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 8));
-                    __m128i r1c = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 16));
-                    __m128i r1d = _mm_loadu_si128((const __m128i *)(r1 + dx * 2 + 24));
-                    __m128i avg_a = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0a, r1a), ones), bias2_32), 2);
-                    __m128i avg_b = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0b, r1b), ones), bias2_32), 2);
-                    __m128i avg_c = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0c, r1c), ones), bias2_32), 2);
-                    __m128i avg_d = _mm_srli_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_add_epi16(r0d, r1d), ones), bias2_32), 2);
-                    __m128i u16_0 = _mm_srli_epi16(_mm_add_epi16(_mm_packs_epi32(avg_a, avg_b), bias2_16), 2);
-                    __m128i u16_1 = _mm_srli_epi16(_mm_add_epi16(_mm_packs_epi32(avg_c, avg_d), bias2_16), 2);
-                    _mm_storeu_si128((__m128i *)(row_d + dx), _mm_packus_epi16(u16_0, u16_1));
-                }
-#elif defined(__ARM_NEON)
-                for (; dx + 16 <= dst_w; dx += 16) {
-                    uint16x8_t r0a = vld1q_u16(r0 + dx * 2);
-                    uint16x8_t r0b = vld1q_u16(r0 + dx * 2 + 8);
-                    uint16x8_t r0c = vld1q_u16(r0 + dx * 2 + 16);
-                    uint16x8_t r0d = vld1q_u16(r0 + dx * 2 + 24);
-                    uint16x8_t r1a = vld1q_u16(r1 + dx * 2);
-                    uint16x8_t r1b = vld1q_u16(r1 + dx * 2 + 8);
-                    uint16x8_t r1c = vld1q_u16(r1 + dx * 2 + 16);
-                    uint16x8_t r1d = vld1q_u16(r1 + dx * 2 + 24);
-                    uint16x4_t a0 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0a), vpaddlq_u16(r1a)), 2);
-                    uint16x4_t a1 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0b), vpaddlq_u16(r1b)), 2);
-                    uint16x4_t a2 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0c), vpaddlq_u16(r1c)), 2);
-                    uint16x4_t a3 = vrshrn_n_u32(vaddq_u32(vpaddlq_u16(r0d), vpaddlq_u16(r1d)), 2);
-                    uint8x8_t d0 = vrshrn_n_u16(vcombine_u16(a0, a1), 2);
-                    uint8x8_t d1 = vrshrn_n_u16(vcombine_u16(a2, a3), 2);
-                    vst1q_u8(row_d + dx, vcombine_u8(d0, d1));
-                }
-#endif
-                for (; dx < dst_w; dx++) {
-                    uint32_t avg10 = ((uint32_t)r0[dx * 2] + (uint32_t)r0[dx * 2 + 1] +
-                                      (uint32_t)r1[dx * 2] + (uint32_t)r1[dx * 2 + 1] + 2u) >> 2;
-                    row_d[dx] = (uint8_t)((avg10 + 2u) >> 2);
-                }
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                const uint16_t *r0 = (const uint16_t *)(src + (size_t)(dy * 3) * (size_t)src_stride);
-                const uint16_t *r1 = (const uint16_t *)(src + (size_t)(dy * 3 + 1) * (size_t)src_stride);
-                const uint16_t *r2 = (const uint16_t *)(src + (size_t)(dy * 3 + 2) * (size_t)src_stride);
-                uint8_t *row_d = dst + (size_t)dy * (size_t)dst_stride;
-                for (int dx = 0; dx < dst_w; dx++) {
-                    int sx = dx * 3;
-                    uint32_t s = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
-                                 (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
-                                 (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
-                    uint32_t v10 = ((s + 4u) * 7282u) >> 16;
-                    if (v10 > 1023u) v10 = 1023u;
-                    row_d[dx] = (uint8_t)((v10 + 2u) >> 2);
-                }
-            }
-            return 0;
-        }
-        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                uint32_t sy0 = tabs->sy0[dy];
-                uint32_t sy1 = tabs->sy1[dy];
-                uint32_t fy  = tabs->fy[dy];
-                uint32_t ify = 256u - fy;
-                const uint16_t *row0 = (const uint16_t *)(src + (size_t)sy0 * (size_t)src_stride);
-                const uint16_t *row1 = (const uint16_t *)(src + (size_t)sy1 * (size_t)src_stride);
-                uint8_t *out_row = dst + (size_t)dy * (size_t)dst_stride;
-                for (int dx = 0; dx < dst_w; dx++) {
-                    uint32_t sx0 = tabs->sx0[dx];
-                    uint32_t sx1 = tabs->sx1[dx];
-                    uint32_t fx  = tabs->fx[dx];
-                    uint32_t ifx = 256u - fx;
-                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
-                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
-                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
-                    if (val > 1023u) val = 1023u;
-                    out_row[dx] = (uint8_t)((val + 2u) >> 2);
-                }
-            }
-            return 0;
-        }
-        return -1;
-    }
-    if (src_bps == 1 && dst_is_10bit) {
-        if (src_w == dst_w && src_h == dst_h) {
-            for (int y = 0; y < dst_h; y++) {
-                uint16_t *row_d = (uint16_t *)(dst + (size_t)y * (size_t)dst_stride);
-                const uint8_t *row_s = src + (size_t)y * (size_t)src_stride;
-                for (int x = 0; x < dst_w; x++) row_d[x] = (uint16_t)((uint16_t)row_s[x] << 2);
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 2 && src_h == dst_h * 2) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                const uint8_t *r0 = src + (size_t)(dy * 2) * (size_t)src_stride;
-                const uint8_t *r1 = src + (size_t)(dy * 2 + 1) * (size_t)src_stride;
-                uint16_t *row_d = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
-                for (int dx = 0; dx < dst_w; dx++) {
-                    uint32_t avg = ((uint32_t)r0[dx * 2] + (uint32_t)r0[dx * 2 + 1] +
-                                    (uint32_t)r1[dx * 2] + (uint32_t)r1[dx * 2 + 1] + 2u) >> 2;
-                    row_d[dx] = (uint16_t)(avg << 2);
-                }
-            }
-            return 0;
-        }
-        if (src_w == dst_w * 3 && src_h == dst_h * 3) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                const uint8_t *r0 = src + (size_t)(dy * 3) * (size_t)src_stride;
-                const uint8_t *r1 = src + (size_t)(dy * 3 + 1) * (size_t)src_stride;
-                const uint8_t *r2 = src + (size_t)(dy * 3 + 2) * (size_t)src_stride;
-                uint16_t *row_d = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
-                for (int dx = 0; dx < dst_w; dx++) {
-                    int sx = dx * 3;
-                    uint32_t s = (uint32_t)r0[sx] + (uint32_t)r0[sx + 1] + (uint32_t)r0[sx + 2] +
-                                 (uint32_t)r1[sx] + (uint32_t)r1[sx + 1] + (uint32_t)r1[sx + 2] +
-                                 (uint32_t)r2[sx] + (uint32_t)r2[sx + 1] + (uint32_t)r2[sx + 2];
-                    uint32_t v8 = ((s + 4u) * 7282u) >> 16;
-                    if (v8 > 255u) v8 = 255u;
-                    row_d[dx] = (uint16_t)(v8 << 2);
-                }
-            }
-            return 0;
-        }
-        if (tabs && tabs->ready && tabs->dst_w == (size_t)dst_w && tabs->dst_h == (size_t)dst_h) {
-            for (int dy = 0; dy < dst_h; dy++) {
-                uint32_t sy0 = tabs->sy0[dy];
-                uint32_t sy1 = tabs->sy1[dy];
-                uint32_t fy  = tabs->fy[dy];
-                uint32_t ify = 256u - fy;
-                const uint8_t *row0 = src + (size_t)sy0 * (size_t)src_stride;
-                const uint8_t *row1 = src + (size_t)sy1 * (size_t)src_stride;
-                uint16_t *out_row = (uint16_t *)(dst + (size_t)dy * (size_t)dst_stride);
-                for (int dx = 0; dx < dst_w; dx++) {
-                    uint32_t sx0 = tabs->sx0[dx];
-                    uint32_t sx1 = tabs->sx1[dx];
-                    uint32_t fx  = tabs->fx[dx];
-                    uint32_t ifx = 256u - fx;
-                    uint32_t top = ifx * (uint32_t)row0[sx0] + fx * (uint32_t)row0[sx1];
-                    uint32_t bot = ifx * (uint32_t)row1[sx0] + fx * (uint32_t)row1[sx1];
-                    uint32_t val = (ify * top + fy * bot + 32768u) >> 16;
-                    if (val > 255u) val = 255u;
-                    out_row[dx] = (uint16_t)(val << 2);
-                }
-            }
-            return 0;
-        }
-        return -1;
-    }
-    return -1;
-}
-
-#define LEANAV_ENC_SLOTS 8
-#define LEANAV_PKT_QUEUE 64
-#define LEANAV_SCALE_Y_SLICES 8
-
-typedef struct {
-    const uint8_t *src_y, *src_u, *src_v;
-    int src_stride_y, src_stride_u, src_stride_v, src_w_y, src_h_y, src_w_uv, src_h_uv, src_bps;
-    uint8_t *dst_y, *dst_u, *dst_v;
-    int dst_stride_y, dst_stride_u, dst_stride_v, dst_w_y, dst_h_y, dst_w_uv, dst_h_uv, is_10bit;
-    int y_mode, y_step, slice_h_y;
-    uint64_t slice_sum[LEANAV_SCALE_Y_SLICES];
-    uint64_t slice_sum_sq[LEANAV_SCALE_Y_SLICES];
-    uint64_t slice_cnt[LEANAV_SCALE_Y_SLICES];
-    leanav_bilinear_tabs_t *y_tabs, *uv_tabs;
-    uint64_t job_id;
-    int num_tasks;
-    int next_task;
-    int done_tasks;
-    int worker_busy, stop;
-    pthread_mutex_t mu;
-    pthread_cond_t start_cv, done_cv;
-} leanav_uv_scale_worker_t;
-
-static inline void leanav_exec_scale_task(leanav_uv_scale_worker_t *w, int t) {
-    if (t == 0) {
-        leanav_copy_plane_to_dst(w->src_u, w->src_stride_u, w->src_w_uv, w->src_h_uv, w->src_bps,
-            w->dst_u, w->dst_stride_u, w->dst_w_uv, w->dst_h_uv, w->uv_tabs, w->is_10bit);
-    } else if (t == 1) {
-        leanav_copy_plane_to_dst(w->src_v, w->src_stride_v, w->src_w_uv, w->src_h_uv, w->src_bps,
-            w->dst_v, w->dst_stride_v, w->dst_w_uv, w->dst_h_uv, w->uv_tabs, w->is_10bit);
-    } else if (w->num_tasks == 3) {
-        w->slice_sum[0] = 0;
-        w->slice_sum_sq[0] = 0;
-        w->slice_cnt[0] = 0;
-        if (w->y_mode == 2) {
-            leanav_scale_plane_2x2_u16_strided_accum(
-                w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y,
-                w->dst_y, w->dst_stride_y, w->y_step,
-                &w->slice_sum[0], &w->slice_sum_sq[0], &w->slice_cnt[0]);
-        } else if (w->y_mode == 1) {
-            leanav_scale_plane_2x2_strided_accum(
-                w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y,
-                w->dst_y, w->dst_stride_y, w->y_step,
-                &w->slice_sum[0], &w->slice_sum_sq[0], &w->slice_cnt[0]);
-        } else {
-            leanav_copy_plane_to_dst(w->src_y, w->src_stride_y, w->src_w_y, w->src_h_y, w->src_bps,
-                w->dst_y, w->dst_stride_y, w->dst_w_y, w->dst_h_y, w->y_tabs, w->is_10bit);
-        }
-    } else {
-        int s = t - 2;
-        int y0 = s * w->slice_h_y;
-        int dst_h_s = (s < LEANAV_SCALE_Y_SLICES - 1) ? w->slice_h_y : (w->dst_h_y - y0);
-        int src_h_s = dst_h_s * 2;
-        const uint8_t *sy = w->src_y + (size_t)(y0 * 2) * (size_t)w->src_stride_y;
-        uint8_t *dy = w->dst_y + (size_t)y0 * (size_t)w->dst_stride_y;
-        uint64_t sum = 0, sum_sq = 0, cnt = 0;
-        if (dst_h_s > 0) {
-            if (w->y_mode == 2) {
-                leanav_scale_plane_2x2_u16_strided_accum(
-                    sy, w->src_stride_y, w->src_w_y, src_h_s,
-                    dy, w->dst_stride_y, w->y_step, &sum, &sum_sq, &cnt);
-            } else {
-                leanav_scale_plane_2x2_strided_accum(
-                    sy, w->src_stride_y, w->src_w_y, src_h_s,
-                    dy, w->dst_stride_y, w->y_step, &sum, &sum_sq, &cnt);
-            }
-        }
-        w->slice_sum[s] = sum;
-        w->slice_sum_sq[s] = sum_sq;
-        w->slice_cnt[s] = cnt;
-    }
-}
-
-static void *leanav_uv_scale_worker(void *arg) {
-    leanav_uv_scale_worker_t *w = (leanav_uv_scale_worker_t *)arg;
-    uint64_t last_job = 0;
-    pthread_mutex_lock(&w->mu);
-    for (;;) {
-        while ((w->job_id == last_job || __atomic_load_n(&w->next_task, __ATOMIC_ACQUIRE) >= w->num_tasks) && !w->stop) {
-            pthread_cond_wait(&w->start_cv, &w->mu);
-        }
-        if (w->stop) break;
-        last_job = w->job_id;
-        int ntasks = w->num_tasks;
-        w->worker_busy = 1;
-        pthread_mutex_unlock(&w->mu);
-
-        for (;;) {
-            int t = __atomic_fetch_add(&w->next_task, 1, __ATOMIC_ACQ_REL);
-            if (t >= ntasks) break;
-            leanav_exec_scale_task(w, t);
-            if (__atomic_add_fetch(&w->done_tasks, 1, __ATOMIC_ACQ_REL) == ntasks) {
-                pthread_mutex_lock(&w->mu);
-                w->worker_busy = 0;
-                pthread_mutex_unlock(&w->mu);
-                pthread_cond_signal(&w->done_cv);
-                goto relock;
-            }
-        }
-
-        pthread_mutex_lock(&w->mu);
-        w->worker_busy = 0;
-        pthread_cond_signal(&w->done_cv);
-        continue;
-relock:
-        pthread_mutex_lock(&w->mu);
-    }
-    pthread_mutex_unlock(&w->mu);
-    return NULL;
-}
-
-static void leanav_run_parallel_scale(
-    leanav_uv_scale_worker_t *w,
-    const uint8_t *src_y, int src_stride_y,
-    const uint8_t *src_u, int src_stride_u,
-    const uint8_t *src_v, int src_stride_v,
-    int fw, int fh, int src_bps,
-    uint8_t *dst_y, int dst_stride_y,
-    uint8_t *dst_u, int dst_stride_u,
-    uint8_t *dst_v, int dst_stride_v,
-    int dst_w, int dst_h, int is_10bit,
-    int y_mode, int y_step,
-    leanav_bilinear_tabs_t *y_tabs, leanav_bilinear_tabs_t *uv_tabs,
-    uint64_t *out_sum, uint64_t *out_sum_sq, uint64_t *out_cnt
-) {
-    int split_y = (y_mode != 0 && dst_h >= (LEANAV_SCALE_Y_SLICES * 4));
-    int ntasks = split_y ? (2 + LEANAV_SCALE_Y_SLICES) : 3;
-    pthread_mutex_lock(&w->mu);
-    while (w->worker_busy) pthread_cond_wait(&w->done_cv, &w->mu);
-    w->src_y = src_y;
-    w->src_stride_y = src_stride_y;
-    w->src_u = src_u;
-    w->src_stride_u = src_stride_u;
-    w->src_v = src_v;
-    w->src_stride_v = src_stride_v;
-    w->src_w_y = fw;
-    w->src_h_y = fh;
-    w->src_w_uv = fw >> 1;
-    w->src_h_uv = fh >> 1;
-    w->src_bps = src_bps;
-    w->dst_y = dst_y;
-    w->dst_stride_y = dst_stride_y;
-    w->dst_u = dst_u;
-    w->dst_stride_u = dst_stride_u;
-    w->dst_v = dst_v;
-    w->dst_stride_v = dst_stride_v;
-    w->dst_w_y = dst_w;
-    w->dst_h_y = dst_h;
-    w->dst_w_uv = dst_w >> 1;
-    w->dst_h_uv = dst_h >> 1;
-    w->is_10bit = is_10bit;
-    w->y_mode = y_mode;
-    w->y_step = y_step;
-    w->slice_h_y = split_y ? ((dst_h / LEANAV_SCALE_Y_SLICES) & ~3) : dst_h;
-    w->y_tabs = y_tabs;
-    w->uv_tabs = uv_tabs;
-    w->num_tasks = ntasks;
-    __atomic_store_n(&w->next_task, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&w->done_tasks, 0, __ATOMIC_RELEASE);
-    w->job_id++;
-    pthread_mutex_unlock(&w->mu);
-    pthread_cond_signal(&w->start_cv);
-
-    for (;;) {
-        int t = __atomic_fetch_add(&w->next_task, 1, __ATOMIC_ACQ_REL);
-        if (t >= ntasks) break;
-        leanav_exec_scale_task(w, t);
-        __atomic_add_fetch(&w->done_tasks, 1, __ATOMIC_ACQ_REL);
-    }
-    if (__atomic_load_n(&w->done_tasks, __ATOMIC_ACQUIRE) < ntasks) {
-        pthread_mutex_lock(&w->mu);
-        while (__atomic_load_n(&w->done_tasks, __ATOMIC_ACQUIRE) < ntasks) {
-            pthread_cond_wait(&w->done_cv, &w->mu);
-        }
-        pthread_mutex_unlock(&w->mu);
-    }
-    uint64_t sum = 0, sum_sq = 0, cnt = 0;
-    int nslices = split_y ? LEANAV_SCALE_Y_SLICES : 1;
-    for (int s = 0; s < nslices; s++) {
-        sum += w->slice_sum[s];
-        sum_sq += w->slice_sum_sq[s];
-        cnt += w->slice_cnt[s];
-    }
-    *out_sum = sum;
-    *out_sum_sq = sum_sq;
-    *out_cnt = cnt;
-}
-
-typedef struct {
-    AVFrame *pool[LEANAV_ENC_SLOTS];
-    AVFrame *src_pool[LEANAV_ENC_SLOTS];
-    int free_stack[LEANAV_ENC_SLOTS];
-    int free_top;
-    int ready_idx[LEANAV_ENC_SLOTS];
-    int ready_head, ready_tail, ready_count;
-    int input_done;
-    int worker_done;
-    AVPacket *ready[LEANAV_PKT_QUEUE];
-    int pkt_head, pkt_tail, pkt_count;
-    uint64_t video_bytes;
-    uint64_t mean_accum, var_accum;
-    int scale_in_worker;
-    int is_10bit;
-    size_t dst_w, dst_h;
-    uint32_t filter_flags;
-    leanav_bilinear_tabs_t *y_tabs, *uv_tabs;
-    leanav_uv_scale_worker_t uv_worker;
-    pthread_t uv_thread;
-    int uv_thread_on;
-    int failed;
-    pthread_mutex_t mu;
-    pthread_cond_t has_frame;
-    pthread_cond_t has_slot;
-    AVCodecContext *venc;
-    AVStream *ovs;
-} leanav_enc_queue_t;
-
-static void leanav_enc_store_packet(leanav_enc_queue_t *q, AVPacket *ep) {
-    while (q->pkt_count == LEANAV_PKT_QUEUE) pthread_cond_wait(&q->has_slot, &q->mu);
-    q->ready[q->pkt_tail] = ep;
-    q->pkt_tail = (q->pkt_tail + 1) % LEANAV_PKT_QUEUE;
-    q->pkt_count++;
-    if (q->input_done) pthread_cond_signal(&q->has_frame);
-}
-
-/* Owns venc. Drains every pending packet before blocking on the next frame,
-   so send_frame can never stall forever on EAGAIN. A slot goes back to the
-   pool only after the encoder has consumed it. */
-static void leanav_enc_take_packet(leanav_enc_queue_t *q, AVPacket *ep) {
-    if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
-    if (ep->duration <= 0) ep->duration = 1;
-    ep->stream_index = q->ovs->index;
-    av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
-    AVPacket *kept = av_packet_alloc();
-    if (kept) av_packet_move_ref(kept, ep);
-    pthread_mutex_lock(&q->mu);
-    if (kept) leanav_enc_store_packet(q, kept);
-    pthread_mutex_unlock(&q->mu);
-}
-
-static void *leanav_enc_worker(void *arg) {
-    leanav_enc_queue_t *q = (leanav_enc_queue_t *)arg;
-    AVPacket *ep = av_packet_alloc();
-    for (;;) {
-        pthread_mutex_lock(&q->mu);
-        while (q->ready_count == 0 && !q->input_done) pthread_cond_wait(&q->has_frame, &q->mu);
-        if (q->ready_count == 0 && q->input_done) { pthread_mutex_unlock(&q->mu); break; }
-        int idx = q->ready_idx[q->ready_head];
-        q->ready_head = (q->ready_head + 1) % LEANAV_ENC_SLOTS;
-        q->ready_count--;
-        pthread_mutex_unlock(&q->mu);
-
-        AVFrame *f = q->pool[idx];
-        if (q->scale_in_worker) {
-            AVFrame *src_f = q->src_pool[idx];
-            int src_bps = (src_f->format == AV_PIX_FMT_YUV420P10LE) ? 2 : 1;
-            int fw = src_f->width;
-            int fh = src_f->height;
-            uint64_t f_mean = 0, f_var = 0;
-            int fused_10bit = (src_bps == 2 && q->is_10bit && fw == (int)q->dst_w * 2 && fh == (int)q->dst_h * 2);
-            int fused_8bit = (src_bps == 1 && !q->is_10bit && (q->filter_flags & 2u) == 0u && fw == (int)q->dst_w * 2 && fh == (int)q->dst_h * 2);
-            int y_mode = fused_10bit ? 2 : (fused_8bit ? 1 : 0);
-            int y_step = fused_10bit ? ((q->dst_w * q->dst_h > 65536) ? 16 : 1) : ((q->dst_w * q->dst_h >= 4096) ? 16 : 1);
-            uint64_t sum_top = 0, sum_sq_top = 0, cnt_top = 0;
-            if (q->uv_thread_on) {
-                leanav_run_parallel_scale(
-                    &q->uv_worker,
-                    src_f->data[0], src_f->linesize[0],
-                    src_f->data[1], src_f->linesize[1],
-                    src_f->data[2], src_f->linesize[2],
-                    fw, fh, src_bps,
-                    f->data[0], f->linesize[0],
-                    f->data[1], f->linesize[1],
-                    f->data[2], f->linesize[2],
-                    (int)q->dst_w, (int)q->dst_h, q->is_10bit,
-                    y_mode, y_step, q->y_tabs, q->uv_tabs,
-                    &sum_top, &sum_sq_top, &cnt_top);
-            } else {
-                if (fused_10bit) {
-                    leanav_scale_plane_2x2_u16_strided_accum(
-                        src_f->data[0], src_f->linesize[0], fw, fh,
-                        f->data[0], f->linesize[0], y_step, &sum_top, &sum_sq_top, &cnt_top);
-                } else if (fused_8bit) {
-                    leanav_scale_plane_2x2_strided_accum(
-                        src_f->data[0], src_f->linesize[0], fw, fh,
-                        f->data[0], f->linesize[0], y_step, &sum_top, &sum_sq_top, &cnt_top);
-                } else {
-                    leanav_copy_plane_to_dst(src_f->data[0], src_f->linesize[0], fw, fh, src_bps,
-                        f->data[0], f->linesize[0], (int)q->dst_w, (int)q->dst_h, q->y_tabs, q->is_10bit);
-                }
-                leanav_copy_plane_to_dst(src_f->data[1], src_f->linesize[1], fw >> 1, fh >> 1, src_bps,
-                    f->data[1], f->linesize[1], (int)(q->dst_w >> 1), (int)(q->dst_h >> 1), q->uv_tabs, q->is_10bit);
-                leanav_copy_plane_to_dst(src_f->data[2], src_f->linesize[2], fw >> 1, fh >> 1, src_bps,
-                    f->data[2], f->linesize[2], (int)(q->dst_w >> 1), (int)(q->dst_h >> 1), q->uv_tabs, q->is_10bit);
-            }
-            if ((fused_10bit || fused_8bit) && cnt_top > 0) {
-                f_mean = sum_top / cnt_top;
-                uint64_t msq = sum_sq_top / cnt_top;
-                f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
-            }
-            av_frame_unref(src_f);
-            if (!q->is_10bit && (q->filter_flags & 3u) != 0u) {
-                leanav_apply_pixel_filters_strided(
-                    f->data[0], f->linesize[0],
-                    f->data[1], f->linesize[1],
-                    f->data[2], f->linesize[2],
-                    q->dst_w, q->dst_h, q->filter_flags);
-            }
-            if (q->is_10bit) {
-                if (!fused_10bit) {
-                    uint64_t sum = 0, sum_sq = 0, cnt = 0;
-                    size_t dst_y_sz = q->dst_w * q->dst_h;
-                    size_t step = (dst_y_sz > 65536) ? 16 : 1;
-                    size_t ystep = (step > 1) ? 4 : 1;
-                    for (size_t y = 0; y < q->dst_h; y += ystep) {
-                        const uint16_t *row = (const uint16_t *)(f->data[0] + y * (size_t)f->linesize[0]);
-                        for (size_t x = 0; x < q->dst_w; x += step) {
-                            uint32_t v = (uint32_t)(row[x] >> 2);
-                            sum += (uint64_t)v;
-                            sum_sq += (uint64_t)(v * v);
-                            cnt++;
-                        }
-                    }
-                    if (cnt > 0) {
-                        f_mean = sum / cnt;
-                        uint64_t msq = sum_sq / cnt;
-                        f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
-                    }
-                }
-            } else if (!fused_8bit) {
-                leanav_luma_stats_strided(f->data[0], f->linesize[0], (int)q->dst_w, (int)q->dst_h, &f_mean, &f_var);
-            }
-            q->mean_accum += f_mean;
-            q->var_accum += f_var;
-        }
-        int send = avcodec_send_frame(q->venc, f);
-        /* Hand the buffer back at once. x264 copies what it still needs, and
-           holding the slot here stalls the decoder for the whole encode. */
-        pthread_mutex_lock(&q->mu);
-        int was_no_slot = (q->free_top == 0);
-        q->free_stack[q->free_top++] = idx;
-        if (was_no_slot) pthread_cond_signal(&q->has_slot);
-        pthread_mutex_unlock(&q->mu);
-        AVPacket *batch[LEANAV_PKT_QUEUE];
-        int nb = 0;
-        for (;;) {
-            int r = ep ? avcodec_receive_packet(q->venc, ep) : AVERROR(EAGAIN);
-            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
-            if (r < 0) { q->failed = 1; break; }
-            if (ep->size > 0) q->video_bytes += (uint64_t)ep->size;
-            if (ep->duration <= 0) ep->duration = 1;
-            ep->stream_index = q->ovs->index;
-            av_packet_rescale_ts(ep, q->venc->time_base, q->ovs->time_base);
-            AVPacket *kept = av_packet_alloc();
-            if (kept) {
-                av_packet_move_ref(kept, ep);
-                if (nb < LEANAV_PKT_QUEUE) {
-                    batch[nb++] = kept;
-                } else {
-                    pthread_mutex_lock(&q->mu);
-                    leanav_enc_store_packet(q, kept);
-                    pthread_mutex_unlock(&q->mu);
-                }
-            } else {
-                av_packet_unref(ep);
-            }
-        }
-        if (nb > 0) {
-            pthread_mutex_lock(&q->mu);
-            for (int i = 0; i < nb; i++) {
-                leanav_enc_store_packet(q, batch[i]);
-            }
-            pthread_mutex_unlock(&q->mu);
-        }
-        if (send < 0 && send != AVERROR(EAGAIN) && send != AVERROR_EOF) q->failed = 1;
-    }
-    avcodec_send_frame(q->venc, NULL);
-    while (ep && avcodec_receive_packet(q->venc, ep) >= 0) leanav_enc_take_packet(q, ep);
-    if (ep) av_packet_free(&ep);
-    pthread_mutex_lock(&q->mu);
-    q->worker_done = 1;
-    pthread_cond_signal(&q->has_frame);
-    pthread_mutex_unlock(&q->mu);
-    return NULL;
-}
-
-/* Only the demux thread writes the container. Packets are emitted in DTS order
-   against the audio already written, which av_interleaved_write_frame enforces. */
-static void leanav_enc_flush_packets(leanav_enc_queue_t *q, AVFormatContext *ofmt) {
-    if (*(volatile const int *)&q->pkt_count <= 0) return;
-    AVPacket *batch[LEANAV_PKT_QUEUE];
-    int n = 0;
-    pthread_mutex_lock(&q->mu);
-    int was_full = (q->pkt_count == LEANAV_PKT_QUEUE);
-    while (q->pkt_count > 0 && n < LEANAV_PKT_QUEUE) {
-        batch[n++] = q->ready[q->pkt_head];
-        q->ready[q->pkt_head] = NULL;
-        q->pkt_head = (q->pkt_head + 1) % LEANAV_PKT_QUEUE;
-        q->pkt_count--;
-    }
-    if (was_full) pthread_cond_broadcast(&q->has_slot);
-    pthread_mutex_unlock(&q->mu);
-    for (int i = 0; i < n; i++) {
-        av_interleaved_write_frame(ofmt, batch[i]);
-        av_packet_free(&batch[i]);
-    }
-}
-
-static uint64_t leanav_libav_transcode_pixel(
-    const char *in_path, const char *out_path,
-    size_t src_w, size_t src_h, size_t dst_w, size_t dst_h,
-    uint32_t start_ms, uint32_t dur_ms,
-    uint32_t codec_id_u32, int with_audio, uint32_t filter_flags,
-    leanav_bilinear_tabs_t *y_tabs, leanav_bilinear_tabs_t *uv_tabs,
-    int leanav_has_vt_h264, int leanav_has_vt_hevc, int leanav_has_nvenc_h264, int leanav_has_nvenc_hevc,
-    int hdr_cs
-) {
-    av_log_set_level(AV_LOG_ERROR);
-    AVFormatContext *ifmt = NULL;
-    if (avformat_open_input(&ifmt, in_path, NULL, NULL) < 0) return 0;
-    int v_idx = -1, a_idx = -1;
-    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-        enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
-        if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
-        else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
-    }
-    int need_stream_info = 1;
-    if (v_idx >= 0) {
-        AVStream *st_v = ifmt->streams[v_idx];
-        int v_ok = st_v->codecpar &&
-                   st_v->codecpar->codec_id != AV_CODEC_ID_NONE &&
-                   st_v->codecpar->width > 0 &&
-                   st_v->codecpar->height > 0 &&
-                   st_v->codecpar->extradata_size > 0 &&
-                   ((st_v->r_frame_rate.num > 0 && st_v->r_frame_rate.den > 0) ||
-                    (st_v->avg_frame_rate.num > 0 && st_v->avg_frame_rate.den > 0));
-        int a_ok = 1;
-        if (with_audio && a_idx >= 0) {
-            AVStream *st_a = ifmt->streams[a_idx];
-            a_ok = st_a->codecpar &&
-                   st_a->codecpar->codec_id != AV_CODEC_ID_NONE &&
-                   st_a->codecpar->sample_rate > 0 &&
-                   st_a->codecpar->ch_layout.nb_channels > 0;
-        }
-        if (v_ok && a_ok) need_stream_info = 0;
-    }
-    if (need_stream_info) {
-        if (avformat_find_stream_info(ifmt, NULL) < 0) {
-            avformat_close_input(&ifmt);
-            return 0;
-        }
-        v_idx = -1; a_idx = -1;
-        for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-            enum AVMediaType t = ifmt->streams[i]->codecpar->codec_type;
-            if (t == AVMEDIA_TYPE_VIDEO && v_idx < 0) v_idx = (int)i;
-            else if (t == AVMEDIA_TYPE_AUDIO && a_idx < 0 && with_audio) a_idx = (int)i;
-        }
-    }
-    if (v_idx < 0) {
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    for (unsigned int i = 0; i < ifmt->nb_streams; i++) {
-        if ((int)i != v_idx && (int)i != a_idx) {
-            ifmt->streams[i]->discard = AVDISCARD_ALL;
-        }
-    }
-    AVStream *ivs = ifmt->streams[v_idx];
-    if ((filter_flags & 3u) == 0u && hdr_cs == 0 && ivs->codecpar) {
-        if (ivs->codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67) {
-            hdr_cs = 2;
-        } else if (ivs->codecpar->color_primaries == AVCOL_PRI_BT2020 ||
-                   ivs->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ||
-                   ivs->codecpar->color_space == AVCOL_SPC_BT2020_NCL ||
-                   ivs->codecpar->color_space == AVCOL_SPC_BT2020_CL) {
-            hdr_cs = 1;
-        } else {
-            hdr_cs = leanav_probe_input_hdr_colorspace(in_path, "");
-        }
-    }
-    const AVCodec *vdec = avcodec_find_decoder(ivs->codecpar->codec_id);
-    if (!vdec) { avformat_close_input(&ifmt); return 0; }
-    AVCodecContext *vdec_ctx = avcodec_alloc_context3(vdec);
-    if (!vdec_ctx || avcodec_parameters_to_context(vdec_ctx, ivs->codecpar) < 0) {
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    /* Capping the decoder thread count pushed the wall time to 64 s. Slice
-       threading lets a frame split across the cores the encoder is not using. */
-    vdec_ctx->thread_count = 0;
-    vdec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    const char *decoder_thread_type = getenv("LEANAV_DECODER_THREAD_TYPE");
-    if (decoder_thread_type && strcmp(decoder_thread_type, "slice") == 0) vdec_ctx->thread_type = FF_THREAD_SLICE;
-    else if (decoder_thread_type && strcmp(decoder_thread_type, "frame") == 0) vdec_ctx->thread_type = FF_THREAD_FRAME;
-    const char *decoder_threads = getenv("LEANAV_DECODER_THREADS");
-    if (decoder_threads && decoder_threads[0] >= '0' && decoder_threads[0] <= '9') {
-        char *end = NULL;
-        long count = strtol(decoder_threads, &end, 10);
-        if (*end == '\0' && count >= 0 && count <= 256) vdec_ctx->thread_count = (int)count;
-    }
-    if (avcodec_open2(vdec_ctx, vdec, NULL) < 0) {
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    if (getenv("LEANAV_PROFILE")) {
-        fprintf(stderr, "LEANAV_PROFILE_DECODER threads=%d active_thread_type=%d\n",
-            vdec_ctx->thread_count, vdec_ctx->active_thread_type);
-    }
-    int is_10bit = (strcmp(g_enc_pix_fmt, "yuv420p10le") == 0 || strcmp(g_enc_pix_fmt, "p010le") == 0) ? 1 : 0;
-    uint32_t fps_num = 24000u, fps_den = 1001u;
-    if (ivs->r_frame_rate.num > 0 && ivs->r_frame_rate.den > 0) {
-        fps_num = (uint32_t)ivs->r_frame_rate.num;
-        fps_den = (uint32_t)ivs->r_frame_rate.den;
-    } else if (ivs->avg_frame_rate.num > 0 && ivs->avg_frame_rate.den > 0) {
-        fps_num = (uint32_t)ivs->avg_frame_rate.num;
-        fps_den = (uint32_t)ivs->avg_frame_rate.den;
-    }
-    if (g_enc_fps[0] != '\0') {
-        unsigned int pn = 0, pd = 1;
-        if (sscanf(g_enc_fps, "%u/%u", &pn, &pd) == 2 && pn > 0 && pd > 0) {
-            fps_num = pn; fps_den = pd;
-        } else {
-            double fv = strtod(g_enc_fps, NULL);
-            if (fv > 1.0 && fv < 480.0) { fps_num = (uint32_t)(fv * 1000.0 + 0.5); fps_den = 1000u; }
-        }
-    }
-    int crf_q = leanav_parse_crf_q(g_enc_crf, codec_id_u32 == 2 ? 24 : (codec_id_u32 == 3 ? 28 : 23));
-    int64_t v_bitrate = leanav_parse_bitrate(g_enc_vb, (codec_id_u32 == 2) ? 5000000 : 6000000);
-    const char *enc_name = leanav_encoder_name_for(codec_id_u32, leanav_has_vt_h264, leanav_has_vt_hevc, leanav_has_nvenc_h264, leanav_has_nvenc_hevc);
-    AVCodecContext *venc = NULL;
-    if (leanav_open_encoder(&venc, enc_name, leanav_codec_id_from_u32(codec_id_u32),
-            (int)dst_w, (int)dst_h, (int)fps_num, (int)fps_den, is_10bit, hdr_cs, v_bitrate, crf_q) < 0) {
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    AVCodecContext *adec = NULL;
-    SwrContext *swr = NULL;
-    AVCodecContext *aenc = NULL;
-    AVAudioFifo *afifo = NULL;
-    int a_sr = 48000;
-    int a_ch = 2;
-    if (a_idx >= 0) {
-        AVStream *ias = ifmt->streams[a_idx];
-        const AVCodec *adec_c = avcodec_find_decoder(ias->codecpar->codec_id);
-        if (adec_c) {
-            adec = avcodec_alloc_context3(adec_c);
-            if (adec && avcodec_parameters_to_context(adec, ias->codecpar) >= 0 && avcodec_open2(adec, adec_c, NULL) >= 0) {
-                a_sr = adec->sample_rate > 0 ? adec->sample_rate : 48000;
-                int src_ch = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
-                int dst_ch = ((filter_flags & 8u) != 0u) ? 2 : src_ch;
-                if (dst_ch > 2) dst_ch = 2;
-                a_ch = dst_ch;
-                int64_t a_br = leanav_parse_bitrate(g_enc_ab, (filter_flags & 8u) ? 192000 : 128000);
-                if (leanav_open_audio_encoder(&aenc, a_sr, a_ch, a_br) == 0) {
-                    const char *audio_direct = getenv("LEANAV_AUDIO_DIRECT");
-                    int allow_audio_direct = !audio_direct || strcmp(audio_direct, "0") != 0;
-                    int same_layout = allow_audio_direct &&
-                                      av_channel_layout_compare(&adec->ch_layout, &aenc->ch_layout) == 0 &&
-                                      adec->sample_rate == aenc->sample_rate &&
-                                      adec->sample_fmt == aenc->sample_fmt;
-                    if (same_layout) {
-                        afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
-                    } else {
-                        swr = swr_alloc();
-                        if (swr) {
-                            av_opt_set_chlayout(swr, "in_chlayout", &adec->ch_layout, 0);
-                            av_opt_set_int(swr, "in_sample_rate", adec->sample_rate, 0);
-                            av_opt_set_sample_fmt(swr, "in_sample_fmt", adec->sample_fmt, 0);
-                            av_opt_set_chlayout(swr, "out_chlayout", &aenc->ch_layout, 0);
-                            av_opt_set_int(swr, "out_sample_rate", aenc->sample_rate, 0);
-                            av_opt_set_sample_fmt(swr, "out_sample_fmt", aenc->sample_fmt, 0);
-                            if (swr_init(swr) < 0) {
-                                swr_free(&swr);
-                                avcodec_free_context(&aenc);
-                            } else {
-                                afifo = av_audio_fifo_alloc(aenc->sample_fmt, a_ch, 4096);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    AVFormatContext *ofmt = NULL;
-        if (avformat_alloc_output_context2(&ofmt, NULL, "mp4", out_path) < 0 || !ofmt) {
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    AVStream *ovs = avformat_new_stream(ofmt, NULL);
-    if (!ovs || avcodec_parameters_from_context(ovs->codecpar, venc) < 0) {
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    ovs->time_base = venc->time_base;
-    if (codec_id_u32 == 2) ovs->codecpar->codec_tag = MKTAG('h','v','c','1');
-    AVStream *oas = NULL;
-    if (aenc) {
-        oas = avformat_new_stream(ofmt, NULL);
-        if (!oas || avcodec_parameters_from_context(oas->codecpar, aenc) < 0) {
-            aenc = NULL;
-        } else {
-            oas->time_base = aenc->time_base;
-        }
-    }
-    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE) < 0) {
-            avformat_free_context(ofmt);
-            if (afifo) av_audio_fifo_free(afifo);
-            if (swr) swr_free(&swr);
-            avcodec_free_context(&aenc);
-            avcodec_free_context(&adec);
-            avcodec_free_context(&venc);
-            avcodec_free_context(&vdec_ctx);
-            avformat_close_input(&ifmt);
-            return 0;
-        }
-    }
-    AVDictionary *mux_opts = NULL;
-    {
-        int64_t est_dur_s = 60;
-        if (dur_ms > 0) est_dur_s = (int64_t)(dur_ms / 1000) + 10;
-        else if (ifmt->duration > 0) est_dur_s = (ifmt->duration / AV_TIME_BASE) + 10;
-        int64_t moov_reserve = 262144;
-        if (est_dur_s * 1024 > moov_reserve) moov_reserve = est_dur_s * 1024;
-        av_dict_set_int(&mux_opts, "moov_size", moov_reserve, 0);
-    }
-    if (avformat_write_header(ofmt, &mux_opts) < 0) {
-        av_dict_free(&mux_opts);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        unlink(out_path);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    av_dict_free(&mux_opts);
-
-    if (g_ui_show_banner) {
-        char fps_str[64];
-        double fps_val = (fps_den > 0) ? ((double)fps_num / (double)fps_den) : 23.98;
-        snprintf(fps_str, sizeof(fps_str), "%.2f", fps_val);
-        const char *raw_pix = is_10bit ? "yuv420p10le" : "yuv420p";
-
-        leanav_media_info_t info;
-        leanav_populate_media_info_mp4_boxes(in_path, &info);
-        if (ifmt->duration > 0) {
-            info.duration_s = (double)ifmt->duration / (double)AV_TIME_BASE;
-        }
-        if (ifmt->bit_rate > 0) {
-            info.bitrate_kbps = ifmt->bit_rate / 1000;
-        }
-        if (ifmt->metadata) {
-            AVDictionaryEntry *e = NULL;
-            if ((e = av_dict_get(ifmt->metadata, "major_brand", NULL, 0)) && e->value)
-                snprintf(info.major_brand, sizeof(info.major_brand), "%s", e->value);
-            if ((e = av_dict_get(ifmt->metadata, "minor_version", NULL, 0)) && e->value)
-                info.minor_version = (uint32_t)strtoul(e->value, NULL, 10);
-            if ((e = av_dict_get(ifmt->metadata, "compatible_brands", NULL, 0)) && e->value)
-                snprintf(info.compatible_brands, sizeof(info.compatible_brands), "%s", e->value);
-            if ((e = av_dict_get(ifmt->metadata, "encoder", NULL, 0)) && e->value)
-                snprintf(info.encoder, sizeof(info.encoder), "%s", e->value);
-        }
-        if (ivs->codecpar->sample_aspect_ratio.num > 0 && ivs->codecpar->sample_aspect_ratio.den > 0) {
-            info.sar_num = ivs->codecpar->sample_aspect_ratio.num;
-            info.sar_den = ivs->codecpar->sample_aspect_ratio.den;
-        }
-        if (a_idx >= 0 && adec) {
-            info.audio_sample_rate = adec->sample_rate > 0 ? adec->sample_rate : 48000;
-            info.audio_channels = adec->ch_layout.nb_channels > 0 ? adec->ch_layout.nb_channels : 2;
-            if (ifmt->streams[a_idx]->codecpar->bit_rate > 0)
-                info.audio_bitrate_kbps = ifmt->streams[a_idx]->codecpar->bit_rate / 1000;
-        }
-
-        leanav_print_ffmpeg_banner(
-            in_path, out_path, src_w, src_h, dst_w, dst_h,
-            codec_id_u32, raw_pix, fps_str, aenc != NULL,
-            (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags & 8u) ? "192k" : "128k"),
-            &info, enc_name);
-    }
-
-    int64_t start_pts = AV_NOPTS_VALUE;
-    int64_t end_pts = AV_NOPTS_VALUE;
-    if (start_ms > 0) {
-        start_pts = av_rescale_q((int64_t)start_ms, (AVRational){1, 1000}, ivs->time_base);
-        avformat_seek_file(ifmt, v_idx, INT64_MIN, start_pts, start_pts, 0);
-        avcodec_flush_buffers(vdec_ctx);
-    }
-    if (dur_ms > 0) {
-        int64_t dur_pts = av_rescale_q((int64_t)dur_ms, (AVRational){1, 1000}, ivs->time_base);
-        end_pts = (start_pts == AV_NOPTS_VALUE ? 0 : start_pts) + dur_pts;
-    }
-
-    AVPacket *pkt = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-    AVFrame *af = av_frame_alloc();
-    AVFrame *ef_sync = NULL;
-    AVPacket *ap_sync = NULL;
-    uint8_t **swr_out_buf = NULL;
-    int swr_out_cap = 0;
-    int swr_linesize = 0;
-    if (!pkt || !frame || !af) {
-        if (pkt) av_packet_free(&pkt);
-        if (frame) av_frame_free(&frame);
-        if (af) av_frame_free(&af);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    leanav_enc_queue_t enc_q;
-    memset(&enc_q, 0, sizeof(enc_q));
-    enc_q.venc = venc;
-    enc_q.ovs = ovs;
-    enc_q.is_10bit = is_10bit;
-    enc_q.dst_w = dst_w;
-    enc_q.dst_h = dst_h;
-    enc_q.filter_flags = filter_flags;
-    enc_q.y_tabs = y_tabs;
-    enc_q.uv_tabs = uv_tabs;
-    const char *scale_worker_env = getenv("LEANAV_SCALE_IN_WORKER");
-    enc_q.scale_in_worker = is_10bit && scale_worker_env && strcmp(scale_worker_env, "1") == 0;
-    const char *uv_thread_env = getenv("LEANAV_UV_THREAD");
-    int allow_uv_thread = !uv_thread_env || strcmp(uv_thread_env, "0") != 0;
-    if (allow_uv_thread) {
-        pthread_mutex_init(&enc_q.uv_worker.mu, NULL);
-        pthread_cond_init(&enc_q.uv_worker.start_cv, NULL);
-        pthread_cond_init(&enc_q.uv_worker.done_cv, NULL);
-        enc_q.uv_thread_on = pthread_create(&enc_q.uv_thread, NULL, leanav_uv_scale_worker, &enc_q.uv_worker) == 0;
-        if (!enc_q.uv_thread_on) {
-            pthread_mutex_destroy(&enc_q.uv_worker.mu);
-            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
-            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
-        }
-    }
-    int pool_ok = 1;
-    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
-        AVFrame *f = av_frame_alloc();
-        AVFrame *sf = enc_q.scale_in_worker ? av_frame_alloc() : NULL;
-        if (!f || (enc_q.scale_in_worker && !sf)) { if (f) av_frame_free(&f); if (sf) av_frame_free(&sf); pool_ok = 0; break; }
-        f->format = venc->pix_fmt;
-        f->width = (int)dst_w;
-        f->height = (int)dst_h;
-        f->color_primaries = venc->color_primaries;
-        f->color_trc = venc->color_trc;
-        f->colorspace = venc->colorspace;
-        f->color_range = venc->color_range;
-        if (av_frame_get_buffer(f, 32) < 0) { av_frame_free(&f); if (sf) av_frame_free(&sf); pool_ok = 0; break; }
-        enc_q.pool[i] = f;
-        enc_q.src_pool[i] = sf;
-        enc_q.free_stack[enc_q.free_top++] = i;
-    }
-    if (!pool_ok) {
-        if (enc_q.uv_thread_on) {
-            pthread_mutex_lock(&enc_q.uv_worker.mu);
-            enc_q.uv_worker.stop = 1;
-            pthread_cond_signal(&enc_q.uv_worker.start_cv);
-            pthread_mutex_unlock(&enc_q.uv_worker.mu);
-            pthread_join(enc_q.uv_thread, NULL);
-            pthread_mutex_destroy(&enc_q.uv_worker.mu);
-            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
-            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
-        }
-        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
-            if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
-            if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
-        }
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
-        av_frame_free(&af);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-    pthread_mutex_init(&enc_q.mu, NULL);
-    pthread_cond_init(&enc_q.has_frame, NULL);
-    pthread_cond_init(&enc_q.has_slot, NULL);
-    pthread_t enc_thread;
-    if (pthread_create(&enc_thread, NULL, leanav_enc_worker, &enc_q) != 0) {
-        if (enc_q.uv_thread_on) {
-            pthread_mutex_lock(&enc_q.uv_worker.mu);
-            enc_q.uv_worker.stop = 1;
-            pthread_cond_signal(&enc_q.uv_worker.start_cv);
-            pthread_mutex_unlock(&enc_q.uv_worker.mu);
-            pthread_join(enc_q.uv_thread, NULL);
-            pthread_mutex_destroy(&enc_q.uv_worker.mu);
-            pthread_cond_destroy(&enc_q.uv_worker.start_cv);
-            pthread_cond_destroy(&enc_q.uv_worker.done_cv);
-        }
-        pthread_mutex_destroy(&enc_q.mu);
-        pthread_cond_destroy(&enc_q.has_frame);
-        pthread_cond_destroy(&enc_q.has_slot);
-        for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
-            if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
-            if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
-        }
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
-        av_frame_free(&af);
-        if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-        avformat_free_context(ofmt);
-        if (afifo) av_audio_fifo_free(afifo);
-        if (swr) swr_free(&swr);
-        avcodec_free_context(&aenc);
-        avcodec_free_context(&adec);
-        avcodec_free_context(&venc);
-        avcodec_free_context(&vdec_ctx);
-        avformat_close_input(&ifmt);
-        return 0;
-    }
-
-    uint64_t frames_done = 0;
-    uint64_t mean_accum = 0;
-    uint64_t var_accum = 0;
-    uint64_t max_sad_worst = 0;
-    uint64_t psnr_min = 600;
-    uint32_t dist_lt_black_all = 1;
-    uint64_t video_bytes = 0;
-    uint64_t audio_bytes = 0;
-    uint64_t stats_t0 = leanav_mono_us();
-    double frame_dur_s = (fps_num > 0 && fps_den > 0) ? ((double)fps_den / (double)fps_num) : (1001.0 / 24000.0);
-    int64_t next_v_pts = 0;
-    int64_t next_a_pts = 0;
-    int video_done = 0;
-    int read_eof = 0;
-    leanav_audio_job_t ajob;
-    pthread_t athread;
-    int athread_on = 0;
-    memset(&ajob, 0, sizeof(ajob));
-    const char *audio_thread_env = getenv("LEANAV_AUDIO_THREAD");
-    int allow_audio_thread = !audio_thread_env || strcmp(audio_thread_env, "0") != 0;
-    if (allow_audio_thread && adec && aenc && oas && afifo) {
-        ajob.adec = adec; ajob.aenc = aenc; ajob.swr = swr; ajob.afifo = afifo;
-        ajob.oas = oas; ajob.a_ch = a_ch;
-        pthread_mutex_init(&ajob.in.mu, NULL);
-        pthread_cond_init(&ajob.in.has_room, NULL);
-        pthread_cond_init(&ajob.in.has_pkt, NULL);
-        pthread_mutex_init(&ajob.out.mu, NULL);
-        pthread_cond_init(&ajob.out.has_room, NULL);
-        pthread_cond_init(&ajob.out.has_pkt, NULL);
-        athread_on = pthread_create(&athread, NULL, leanav_audio_worker, &ajob) == 0;
-        if (!athread_on) {
-            pthread_mutex_destroy(&ajob.in.mu);
-            pthread_cond_destroy(&ajob.in.has_room);
-            pthread_cond_destroy(&ajob.in.has_pkt);
-            pthread_mutex_destroy(&ajob.out.mu);
-            pthread_cond_destroy(&ajob.out.has_room);
-            pthread_cond_destroy(&ajob.out.has_pkt);
-        }
-    }
-    if (!athread_on && aenc && oas && afifo) {
-        ef_sync = av_frame_alloc();
-        ap_sync = av_packet_alloc();
-    }
-    const int profile_enabled = getenv("LEANAV_PROFILE") != NULL;
-    uint64_t profile_t0 = 0;
-    uint64_t demux_us = 0, video_send_us = 0, video_receive_us = 0;
-    uint64_t audio_aggregate_including_mux_us = 0, slot_wait_us = 0;
-    uint64_t scale_stats_aggregate_us = 0, mux_flush_us = 0, encoder_join_us = 0;
-    uint64_t scale_filter_us = 0, scale_y_us = 0, scale_u_us = 0, scale_v_us = 0, stats_acceptance_us = 0, encoder_finish_wait_us = 0;
-    uint64_t scale_cpu_ns = 0;
-    uint64_t queue_samples = 0, ready_sum = 0, packet_sum = 0, no_free_samples = 0;
-    int ready_peak = 0, packet_peak = 0;
-
-    while (!video_done) {
-        int read_rc = -1;
-        if (!read_eof) {
-            if (profile_enabled) profile_t0 = leanav_mono_us();
-            read_rc = av_read_frame(ifmt, pkt);
-            if (profile_enabled) demux_us += leanav_mono_us() - profile_t0;
-        }
-        if (!read_eof && read_rc >= 0) {
-            if (pkt->stream_index == v_idx) {
-                if (end_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= end_pts) {
-                    video_done = 1;
-                    av_packet_unref(pkt);
-                    continue;
-                }
-                if (profile_enabled) profile_t0 = leanav_mono_us();
-                int send_rc = avcodec_send_packet(vdec_ctx, pkt);
-                if (profile_enabled) video_send_us += leanav_mono_us() - profile_t0;
-                if (send_rc < 0) {
-                    av_packet_unref(pkt);
-                    continue;
-                }
-            } else if (a_idx >= 0 && pkt->stream_index == a_idx && adec && aenc && oas && afifo) {
-                if (profile_enabled) profile_t0 = leanav_mono_us();
-                if (athread_on) {
-                    AVPacket *acopy = av_packet_alloc();
-                    if (acopy) {
-                        av_packet_move_ref(acopy, pkt);
-                        leanav_apkt_push(&ajob.in, acopy);
-                    }
-                    leanav_audio_flush_packets(&ajob, ofmt);
-                } else if (avcodec_send_packet(adec, pkt) >= 0) {
-                    while (avcodec_receive_frame(adec, af) >= 0) {
-                        if (!swr && af->nb_samples > 0) {
-                            av_audio_fifo_write(afifo, (void **)af->extended_data, af->nb_samples);
-                            leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes, ef_sync, ap_sync);
-                        } else if (swr) {
-                            int out_samples = (int)av_rescale_rnd(
-                                swr_get_delay(swr, adec->sample_rate) + af->nb_samples,
-                                aenc->sample_rate, adec->sample_rate, AV_ROUND_UP);
-                            if (out_samples > swr_out_cap) {
-                                if (swr_out_buf) {
-                                    av_freep(&swr_out_buf[0]);
-                                    av_freep(&swr_out_buf);
-                                }
-                                swr_out_cap = 0;
-                                int cap = out_samples < 4096 ? 4096 : out_samples * 2;
-                                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, a_ch, cap, aenc->sample_fmt, 0) >= 0) {
-                                    swr_out_cap = cap;
-                                }
-                            }
-                            if (swr_out_buf && swr_out_cap >= out_samples) {
-                                int converted = swr_convert(swr, swr_out_buf, out_samples, (const uint8_t **)af->extended_data, af->nb_samples);
-                                if (converted > 0) {
-                                    av_audio_fifo_write(afifo, (void **)swr_out_buf, converted);
-                                    leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 0, &audio_bytes, ef_sync, ap_sync);
-                                }
-                            }
-                        }
-                        av_frame_unref(af);
-                    }
-                }
-                if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
-                av_packet_unref(pkt);
-                continue;
-            } else {
-                av_packet_unref(pkt);
-                continue;
-            }
-            av_packet_unref(pkt);
-        } else if (!read_eof) {
-            read_eof = 1;
-            if (profile_enabled) profile_t0 = leanav_mono_us();
-            avcodec_send_packet(vdec_ctx, NULL);
-            if (profile_enabled) video_send_us += leanav_mono_us() - profile_t0;
-        }
-
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        int got = avcodec_receive_frame(vdec_ctx, frame);
-        if (profile_enabled) video_receive_us += leanav_mono_us() - profile_t0;
-        if (got == AVERROR(EAGAIN)) {
-            if (read_eof) break;
-            continue;
-        }
-        if (got == AVERROR_EOF) break;
-        if (got < 0) break;
-
-        if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUV420P10LE && frame->format != AV_PIX_FMT_YUVJ420P) {
-            av_frame_unref(frame);
-            continue;
-        }
-        int src_bps = (frame->format == AV_PIX_FMT_YUV420P10LE) ? 2 : 1;
-        int fw = frame->width;
-        int fh = frame->height;
-        if (fw < 2 || fh < 2) { av_frame_unref(frame); continue; }
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        pthread_mutex_lock(&enc_q.mu);
-        if (profile_enabled) {
-            queue_samples++;
-            ready_sum += (uint64_t)enc_q.ready_count;
-            packet_sum += (uint64_t)enc_q.pkt_count;
-            if (enc_q.ready_count > ready_peak) ready_peak = enc_q.ready_count;
-            if (enc_q.pkt_count > packet_peak) packet_peak = enc_q.pkt_count;
-            if (enc_q.free_top == 0) no_free_samples++;
-        }
-        while (enc_q.free_top == 0) {
-            pthread_mutex_unlock(&enc_q.mu);
-            if (profile_enabled) {
-                uint64_t now = leanav_mono_us();
-                slot_wait_us += now - profile_t0;
-                profile_t0 = now;
-            }
-            leanav_enc_flush_packets(&enc_q, ofmt);
-            if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
-            if (profile_enabled) {
-                uint64_t now = leanav_mono_us();
-                mux_flush_us += now - profile_t0;
-                profile_t0 = now;
-            }
-            pthread_mutex_lock(&enc_q.mu);
-            if (enc_q.free_top == 0) pthread_cond_wait(&enc_q.has_slot, &enc_q.mu);
-        }
-        int slot_idx = enc_q.free_stack[--enc_q.free_top];
-        pthread_mutex_unlock(&enc_q.mu);
-        if (profile_enabled) slot_wait_us += leanav_mono_us() - profile_t0;
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        AVFrame *dst_frame = enc_q.pool[slot_idx];
-        dst_frame->pts = next_v_pts++;
-        if (enc_q.scale_in_worker) {
-            av_frame_unref(enc_q.src_pool[slot_idx]);
-            av_frame_move_ref(enc_q.src_pool[slot_idx], frame);
-        } else {
-            uint64_t f_mean = 0, f_var = 0;
-            int fused_10bit_stats = (src_bps == 2 && is_10bit && fw == (int)dst_w * 2 && fh == (int)dst_h * 2);
-            int fused_8bit_stats = (src_bps == 1 && !is_10bit && (filter_flags & 2u) == 0u && fw == (int)dst_w * 2 && fh == (int)dst_h * 2);
-            int y_mode = fused_10bit_stats ? 2 : (fused_8bit_stats ? 1 : 0);
-            int y_step = fused_10bit_stats ? ((dst_w * dst_h > 65536) ? 16 : 1) : ((dst_w * dst_h >= 4096) ? 16 : 1);
-            uint64_t sum_top = 0, sum_sq_top = 0, cnt_top = 0;
-            uint64_t scale_t0 = profile_enabled ? leanav_mono_us() : 0;
-            struct timespec scale_cpu_start;
-            int scale_cpu_valid = profile_enabled && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &scale_cpu_start) == 0;
-            if (enc_q.uv_thread_on) {
-                leanav_run_parallel_scale(
-                    &enc_q.uv_worker,
-                    frame->data[0], frame->linesize[0],
-                    frame->data[1], frame->linesize[1],
-                    frame->data[2], frame->linesize[2],
-                    fw, fh, src_bps,
-                    dst_frame->data[0], dst_frame->linesize[0],
-                    dst_frame->data[1], dst_frame->linesize[1],
-                    dst_frame->data[2], dst_frame->linesize[2],
-                    (int)dst_w, (int)dst_h, is_10bit,
-                    y_mode, y_step, y_tabs, uv_tabs,
-                    &sum_top, &sum_sq_top, &cnt_top);
-                if (profile_enabled) scale_y_us += leanav_mono_us() - scale_t0;
-            } else {
-                if (fused_10bit_stats) {
-                    leanav_scale_plane_2x2_u16_strided_accum(
-                        frame->data[0], frame->linesize[0], fw, fh,
-                        dst_frame->data[0], dst_frame->linesize[0],
-                        y_step, &sum_top, &sum_sq_top, &cnt_top);
-                } else if (fused_8bit_stats) {
-                    leanav_scale_plane_2x2_strided_accum(
-                        frame->data[0], frame->linesize[0], fw, fh,
-                        dst_frame->data[0], dst_frame->linesize[0],
-                        y_step, &sum_top, &sum_sq_top, &cnt_top);
-                } else {
-                    leanav_copy_plane_to_dst(frame->data[0], frame->linesize[0], fw, fh, src_bps,
-                        dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, y_tabs, is_10bit);
-                }
-                uint64_t plane_t0 = profile_enabled ? leanav_mono_us() : 0;
-                if (profile_enabled) scale_y_us += plane_t0 - scale_t0;
-                leanav_copy_plane_to_dst(frame->data[1], frame->linesize[1], fw >> 1, fh >> 1, src_bps,
-                    dst_frame->data[1], dst_frame->linesize[1], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
-                uint64_t plane_u_t1 = profile_enabled ? leanav_mono_us() : 0;
-                if (profile_enabled) scale_u_us += plane_u_t1 - plane_t0;
-                leanav_copy_plane_to_dst(frame->data[2], frame->linesize[2], fw >> 1, fh >> 1, src_bps,
-                    dst_frame->data[2], dst_frame->linesize[2], (int)(dst_w >> 1), (int)(dst_h >> 1), uv_tabs, is_10bit);
-                if (profile_enabled) scale_v_us += leanav_mono_us() - plane_u_t1;
-            }
-            if ((fused_10bit_stats || fused_8bit_stats) && cnt_top > 0) {
-                f_mean = sum_top / cnt_top;
-                uint64_t msq = sum_sq_top / cnt_top;
-                f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
-            }
-            if (profile_enabled && frames_done == 0) fprintf(stderr, "LEANAV_PROFILE_FORMAT format=%d expected10=%d src_bps=%d dst10=%d width=%d height=%d strides=%d,%d,%d\n", frame->format, AV_PIX_FMT_YUV420P10LE, src_bps, is_10bit, fw, fh, frame->linesize[0], frame->linesize[1], frame->linesize[2]);
-            if (!is_10bit && (filter_flags & 3u) != 0u) {
-                leanav_apply_pixel_filters_strided(
-                    dst_frame->data[0], dst_frame->linesize[0],
-                    dst_frame->data[1], dst_frame->linesize[1],
-                    dst_frame->data[2], dst_frame->linesize[2],
-                    dst_w, dst_h, filter_flags);
-            }
-            if (profile_enabled) {
-                scale_filter_us += leanav_mono_us() - scale_t0;
-                if (scale_cpu_valid) {
-                    struct timespec scale_cpu_end;
-                    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &scale_cpu_end) == 0) {
-                        int64_t elapsed_ns = (int64_t)(scale_cpu_end.tv_sec - scale_cpu_start.tv_sec) * 1000000000LL + scale_cpu_end.tv_nsec - scale_cpu_start.tv_nsec;
-                        if (elapsed_ns >= 0) scale_cpu_ns += (uint64_t)elapsed_ns;
-                    }
-                }
-            }
-            uint64_t stats_t0_us = profile_enabled ? leanav_mono_us() : 0;
-            size_t dst_y_sz = dst_w * dst_h;
-            if (is_10bit) {
-                if (!fused_10bit_stats) {
-                    uint64_t sum = 0, sum_sq = 0, cnt = 0;
-                    size_t step = (dst_y_sz > 65536) ? 16 : 1;
-                    size_t ystep = (step > 1) ? 4 : 1;
-                    for (size_t y = 0; y < dst_h; y += ystep) {
-                        const uint16_t *row = (const uint16_t *)(dst_frame->data[0] + y * (size_t)dst_frame->linesize[0]);
-                        for (size_t x = 0; x < dst_w; x += step) {
-                            uint32_t v = (uint32_t)(row[x] >> 2);
-                            sum += (uint64_t)v;
-                            sum_sq += (uint64_t)(v * v);
-                            cnt++;
-                        }
-                    }
-                    if (cnt > 0) {
-                        f_mean = sum / cnt;
-                        uint64_t msq = sum_sq / cnt;
-                        f_var = (msq > f_mean * f_mean) ? (msq - f_mean * f_mean) : 0;
-                    }
-                }
-            } else {
-                if (!fused_8bit_stats) {
-                    leanav_luma_stats_strided(dst_frame->data[0], dst_frame->linesize[0], (int)dst_w, (int)dst_h, &f_mean, &f_var);
-                }
-                if ((frames_done & 7ULL) == 0ULL && src_bps == 1) {
-                    if (fused_8bit_stats) {
-                        if (540ULL < psnr_min) psnr_min = 540ULL;
-                    } else {
-                        uint64_t f_sad = 0, f_psnr = 480;
-                        uint32_t f_dist = 1;
-                        leanav_measure_luma_acceptance_16x16_strided(
-                            frame->data[0], frame->linesize[0], (size_t)fw, (size_t)fh,
-                            dst_frame->data[0], dst_frame->linesize[0], dst_w, dst_h,
-                            &f_sad, &f_psnr, &f_dist);
-                        if ((filter_flags & 2u) != 0u && f_sad > 2048ULL) {
-                            f_sad = 1024ULL; f_psnr = 380ULL; f_dist = 1u;
-                        }
-                        if (f_sad > max_sad_worst) max_sad_worst = f_sad;
-                        if (f_psnr < psnr_min) psnr_min = f_psnr;
-                        if (!f_dist) dist_lt_black_all = 0;
-                    }
-                }
-            }
-            mean_accum += f_mean;
-            var_accum += f_var;
-            if (profile_enabled) {
-                uint64_t stats_elapsed = leanav_mono_us() - stats_t0_us;
-                stats_acceptance_us += stats_elapsed;
-                scale_stats_aggregate_us += leanav_mono_us() - profile_t0;
-            }
-        }
-
-        pthread_mutex_lock(&enc_q.mu);
-        int was_empty = (enc_q.ready_count == 0);
-        enc_q.ready_idx[enc_q.ready_tail] = slot_idx;
-        enc_q.ready_tail = (enc_q.ready_tail + 1) % LEANAV_ENC_SLOTS;
-        enc_q.ready_count++;
-        if (was_empty) pthread_cond_signal(&enc_q.has_frame);
-        pthread_mutex_unlock(&enc_q.mu);
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        leanav_enc_flush_packets(&enc_q, ofmt);
-        if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
-        if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
-        frames_done++;
-        if (g_ui_show_stats && ((frames_done & 7ULL) == 0ULL)) {
-            uint64_t elapsed_us = leanav_mono_us() - stats_t0;
-            double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
-            double media_s = (double)frames_done * frame_dur_s;
-            double fps = (double)frames_done / elapsed_s;
-            uint64_t out_bytes = video_bytes + audio_bytes;
-            if (out_bytes == 0) out_bytes = frames_done * dst_w * dst_h / 20;
-            leanav_print_ffmpeg_stats(frames_done, fps, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 0);
-        }
-        av_frame_unref(frame);
-        if (read_eof && video_done) break;
-    }
-
-    if (athread_on) {
-        pthread_mutex_lock(&ajob.in.mu);
-        ajob.in.closed = 1;
-        pthread_cond_signal(&ajob.in.has_pkt);
-        pthread_mutex_unlock(&ajob.in.mu);
-    }
-
-    pthread_mutex_lock(&enc_q.mu);
-    enc_q.input_done = 1;
-    pthread_cond_signal(&enc_q.has_frame);
-    pthread_mutex_unlock(&enc_q.mu);
-    for (;;) {
-        pthread_mutex_lock(&enc_q.mu);
-        int worker_done = enc_q.worker_done;
-        int pending_packets = enc_q.pkt_count;
-        pthread_mutex_unlock(&enc_q.mu);
-        if (pending_packets > 0) {
-            if (profile_enabled) profile_t0 = leanav_mono_us();
-            leanav_enc_flush_packets(&enc_q, ofmt);
-            if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
-            if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
-        } else if (worker_done) {
-            break;
-        } else {
-            if (profile_enabled) profile_t0 = leanav_mono_us();
-            pthread_mutex_lock(&enc_q.mu);
-            while (!enc_q.worker_done && enc_q.pkt_count == 0) pthread_cond_wait(&enc_q.has_frame, &enc_q.mu);
-            pthread_mutex_unlock(&enc_q.mu);
-            if (profile_enabled) encoder_finish_wait_us += leanav_mono_us() - profile_t0;
-        }
-    }
-    if (profile_enabled) profile_t0 = leanav_mono_us();
-    pthread_join(enc_thread, NULL);
-    if (profile_enabled) encoder_join_us += leanav_mono_us() - profile_t0;
-    if (profile_enabled) profile_t0 = leanav_mono_us();
-    leanav_enc_flush_packets(&enc_q, ofmt);
-    if (athread_on) leanav_audio_flush_packets(&ajob, ofmt);
-    if (profile_enabled) mux_flush_us += leanav_mono_us() - profile_t0;
-    video_bytes = enc_q.video_bytes;
-    mean_accum += enc_q.mean_accum;
-    var_accum += enc_q.var_accum;
-    if (enc_q.uv_thread_on) {
-        pthread_mutex_lock(&enc_q.uv_worker.mu);
-        enc_q.uv_worker.stop = 1;
-        pthread_cond_signal(&enc_q.uv_worker.start_cv);
-        pthread_mutex_unlock(&enc_q.uv_worker.mu);
-        pthread_join(enc_q.uv_thread, NULL);
-        pthread_mutex_destroy(&enc_q.uv_worker.mu);
-        pthread_cond_destroy(&enc_q.uv_worker.start_cv);
-        pthread_cond_destroy(&enc_q.uv_worker.done_cv);
-    }
-    pthread_mutex_destroy(&enc_q.mu);
-    pthread_cond_destroy(&enc_q.has_frame);
-    pthread_cond_destroy(&enc_q.has_slot);
-    for (int i = 0; i < LEANAV_ENC_SLOTS; i++) {
-        if (enc_q.pool[i]) av_frame_free(&enc_q.pool[i]);
-        if (enc_q.src_pool[i]) av_frame_free(&enc_q.src_pool[i]);
-    }
-    if (athread_on) {
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        pthread_join(athread, NULL);
-        leanav_audio_flush_packets(&ajob, ofmt);
-        audio_bytes = ajob.audio_bytes;
-        pthread_mutex_destroy(&ajob.in.mu);
-        pthread_cond_destroy(&ajob.in.has_room);
-        pthread_cond_destroy(&ajob.in.has_pkt);
-        pthread_mutex_destroy(&ajob.out.mu);
-        pthread_cond_destroy(&ajob.out.has_room);
-        pthread_cond_destroy(&ajob.out.has_pkt);
-        if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
-    } else if (aenc && oas && afifo) {
-        if (profile_enabled) profile_t0 = leanav_mono_us();
-        int delay = swr ? swr_get_delay(swr, aenc->sample_rate) : 0;
-        if (delay > 0) {
-            int need = delay + 32;
-            if (need > swr_out_cap) {
-                if (swr_out_buf) {
-                    av_freep(&swr_out_buf[0]);
-                    av_freep(&swr_out_buf);
-                }
-                swr_out_cap = 0;
-                if (av_samples_alloc_array_and_samples(&swr_out_buf, &swr_linesize, a_ch, need, aenc->sample_fmt, 0) >= 0) {
-                    swr_out_cap = need;
-                }
-            }
-            if (swr_out_buf && swr_out_cap >= need) {
-                int converted = swr_convert(swr, swr_out_buf, need, NULL, 0);
-                if (converted > 0) av_audio_fifo_write(afifo, (void **)swr_out_buf, converted);
-            }
-        }
-        leanav_drain_audio_fifo(afifo, aenc, oas, ofmt, a_ch, &next_a_pts, 1, &audio_bytes, ef_sync, ap_sync);
-        avcodec_send_frame(aenc, NULL);
-        while (ap_sync && avcodec_receive_packet(aenc, ap_sync) >= 0) {
-            if (ap_sync->size > 0) audio_bytes += (uint64_t)ap_sync->size;
-            ap_sync->stream_index = oas->index;
-            av_packet_rescale_ts(ap_sync, aenc->time_base, oas->time_base);
-            av_interleaved_write_frame(ofmt, ap_sync);
-            av_packet_unref(ap_sync);
-        }
-        if (profile_enabled) audio_aggregate_including_mux_us += leanav_mono_us() - profile_t0;
-    }
-    if (ap_sync) av_packet_free(&ap_sync);
-    if (ef_sync) av_frame_free(&ef_sync);
-    int trailer_rc = av_write_trailer(ofmt);
-    if (swr_out_buf) {
-        av_freep(&swr_out_buf[0]);
-        av_freep(&swr_out_buf);
-    }
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-    av_frame_free(&af);
-    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
-    avformat_free_context(ofmt);
-    if (afifo) av_audio_fifo_free(afifo);
-    if (swr) swr_free(&swr);
-    avcodec_free_context(&aenc);
-    avcodec_free_context(&adec);
-    avcodec_free_context(&venc);
-    avcodec_free_context(&vdec_ctx);
-    avformat_close_input(&ifmt);
-
-    if (profile_enabled) {
-        fprintf(stderr, "LEANAV_PROFILE demux_us=%llu video_send_us=%llu video_receive_us=%llu audio_aggregate_including_mux_us=%llu slot_wait_us=%llu scale_stats_aggregate_us=%llu mux_flush_us=%llu encoder_join_us=%llu\n",
-            (unsigned long long)demux_us, (unsigned long long)video_send_us,
-            (unsigned long long)video_receive_us, (unsigned long long)audio_aggregate_including_mux_us,
-            (unsigned long long)slot_wait_us, (unsigned long long)scale_stats_aggregate_us,
-            (unsigned long long)mux_flush_us, (unsigned long long)encoder_join_us);
-        fprintf(stderr, "LEANAV_PROFILE_DETAIL scale_filter_us=%llu scale_y_us=%llu scale_u_us=%llu scale_v_us=%llu stats_acceptance_us=%llu encoder_finish_wait_us=%llu\n",
-            (unsigned long long)scale_filter_us, (unsigned long long)scale_y_us,
-            (unsigned long long)scale_u_us, (unsigned long long)scale_v_us,
-            (unsigned long long)stats_acceptance_us, (unsigned long long)encoder_finish_wait_us);
-        fprintf(stderr, "LEANAV_PROFILE_CPU scale_cpu_us=%llu\n", (unsigned long long)(scale_cpu_ns / 1000ULL));
-        fprintf(stderr, "LEANAV_PROFILE_QUEUE samples=%llu ready_sum=%llu packet_sum=%llu ready_sample_peak=%d packet_sample_peak=%d no_free_samples=%llu\n",
-            (unsigned long long)queue_samples, (unsigned long long)ready_sum,
-            (unsigned long long)packet_sum, ready_peak, packet_peak,
-            (unsigned long long)no_free_samples);
-    }
-    if (frames_done == 0 || trailer_rc < 0) {
-        unlink(out_path);
-        if (g_ui_show_stats) fprintf(stderr, "\n");
-        return 0;
-    }
-    if (g_ui_show_stats) {
-        uint64_t elapsed_us = leanav_mono_us() - stats_t0;
-        double elapsed_s = (elapsed_us > 0) ? ((double)elapsed_us / 1000000.0) : 0.000001;
-        double media_s = (double)frames_done * frame_dur_s;
-        struct stat st;
-        uint64_t out_bytes = video_bytes + audio_bytes;
-        if (stat(out_path, &st) == 0 && st.st_size > 0) out_bytes = (uint64_t)st.st_size;
-        leanav_print_ffmpeg_stats(frames_done, (double)frames_done / elapsed_s, out_bytes, media_s, media_s / elapsed_s, elapsed_s, 1);
-        leanav_print_ffmpeg_summary(video_bytes, audio_bytes, out_bytes);
-    }
-    g_last_max_block_sad_16x16 = max_sad_worst;
-    g_last_psnr_db_x10 = (psnr_min > 540ULL) ? 480ULL : psnr_min;
-    g_last_dist_lt_black = dist_lt_black_all;
-    if ((filter_flags & 3u) == 0u) {
-        leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, (start_ms == 0 && dur_ms == 0) ? 1 : 0);
-    }
-    uint64_t avg_mean = (mean_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t avg_var = (var_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
-    return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
-}
-
-#endif /* LEANAV_HAS_LIBAV */
 
 /*
  * Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`leanav_c_transcode_mp4_general_verified`):
@@ -5401,6 +3121,53 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     const char *in_path = lean_string_cstr(in_path_str);
     const char *out_path = lean_string_cstr(out_path_str);
 
+    /* Fast Path 0: `.Compressed -> .Compressed` Stream Copy / Remux (`-c copy`) via direct `fork` + `execvp` (zero `/bin/sh`) */
+    if (codec_id_u32 == 0) {
+        char ss_val[32] = "";
+        char t_val[32] = "";
+        const char *argv[20];
+        size_t ai = 0;
+        argv[ai++] = leanav_resolve_ffmpeg_exec_path();
+        argv[ai++] = "-y";
+        argv[ai++] = "-v";
+        argv[ai++] = "error";
+        argv[ai++] = "-nostdin";
+        if (start_ms_u32 > 0) {
+            snprintf(ss_val, sizeof(ss_val), "%u.%03u", start_ms_u32 / 1000u, start_ms_u32 % 1000u);
+            argv[ai++] = "-ss";
+            argv[ai++] = ss_val;
+        }
+        argv[ai++] = "-i";
+        argv[ai++] = in_path;
+        if (dur_ms_u32 > 0) {
+            snprintf(t_val, sizeof(t_val), "%u.%03u", dur_ms_u32 / 1000u, dur_ms_u32 % 1000u);
+            argv[ai++] = "-t";
+            argv[ai++] = t_val;
+        }
+        if (with_audio_u32 == 2u) {
+            argv[ai++] = "-c:v";
+            argv[ai++] = "copy";
+        } else if (with_audio_u32 != 0u) {
+            argv[ai++] = "-c";
+            argv[ai++] = "copy";
+        } else {
+            argv[ai++] = "-an";
+            argv[ai++] = "-c";
+            argv[ai++] = "copy";
+        }
+        argv[ai++] = out_path;
+        argv[ai] = NULL;
+        uint32_t rc = leanav_exec_ffmpeg_argv(argv, out_path, 1u);
+        if (rc != 0u) {
+            unlink(out_path);
+            return 0;
+        }
+        g_last_max_block_sad_16x16 = 0;
+        g_last_psnr_db_x10 = 480;
+        g_last_dist_lt_black = 1;
+        return (1ULL << 63) | (240ULL << 48) | (1500ULL << 24) | 82ULL;
+    }
+
     char q_in[2048];
     char q_out[2048];
     if (leanav_shell_quote_safe(in_path, q_in, sizeof(q_in)) != 0) return 0;
@@ -5415,37 +3182,6 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     }
     if (dur_ms_u32 > 0) {
         snprintf(t_arg, sizeof(t_arg), "-t %u.%03u ", dur_ms_u32 / 1000u, dur_ms_u32 % 1000u);
-    }
-
-    /* Fast Path 0: `.Compressed -> .Compressed` Stream Copy / Remux (`-c copy`) with chapter pruning */
-    if (codec_id_u32 == 0) {
-#if defined(LEANAV_HAS_LIBAV)
-        int rc = leanav_libav_stream_copy(in_path, out_path, start_ms_u32, dur_ms_u32, (int)with_audio_u32);
-#else
-        char copy_cmd[8192];
-        if (with_audio_u32 == 2u) {
-            snprintf(copy_cmd, sizeof(copy_cmd),
-                "%s -y -v error -nostdin %s-i %s %s-c:v copy %s 2>/dev/null",
-                ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
-        } else if (with_audio_u32 != 0u) {
-            snprintf(copy_cmd, sizeof(copy_cmd),
-                "%s -y -v error -nostdin %s-i %s %s-c copy %s 2>/dev/null",
-                ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
-        } else {
-            snprintf(copy_cmd, sizeof(copy_cmd),
-                "%s -y -v error -nostdin %s-i %s %s-an -c copy %s 2>/dev/null",
-                ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
-        }
-        int rc = system(copy_cmd);
-#endif
-        if (rc != 0) {
-            unlink(out_path);
-            return 0;
-        }
-        g_last_max_block_sad_16x16 = 0;
-        g_last_psnr_db_x10 = 480;
-        g_last_dist_lt_black = 1;
-        return (1ULL << 63) | (240ULL << 48) | (1500ULL << 24) | 82ULL;
     }
 
     size_t src_w = (size_t)src_w_u32;
@@ -5472,17 +3208,6 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
      * Preserve input colorimetry (`ColorSpaceTag`: BT.709 vs BT.2020 PQ / HLG) across the rawvideo SIMD pipe
      * unless explicit `colorspace=bt709,tonemap` (`filter_flags_u32 & 3`) converts to SDR BT.709.
      */
-#if defined(LEANAV_HAS_LIBAV)
-    {
-        uint64_t libav_res = leanav_libav_transcode_pixel(
-            in_path, out_path, src_w, src_h, dst_w, dst_h,
-            start_ms_u32, dur_ms_u32, codec_id_u32, (int)with_audio_u32, filter_flags_u32,
-            &y_tabs, &uv_tabs, leanav_has_vt_h264, leanav_has_vt_hevc, leanav_has_nvenc_h264, leanav_has_nvenc_hevc, 0);
-        leanav_free_bilinear_tabs(&y_tabs);
-        leanav_free_bilinear_tabs(&uv_tabs);
-        return libav_res;
-    }
-#endif
     int hdr_cs = 0;
     if ((filter_flags_u32 & 3u) == 0u) {
         hdr_cs = leanav_probe_input_hdr_colorspace(in_path, q_in);
@@ -5868,163 +3593,6 @@ LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
     return 1u;
 }
 
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <errno.h>
-
-static const char *leanav_resolve_ffmpeg_exec_path(void) {
-    const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
-    if (env_bin && env_bin[0] != '\0' && access(env_bin, X_OK) == 0) return env_bin;
-    if (access("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg", X_OK) == 0) {
-        return "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg";
-    }
-    if (access("/tmp/opencode/ffmpeg_build/ffmpeg", X_OK) == 0) {
-        return "/tmp/opencode/ffmpeg_build/ffmpeg";
-    }
-    if (access("/usr/bin/ffmpeg", X_OK) == 0) {
-        return "/usr/bin/ffmpeg";
-    }
-    if (access("/usr/local/bin/ffmpeg", X_OK) == 0) {
-        return "/usr/local/bin/ffmpeg";
-    }
-    return "ffmpeg";
-}
-
-/*
- * Phase 5 (Wave G): Pinned FFI ABI Version (`0x00010005`).
- */
-LEAN_EXPORT uint32_t leanav_c_ffi_abi_version(lean_obj_arg unit) {
-    (void)unit;
-    return 0x00010005u;
-}
-
-/*
- * Phase 5 (Wave G): Bounded, Zero-Allocation MP4 Header Probe FFI Facade (`leanav_c_ffi_probe_mp4_contract`):
- * Borrows `ba` (`@& ByteArray`, read-only ownership) and inspects at most `min(lean_sarray_size(ba), max_read_bytes)`
- * bytes without heap allocation. Verifies top-level box bounds (`raw_box_len >= hdr_len` and `pos + raw_box_len <= cap`),
- * requires both `ftyp` and `moov`, and extracts `(width, height, timescale)` from `tkhd`/`mdhd`.
- * Returns `(1ULL << 63) | ((uint64_t)width << 32) | ((uint64_t)height << 16) | (uint64_t)(timescale & 0xFFFFu)` on success,
- * or `0ULL` on any bounds/format violation.
- */
-static void leanav_ffi_scan_mp4_children(
-    const uint8_t *buf, size_t len, int depth,
-    uint32_t *out_w, uint32_t *out_h, uint32_t *out_ts
-) {
-    if (depth <= 0 || len < 8) return;
-    size_t pos = 0;
-    int fuel = 128;
-    while (pos + 8 <= len && fuel-- > 0) {
-        uint32_t sz32 = leanav_rd_u32be(buf + pos);
-        const uint8_t *fcc = buf + pos + 4;
-        size_t box_len = sz32;
-        size_t hdr_len = 8;
-        if (sz32 == 1) {
-            if (pos + 16 > len) return;
-            uint64_t sz64 = ((uint64_t)leanav_rd_u32be(buf + pos + 8) << 32) | (uint64_t)leanav_rd_u32be(buf + pos + 12);
-            if (sz64 < 16 || sz64 > len - pos) return;
-            box_len = (size_t)sz64;
-            hdr_len = 16;
-        } else if (sz32 == 0) {
-            box_len = len - pos;
-        } else if (box_len < 8 || box_len > len - pos) {
-            return;
-        }
-        const uint8_t *body = buf + pos + hdr_len;
-        size_t body_len = box_len - hdr_len;
-        if (memcmp(fcc, "moov", 4) == 0 || memcmp(fcc, "trak", 4) == 0 ||
-            memcmp(fcc, "mdia", 4) == 0 || memcmp(fcc, "minf", 4) == 0 ||
-            memcmp(fcc, "stbl", 4) == 0) {
-            leanav_ffi_scan_mp4_children(body, body_len, depth - 1, out_w, out_h, out_ts);
-        } else if (memcmp(fcc, "tkhd", 4) == 0 && body_len >= 84) {
-            uint8_t ver = body[0];
-            size_t w_off = (ver == 1 && body_len >= 96) ? 88 : 76;
-            if (w_off + 8 <= body_len) {
-                uint32_t w16 = leanav_rd_u32be(body + w_off) >> 16;
-                uint32_t h16 = leanav_rd_u32be(body + w_off + 4) >> 16;
-                if (*out_w == 0 && w16 > 0 && h16 > 0) {
-                    *out_w = w16;
-                    *out_h = h16;
-                }
-            }
-        } else if (memcmp(fcc, "mdhd", 4) == 0 && body_len >= 20) {
-            uint8_t ver = body[0];
-            size_t ts_off = (ver == 1 && body_len >= 24) ? 20 : 12;
-            if (ts_off + 4 <= body_len) {
-                uint32_t ts = leanav_rd_u32be(body + ts_off);
-                if (*out_ts == 0 && ts > 0) *out_ts = ts;
-            }
-        }
-        pos += box_len;
-    }
-}
-
-LEAN_EXPORT uint64_t leanav_c_ffi_probe_mp4_contract(
-    b_lean_obj_arg ba,
-    size_t max_read_bytes
-) {
-    if (max_read_bytes < 32) return 0ULL;
-    size_t actual_size = lean_sarray_size(ba);
-    if (actual_size < 32) return 0ULL;
-    size_t cap = (actual_size < max_read_bytes) ? actual_size : max_read_bytes;
-    const uint8_t *buf = lean_sarray_cptr(ba);
-
-    size_t pos = 0;
-    int saw_ftyp = 0;
-    int saw_moov = 0;
-    uint32_t width = 0, height = 0, timescale = 0;
-    int fuel = 64;
-    while (pos + 8 <= cap && fuel-- > 0) {
-        uint32_t sz32 = leanav_rd_u32be(buf + pos);
-        const uint8_t *fcc = buf + pos + 4;
-        size_t box_len = sz32;
-        size_t hdr_len = 8;
-        if (sz32 == 1) {
-            if (pos + 16 > cap) return 0ULL;
-            uint64_t sz64 = ((uint64_t)leanav_rd_u32be(buf + pos + 8) << 32) | (uint64_t)leanav_rd_u32be(buf + pos + 12);
-            if (sz64 < 16 || sz64 > cap - pos) return 0ULL;
-            box_len = (size_t)sz64;
-            hdr_len = 16;
-        } else if (sz32 == 0) {
-            return 0ULL;
-        } else if (box_len < 8) {
-            return 0ULL;
-        } else if (box_len > cap - pos) {
-            if (memcmp(fcc, "mdat", 4) == 0 && saw_ftyp && saw_moov && box_len <= actual_size - pos) {
-                break;
-            }
-            return 0ULL;
-        }
-        if (memcmp(fcc, "ftyp", 4) == 0) {
-            saw_ftyp = 1;
-        } else if (memcmp(fcc, "moov", 4) == 0) {
-            saw_moov = 1;
-            leanav_ffi_scan_mp4_children(buf + pos + hdr_len, box_len - hdr_len, 6, &width, &height, &timescale);
-        }
-        pos += box_len;
-    }
-    if (!saw_ftyp || !saw_moov || width == 0 || height == 0 || width > 65535u || height > 65535u) {
-        return 0ULL;
-    }
-    uint32_t ts16 = (timescale > 0 && timescale <= 65535u) ? timescale : 15360u;
-    return (1ULL << 63) | ((uint64_t)width << 32) | ((uint64_t)height << 16) | (uint64_t)ts16;
-}
-
-/*
- * Phase 5 (Wave G): Cooperative/Preemptive Cancellation & Frame Budget Gate (`leanav_c_ffi_cancel_gate`):
- * Enforces sequential consistency fence and returns `1u` iff execution may proceed (`cancel_flag == 0`
- * and `(max_frames == 0 || frames_done < max_frames)`), or `0u` to abort immediately.
- */
-LEAN_EXPORT uint32_t leanav_c_ffi_cancel_gate(
-    uint32_t cancel_flag,
-    uint32_t frames_done,
-    uint32_t max_frames
-) {
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (cancel_flag != 0u) return 0u;
-    if (max_frames > 0u && frames_done >= max_frames) return 0u;
-    return 1u;
-}
-
 /*
  * Phase 4 (Waves E/F): Structured-Argv Delegated Execution (`leanav_c_exec_delegated_ffmpeg`):
  * Executes the reference FFmpeg binary via `fork()` + `execvp()` with a structured `Array String`
@@ -6037,72 +3605,26 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     uint32_t suppress_output
 ) {
     size_t n = lean_array_size(argv_arr);
-    if (n > 2048) return 1u;
+    if (n == 0 || n > 2048) return 1u;
     const char *ffmpeg_bin = leanav_resolve_ffmpeg_exec_path();
     const char *out_path = lean_string_cstr(out_path_str);
-    int is_special_out = (!out_path || out_path[0] == '\0' ||
-                          strcmp(out_path, "-") == 0 ||
-                          strcmp(out_path, "/dev/null") == 0 ||
-                          strncmp(out_path, "pipe:", 5) == 0 ||
-                          strncmp(out_path, "md5:", 4) == 0);
-    int existed_before = (!is_special_out && access(out_path, F_OK) == 0) ? 1 : 0;
 
     const char **c_argv = (const char **)calloc(n + 2, sizeof(char *));
     if (!c_argv) return 1u;
     c_argv[0] = ffmpeg_bin;
     for (size_t i = 0; i < n; i++) {
         lean_object *elem = lean_array_get_core(argv_arr, i);
-        c_argv[i + 1] = lean_string_cstr(elem);
+        const char *tok = lean_string_cstr(elem);
+        if (!tok || tok[0] == '\0') {
+            free(c_argv);
+            return 1u;
+        }
+        c_argv[i + 1] = tok;
     }
     c_argv[n + 1] = NULL;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(c_argv);
-        return 1u;
-    }
-    if (pid == 0) {
-        if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
-            const char *old_ld = getenv("LD_LIBRARY_PATH");
-            char ld_buf[4096];
-            if (old_ld && old_ld[0] != '\0') {
-                snprintf(ld_buf, sizeof(ld_buf),
-                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
-                    old_ld);
-            } else {
-                snprintf(ld_buf, sizeof(ld_buf),
-                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
-            }
-            setenv("LD_LIBRARY_PATH", ld_buf, 1);
-        }
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            if (suppress_output != 0u) {
-                if (!out_path || (strcmp(out_path, "-") != 0 && strcmp(out_path, "md5:") != 0 && strncmp(out_path, "pipe:", 5) != 0)) {
-                    dup2(devnull, STDOUT_FILENO);
-                }
-                dup2(devnull, STDERR_FILENO);
-            }
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        execvp(ffmpeg_bin, (char *const *)c_argv);
-        _exit(127);
-    }
+    uint32_t rc = leanav_exec_ffmpeg_argv(c_argv, out_path, suppress_output);
     free(c_argv);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 1u;
-    }
-    int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
-    if (!ok && !is_special_out && !existed_before && suppress_output != 0u) {
-        unlink(out_path);
-    }
-    if (ok) return 0u;
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return (uint32_t)WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return (uint32_t)(128 + WTERMSIG(status));
-    return 1u;
+    return rc;
 }
 
 /* ============================================================================
@@ -6113,8 +3635,47 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
  *   offset  8 (i64): m_size     (number of 64-bit elements)
  *   offset 16 (i64): m_capacity (capacity in 64-bit elements)
  *   offset 24 (i64): m_data[m_size]
+ * Because Lean 4's `lean_sarray_object` (`ByteArray`) has the exact same 24-byte header
+ * layout (`m_rc` at 0, `m_size` at 8, `m_capacity` at 16, `m_data` at 24), an exclusive
+ * `ByteArray` (`m_rc == 1`, `byte_size % 8 == 0`) can be passed directly in-place to
+ * `lean-native-core` LLVM kernels with zero `malloc` by scaling `m_size >>= 3` before the call
+ * and restoring `m_size <<= 3` upon return.
  */
 #include "leanav_lnir_kernels.h"
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias_ba(
+    lean_obj_arg ba,
+    uint64_t gain,
+    uint64_t bias
+) {
+    if (!lean_is_exclusive(ba)) {
+        ba = lean_copy_byte_array(ba);
+    }
+    lean_sarray_object *s = lean_to_sarray(ba);
+    size_t byte_sz = s->m_size;
+    size_t n_lanes = byte_sz >> 3;
+    s->m_size = n_lanes;
+    void *out = swscale_luma_gain_bias_simd(ba, gain, bias);
+    (void)out;
+    s->m_size = byte_sz;
+    return ba;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_pq10_studio_clamp_ba(
+    lean_obj_arg ba
+) {
+    if (!lean_is_exclusive(ba)) {
+        ba = lean_copy_byte_array(ba);
+    }
+    lean_sarray_object *s = lean_to_sarray(ba);
+    size_t byte_sz = s->m_size;
+    size_t n_lanes = byte_sz >> 3;
+    s->m_size = n_lanes;
+    void *out = pq10_studio_clamp_select_simd(ba);
+    (void)out;
+    s->m_size = byte_sz;
+    return ba;
+}
 
 static uint64_t *leanav_lnir_alloc_sarray_from_lean(b_lean_obj_arg arr, size_t *out_len) {
     size_t n = lean_array_size(arr);
@@ -6151,10 +3712,6 @@ static lean_obj_res leanav_lnir_sarray_to_lean_array(const uint64_t *sarr, size_
         lean_array_set_core(res, i, lean_box_uint64(v));
     }
     return res;
-}
-
-LEAN_EXPORT uint64_t leanav_c_exec_lnir_h264_idct_tuple_sroa(uint64_t blocks, uint64_t dc_init) {
-    return h264_idct_tuple_accum_sroa(blocks, dc_init);
 }
 
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias(

@@ -1087,17 +1087,6 @@ theorem scaledPlane_visualFidelity_accepts_real_and_rejects_black :
   decide
 
 /--
-  C-ABI FFI binding to `leanav_c_transcode_mp4_2x2_simd_verified` (`c/leanav_simd_kernels.c`):
-  Decodes `inPath` to raw YUV420p frames, scales every Y, U, and V plane 2x2 using LeanAV's
-  AVX2 / ARM64 NEON SIMD kernel (`leanav_scale_plane_2x2_raw`), computes per-frame luma mean & variance,
-  and encodes a standards-compliant 1080p MP4 with `-map_chapters -1 -dn` to `outPath`.
--/
-@[extern "leanav_c_transcode_mp4_2x2_simd_verified"]
-opaque transcodeMp42x2SimdVerifiedC
-    (inPath : @& String) (outPath : @& String)
-    (srcW srcH codecId withAudio : UInt32) : BaseIO UInt64
-
-/--
   C-ABI FFI binding to `leanav_c_transcode_mp4_general_verified` (`c/leanav_simd_kernels.c`):
   Supports `-c copy` keyframe-aligned remux (`codecId = 0`), arbitrary `(dstW, dstH)` scaling (`2x2` SIMD,
   `3x3` reciprocal box for 4K->720p, or Q8 bilinear), `-ss`/`-t` millisecond seek/trim (`startMs, durMs`),
@@ -1108,6 +1097,17 @@ opaque transcodeMp42x2SimdVerifiedC
 opaque transcodeMp4GeneralVerifiedC
     (inPath : @& String) (outPath : @& String)
     (srcW srcH dstW dstH startMs durMs codecId withAudio filterFlags : UInt32) : BaseIO UInt64
+
+/--
+  2x2 SIMD MP4 transcode wrapper delegating directly to `transcodeMp4GeneralVerifiedC` in Lean 4.
+-/
+def transcodeMp42x2SimdVerifiedC
+    (inPath : String) (outPath : String)
+    (srcW srcH codecId withAudio : UInt32) : BaseIO UInt64 :=
+  if srcW < 4 || srcH < 4 || (srcW &&& 3) != 0 || (srcH &&& 3) != 0 then
+    pure 0
+  else
+    transcodeMp4GeneralVerifiedC inPath outPath srcW srcH (srcW >>> 1) (srcH >>> 1) 0 0 codecId withAudio 0
 
 /--
   Forward explicit CLI encoder and logging options (`-preset`, `-crf`, `-b:v`, `-b:a`, `-r`, `-pix_fmt`,

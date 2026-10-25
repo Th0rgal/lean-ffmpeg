@@ -12,11 +12,7 @@ extern_lib libleanav_dsp pkg := do
   let simdSrcJob ← inputTextFile <| pkg.dir / "c" / "leanav_simd_kernels.c"
   let leanIncludeDir ← getLeanIncludeDir
   let cDir := pkg.dir / "c"
-  let brewIncOk ← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists
-  let brewLibOk ← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists
-  let mut incFlags : Array String := #["-I", leanIncludeDir.toString, "-I", cDir.toString]
-  if System.Platform.isOSX && brewIncOk && brewLibOk then
-    incFlags := incFlags ++ #["-I", "/opt/homebrew/include", "-DLEANAV_ENABLE_LIBAV=1"]
+  let incFlags : Array String := #["-I", leanIncludeDir.toString, "-I", cDir.toString]
   let cpuInfo : FilePath := "/proc/cpuinfo"
   let hasAvx2 : Bool ← if ← cpuInfo.pathExists then
     let txt ← IO.FS.readFile cpuInfo
@@ -52,4 +48,4 @@ lean_lib «LeanAV» where
 lean_exe «lffmpeg» where
   root := `LeanAV.Main
   supportInterpreter := false
-  moreLinkArgs := if System.Platform.isOSX then (if (run_io do return (← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists) && (← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists)) then #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"] else #[]) else #["-lpthread"]
+  moreLinkArgs := if System.Platform.isOSX then #[] else #["-lpthread"]

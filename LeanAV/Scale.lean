@@ -773,7 +773,7 @@ def tonemapPq10ToBt709Sdr8 (y10 : UInt16) : UInt8 :=
     let out := 16 + Nat.min 219 yOff
     out.toUInt8
 
-@[extern "leanav_c_tonemap_pq10_to_bt709_u8"]
+@[export leanav_c_tonemap_pq10_to_bt709_u8]
 def tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8 :=
   tonemapPq10ToBt709Sdr8 y10
 

@@ -1408,8 +1408,14 @@ def runVerifyKernels : IO UInt32 := do
     (execLnirAv1CdefFmaC vX.toArray vY.toArray vZ.toArray).toList == evalLnirKernel .fmaBlend vX vY vZ
   let lnirClampOk :=
     (execLnirPq10StudioClampC vX.toArray).toList == evalLnirKernel .pq10StudioClamp vX [] []
+  let baX := packInt64LanesLe vX
+  let lnirZeroCopyBaOk :=
+    verifyLnirSArrayContract baX.size 8 true true &&
+    !verifyLnirSArrayContract 0 8 true true &&
+    unpackInt64LanesLe (execLnirSwscaleGainBiasBaC (packInt64LanesLe vX) 5 (-12)) == evalLnirKernel (.gainBias 5 (-12)) vX [] [] &&
+    unpackInt64LanesLe (execLnirPq10StudioClampBaC (packInt64LanesLe vX)) == evalLnirKernel .pq10StudioClamp vX [] []
   let lnirCompiledOk :=
-    lnirSuiteOk && lnirSroaOk && lnirSwscaleOk && lnirSaxpyOk && lnirWienerOk && lnirCdefOk && lnirClampOk
+    lnirSuiteOk && lnirSroaOk && lnirSwscaleOk && lnirSaxpyOk && lnirWienerOk && lnirCdefOk && lnirClampOk && lnirZeroCopyBaOk
 
   let t1 ← IO.monoNanosNow
   let allOk := rescaleOk && scaleOk && ivfOk && lnirCompiledOk
@@ -1886,6 +1892,9 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.PlanIR.specFfiCancelGate_iff_universal
 #print axioms LeanAV.PlanIR.rescalePtsIndependentOrFallback_negative_universal
 #print axioms LeanAV.PlanIR.independentKernel_fallback_complete_and_sound
+#print axioms LeanAV.PlanIR.verifyExecArgvHygiene_rejects_empty_and_nul_universal
+#print axioms LeanAV.PlanIR.ffiProbeMp4ContractPure_rejects_short_universal
+#print axioms LeanAV.NativeKernels.verifyLnirSArrayContract_sound
 #print axioms LeanAV.Cli.cliSecondsToMillis_zero_den_universal
 
 

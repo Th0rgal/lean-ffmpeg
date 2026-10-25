@@ -586,6 +586,51 @@ theorem checkLnirKernel_sound (k : LnirKernelDescriptor)
   intro x y hx hy
   exact ⟨bound hBps hSrcWs hSrcFit hVec64 hx hy, bound hBps hDstWs hDstFit hVec64 hx hy⟩
 
+/-- Zero-copy `ByteArray` (`lean_sarray_object`) 64-bit lane alignment and exclusivity gate for `LeanNative` LLVM kernels. -/
+def verifyLnirSArrayContract (byteSize minLanes : Nat) (isExclusive requireExclusive : Bool) : Bool :=
+  decide (0 < byteSize ∧ byteSize % 8 = 0 ∧ minLanes * 8 ≤ byteSize ∧ (requireExclusive = true → isExclusive = true))
+
+/-- Universal Theorem (`verifyLnirSArrayContract_sound`):
+    If `verifyLnirSArrayContract` succeeds, the `ByteArray` has positive 8-byte-aligned capacity for `minLanes` 64-bit lanes and satisfies exclusivity. -/
+theorem verifyLnirSArrayContract_sound (byteSize minLanes : Nat) (isExclusive requireExclusive : Bool)
+    (h : verifyLnirSArrayContract byteSize minLanes isExclusive requireExclusive = true) :
+    0 < byteSize ∧ byteSize % 8 = 0 ∧ minLanes * 8 ≤ byteSize ∧ (requireExclusive = true → isExclusive = true) := by
+  unfold verifyLnirSArrayContract at h
+  exact of_decide_eq_true h
+
+/-- Pack a `List Int64` into an 8-byte-aligned little-endian `ByteArray` for zero-copy `LeanNative` SIMD execution. -/
+def packInt64LanesLe (xs : List Int64) : ByteArray := Id.run do
+  let mut ba := ByteArray.emptyWithCapacity (xs.length * 8)
+  for x in xs do
+    let u := x.toUInt64
+    ba := ba.push (u &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 8) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 16) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 24) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 32) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 40) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 48) &&& 0xFF).toUInt8
+    ba := ba.push ((u >>> 56) &&& 0xFF).toUInt8
+  return ba
+
+/-- Unpack an 8-byte-aligned little-endian `ByteArray` back into `List Int64` lanes. -/
+def unpackInt64LanesLe (ba : ByteArray) : List Int64 := Id.run do
+  let n := ba.size / 8
+  let mut out : Array Int64 := Array.mkEmpty n
+  for i in [:n] do
+    let base := i * 8
+    let u : UInt64 :=
+      ba[base]!.toUInt64 |||
+      (ba[base + 1]!.toUInt64 <<< 8) |||
+      (ba[base + 2]!.toUInt64 <<< 16) |||
+      (ba[base + 3]!.toUInt64 <<< 24) |||
+      (ba[base + 4]!.toUInt64 <<< 32) |||
+      (ba[base + 5]!.toUInt64 <<< 40) |||
+      (ba[base + 6]!.toUInt64 <<< 48) |||
+      (ba[base + 7]!.toUInt64 <<< 56)
+    out := out.push (Int64.ofUInt64 u)
+  return out.toList
+
 /-! ## C-ABI Runtime Bridge to `lean-native-core`-Compiled Machine Code (`c/libleanav_lnir.o`) -/
 
 /-- Execute all 12 `lean-native-core`-compiled LNIR DSP kernels linked in `libleanav_dsp.a`
@@ -594,9 +639,17 @@ theorem checkLnirKernel_sound (k : LnirKernelDescriptor)
 @[extern "leanav_c_verify_compiled_lnir_suite"]
 opaque verifyCompiledLnirSuiteC : Unit → UInt32
 
-/-- Invoke `lean-native-core`-compiled `h264_idct_tuple_accum_sroa(blocks, dcInit)` over C-ABI. -/
-@[extern "leanav_c_exec_lnir_h264_idct_tuple_sroa"]
+/-- Invoke `lean-native-core`-compiled `@h264_idct_tuple_accum_sroa(blocks, dcInit)` directly over C-ABI (zero C wrapper). -/
+@[extern "h264_idct_tuple_accum_sroa"]
 opaque execLnirH264IdctTupleSroaC (blocks : UInt64) (dcInit : UInt64) : UInt64
+
+/-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` in-place on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
+@[extern "leanav_c_exec_lnir_swscale_gain_bias_ba"]
+opaque execLnirSwscaleGainBiasBaC (ba : ByteArray) (gain : Int64) (bias : Int64) : ByteArray
+
+/-- Invoke `lean-native-core`-compiled `pq10_studio_clamp_select_simd` in-place on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
+@[extern "leanav_c_exec_lnir_pq10_studio_clamp_ba"]
+opaque execLnirPq10StudioClampBaC (ba : ByteArray) : ByteArray
 
 /-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` on an `Array Int64` buffer. -/
 @[extern "leanav_c_exec_lnir_swscale_gain_bias"]
