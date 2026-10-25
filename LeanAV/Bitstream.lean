@@ -1208,7 +1208,7 @@ def withSliceBits (sliceBits : Nat) (m : BitM α) : BitM α where
 -/
 theorem withSliceBits_confined {α : Type} (sliceBits : Nat) (m : BitM α)
     (c c' : BitCursor) (res : α)
-    (hOk : (withSliceBits sliceBits m).run c = .ok (res, c')) :
+    (hOk : (BitM.withSliceBits sliceBits m).run c = .ok (res, c')) :
     (∃ (hSlice : c.bitPos + sliceBits ≤ c.limitBits) (subEnd : BitCursor),
       m.run {
         buf := c.buf

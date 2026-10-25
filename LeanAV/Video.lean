@@ -2530,8 +2530,8 @@ theorem all_take_of_all {α : Type} (p : α → Bool) (n : Nat) (xs : List α)
 
 /-- Helper lemma: monotonicity of `slotValidBelow` when `nextPicId` increases to `nextPicId + 1`. -/
 theorem all_slotValidBelow_succ (nextPicId : Nat) (xs : List DpbRefSlot)
-    (hAll : xs.all (slotValidBelow nextPicId) = true) :
-    xs.all (slotValidBelow (nextPicId + 1)) = true := by
+    (hAll : xs.all (DpbState.slotValidBelow nextPicId) = true) :
+    xs.all (DpbState.slotValidBelow (nextPicId + 1)) = true := by
   induction xs with
   | nil => simp
   | cons s rest ih =>
