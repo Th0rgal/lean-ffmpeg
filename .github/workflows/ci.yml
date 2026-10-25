@@ -17,6 +17,13 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install FFmpeg runtime
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Turbo Lean incremental build
+        uses: Th0rgal/turbo-lean@5a6a2534697179dc38fdd8eb812f256703540202
+        with:
+          project-dir: "."
+          command: build
+          seed-shards: "true"
+          mode: trusted
       - name: Build
         run: lake build
       - name: Self-test

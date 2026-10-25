@@ -4,4 +4,5 @@ build/
 artifacts/
 lake-manifest.json
 *.o
+.tools/
 

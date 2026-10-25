@@ -222,7 +222,7 @@ def supportedPreset (s : String) : Bool :=
 
 /-- Supported `-pix_fmt` tokens. -/
 def supportedPixFmt (s : String) : Bool :=
-  ["yuv420p", "yuv420p10le", "p010le", "nv12", "yuv422p", "yuv422p10le", "yuv444p", "rgb24", "gray"].contains s
+  ["yuv420p", "yuv420p10le", "p010le"].contains s
 
 /-- Supported `-loglevel` / `-v` tokens. -/
 def supportedLogLevel (s : String) : Bool :=
@@ -578,7 +578,10 @@ theorem cli_encoder_options_retained_and_invalid_rejected :
     cfg.errors = [] ∧
     badCrf.errors ≠ [] ∧
     badPreset.errors ≠ [] ∧
-    badFlag.errors ≠ [] := by
+    badFlag.errors ≠ [] ∧
+    supportedPixFmt "yuv420p" = true ∧
+    supportedPixFmt "yuv420p10le" = true ∧
+    supportedPixFmt "nv12" = false := by
   decide
 
 end LeanAV.Cli

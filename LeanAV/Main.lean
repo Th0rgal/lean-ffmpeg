@@ -980,6 +980,16 @@ def reportCliError (cfg : CliConfig) (jsonMsg textMsg : String) : IO UInt32 := d
     IO.eprintln textMsg
   return 1
 
+def runtimeVideoFilterStageSupported (stage : String) : Bool :=
+  stage.startsWith "scale=" ||
+  stage == "colorspace=bt709" ||
+  stage == "bt2020_to_bt709" ||
+  stage == "tonemap" ||
+  stage == "tonemap=reinhard"
+
+def runtimeVideoFilterSupported (spec : String) : Bool :=
+  spec.splitOn "," |>.all runtimeVideoFilterStageSupported
+
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
     (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
@@ -1123,12 +1133,16 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           "File exists"
     let filterOps ← match validCfg.videoFilter with
       | some vfStr =>
+        if !runtimeVideoFilterSupported vfStr then
+          return ← reportCliError validCfg
+            (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"unsupported\": \"-vf\" }")
+            "Unsupported runtime video filter; supported stages are scale, colorspace=bt709, and tonemap"
         match parseVideoFilterGraph vfStr with
         | .ok ops => pure ops
         | .error msg =>
           if validCfg.jsonOutput then
-            IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"filter_error\": \"{msg}\" }"
-          else if validCfg.logLevel != "quiet" && validCfg.logLevel != "-8" then
+            IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"filter_error\": \"{jsonEscape msg}\" }"
+          else if !cliQuiet validCfg.logLevel then
             IO.eprintln s!"Error initializing filtergraph: {msg}"
           return 1
       | none => pure []
