@@ -739,7 +739,7 @@ theorem divRoundNat_zero_error_lt_one_tick (c pts b : Nat) (hc : 0 < c) :
   omega
 
 /--
-  Universal Theorem (P0 Nearest-Tie-Away-From-Zero Error Bound — `AV_ROUND_NEAR_INF`):
+  Universal Theorem (P0 Nearest-Tie-Away-From-Zero Error Bound, `AV_ROUND_NEAR_INF`):
   For any non-negative `pts : Nat` and positive denominator `c > 0`, `q = divRoundNat (pts * b) c .nearInf`
   satisfies both the shifted quotient bracket `q * c ≤ pts * b + c / 2 ∧ pts * b + c / 2 < (q + 1) * c`
   and the explicit two-sided half-tick absolute-error bound:

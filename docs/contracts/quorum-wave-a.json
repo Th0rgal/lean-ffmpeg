@@ -60,7 +60,7 @@
   },
   "user_deferral_authorization": {
     "authorized_by": "Thomas",
-    "instruction": "Tu as l’autorisation de continuer toutes les phases jusqu à la fin sans quorum, on fera la validation à la fin",
+    "instruction": "Authorized to continue all phases until completion without intermediate quorum gates, with final validation at the end",
     "phase_progression_unblocked": true,
     "final_quorum_validation_timing": "completed_at_end_of_campaign"
   },

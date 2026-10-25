@@ -252,7 +252,7 @@ def decodeBit15 (st : RangeDecoder) (prob15 : UInt32) : UInt8 × RangeDecoder :=
 
 end RangeDecoder
 
-/-! ## Exact Bitstream Writer (`BitWriter` — R0 Round-Trip Inverse of `BitReader`) -/
+/-! ## Exact Bitstream Writer (`BitWriter`, R0 Round-Trip Inverse of `BitReader`) -/
 
 /--
   MSB-first bit writer (`PutBitContext` replacement) accumulating bits into a `ByteArray`

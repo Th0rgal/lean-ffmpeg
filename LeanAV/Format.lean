@@ -2,7 +2,7 @@
   LeanAV.Format: Verified Zero-Copy Container Demuxers & Muxers (`libavformat` Replacement)
 
   Implements total, bounds-gated (`verifySliceBounds` / `verifyPacketBounds`) parsers and serializers for:
-  1. IVF (`DKIF` 32-byte header + 12-byte frame headers for AV1 / VP9 / VP8) — full mux + demux round-trip
+  1. IVF (`DKIF` 32-byte header + 12-byte frame headers for AV1 / VP9 / VP8), full mux + demux round-trip
   2. ISO Base Media File Format (`MP4` / `ISOBMFF` / `MOV`: `ftyp`, `moov`, `mvhd`, `trak`, `stbl`, `mdat`, `moof`)
   3. Matroska / WebM (`EBML` header `0x1A45DFA3`, Segment `0x18538067`, Cluster `0x1F43B675`, SimpleBlock `0xA3`)
   4. Ogg (`OggS` page capture pattern, granule position, segment table for Opus / FLAC / Vorbis)
@@ -113,7 +113,7 @@ def fourCCEq (s : ByteSlice) (off : Nat) (c0 c1 c2 c3 : Char) : Bool :=
   s.getByteD (off + 2) 0 == c2.toNat.toUInt8 &&
   s.getByteD (off + 3) 0 == c3.toNat.toUInt8
 
-/-! ## 2. IVF Container (`AV1` / `VP9` / `VP8`) — Zero-Copy Demuxer & Deterministic Muxer -/
+/-! ## 2. IVF Container (`AV1` / `VP9` / `VP8`): Zero-Copy Demuxer & Deterministic Muxer -/
 
 /-- IVF 32-byte stream header (`DKIF`). -/
 structure IvfHeader where
@@ -229,7 +229,7 @@ def demuxIvfStreamFast (s : ByteSlice) : Option (IvfHeader × Array AVPacketView
     idx := idx + 1
   return some (hdr, pkts)
 
-/-! ## 3. ISO Base Media File Format (`MP4` / `ISOBMFF` / `MOV`) — Box Walker, Demuxer & Muxer -/
+/-! ## 3. ISO Base Media File Format (`MP4` / `ISOBMFF` / `MOV`): Box Walker, Demuxer & Muxer -/
 
 /-- Zero-copy ISOBMFF Box (`Atom`) view. -/
 structure Mp4BoxView where

@@ -152,7 +152,7 @@ def scanAnnexBNalUnits (s : ByteSlice) (isHevc : Bool := false) : Array NalUnitV
         out := out.push { nalHeader := hdr, nalType, payload := pSlice }
   return out
 
-/-! ## 3. Intra Prediction (`DC`, `Vertical`, `Horizontal`, `Paeth` — AV1 / H.264 / PNG / FFV1) -/
+/-! ## 3. Intra Prediction (`DC`, `Vertical`, `Horizontal`, `Paeth` for AV1 / H.264 / PNG / FFV1) -/
 
 /-- Paeth / Median predictor used by AV1 (`PAETH_PRED`), PNG (`Filter 4`), and FFV1 lossless video (`Regime R0`). -/
 @[inline]
@@ -1443,7 +1443,7 @@ theorem ffv1PlaneRangeR0_encode_decode_roundtrip :
      | none => false) = true := by
   decide
 
-/-! ### Inter-Frame Decoded Picture Buffer (`DPB` — H.264 / HEVC / AV1 Reference Frame State Machine) -/
+/-! ### Inter-Frame Decoded Picture Buffer (`DPB`: H.264 / HEVC / AV1 Reference Frame State Machine) -/
 
 /--
   Reference picture slot in the Decoded Picture Buffer (`DPB`), holding `frameNum`,
@@ -2367,7 +2367,7 @@ inductive CodecStateErr where
   Proof-Carrying Activated Decoding Context (`ActiveCtx`):
   Follows the Fable/Astra "Parse, Don't Validate" pattern:
   - Bundles `sps`, `pps`, and `req` together with propositional coherence proof fields `h_link`, `h_bounds`, and `h_dim`.
-  - Downstream `decodeSlice` takes `ActiveCtx` directly—no `(h : nal.spsId = sps.id)` hypotheses pollute call signatures,
+  - Downstream `decodeSlice` takes `ActiveCtx` directly, so no `(h : nal.spsId = sps.id)` hypotheses pollute call signatures,
     and mid-frame SPS/PPS ID/dimension mismatches are rejected at construction by `activateCtx`.
 -/
 structure ActiveCtx where

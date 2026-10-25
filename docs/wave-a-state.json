@@ -154,7 +154,7 @@
     "quorum": {
       "status": "deferred_to_final_validation_by_user",
       "authorized_by": "Thomas",
-      "instruction": "Tu as l’autorisation de continuer toutes les phases jusqu à la fin sans quorum, on fera la validation à la fin",
+      "instruction": "Authorized to continue all phases until completion without intermediate quorum gates, with final validation at the end",
       "phases_3_to_7_record": "validated telemetry ingested (38400 heartbeats, 14500 tokens); maxwell audit-campaign clean (0 issues)"
     }
   },
