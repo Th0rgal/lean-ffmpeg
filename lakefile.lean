@@ -14,18 +14,9 @@ extern_lib libleanav_dsp pkg := do
   let cDir := pkg.dir / "c"
   let brewIncOk ← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists
   let brewLibOk ← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists
-  let linuxX86Inc ← ("/usr/include/x86_64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
-  let linuxArmInc ← ("/usr/include/aarch64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
-  let linuxGenInc ← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists
-  let linuxX86Lib ← ("/usr/lib/x86_64-linux-gnu/libavformat.so" : FilePath).pathExists
-  let linuxArmLib ← ("/usr/lib/aarch64-linux-gnu/libavformat.so" : FilePath).pathExists
   let mut incFlags : Array String := #["-I", leanIncludeDir.toString, "-I", cDir.toString]
-  if brewIncOk && brewLibOk then
+  if System.Platform.isOSX && brewIncOk && brewLibOk then
     incFlags := incFlags ++ #["-I", "/opt/homebrew/include", "-DLEANAV_ENABLE_LIBAV=1"]
-  else if (linuxX86Inc || linuxGenInc) && linuxX86Lib then
-    incFlags := incFlags ++ #["-DLEANAV_ENABLE_LIBAV=1"]
-  else if (linuxArmInc || linuxGenInc) && linuxArmLib then
-    incFlags := incFlags ++ #["-DLEANAV_ENABLE_LIBAV=1"]
   let cpuInfo : FilePath := "/proc/cpuinfo"
   let hasAvx2 : Bool ← if ← cpuInfo.pathExists then
     let txt ← IO.FS.readFile cpuInfo
@@ -61,4 +52,4 @@ lean_lib «LeanAV» where
 lean_exe «lffmpeg» where
   root := `LeanAV.Main
   supportInterpreter := false
-  moreLinkArgs := if System.Platform.isOSX then (if (run_io do return (← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists) && (← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists)) then #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"] else #[]) else (if (run_io do return ((← ("/usr/include/x86_64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists) || (← ("/usr/include/aarch64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists) || (← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists)) && ((← ("/usr/lib/x86_64-linux-gnu/libavformat.so" : FilePath).pathExists) || (← ("/usr/lib/aarch64-linux-gnu/libavformat.so" : FilePath).pathExists))) then #["-L/usr/lib/x86_64-linux-gnu", "-L/usr/lib/aarch64-linux-gnu", "-lavformat", "-lavcodec", "-lswresample", "-lavutil", "-lpthread"] else #["-lpthread"])
+  moreLinkArgs := if System.Platform.isOSX then (if (run_io do return (← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists) && (← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists)) then #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"] else #[]) else #["-lpthread"]
