@@ -36,19 +36,37 @@
     "persistent_disagreement": "block_and_create_maxwell_branch"
   },
   "review_status": {
-    "fable": {"status": "deferred_to_final_validation_by_user", "verdict": null},
-    "astra": {"status": "deferred_to_final_validation_by_user", "verdict": null},
-    "gemini": {"status": "deferred_to_final_validation_by_user", "verdict": null}
+    "fable": {
+      "status": "completed",
+      "mission_id": "20e7bae7-a9ed-412d-9314-624296673d97",
+      "model": "claude-fable-5-1",
+      "harness": "claudecode",
+      "verdict": "approve_with_limits"
+    },
+    "astra": {
+      "status": "completed",
+      "mission_id": "667e0fbb-daed-40f3-a989-876e75778181",
+      "model": "gpt-6-astra",
+      "harness": "codex",
+      "verdict": "approve_with_limits"
+    },
+    "gemini": {
+      "status": "completed",
+      "mission_id": "912bb20d-d926-484b-b6e9-f761aa4c61df",
+      "model": "gemini-4-argon",
+      "harness": "antigravity",
+      "verdict": "approve_with_limits"
+    }
   },
   "user_deferral_authorization": {
     "authorized_by": "Thomas",
     "instruction": "Tu as l’autorisation de continuer toutes les phases jusqu à la fin sans quorum, on fera la validation à la fin",
     "phase_progression_unblocked": true,
-    "final_quorum_validation_timing": "end_of_campaign"
+    "final_quorum_validation_timing": "completed_at_end_of_campaign"
   },
   "promotion": {
-    "status": "blocked_pending_three_model_quorum",
-    "reason": "external reviewers deferred to end-of-campaign validation per explicit user authorization",
+    "status": "quorum_completed_and_remediated",
+    "reason": "All 3 external reviewers (Claude Fable 5.1, GPT-6 Astra, Gemini 4 Argon) audited the repository and all identified parity, security, universal theorem, and simplification items were remediated and verified",
     "local_review_does_not_substitute": true
   }
 }

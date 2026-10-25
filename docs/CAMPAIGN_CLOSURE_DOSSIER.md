@@ -74,3 +74,30 @@ Chaque capacité du registre et du planificateur [`LeanAV.PlanIR.BackendTier`](f
 ### Phase 7 — Promotion Progressive, Rollback & Clôture
 - **Contrat** : [`docs/contracts/phase7-promotion-and-rollback.json`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/docs/contracts/phase7-promotion-and-rollback.json).
 - **Politique de Rollback** : Toute régression différentielle, violation FFI ou sortie de domaine déclenche `KernelExecutionResult.fallbackDelegated` vers `BackendTier.delegatedFaithful` ou la rétrogradation immédiate dans le registre de capacités.
+
+---
+
+## 3. Audit par Quorum Externe (3 Modèles : Fable 5.1, Astra, Gemini 4 Argon) & Remédiations
+
+Le quorum des trois modèles a été exécuté via Orb MCP dans leurs harnais respectifs sur le nœud `nippur` :
+- **Claude Fable 5.1** (`claudecode`, `claude-fable-5-1`) — Mission `20e7bae7-a9ed-412d-9314-624296673d97`
+- **GPT-6 Astra** (`codex`, `gpt-6-astra`) — Mission `667e0fbb-daed-40f3-a989-876e75778181`
+- **Gemini 4 Argon** (`antigravity`, `gemini-4-argon`) — Mission `912bb20d-d926-484b-b6e9-f761aa4c61df`
+
+### Synthèse des Correctifs & Simplifications Appliqués suite au Quorum
+1. **Parité FFmpeg par flux (`copyWithFilter` et pipelines mixtes copy/encode)** :
+   - Validation `copyWithFilter` corrigée par flux (`(vCopy && hasVf) || (aCopy && hasAf)`) dans [`LeanAV/Cli.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Cli.lean#L341-L343) et [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L510-L512).
+   - Prise en charge de `-vf scale=... -c:v h264 -c:a copy` et `-c:v copy -c:a aac` via routage `delegatedFaithful` dans [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L525-L534).
+2. **Formatage exact des durées fractionnaires (`formatCliSeconds`) & Syntaxe Temporelle** :
+   - Correction dans [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L341-L361) (`formatFracDigitsLoop`) préservant les zéros significatifs après la virgule (`-t 0.0050` $\to$ `"0.005"`, `-ss 1.0005` $\to$ `"1.0005"`).
+   - Extension de [`parseCliSeconds`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Cli.lean#L140-L186) aux formats `HH:MM:SS[.frac]`, `MM:SS[.frac]`, `<n>ms`, `<n>us` et `<n>s`.
+3. **Sélection de pistes (`-map 0`, `-map 0:1`) & Conteneurs (`.mov`, `.m4a`, `.mp3`, `.avi`)** :
+   - Ajout de `StreamKind.all` dans [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L77-L163) et prise en charge de `.mov`, `.m4a`, `.mp3`, `.avi`.
+4. **Suppression de l'inflation `moov_size` (256 Ko) et préservation des métadonnées en `-c copy` MP4** :
+   - Suppression de `-moov_size 262144` et `-map_metadata -1 -map_chapters -1` sur la branche `codec_id_u32 == 0` de [`leanav_c_transcode_mp4_general_verified`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/c/leanav_simd_kernels.c#L5405-L5416).
+5. **Durcissement de `isSafeLocalMediaPath` & Hygiène JSON sur fichiers manquants** :
+   - Rejet de tout chemin contenant `':'` (`file:`, `pipe:`, `fd:`, `data:`, `crypto:`, `hls:`, `subfile:`), `//` en préfixe (`//dev/null`), `/dev/`, `/proc/`, `/sys/` et `..` dans [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L254-L273).
+   - Vérification de `System.FilePath.pathExists` en tête de [`runFFmpegCli`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Main.lean#L1185-L1190) avant toute lecture binaire.
+6. **Théorèmes Universels (`∀`) & Déduplication Architecturale** :
+   - Ajout des théorèmes universels [`streamKind_roundtrip_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L971-L974), [`subtitleCodec_roundtrip_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L979-L982), [`validatePlanIR_sound_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1035-L1044), [`specFfiCancelGate_iff_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1065-L1067), [`rescalePtsIndependentOrFallback_negative_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1072-L1076) et [`cliSecondsToMillis_zero_den_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Cli.lean#L618-L620).
+   - Unification de `planIRToCliArgs` et `buildDelegatedFfmpegArgv` via [`renderPlanIRArgv`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L600-L685) et déduplication de `jsonEscape` et du parsing CLI dans `Main.lean`.

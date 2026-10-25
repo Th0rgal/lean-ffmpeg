@@ -30,7 +30,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi tests/differential/fixtures/input-av.mp4
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Suite de tests différentiels et de registre Python (58 tests)
+# Suite de tests différentiels et de registre Python (59 tests)
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```
@@ -40,10 +40,10 @@ python3 -m unittest discover -s tests/differential -p "test_*.py"
 ## Utilisation CLI (`lffmpeg`)
 
 ```bash
-# Transcodage H.264 + redimensionnement
-./.lake/build/bin/lffmpeg -y -i input.mp4 -vf scale=960:540 -c:v h264 -preset ultrafast -crf 23 -c:a aac output.mp4
+# Transcodage H.264 + redimensionnement (ou copie audio -c:a copy)
+./.lake/build/bin/lffmpeg -y -i input.mp4 -vf scale=960:540 -c:v h264 -preset ultrafast -crf 23 -c:a copy output.mp4
 
-# Remux MKV avec sélection de pistes et métadonnées
+# Remux MKV/MOV avec sélection de pistes (-map 0 ou -map 0:v:0) et métadonnées
 ./.lake/build/bin/lffmpeg -y -i input.mp4 -map 0:v:0 -map 0:a:0 -metadata title="LeanAV" -c copy output.mkv
 
 # Inspecter le plan d'exécution vérifié (MediaPlanIR en JSON)
@@ -66,8 +66,8 @@ Mesures effectuées sur Linux x86\_64 (médiane sur 7 exécutions après warmup)
 | **Remux MKV (`-map` + `-metadata -c copy`)** | `81.5 ms` | `86.1 ms` | `1.06x` | Validation `MediaPlanIR` + délégation `execvp` (`7.83 Mo` identiques) |
 | **Extraction audio WAV (`-vn -c:a pcm_s16le`)** | `74.4 ms` | `82.1 ms` | `1.10x` | Sortie bit-exacte (`385 102 octets`) |
 | **Extraction audio FLAC (`-vn -c:a flac`)** | `82.3 ms` | `90.6 ms` | `1.10x` | Sortie bit-exacte (`231 784 octets`) |
-| **Stream copy MP4 1080p (`-c copy`, 7.65 Mo)** | `71.6 ms` | `81.4 ms` | `1.14x` | Probe zéro-copie `pread` + remux C-ABI `libavformat` |
-| **Stream copy MP4 320×240 (`-c copy`, fixture)** | `62.7 ms` | `72.2 ms` | `1.15x` | Probe C-ABI + remux direct |
+| **Stream copy MP4 1080p (`-c copy`, 7.65 Mo)** | `71.6 ms` | `81.4 ms` | `1.14x` | Probe zéro-copie `pread` + remux `libavformat` sans inflation `moov` |
+| **Stream copy MP4 320×240 (`-c copy`, fixture)** | `62.7 ms` | `72.2 ms` | `1.15x` | Sortie `22.5 Ko` (identique à `ffmpeg`, métadonnées préservées) |
 | **Scale 1080p → 540p + H.264 (`-vf scale=960:540`)** | `496.0 ms` | `912.0 ms` | `1.84x` | Probe formel + pipeline C-ABI `libavcodec`/`libswscale` |
 | **Seek + Trim (`-ss 1.0 -t 2.0` H.264 + AAC)** | `407.2 ms` | `932.5 ms` | `2.29x` | Décodage/ré-encodage borné par timestamps exacts `AVRational` |
 
@@ -86,7 +86,7 @@ Mesures effectuées sur Linux x86\_64 (médiane sur 7 exécutions après warmup)
 
 ## Structure du Dépôt
 
-- `LeanAV/` : Spécifications, théorèmes (`0 sorryAx`), `PlanIR.lean` (`MediaPlanIR`), `Cli.lean`, `Mp4.lean`, `Vp9.lean`, `FfmpegLink.lean`, `Main.lean`.
+- `LeanAV/` : Spécifications et théorèmes universels (`0 sorryAx`, `0` alerte `turbo-lean`) — `Core.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Filter.lean`, `Encoder.lean`, `Spec.lean`, `Cli.lean`, `PlanIR.lean`, `Main.lean`.
 - `c/leanav_simd_kernels.c` : Noyaux SIMD C-ABI, façade `libavformat`/`libavcodec`/`libswscale` et exécution déléguée `execvp` sans shell.
-- `tests/` : Suite de tests unitaires et différentiels (`58` tests Python) face à `ffmpeg`/`ffprobe`.
+- `tests/` : Suite de tests unitaires et différentiels (`59` tests Python) face à `ffmpeg`/`ffprobe`.
 - `docs/` : Plan Maxwell (`FFMPEG_PARITY_MAXWELL_PLAN.md`), registre de capacités (`capability-registry.json`), contrats (`docs/contracts/`) et dossier de clôture (`CAMPAIGN_CLOSURE_DOSSIER.md`).

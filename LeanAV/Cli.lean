@@ -73,9 +73,8 @@ structure CliSeconds where
   den : Nat
   deriving Repr, DecidableEq, Inhabited
 
-/-- Parse a decimal seconds string (`"1.5"` -> `{num := 15, den := 10}`, `"2"` -> `{num := 2, den := 1}`). -/
-def parseCliSeconds (s : String) : Option CliSeconds := Id.run do
-  let chars := s.toList
+/-- Parse a plain decimal char list (`"1.5"` -> `{num := 15, den := 10}`, `"2"` -> `{num := 2, den := 1}`). -/
+def parseDecimalSecondsChars (chars : List Char) : Option CliSeconds := Id.run do
   if chars.isEmpty then return none
   let mut n : Nat := 0
   let mut den : Nat := 1
@@ -94,6 +93,62 @@ def parseCliSeconds (s : String) : Option CliSeconds := Id.run do
       else return none
   if !seenDigit then return none
   return some { num := n, den := den }
+
+/-- Parse a non-negative integer from a non-empty `List Char`. -/
+def parseNonNegIntChars (chars : List Char) : Option Nat := Id.run do
+  if chars.isEmpty then return none
+  let mut acc : Nat := 0
+  for c in chars do
+    let d := c.toNat
+    if 48 ≤ d && d ≤ 57 then
+      acc := acc * 10 + (d - 48)
+    else return none
+  return some acc
+
+/-- Split a `List Char` on `':'` into segments. -/
+def splitColonCharsLoop : List Char → List Char → List (List Char)
+  | [], cur => [cur.reverse]
+  | c :: cs, cur =>
+    if c == ':' then cur.reverse :: splitColonCharsLoop cs []
+    else splitColonCharsLoop cs (c :: cur)
+
+/--
+  Parse an FFmpeg timestamp/duration string (`"1.5"`, `"2"`, `"00:00:00.5"`, `"01:30"`,
+  `"500ms"`, `"250000us"`, `"2.5s"`) into exact rational `CliSeconds`.
+-/
+def parseCliSeconds (s : String) : Option CliSeconds :=
+  let chars := s.toList
+  if chars.isEmpty then none
+  else
+    match chars.reverse with
+    | 's' :: 'm' :: revBase =>
+      match parseDecimalSecondsChars revBase.reverse with
+      | some r => some { num := r.num, den := r.den * 1000 }
+      | none   => none
+    | 's' :: 'u' :: revBase =>
+      match parseDecimalSecondsChars revBase.reverse with
+      | some r => some { num := r.num, den := r.den * 1000000 }
+      | none   => none
+    | 's' :: revBase =>
+      parseDecimalSecondsChars revBase.reverse
+    | _ =>
+      match splitColonCharsLoop chars [] with
+      | [only] => parseDecimalSecondsChars only
+      | [mmChars, ssChars] =>
+        match parseNonNegIntChars mmChars, parseDecimalSecondsChars ssChars with
+        | some mm, some sec =>
+          if sec.num < 60 * sec.den then
+            some { num := mm * 60 * sec.den + sec.num, den := sec.den }
+          else none
+        | _, _ => none
+      | [hhChars, mmChars, ssChars] =>
+        match parseNonNegIntChars hhChars, parseNonNegIntChars mmChars, parseDecimalSecondsChars ssChars with
+        | some hh, some mm, some sec =>
+          if mm < 60 && sec.num < 60 * sec.den then
+            some { num := (hh * 3600 + mm * 60) * sec.den + sec.num, den := sec.den }
+          else none
+        | _, _, _ => none
+      | _ => none
 
 def cliSecondsToMillis (s : CliSeconds) : Option UInt32 :=
   if s.den == 0 then
@@ -218,8 +273,8 @@ def CliConfig.fail (cfg : CliConfig) (e : CliError) : CliConfig :=
 
 /-- Supported `-f` container formats. -/
 def supportedFormat (s : String) : Bool :=
-  ["mp4", "matroska", "mkv", "webm", "mpegts", "h264", "hevc", "av1",
-   "ivf", "wav", "adts", "ogg", "flac", "null", "framecrc", "md5", "rawvideo"].contains s
+  ["mp4", "mov", "ipod", "m4a", "matroska", "mkv", "webm", "mpegts", "avi", "mp3",
+   "h264", "hevc", "av1", "ivf", "wav", "adts", "ogg", "flac", "null", "framecrc", "md5", "rawvideo"].contains s
 
 /-- Supported `-preset` encoder tokens. -/
 def supportedPreset (s : String) : Bool :=
@@ -466,7 +521,8 @@ def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
 def parseFFmpegArgs (args : List String) : CliConfig :=
   parseFFmpegArgsLoop args {}
 
-/-- Validate a `CliConfig` via the C-ABI gate `verifyCliInvocation` (`cliInvokeGateSpec`), fail-closed. -/
+/-- Validate a `CliConfig` via the C-ABI gate `verifyCliInvocation` (`cliInvokeGateSpec`), fail-closed.
+    Per-stream filter vs copy check: `-vf` only conflicts with `-c:v copy`, and `-af` only conflicts with `-c:a copy`. -/
 def validateCliConfig (cfg : CliConfig) : Except (List CliError) CliConfig :=
   let hasInput : UInt32 := if cfg.inputs.isEmpty then 0 else 1
   let hasOutput : UInt32 := if cfg.output.isNone && cfg.daemon.isNone then 0 else 1
@@ -476,16 +532,17 @@ def validateCliConfig (cfg : CliConfig) : Except (List CliError) CliConfig :=
       match e with
       | CliError.unsupportedCodecOrFlag _ => acc + 1
       | _ => acc) 0).toUInt32
-  let copyMode : UInt32 :=
-    if cfg.videoCodec == some .copy || cfg.audioCodec == some .copy then 1 else 0
-  let filterCount : UInt32 :=
-    (if cfg.videoFilter.isSome then 1 else 0) + (if cfg.audioFilter.isSome then 1 else 0)
+  let hasCopyFilterConflict : Bool :=
+    (cfg.videoCodec == some .copy && cfg.videoFilter.isSome) ||
+    (cfg.audioCodec == some .copy && cfg.audioFilter.isSome)
+  let copyMode : UInt32 := if hasCopyFilterConflict then 1 else 0
+  let filterCount : UInt32 := if hasCopyFilterConflict then 1 else 0
   let gateOk := verifyCliInvocation hasInput hasOutput unknownFlags unsupportedCodecs copyMode filterCount == 1
   if !gateOk then
     let extra : List CliError :=
       (if cfg.inputs.isEmpty then [.missingInput] else []) ++
       (if cfg.output.isNone && cfg.daemon.isNone then [.missingOutput] else []) ++
-      (if copyMode == 1 && filterCount > 0 then [.copyWithFilter] else [])
+      (if hasCopyFilterConflict then [.copyWithFilter] else [])
     .error (cfg.errors ++ extra)
   else .ok cfg
 
@@ -545,6 +602,8 @@ theorem cliValidate_copyWithFilter_rejected_and_transcode_accepted :
 theorem parseCliSeconds_exact_and_rejects_malformed :
     parseCliSeconds "1.5" = some { num := 15, den := 10 } ∧
     parseCliSeconds "24" = some { num := 24, den := 1 } ∧
+    parseCliSeconds "00:00:00.5" = some { num := 5, den := 10 } ∧
+    parseCliSeconds "500ms" = some { num := 500, den := 1000 } ∧
     parseCliSeconds "1.2.3" = none ∧
     parseCliSeconds "" = none ∧
     parseCliSeconds "abc" = none := by
@@ -552,11 +611,17 @@ theorem parseCliSeconds_exact_and_rejects_malformed :
 
 theorem cliSecondsToMillis_exact_and_rejects_overflow :
     (parseCliSeconds "0.5").bind cliSecondsToMillis = some 500 ∧
+    (parseCliSeconds "00:00:00.5").bind cliSecondsToMillis = some 500 ∧
     (parseCliSeconds "1.25").bind cliSecondsToMillis = some 1250 ∧
     (parseCliSeconds "4294967").bind cliSecondsToMillis = some 4294967000 ∧
     (parseCliSeconds "4294968").bind cliSecondsToMillis = none ∧
     cliSecondsToMillis { num := 1, den := 0 } = none := by
-  simp [parseCliSeconds, cliSecondsToMillis]
+  decide
+
+/-- Universal Theorem: Any `CliSeconds` with a zero denominator is rejected (`none`) by `cliSecondsToMillis`. -/
+theorem cliSecondsToMillis_zero_den_universal (n : Nat) :
+    cliSecondsToMillis { num := n, den := 0 } = none := by
+  rfl
 
 /--
   Theorem (Wave 51): `resolveScaleDims` preserves exact 16:9 aspect ratio with even YUV420p alignment
@@ -578,7 +643,11 @@ theorem resolveScaleDims_proportional_even_and_cli_flags_verified :
   into `CliConfig` and fail-closes (`errors ≠ []`) on invalid `-crf`, `-preset`, `-r`, or unknown flags (`-foobar`).
 -/
 theorem cli_encoder_options_retained_and_invalid_rejected :
-    let cfg := parseFFmpegArgs ["-hide_banner", "-nostats", "-v", "warning", "-json", "-i", "in.mp4", "-preset", "veryfast", "-crf", "18", "-b:v", "4M", "-b:a", "192k", "-r", "60/1", "-pix_fmt", "yuv420p10le", "out.mp4"]
+    let cfg := parseFFmpegArgs [
+      "-hide_banner", "-nostats", "-v", "warning", "-json", "-i", "in.mp4",
+      "-preset", "veryfast", "-crf", "18", "-b:v", "4M", "-b:a", "192k",
+      "-r", "60/1", "-pix_fmt", "yuv420p10le", "out.mp4"
+    ]
     let defCfg := parseFFmpegArgs ["-i", "in.mp4", "out.mp4"]
     let badCrf := parseFFmpegArgs ["-i", "in.mp4", "-crf", "99", "out.mp4"]
     let badPreset := parseFFmpegArgs ["-i", "in.mp4", "-preset", "bogus_preset", "out.mp4"]

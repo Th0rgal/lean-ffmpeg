@@ -5406,12 +5406,12 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         if (with_audio_u32) {
             snprintf(copy_cmd, sizeof(copy_cmd),
                 "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 -map 0:a:0? "
-                "-map_chapters -1 -map_metadata -1 -dn -sn -c:v copy -c:a copy -moov_size 262144 %s 2>/dev/null",
+                "-dn -sn -c:v copy -c:a copy %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         } else {
             snprintf(copy_cmd, sizeof(copy_cmd),
                 "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 "
-                "-map_chapters -1 -map_metadata -1 -dn -sn -an -c:v copy -moov_size 262144 %s 2>/dev/null",
+                "-dn -sn -an -c:v copy %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         }
         int rc = system(copy_cmd);
@@ -6045,7 +6045,9 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
             if (suppress_output != 0u) {
-                dup2(devnull, STDOUT_FILENO);
+                if (!out_path || strcmp(out_path, "-") != 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                }
                 dup2(devnull, STDERR_FILENO);
             }
             if (devnull > STDERR_FILENO) close(devnull);
@@ -6063,6 +6065,8 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     if (!ok && out_path && out_path[0] != '\0' && strcmp(out_path, "-") != 0) {
         unlink(out_path);
     }
-    return ok ? 0u : 1u;
+    if (ok) return 0u;
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return (uint32_t)WEXITSTATUS(status);
+    return 1u;
 }
 

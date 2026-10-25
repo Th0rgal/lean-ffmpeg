@@ -982,15 +982,7 @@ def getFileByteSizeOr (path : String) (fallback : Nat) : IO Nat := do
   catch _ =>
     return fallback
 
-def jsonEscape (s : String) : String :=
-  String.ofList (s.toList.flatMap fun c =>
-    match c with
-    | '"' => ['\\', '"']
-    | '\\' => ['\\', '\\']
-    | '\n' => ['\\', 'n']
-    | '\r' => ['\\', 'r']
-    | '\t' => ['\\', 't']
-    | _ => [c])
+abbrev jsonEscape : String → String := LeanAV.PlanIR.escapeJsonStr
 
 def cliQuiet (level : String) : Bool :=
   level == "quiet" || level == "-8" || level == "panic" || level == "fatal" || level == "0"
@@ -1094,12 +1086,10 @@ def tryFastHeaderProbeTranscode
 
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
-  let plan := parseArgsToPlanIR args
+  let (cfg, ext, plan) := parseArgsWithPlanIR args
   if plan.resources.dumpPlan then
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1
-  let ext := extractExtendedPlanFlagsLoop args {}
-  let cfg := parseFFmpegArgs ext.baseArgs
   if !ext.extraErrors.isEmpty then
     let allErrs := cfg.errors ++ ext.extraErrors
     if cfg.jsonOutput then
@@ -1134,12 +1124,16 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t milliseconds overflow\"}"
         "-t value is too large"
+    if validCfg.daemon.isSome || validCfg.golden.isSome then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"unsupported\":\"-daemon/-golden\"}"
+        "Unsupported execution options: -daemon/-golden"
+    if !(← System.FilePath.pathExists inPath) then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
+        (s!"{inPath}: No such file or directory")
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
     if plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer then
-      if !(← System.FilePath.pathExists inPath) then
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated\",\"error\":\"input file does not exist\"}"
-          (s!"{inPath}: No such file or directory")
       if !validCfg.overwrite && outPath != "-" && validCfg.format != some "null" then
         if (← System.FilePath.pathExists outPath) then
           return ← reportCliError validCfg
@@ -1164,37 +1158,6 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         return ← reportCliError validCfg
           (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
           (s!"Delegated conversion failed! ({inPath} -> {outPath})")
-    let unsupportedExecution : List String :=
-      (if validCfg.audioFilter.isSome then ["-af"] else []) ++
-      (if validCfg.noVideo then ["-vn"] else []) ++
-      (if validCfg.daemon.isSome then ["-daemon"] else []) ++
-      (if validCfg.golden.isSome then ["-golden"] else []) ++
-      (if validCfg.threads.isSome then ["-threads"] else []) ++
-      (if validCfg.bFrames.isSome then ["-bf"] else []) ++
-      (if validCfg.gopSize.isSome then ["-g"] else []) ++
-      (if validCfg.movflags.isSome then ["-movflags"] else []) ++
-      (if validCfg.videoFrames.isSome then ["-frames:v"] else []) ++
-      (if validCfg.audioRate.isSome then ["-ar"] else []) ++
-      (if validCfg.audioChannels.isSome && validCfg.audioChannels != some 2 then ["-ac"] else []) ++
-      (if validCfg.format.isSome && validCfg.format != some "mp4" then ["-f"] else []) ++
-      (if validCfg.audioCodec.isSome && validCfg.audioCodec != some .copy && validCfg.audioCodec != some .aac then ["-c:a"] else []) ++
-      (if validCfg.audioCodec == some .copy && validCfg.videoCodec != some .copy then ["-c:a copy"] else []) ++
-      (if validCfg.videoCodec == some .copy && validCfg.audioCodec == some .aac then ["-c:a aac"] else [])
-    if !unsupportedExecution.isEmpty then
-      let unsupportedText := String.intercalate ", " unsupportedExecution
-      return ← reportCliError validCfg
-        (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"unsupported\": \"{jsonEscape unsupportedText}\" }")
-        (s!"Unsupported execution options: {unsupportedText}")
-    let codecError := match validCfg.videoCodec with
-      | some .copy | some .h264 | some .hevc | some .av1 | none => none
-      | some _ => some "-c:v codec is not implemented by the CLI"
-    if let some msg := codecError then
-      return ← reportCliError validCfg
-        (s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error\": \"{jsonEscape msg}\" }") msg
-    if validCfg.format == some "null" then
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"null output format is not implemented\"}"
-        "The null output format is not implemented"
     let hasExplicitMp4 := validCfg.format == some "mp4"
     let lowerOut := outPath.toLower
     if !hasExplicitMp4 && !(lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v") then
@@ -1251,18 +1214,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
             else
               pure none
       | none => pure none
-    let startMsOpt : Option UInt32 := validCfg.startSec.bind cliSecondsToMillis
-    let durMsOpt : Option UInt32 := validCfg.durationSec.bind cliSecondsToMillis
-    let startMs : UInt32 := startMsOpt.getD 0
-    let durMs : UInt32 := durMsOpt.getD 0
-    if validCfg.startSec.isSome && startMsOpt.isNone then
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-ss milliseconds overflow\"}"
-        "-ss value is too large"
-    if validCfg.durationSec.isSome && durMsOpt.isNone then
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t milliseconds overflow\"}"
-        "-t value is too large"
+    let startMs : UInt32 := plan.timeline.startMs.getD 0
+    let durMs : UInt32 := plan.timeline.durationMs.getD 0
     let withAudio := !validCfg.noAudio
     let handledFast ← match fastDemuxOpt with
       | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 fastDemux startMs durMs withAudio
@@ -1896,11 +1849,17 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.NativeKernels.evalLnir_libav_videotoolbox_p010_strided_pack_fma_equiv
 #print axioms LeanAV.NativeKernels.fastBox3x3DownscaleU10Sum_eq_spec_and_bounded
 #print axioms LeanAV.PlanIR.streamMapSpec_parse_format_roundtrip
+#print axioms LeanAV.PlanIR.streamKind_roundtrip_universal
+#print axioms LeanAV.PlanIR.subtitleCodec_roundtrip_universal
 #print axioms LeanAV.PlanIR.metadataSpec_parse_format_roundtrip
 #print axioms LeanAV.PlanIR.protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversal
 #print axioms LeanAV.PlanIR.planIR_cli_roundtrip_verified
+#print axioms LeanAV.PlanIR.validatePlanIR_sound_universal
 #print axioms LeanAV.PlanIR.validatePlanIR_sound_and_rejects_unsafe
+#print axioms LeanAV.PlanIR.specFfiCancelGate_iff_universal
+#print axioms LeanAV.PlanIR.rescalePtsIndependentOrFallback_negative_universal
 #print axioms LeanAV.PlanIR.independentKernel_fallback_complete_and_sound
+#print axioms LeanAV.Cli.cliSecondsToMillis_zero_den_universal
 
 
 

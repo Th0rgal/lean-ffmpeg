@@ -49,12 +49,13 @@ def BackendTier.toString : BackendTier → String
 
 /-! ## 2. Stream Selectors, Metadata, Subtitles, Bitstream Filters & Protocol Gate (Phases 3 & 4) -/
 
-/-- Elementary stream kind (`v`, `a`, `s`, `d`). -/
+/-- Elementary stream kind (`v`, `a`, `s`, `d`, or `all` for `-map 0` / `-map 0:1`). -/
 inductive StreamKind where
   | video
   | audio
   | subtitle
   | data
+  | all
   deriving Repr, DecidableEq, Inhabited
 
 def StreamKind.toShortCode : StreamKind → String
@@ -62,6 +63,14 @@ def StreamKind.toShortCode : StreamKind → String
   | .audio    => "a"
   | .subtitle => "s"
   | .data     => "d"
+  | .all      => "*"
+
+def StreamKind.toChar : StreamKind → Char
+  | .video    => 'v'
+  | .audio    => 'a'
+  | .subtitle => 's'
+  | .data     => 'd'
+  | .all      => '*'
 
 def parseStreamKindChar : Char → Option StreamKind
   | 'v' => some .video
@@ -70,7 +79,7 @@ def parseStreamKindChar : Char → Option StreamKind
   | 'd' => some .data
   | _   => none
 
-/-- Typed `-map <inputIdx>:<kind>[:<streamIdx>][?]` selector. -/
+/-- Typed `-map <inputIdx>[:<kind>][:<streamIdx>][?]` selector. -/
 structure StreamMapSpec where
   inputIdx  : Nat
   kind      : StreamKind
@@ -79,10 +88,12 @@ structure StreamMapSpec where
   deriving Repr, DecidableEq, Inhabited
 
 def formatStreamMapSpec (m : StreamMapSpec) : String :=
-  let base := s!"{m.inputIdx}:{m.kind.toShortCode}"
-  let withIdx := match m.streamIdx with
-    | some idx => s!"{base}:{idx}"
-    | none     => base
+  let withIdx :=
+    match m.kind, m.streamIdx with
+    | .all, none     => s!"{m.inputIdx}"
+    | .all, some idx => s!"{m.inputIdx}:{idx}"
+    | k, none        => s!"{m.inputIdx}:{k.toShortCode}"
+    | k, some idx    => s!"{m.inputIdx}:{k.toShortCode}:{idx}"
   if m.optional then withIdx ++ "?" else withIdx
 
 /-- Kernel-reducible ASCII lowercase conversion on a `Char`. -/
@@ -116,7 +127,7 @@ def splitStrOnChar (s : String) (sep : Char) : List String :=
   if s.toList.isEmpty then [""]
   else splitCharsOnLoop sep s.toList []
 
-/-- Parse a stream map token (`"0:v:0"`, `"0:a:0?"`, `"0:s?"`, `"0:v"`). -/
+/-- Parse a stream map token (`"0:v:0"`, `"0:a:0?"`, `"0:s?"`, `"0:v"`, `"0"`, `"0:1"`). -/
 def parseStreamMapSpec (s : String) : Option StreamMapSpec :=
   let (coreStr, isOpt) :=
     match s.toList.reverse with
@@ -124,12 +135,23 @@ def parseStreamMapSpec (s : String) : Option StreamMapSpec :=
     | _              => (s, false)
   let parts := splitStrOnChar coreStr ':'
   match parts with
-  | [inStr, kindStr] =>
-    match parseNonNegNatSpec inStr, kindStr.toList with
+  | [inStr] =>
+    match parseNonNegNatSpec inStr with
+    | some inIdx => some { inputIdx := inIdx, kind := .all, streamIdx := none, optional := isOpt }
+    | none       => none
+  | [inStr, secondStr] =>
+    match parseNonNegNatSpec inStr, secondStr.toList with
     | some inIdx, [kc] =>
       match parseStreamKindChar kc with
       | some k => some { inputIdx := inIdx, kind := k, streamIdx := none, optional := isOpt }
-      | none   => none
+      | none   =>
+        match parseNonNegNatSpec secondStr with
+        | some stIdx => some { inputIdx := inIdx, kind := .all, streamIdx := some stIdx, optional := isOpt }
+        | none       => none
+    | some inIdx, _ =>
+      match parseNonNegNatSpec secondStr with
+      | some stIdx => some { inputIdx := inIdx, kind := .all, streamIdx := some stIdx, optional := isOpt }
+      | none       => none
     | _, _ => none
   | [inStr, kindStr, stStr] =>
     match parseNonNegNatSpec inStr, kindStr.toList, parseNonNegNatSpec stStr with
@@ -215,23 +237,26 @@ def charsContainSublist (needle haystack : List Char) : Bool :=
 
 /--
   Phase 4 (Wave F) & §8 Security Gate (`isSafeLocalMediaPath`):
-  Rejects empty paths, parent traversal (`..` path segments), device nodes (`/dev/`),
-  and network/synthetic URI schemes (`http:`, `https:`, `rtmp:`, `rtsp:`, `tcp:`, `udp:`,
-  `concat:`, `subfile:`, `lavfi:`, `ftp:`, `sftp:`, `tls:`, `srt:`).
+  Rejects empty paths, leading whitespace, double-slash roots (`//dev/null`),
+  parent traversal (`..` path segments), device/kernel nodes (`/dev/`, `/proc/`, `/sys/`),
+  and any URI/protocol scheme containing `':'` (`http:`, `https:`, `rtmp:`, `rtsp:`, `tcp:`, `udp:`,
+  `file:`, `pipe:`, `fd:`, `data:`, `crypto:`, `hls:`, `concat:`, `subfile:`, `lavfi:`, `ftp:`, `sftp:`, `tls:`, `srt:`, `v4l2:`, `alsa:`).
 -/
 def isSafeLocalMediaPath (path : String) : Bool :=
   let chars := path.toList
-  if chars.isEmpty then false
-  else
-    let lower := strToLowerAscii path
-    let forbiddenPrefixes : List String :=
-      ["http://", "https://", "rtmp://", "rtsp://", "tcp://", "udp://",
-       "concat:", "subfile:", "lavfi:", "ftp://", "sftp://", "tls://", "srt://",
-       "/dev/", "v4l2:", "alsa:"]
-    let hasForbiddenPrefix := forbiddenPrefixes.any (fun p => strStartsWithFast lower p)
-    let segments := splitStrOnChar path '/'
-    let hasDotDot := segments.contains ".."
-    !hasForbiddenPrefix && !hasDotDot
+  match chars with
+  | [] => false
+  | c0 :: _ =>
+    if c0 == ' ' || c0 == '\t' || c0 == '\n' || c0 == '\r' then false
+    else if chars.contains ':' then false
+    else
+      let lower := strToLowerAscii path
+      let forbiddenPrefixes : List String :=
+        ["//", "/dev/", "/proc/", "/sys/"]
+      let hasForbiddenPrefix := forbiddenPrefixes.any (fun p => strStartsWithFast lower p)
+      let segments := splitStrOnChar path '/'
+      let hasDotDot := segments.contains ".."
+      !hasForbiddenPrefix && !hasDotDot
 
 /-! ## 3. Phase 3 Typed Intermediate Representation (`MediaPlanIR`) -/
 
@@ -336,21 +361,27 @@ structure MediaPlanIR where
   backend   : BackendPolicyIR
   deriving Repr, DecidableEq, Inhabited
 
-/-- Format a `CliSeconds` value back to its canonical string (`"2"` or `"1.5"`). -/
+/-- Emit exact fractional digits for `rem / den` with leading-zero preservation (`50 / 10000` -> `"005"`). -/
+def formatFracDigitsLoop (rem den : Nat) : Nat → List Char
+  | 0 => []
+  | fuel + 1 =>
+    if rem == 0 then []
+    else
+      let prod := rem * 10
+      let digit := prod / den
+      let nextRem := prod % den
+      Char.ofNat (48 + digit) :: formatFracDigitsLoop nextRem den fuel
+
+/-- Format a `CliSeconds` value back to its canonical decimal string (`"2"`, `"1.5"`, `"0.005"`). -/
 def formatCliSeconds (s : CliSeconds) : String :=
   if s.den ≤ 1 then s!"{s.num}"
   else
     let intPart := s.num / s.den
     let remPart := s.num % s.den
     if remPart == 0 then s!"{intPart}"
-    else if s.den == 10 then s!"{intPart}.{remPart}"
-    else if s.den == 100 then
-      let pad := if remPart < 10 then "0" else ""
-      s!"{intPart}.{pad}{remPart}"
-    else if s.den == 1000 then
-      let pad := if remPart < 10 then "00" else if remPart < 100 then "0" else ""
-      s!"{intPart}.{pad}{remPart}"
-    else s!"{intPart}.{remPart}"
+    else
+      let fracStr := String.ofList (formatFracDigitsLoop remPart s.den 9)
+      if fracStr == "" then s!"{intPart}" else s!"{intPart}.{fracStr}"
 
 def codecToCanonicalString : CliCodec → String
   | .copy     => "copy"
@@ -366,6 +397,18 @@ def codecToCanonicalString : CliCodec → String
   | .pcmS16le => "pcm_s16le"
   | .rawvideo => "rawvideo"
 
+def codecToDelegatedVideoEncoder : CliCodec → String
+  | .h264 => "libx264"
+  | .hevc => "libx265"
+  | .av1  => "libsvtav1"
+  | .vp9  => "libvpx-vp9"
+  | .opus => "libopus"
+  | c     => codecToCanonicalString c
+
+def codecToDelegatedAudioEncoder : CliCodec → String
+  | .opus => "libopus"
+  | c     => codecToCanonicalString c
+
 /-- Infer container format from explicit `-f` or output file extension. -/
 def inferContainerFormat (explicitFmt : Option String) (outPath : String) : String :=
   match explicitFmt with
@@ -373,12 +416,16 @@ def inferContainerFormat (explicitFmt : Option String) (outPath : String) : Stri
   | none =>
     let lower := strToLowerAscii outPath
     if strEndsWithFast lower ".mp4" || strEndsWithFast lower ".m4v" then "mp4"
+    else if strEndsWithFast lower ".mov" then "mov"
+    else if strEndsWithFast lower ".m4a" then "ipod"
     else if strEndsWithFast lower ".mkv" then "matroska"
     else if strEndsWithFast lower ".webm" then "webm"
     else if strEndsWithFast lower ".wav" then "wav"
     else if strEndsWithFast lower ".flac" then "flac"
     else if strEndsWithFast lower ".ogg" || strEndsWithFast lower ".opus" then "ogg"
+    else if strEndsWithFast lower ".mp3" then "mp3"
     else if strEndsWithFast lower ".ts" then "mpegts"
+    else if strEndsWithFast lower ".avi" then "avi"
     else if strEndsWithFast lower ".ivf" then "ivf"
     else if strEndsWithFast lower ".aac" then "adts"
     else "unknown"
@@ -483,9 +530,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   let durMsOpt := cfg.durationSec.bind cliSecondsToMillis
   let startOverflow := cfg.startSec.isSome && startMsOpt.isNone
   let durOverflow := cfg.durationSec.isSome && durMsOpt.isNone
-  let copyMode := cfg.videoCodec == some .copy || cfg.audioCodec == some .copy
-  let hasFilter := cfg.videoFilter.isSome || cfg.audioFilter.isSome
-  let copyFilterErr : List CliError := if copyMode && hasFilter then [.copyWithFilter] else []
+  let hasCopyFilterConflict : Bool :=
+    (cfg.videoCodec == some .copy && cfg.videoFilter.isSome) ||
+    (cfg.audioCodec == some .copy && cfg.audioFilter.isSome)
+  let copyFilterErr : List CliError := if hasCopyFilterConflict then [.copyWithFilter] else []
   let missingInErr : List CliError := if cfg.inputs.isEmpty then [.missingInput] else []
   let missingOutErr : List CliError := if cfg.output.isNone && cfg.daemon.isNone then [.missingOutput] else []
   let allErrors := cfg.errors ++ ext.extraErrors ++ copyFilterErr ++ missingInErr ++ missingOutErr
@@ -551,6 +599,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   let unsupportedDaemonOrGolden := cfg.daemon.isSome || cfg.golden.isSome
   let unknownFormat := inferredFmt == "unknown"
 
+  let isMixedCopyTranscode : Bool :=
+    (cfg.audioCodec == some .copy && cfg.videoCodec != some .copy) ||
+    (cfg.videoCodec == some .copy && cfg.audioCodec.isSome && cfg.audioCodec != some .copy)
+
   let isDelegatedContainerOrOption : Bool :=
     inferredFmt != "mp4" ||
     !ext.maps.isEmpty ||
@@ -568,6 +620,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     cfg.bFrames.isSome ||
     cfg.gopSize.isSome ||
     cfg.movflags.isSome ||
+    isMixedCopyTranscode ||
     (cfg.audioCodec.isSome && cfg.audioCodec != some .copy && cfg.audioCodec != some .aac) ||
     (cfg.videoCodec == some .vp9 || cfg.videoCodec == some .prores || cfg.videoCodec == some .ffv1)
 
@@ -636,25 +689,41 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
 def lowerCliToPlanIR (cfg : CliConfig) : MediaPlanIR :=
   lowerCliWithExtToPlanIR cfg {}
 
-/-- Parse raw FFmpeg CLI arguments (including Phase 3/4 flags) directly into a typed `MediaPlanIR`. -/
-def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
+/-- Single-pass parse and lowering returning `(CliConfig, ExtendedPlanFlags, MediaPlanIR)`. -/
+def parseArgsWithPlanIR (args : List String) : CliConfig × ExtendedPlanFlags × MediaPlanIR :=
   let ext := extractExtendedPlanFlagsLoop args {}
   let cfg := parseFFmpegArgs ext.baseArgs
-  lowerCliWithExtToPlanIR cfg ext
+  let plan := lowerCliWithExtToPlanIR cfg ext
+  (cfg, ext, plan)
 
-/-- Render a typed `MediaPlanIR` back into canonical FFmpeg CLI arguments (round-trip inverse of `parseArgsToPlanIR`). -/
-def planIRToCliArgs (plan : MediaPlanIR) : List String :=
+/-- Parse raw FFmpeg CLI arguments (including Phase 3/4 flags) directly into a typed `MediaPlanIR`. -/
+def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
+  (parseArgsWithPlanIR args).2.2
+
+/--
+  Unified argv renderer for `MediaPlanIR`:
+  - `forDelegation = false`: renders canonical `lffmpeg` CLI arguments (round-trip inverse of `parseArgsToPlanIR`).
+  - `forDelegation = true`: renders structured `ffmpeg` argv for `fork` + `execvp` (`-nostdin`, encoder names).
+-/
+def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :=
   let outOpt := plan.outputs.head?
+  let preArgs : List String := if forDelegation then ["-nostdin"] else []
   let overwriteArgs : List String :=
     match outOpt with
     | some o => if o.overwrite then ["-y"] else ["-n"]
     | none   => []
   let resArgs : List String :=
-    (if plan.resources.hideBanner then ["-hide_banner"] else []) ++
-    (if plan.resources.showStats then ["-stats"] else ["-nostats"]) ++
-    (if plan.resources.logLevel != "info" then ["-v", plan.resources.logLevel] else []) ++
-    (if plan.resources.jsonOutput then ["-json"] else []) ++
-    (match plan.resources.threads with | some t => ["-threads", s!"{t}"] | none => [])
+    if forDelegation then
+      (if plan.resources.hideBanner || plan.resources.jsonOutput then ["-hide_banner"] else []) ++
+      (if !plan.resources.showStats || plan.resources.jsonOutput then ["-nostats"] else []) ++
+      ["-v", if plan.resources.jsonOutput then "error" else plan.resources.logLevel]
+    else
+      (if plan.resources.dumpPlan then ["-dump-plan"] else []) ++
+      (if plan.resources.hideBanner then ["-hide_banner"] else []) ++
+      (if plan.resources.showStats then ["-stats"] else ["-nostats"]) ++
+      (if plan.resources.logLevel != "info" then ["-v", plan.resources.logLevel] else []) ++
+      (if plan.resources.jsonOutput then ["-json"] else []) ++
+      (match plan.resources.threads with | some t => ["-threads", s!"{t}"] | none => [])
   let timeArgs : List String :=
     (match plan.timeline.startSec with | some s => ["-ss", formatCliSeconds s] | none => []) ++
     (match plan.timeline.durationSec with | some d => ["-t", formatCliSeconds d] | none => [])
@@ -681,11 +750,15 @@ def planIRToCliArgs (plan : MediaPlanIR) : List String :=
       (if o.noVideo then ["-vn"] else []) ++
       (if o.noAudio then ["-an"] else []) ++
       (if o.noSubtitle then ["-sn"] else []) ++
-      (match o.videoCodec, o.audioCodec with
-       | some .copy, some .copy => ["-c", "copy"]
-       | vc, ac =>
-         (match vc with | some c => ["-c:v", codecToCanonicalString c] | none => []) ++
-         (match ac with | some c => ["-c:a", codecToCanonicalString c] | none => [])) ++
+      (if forDelegation then
+        (match o.videoCodec with | some vc => ["-c:v", codecToDelegatedVideoEncoder vc] | none => []) ++
+        (match o.audioCodec with | some ac => ["-c:a", codecToDelegatedAudioEncoder ac] | none => [])
+       else
+        match o.videoCodec, o.audioCodec with
+        | some .copy, some .copy => ["-c", "copy"]
+        | vc, ac =>
+          (match vc with | some c => ["-c:v", codecToCanonicalString c] | none => []) ++
+          (match ac with | some c => ["-c:a", codecToCanonicalString c] | none => [])) ++
       (match o.subtitleCodec with | some sc => ["-c:s", sc.toString] | none => []) ++
       (match o.videoSize with | some (w, h) => ["-s", s!"{w}x{h}"] | none => []) ++
       (match o.videoFrames with | some n => ["-frames:v", s!"{n}"] | none => []) ++
@@ -699,10 +772,18 @@ def planIRToCliArgs (plan : MediaPlanIR) : List String :=
       (match o.frameRate with | some r => ["-r", r] | none => []) ++
       (match o.videoBitrate with | some vb => ["-b:v", vb] | none => []) ++
       (match o.audioBitrate with | some ab => ["-b:a", ab] | none => []) ++
+      (if forDelegation then (match plan.resources.threads with | some t => ["-threads", s!"{t}"] | none => []) else []) ++
       (match o.movflags with | some mf => ["-movflags", mf] | none => []) ++
-      (if supportedFormat o.format && inferContainerFormat none o.path != o.format then ["-f", o.format] else []) ++
-      [o.path]
-  overwriteArgs ++ resArgs ++ timeArgs ++ inArgs ++ explicitMaps ++ metaArgs ++ graphArgs ++ outArgs
+      (if forDelegation && o.format == "null" then
+        ["-f", "null", "-"]
+       else
+        (if supportedFormat o.format && inferContainerFormat none o.path != o.format then ["-f", o.format] else []) ++
+        [o.path])
+  preArgs ++ overwriteArgs ++ resArgs ++ timeArgs ++ inArgs ++ explicitMaps ++ metaArgs ++ graphArgs ++ outArgs
+
+/-- Render a typed `MediaPlanIR` back into canonical FFmpeg CLI arguments (round-trip inverse of `parseArgsToPlanIR`). -/
+def planIRToCliArgs (plan : MediaPlanIR) : List String :=
+  renderPlanIRArgv plan false
 
 /-- Validate a `MediaPlanIR` before execution (fail-closed). -/
 def validatePlanIR (plan : MediaPlanIR) : Except (List String) MediaPlanIR :=
@@ -760,96 +841,8 @@ def serializePlanIRJson (plan : MediaPlanIR) : String :=
   p0 ++ p1a ++ p1b ++ p2 ++ p3 ++ p4 ++ p5a ++ p5b ++ p6a ++ p6b ++ p7
 
 /-- Build the structured `Array String` argv for `delegated_faithful` FFmpeg execution (zero shell interpolation). -/
-def buildDelegatedFfmpegArgv (plan : MediaPlanIR) : Array String := Id.run do
-  let some o := plan.outputs.head? | return #[]
-  let mut argv : Array String := #["-nostdin"]
-  if o.overwrite then
-    argv := argv.push "-y"
-  else
-    argv := argv.push "-n"
-  if plan.resources.hideBanner || plan.resources.jsonOutput then
-    argv := argv.push "-hide_banner"
-  if !plan.resources.showStats || plan.resources.jsonOutput then
-    argv := argv.push "-nostats"
-  let effLog := if plan.resources.jsonOutput then "error" else plan.resources.logLevel
-  argv := argv ++ #["-v", effLog]
-  if let some s := plan.timeline.startSec then
-    argv := argv ++ #["-ss", formatCliSeconds s]
-  if let some d := plan.timeline.durationSec then
-    argv := argv ++ #["-t", formatCliSeconds d]
-  for i in plan.inputs do
-    argv := argv ++ #["-i", i.path]
-  if plan.maps != plan.streams then
-    for m in plan.maps do
-      argv := argv ++ #["-map", formatStreamMapSpec m]
-  for kv in plan.metadata.entries do
-    argv := argv ++ #["-metadata", formatMetadataSpec kv]
-  if plan.metadata.mapMetadataSource != -1 then
-    argv := argv ++ #["-map_metadata", s!"{plan.metadata.mapMetadataSource}"]
-  if plan.metadata.mapChaptersSource != -1 then
-    argv := argv ++ #["-map_chapters", s!"{plan.metadata.mapChaptersSource}"]
-  if let some vf := plan.graphs.videoFilter then
-    argv := argv ++ #["-vf", vf]
-  if let some af := plan.graphs.audioFilter then
-    argv := argv ++ #["-af", af]
-  for b in plan.graphs.bitstreamFilters do
-    match b.kind with
-    | .audio => argv := argv ++ #["-bsf:a", b.filterName]
-    | _      => argv := argv ++ #["-bsf:v", b.filterName]
-  if o.noVideo then argv := argv.push "-vn"
-  if o.noAudio then argv := argv.push "-an"
-  if o.noSubtitle then argv := argv.push "-sn"
-  if let some vc := o.videoCodec then
-    let encTok := match vc with
-      | .h264 => "libx264"
-      | .hevc => "libx265"
-      | .av1  => "libsvtav1"
-      | .vp9  => "libvpx-vp9"
-      | .opus => "libopus"
-      | c     => codecToCanonicalString c
-    argv := argv ++ #["-c:v", encTok]
-  if let some ac := o.audioCodec then
-    let aTok := match ac with
-      | .opus => "libopus"
-      | c     => codecToCanonicalString c
-    argv := argv ++ #["-c:a", aTok]
-  if let some sc := o.subtitleCodec then
-    argv := argv ++ #["-c:s", sc.toString]
-  if let some (w, h) := o.videoSize then
-    argv := argv ++ #["-s", s!"{w}x{h}"]
-  if let some n := o.videoFrames then
-    argv := argv ++ #["-frames:v", s!"{n}"]
-  if let some ar := o.audioRate then
-    argv := argv ++ #["-ar", s!"{ar}"]
-  if let some ac := o.audioChannels then
-    argv := argv ++ #["-ac", s!"{ac}"]
-  if let some pf := o.pixelFormat then
-    argv := argv ++ #["-pix_fmt", pf]
-  if let some pr := o.preset then
-    argv := argv ++ #["-preset", pr]
-  if let some crf := o.crf then
-    argv := argv ++ #["-crf", crf]
-  if let some bf := o.bFrames then
-    argv := argv ++ #["-bf", s!"{bf}"]
-  if let some g := o.gopSize then
-    argv := argv ++ #["-g", s!"{g}"]
-  if let some r := o.frameRate then
-    argv := argv ++ #["-r", r]
-  if let some vb := o.videoBitrate then
-    argv := argv ++ #["-b:v", vb]
-  if let some ab := o.audioBitrate then
-    argv := argv ++ #["-b:a", ab]
-  if let some t := plan.resources.threads then
-    argv := argv ++ #["-threads", s!"{t}"]
-  if let some mf := o.movflags then
-    argv := argv ++ #["-movflags", mf]
-  if o.format == "null" then
-    argv := argv ++ #["-f", "null", "-"]
-  else
-    if inferContainerFormat none o.path != o.format then
-      argv := argv ++ #["-f", o.format]
-    argv := argv.push o.path
-  return argv
+def buildDelegatedFfmpegArgv (plan : MediaPlanIR) : Array String :=
+  if plan.outputs.isEmpty then #[] else (renderPlanIRArgv plan true).toArray
 
 /-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract -/
 
@@ -952,16 +945,33 @@ set_option maxHeartbeats 1600000
 
 /--
   Theorem (Phase 3 / Wave D): `parseStreamMapSpec` and `formatStreamMapSpec` form an exact round-trip
-  on valid stream selectors (`0:v:0`, `0:a:0?`, `0:s`) and reject malformed selectors (`0:x:0`, `bad`, `0:v:0:1`).
+  on valid stream selectors (`0:v:0`, `0:a:0?`, `1:s?`, `0`, `0:1`) and reject malformed selectors (`0:x:0`, `bad`, `0:v:0:1`).
 -/
 theorem streamMapSpec_parse_format_roundtrip :
     (parseStreamMapSpec "0:v:0").map formatStreamMapSpec = some "0:v:0" ∧
     (parseStreamMapSpec "0:a:0?").map formatStreamMapSpec = some "0:a:0?" ∧
     (parseStreamMapSpec "1:s?").map formatStreamMapSpec = some "1:s?" ∧
+    (parseStreamMapSpec "0").map formatStreamMapSpec = some "0" ∧
+    (parseStreamMapSpec "0:1").map formatStreamMapSpec = some "0:1" ∧
     parseStreamMapSpec "0:x:0" = none ∧
     parseStreamMapSpec "0:v:0:1" = none ∧
     parseStreamMapSpec "malformed" = none := by
   decide
+
+/--
+  Universal Theorem: Every elementary `StreamKind` (`video`, `audio`, `subtitle`, `data`)
+  round-trips exactly through `toChar` and `parseStreamKindChar`.
+-/
+theorem streamKind_roundtrip_universal (k : StreamKind) (h : k ≠ .all) :
+    parseStreamKindChar k.toChar = some k := by
+  cases k <;> first | rfl | contradiction
+
+/--
+  Universal Theorem: Every `SubtitleCodecSpec` round-trips through `toString` and `parseSubtitleCodecSpec`.
+-/
+theorem subtitleCodec_roundtrip_universal (c : SubtitleCodecSpec) :
+    parseSubtitleCodecSpec c.toString = some c := by
+  cases c <;> rfl
 
 /--
   Theorem (Phase 4 / Wave E): `parseMetadataSpec` and `formatMetadataSpec` round-trip valid `key=value`
@@ -976,7 +986,8 @@ theorem metadataSpec_parse_format_roundtrip :
 
 /--
   Theorem (Phase 4 / Wave F & §8 Security): `isSafeLocalMediaPath` accepts local relative and absolute
-  media paths while rejecting network URLs (`http://`, `rtsp://`), synthetic/device inputs (`/dev/video0`, `lavfi:`),
+  media paths while rejecting network URLs (`http://`, `rtsp://`), `file:`/`pipe:`/`data:` URI schemes,
+  double-slash roots (`//dev/null`), synthetic/device inputs (`/dev/video0`, `lavfi:`),
   and parent directory traversal (`../secret.mp4`).
 -/
 theorem protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversal :
@@ -984,6 +995,9 @@ theorem protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversa
     isSafeLocalMediaPath "/tmp/output.mkv" = true ∧
     isSafeLocalMediaPath "http://example.com/stream.m3u8" = false ∧
     isSafeLocalMediaPath "rtsp://10.0.0.1/live" = false ∧
+    isSafeLocalMediaPath "file:///etc/passwd" = false ∧
+    isSafeLocalMediaPath "pipe:0" = false ∧
+    isSafeLocalMediaPath "//dev/null" = false ∧
     isSafeLocalMediaPath "/dev/video0" = false ∧
     isSafeLocalMediaPath "lavfi:testsrc" = false ∧
     isSafeLocalMediaPath "fixtures/../outside.mp4" = false ∧
@@ -993,7 +1007,8 @@ theorem protocolSecurityPolicy_accepts_local_and_rejects_network_device_traversa
 /--
   Theorem (Phase 3 / Wave D): `parseArgsToPlanIR` and `planIRToCliArgs` satisfy the exact CLI <-> IR
   round-trip law across MP4 stream copy, H.264 transcode with timeline/filter/encoder options,
-  and Phase 4 delegated Matroska remux with `-map`, `-metadata`, `-bsf:v`, and `-c:s`.
+  and Phase 4 delegated Matroska remux with `-map`, `-metadata`, `-bsf:v`, and `-c:s`,
+  and `formatCliSeconds` preserves leading fractional zeros (`50/10000` -> `"0.005"`, `10005/10000` -> `"1.0005"`).
 -/
 theorem planIR_cli_roundtrip_verified :
     let copyArgs := ["-y", "-i", "in.mp4", "-c", "copy", "out.mp4"]
@@ -1005,6 +1020,8 @@ theorem planIR_cli_roundtrip_verified :
     parseArgsToPlanIR (planIRToCliArgs pCopy) = pCopy ∧
     parseArgsToPlanIR (planIRToCliArgs pTrans) = pTrans ∧
     parseArgsToPlanIR (planIRToCliArgs pPhase4) = pPhase4 ∧
+    formatCliSeconds { num := 50, den := 10000 } = "0.005" ∧
+    formatCliSeconds { num := 10005, den := 10000 } = "1.0005" ∧
     pCopy.backend.tier = .delegatedFaithful ∧
     pTrans.backend.tier = .translatedPartial ∧
     pPhase4.backend.tier = .delegatedFaithful ∧
@@ -1012,17 +1029,51 @@ theorem planIR_cli_roundtrip_verified :
   decide
 
 /--
-  Theorem (Phase 3 & Phase 4 Validation Gate): `validatePlanIR` accepts valid `delegatedFaithful` and
-  `translatedPartial` plans and rejects plans with `copyWithFilter`, invalid `-map`, disallowed `http://` URLs,
-  or `-ss` millisecond overflow.
+  Universal Theorem: `validatePlanIR` succeeds with `.ok plan'` if and only if `plan' = plan`,
+  `plan.errors.isEmpty = true`, and `plan.backend.tier ≠ .unsupported`.
+-/
+theorem validatePlanIR_sound_universal (plan plan' : MediaPlanIR)
+    (h : validatePlanIR plan = .ok plan') :
+    plan' = plan ∧ plan.errors.isEmpty = true ∧ plan.backend.tier ≠ .unsupported := by
+  unfold validatePlanIR at h
+  split at h
+  · contradiction
+  · injection h with hEq
+    rename_i hCond
+    simp only [Bool.not_eq_true, Bool.or_eq_false_iff, Bool.not_eq_false', beq_eq_false_iff_ne] at hCond
+    exact ⟨hEq.symm, hCond.1, hCond.2⟩
+
+/--
+  Theorem (Phase 3 & Phase 4 Validation Gate): `validatePlanIR` accepts valid `delegatedFaithful`,
+  `translatedPartial`, and mixed `-vf scale=... -c:v h264 -c:a copy` plans, and rejects plans with
+  same-stream `copyWithFilter`, invalid `-map`, disallowed `http://` URLs, or `-ss` millisecond overflow.
 -/
 theorem validatePlanIR_sound_and_rejects_unsafe :
+    let mixedArgs :=
+      ["-y", "-i", "in.mp4", "-vf", "scale=160:90", "-c:v", "h264", "-c:a", "copy", "out.mp4"]
     (validatePlanIR (parseArgsToPlanIR ["-y", "-i", "in.mp4", "-c", "copy", "out.mp4"])).isOk = true ∧
+    (validatePlanIR (parseArgsToPlanIR mixedArgs)).isOk = true ∧
     (validatePlanIR (parseArgsToPlanIR ["-y", "-i", "in.mp4", "-c", "copy", "-vf", "hflip", "out.mp4"])).isOk = false ∧
     (validatePlanIR (parseArgsToPlanIR ["-y", "-i", "in.mp4", "-map", "bad_map", "-c", "copy", "out.mp4"])).isOk = false ∧
     (validatePlanIR (parseArgsToPlanIR ["-y", "-i", "http://evil.example/in.mp4", "-c", "copy", "out.mp4"])).isOk = false ∧
     (validatePlanIR (parseArgsToPlanIR ["-y", "-ss", "4294968", "-i", "in.mp4", "-c", "copy", "out.mp4"])).isOk = false := by
   decide
+
+/--
+  Universal Theorem: `specFfiCancelGate` returns `true` iff `cancelFlag = 0` and `(maxFrames = 0 ∨ framesDone < maxFrames)`.
+-/
+theorem specFfiCancelGate_iff_universal (c f m : UInt32) :
+    specFfiCancelGate c f m = true ↔ (c = 0 ∧ (m = 0 ∨ f < m)) := by
+  simp [specFfiCancelGate]
+
+/--
+  Universal Theorem: `rescalePtsIndependentOrFallback` deterministically falls back on any negative timestamp `Int.negSucc n`.
+-/
+theorem rescalePtsIndependentOrFallback_negative_universal (n sn sd dn dd : Nat) :
+    rescalePtsIndependentOrFallback (Int.negSucc n) sn sd dn dd =
+      .fallbackDelegated "negative_pts_requires_signed_timeline_shift" := by
+  unfold rescalePtsIndependentOrFallback
+  simp [Int.negSucc_lt_zero]
 
 /--
   Theorem (Phase 5 & Phase 6): `specFfiCancelGate` enforces cancellation and frame budgets,

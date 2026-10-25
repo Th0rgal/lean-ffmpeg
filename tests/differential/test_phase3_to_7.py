@@ -280,6 +280,95 @@ class Phase3To7Tests(unittest.TestCase):
         for section in ("Phase 0", "Phase 1", "Phase 2", "Phase 3", "Phase 4", "Phase 5", "Phase 6", "Phase 7"):
             self.assertIn(section, text)
 
+    # -------------------------------------------------------------------------
+    # 3-Model Quorum Audit Regressions (Claude Fable 5.1, GPT-6 Astra, Gemini 4 Argon)
+    # -------------------------------------------------------------------------
+    def test_quorum_ffmpeg_parity_and_security_hardening(self):
+        with tempfile.TemporaryDirectory(prefix="quorum-parity-") as tmp:
+            root = Path(tmp)
+
+            # 1. Mixed video filter + audio copy (-vf scale=160:90 -c:v h264 -c:a copy)
+            mixed_out = root / "mixed_vf_acopy.mp4"
+            r_mixed = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(FIXTURE_AV),
+                "-vf", "scale=160:90", "-c:v", "h264", "-c:a", "copy", str(mixed_out),
+            ])
+            self.assertEqual(r_mixed.returncode, 0, r_mixed.stderr)
+            mixed_probe = self.probe_json(mixed_out)
+            v_streams = [s for s in mixed_probe["streams"] if s["codec_type"] == "video"]
+            a_streams = [s for s in mixed_probe["streams"] if s["codec_type"] == "audio"]
+            self.assertEqual((v_streams[0]["width"], v_streams[0]["height"]), (160, 90))
+            self.assertEqual(len(a_streams), 1)
+
+            # 2. Mixed video copy + audio re-encode (-c:v copy -c:a aac)
+            vcopy_aenc = root / "vcopy_aenc.mp4"
+            r_vcopy = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(FIXTURE_AV),
+                "-c:v", "copy", "-c:a", "aac", str(vcopy_aenc),
+            ])
+            self.assertEqual(r_vcopy.returncode, 0, r_vcopy.stderr)
+
+            # 3. Fractional leading zeros in duration (-t 0.0050 -> "0.005", matching ffmpeg packet count)
+            ref_frac = root / "ref_frac.mkv"
+            cand_frac = root / "cand_frac.mkv"
+            r_ref_frac = self.run_cmd([
+                REFERENCE, "-v", "error", "-y", "-i", str(FIXTURE_AV),
+                "-t", "0.0050", "-c", "copy", str(ref_frac),
+            ])
+            r_cand_frac = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(FIXTURE_AV),
+                "-t", "0.0050", "-c", "copy", str(cand_frac),
+            ])
+            self.assertEqual(r_ref_frac.returncode, 0, r_ref_frac.stderr)
+            self.assertEqual(r_cand_frac.returncode, 0, r_cand_frac.stderr)
+            self.assertEqual(ref_frac.stat().st_size, cand_frac.stat().st_size)
+
+            # 4. Sexagesimal and millisecond time syntax (-ss 00:00:00.5 -t 500ms)
+            time_out = root / "time_syntax.mp4"
+            r_time = self.run_cmd([
+                BINARY, "-json", "-y", "-ss", "00:00:00.5", "-t", "500ms",
+                "-i", str(FIXTURE_AV), "-c:v", "h264", "-c:a", "aac", str(time_out),
+            ])
+            self.assertEqual(r_time.returncode, 0, r_time.stderr)
+
+            # 5. Stream mapping (-map 0 and -map 0:1) and .mov container output
+            mov_out = root / "mapped.mov"
+            r_mov = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(FIXTURE_AV),
+                "-map", "0", "-c", "copy", str(mov_out),
+            ])
+            self.assertEqual(r_mov.returncode, 0, r_mov.stderr)
+            self.assertEqual(len(self.probe_json(mov_out)["streams"]), 2)
+
+            # 6. MP4 stream copy size parity (no 256 KB moov bloat)
+            copy_mp4 = root / "copy.mp4"
+            r_copy = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(FIXTURE_AV), "-c", "copy", str(copy_mp4),
+            ])
+            self.assertEqual(r_copy.returncode, 0, r_copy.stderr)
+            self.assertLess(copy_mp4.stat().st_size, FIXTURE_AV.stat().st_size * 2)
+
+            # 7. Clean JSON error on missing input file (no uncaught exception on stderr)
+            missing_in = root / "does_not_exist.mp4"
+            missing_out = root / "missing_out.mp4"
+            r_missing = self.run_cmd([
+                BINARY, "-json", "-y", "-i", str(missing_in), "-c:v", "h264", str(missing_out),
+            ])
+            self.assertNotEqual(r_missing.returncode, 0)
+            self.assertEqual(r_missing.stderr.strip(), "")
+            missing_doc = json.loads(r_missing.stdout.strip())
+            self.assertFalse(missing_doc["ok"])
+
+            # 8. Protocol/device path hardening (//dev/null, file:///..., pipe:0, data:...)
+            for unsafe_path in ("//dev/null", "file:///etc/passwd", "pipe:0", "data:text/plain;base64,AA=="):
+                with self.subTest(unsafe_path=unsafe_path):
+                    r_unsafe = self.run_cmd([
+                        BINARY, "-json", "-y", "-i", unsafe_path, "-c", "copy", str(root / "bad.mp4"),
+                    ])
+                    self.assertNotEqual(r_unsafe.returncode, 0)
+                    unsafe_doc = json.loads(r_unsafe.stdout.strip())
+                    self.assertFalse(unsafe_doc["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
