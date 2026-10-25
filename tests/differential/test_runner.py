@@ -314,7 +314,7 @@ class RunnerTests(unittest.TestCase):
         data = self.run_capture("import os; print(os.getcwd())", "print('ok')")
         record = data["records"][0]
         self.assertEqual(record["command"][1:], [])
-        self.assertTrue(record["stdout"].strip().startswith("/tmp/differential-"))
+        self.assertIn("/differential-", record["stdout"].strip())
         self.assertIsNotNone(record["executable"]["sha256"])
 
     def test_output_path_rejects_traversal(self):
@@ -347,8 +347,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_child_environment_is_deterministic(self):
         data = self.run_capture(
-            "import os; print(sorted(os.environ))",
-            "import os; print(sorted(os.environ))",
+            "import os; print(sorted(k for k in os.environ if k != '__CF_USER_TEXT_ENCODING'))",
+            "import os; print(sorted(k for k in os.environ if k != '__CF_USER_TEXT_ENCODING'))",
         )
         self.assertEqual(data["records"][0]["stdout"], data["records"][1]["stdout"])
         self.assertEqual(

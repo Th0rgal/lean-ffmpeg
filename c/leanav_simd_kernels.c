@@ -82,6 +82,8 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 
 #if defined(LEANAV_ENABLE_LIBAV) && defined(__has_include)
 #if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>) && __has_include(<libswresample/swresample.h>)
+#include <libavcodec/version.h>
+#if LIBAVCODEC_VERSION_MAJOR >= 59
 #define LEANAV_HAS_LIBAV 1
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -92,6 +94,7 @@ static void leanav_cprint(FILE *fp, const char *color, const char *fmt, ...) {
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/audio_fifo.h>
+#endif
 #endif
 #endif
 

@@ -25,10 +25,13 @@ ENVIRONMENT_POLICY = {
 
 def resource_limits(cpu_seconds=None, address_space_bytes=None):
     def apply_limits():
-        if cpu_seconds is not None:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-        if address_space_bytes is not None:
-            resource.setrlimit(resource.RLIMIT_AS, (address_space_bytes, address_space_bytes))
+        try:
+            if cpu_seconds is not None:
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+            if address_space_bytes is not None:
+                resource.setrlimit(resource.RLIMIT_AS, (address_space_bytes, address_space_bytes))
+        except (ValueError, OSError):
+            os._exit(1)
     return apply_limits
 
 
@@ -61,7 +64,7 @@ def fixture_output_path(case_dir, output):
 def kill_process_group(process):
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     process.wait()
 
