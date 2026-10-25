@@ -18,7 +18,7 @@ jobs:
       - name: Install FFmpeg runtime
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Turbo Lean incremental build
-        uses: Th0rgal/turbo-lean@5a6a2534697179dc38fdd8eb812f256703540202
+        uses: Th0rgal/turbo-lean@f4887f20fed88a4945b607fafc249e1d39af4ddf
         with:
           project-dir: "."
           command: build
@@ -26,10 +26,24 @@ jobs:
           mode: trusted
       - name: Build
         run: lake build
-      - name: Self-test
-        run: .lake/build/bin/lffmpeg self-test
+      - name: Zero-Trust Spec Audit (turbo-lean)
+        run: |
+          turbo-lean --json audit-spec LeanAV/Spec.lean
+          turbo-lean --json audit-spec LeanAV/Domain.lean
+          turbo-lean --json audit-spec LeanAV/PlanIR.lean
+          turbo-lean --json audit-spec LeanAV/NativeKernels.lean
+      - name: Self-test & C-ABI / Kernel Verification
+        run: |
+          .lake/build/bin/lffmpeg self-test
+          .lake/build/bin/lffmpeg verify-ffi
+          .lake/build/bin/lffmpeg verify-kernels
       - name: Axiom audit
         run: lake env lean scripts/check_axioms.lean
+      - name: Unit & Differential Test Suite
+        run: |
+          python3 -m unittest discover -s tests -p "test_*.py"
+          python3 -m unittest discover -s tests/differential -p "test_phase*.py"
+          python3 -m unittest discover -s tests/differential -p "test_quorum*.py"
       - name: CLI smoke tests
         run: |
           set +e
@@ -64,3 +78,5 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: lake build
       - run: .lake/build/bin/lffmpeg self-test
+      - run: .lake/build/bin/lffmpeg verify-ffi
+      - run: .lake/build/bin/lffmpeg verify-kernels

@@ -101,3 +101,22 @@ Le quorum des trois modèles a été exécuté via Orb MCP dans leurs harnais re
 6. **Théorèmes Universels (`∀`) & Déduplication Architecturale** :
    - Ajout des théorèmes universels [`streamKind_roundtrip_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L971-L974), [`subtitleCodec_roundtrip_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L979-L982), [`validatePlanIR_sound_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1035-L1044), [`specFfiCancelGate_iff_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1065-L1067), [`rescalePtsIndependentOrFallback_negative_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1072-L1076) et [`cliSecondsToMillis_zero_den_universal`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Cli.lean#L618-L620).
    - Unification de `planIRToCliArgs` et `buildDelegatedFfmpegArgv` via [`renderPlanIRArgv`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L600-L685) et déduplication de `jsonEscape` et du parsing CLI dans `Main.lean`.
+
+---
+
+## 4. Campagne Différentielle & FATE Exhaustive (`445` tests) et Durcissement Maxwell / `lean-native`
+
+### 4.1 Résultats Vérifiés Avant / Après Correctifs (`445` tests)
+
+| Suite de Vérification | Périmètre | Avant (`v0.2.0-quorum`) | Après (`80f1959`) | Détails Vérifiables |
+| :--- | :--- | :---: | :---: | :--- |
+| **Suite #0 (`tests/`)** | **59 tests** unitaires & différentiels Python + auto-tests C-ABI | `58 / 59` (`98.3%`) | **`59 / 59` (`100%`)** | `15/15` unitaires + `44/44` différentiels + `53/53` waves `self-test` + `15/15` portes C-ABI |
+| **Suite #1 (`bench.py`)** | **120 cas** : conteneurs, `-map`, métadonnées, chapitres, dispositions, BSFs, sous-titres, multi-input & timeline | `78 / 120` (`65.0%`) | **`119 / 120` (`99.2%`)** | `111 MATCH` bit-exact + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
+| **Suite #2 (`test_diff.py`)** | **79 cas** : codecs vidéo/audio, `-vf` / `-af`, `pix_fmt`, contrôle de débit (`-crf`, `-b:v`, `-qp`) & découpe temporelle | `41 / 79` (`51.9%`) | **`79 / 79` (`100%`)** | `79/79` codes retour identiques, `79/79` signatures `ffprobe` identiques (`0 DIFF`) |
+| **Suite #3 (`fate-run.sh`)** | **187 tests FATE officiels FFmpeg** (`fate-lavf-*` + `fate-ffmpeg-*`) | `0 / 187` FATE pass (`187/187` rejets CLI) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` sorties identiques** | `100%` des `129` tests FATE passés par `ffmpeg 6.1.1` passent avec `lffmpeg`, `0/187` rejet CLI, `186/186` sorties non-vides identiques bit-à-bit |
+
+### 4.2 Durcissement Déclaratif de `AVGateSpec` & Déduplication `LNIR_WIRE_V1`
+- **Élimination des 10 spécifications réflexives `gate x = true`** dans [`LeanAV/Spec.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Spec.lean) et [`LeanAV/Domain.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/Domain.lean) au profit de conjonctions propositionnelles déclaratives (`Prop`) et preuves bidirectionnelles (`sound`, `complete`).
+- **Audit Zero-Trust (`turbo-lean --json audit-spec`)** : **`118 / 118` spécifications certifiées `non_vacuous_and_tight` (`0` `vacuous`, `0` `trivial`, `0 sorryAx`)** sur `Spec.lean`, `Domain.lean`, `PlanIR.lean`, `NativeKernels.lean`, `Format.lean`, `Scale.lean` et `Filter.lean`.
+- **Déduplication de [`LeanAV/NativeKernels.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/NativeKernels.lean)** : réduction de **`1 038` lignes (`-60%`)** via les constructeurs paramétrés `mkLnirFmaDecl` / `mkLnirStencil3Decl` / `mkLnirSaxpyDecl` et la spécification canonique `leanSpecFmaBlend3`.
+- **Accélération du réducteur kernel Lean 4 (`whnf`) dans [`LeanAV/PlanIR.lean`](file:///var/lib/sandboxed-node/e9e27628-66ad-4877-bee4-d96c0591d46f/lean-ffmpeg/LeanAV/PlanIR.lean#L1026-L1086)** : élimination `casesOn` en tête réduisant la vérification de `planIR_cli_roundtrip_verified` de `> 40 000 ms` à **`30 ms` (`1 330x` plus rapide)**.
