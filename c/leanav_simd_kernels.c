@@ -1251,11 +1251,11 @@ static const char *leanav_color_vui_args_for_cs(int hdr_cs, uint32_t codec_id_u3
 }
 
 static const char *leanav_ffmpeg_bin_cmd(void) {
-    return "PATH=\"/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
+    return "LD_LIBRARY_PATH=\"/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH\" PATH=\"/tmp/opencode/ffmpeg-runtime-full/bin:/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffmpeg";
 }
 
 static const char *leanav_ffprobe_bin_cmd(void) {
-    return "PATH=\"/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe";
+    return "LD_LIBRARY_PATH=\"/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH\" PATH=\"/tmp/opencode/ffmpeg-runtime-full/bin:/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe";
 }
 
 /*
@@ -1369,18 +1369,25 @@ static void leanav_measure_luma_acceptance_16x16_strided(
                         total_sq_err += (uint64_t)ad * (uint64_t)ad;
                     }
                 } else {
-                    size_t sy0 = (dy * src_h) / dst_h;
-                    size_t sy1 = ((dy + 1) * src_h - 1) / dst_h;
-                    if (sy1 >= src_h) sy1 = src_h - 1;
+                    size_t sy_q8 = (dy * src_h * 256u) / dst_h;
+                    size_t sy0 = sy_q8 >> 8;
+                    if (sy0 >= src_h) sy0 = src_h - 1;
+                    size_t sy1 = (sy0 + 1 < src_h) ? (sy0 + 1) : sy0;
+                    uint32_t fy = (uint32_t)(sy_q8 & 0xFFu);
+                    uint32_t ify = 256u - fy;
                     const uint8_t *s_row0 = src_luma + sy0 * (size_t)src_stride;
                     const uint8_t *s_row1 = src_luma + sy1 * (size_t)src_stride;
                     for (size_t x = 0; x < 16; x++) {
                         size_t dx = bx + x;
-                        size_t sx0 = (dx * src_w) / dst_w;
-                        size_t sx1 = ((dx + 1) * src_w - 1) / dst_w;
-                        if (sx1 >= src_w) sx1 = src_w - 1;
-                        uint32_t r = ((uint32_t)s_row0[sx0] + (uint32_t)s_row0[sx1] +
-                                      (uint32_t)s_row1[sx0] + (uint32_t)s_row1[sx1] + 2u) >> 2;
+                        size_t sx_q8 = (dx * src_w * 256u) / dst_w;
+                        size_t sx0 = sx_q8 >> 8;
+                        if (sx0 >= src_w) sx0 = src_w - 1;
+                        size_t sx1 = (sx0 + 1 < src_w) ? (sx0 + 1) : sx0;
+                        uint32_t fx = (uint32_t)(sx_q8 & 0xFFu);
+                        uint32_t ifx = 256u - fx;
+                        uint32_t top = ifx * (uint32_t)s_row0[sx0] + fx * (uint32_t)s_row0[sx1];
+                        uint32_t bot = ifx * (uint32_t)s_row1[sx0] + fx * (uint32_t)s_row1[sx1];
+                        uint32_t r = (ify * top + fy * bot + 32768u) >> 16;
                         uint32_t d = d_row[x];
                         uint32_t ad = (d >= r) ? (d - r) : (r - d);
                         uint32_t bd = (r >= 16u) ? (r - 16u) : (16u - r);
@@ -2391,6 +2398,7 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
                 out_mdhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(out_buf + bp + 28) : leanav_rd_u32be(out_buf + bp + 20);
             }
         }
+        int in_has_nonzero_mt = 0;
         /* Rescale v0 elst entries inside `edts_box` if `edts` contains an `elst` child at offset 8 */
         if (memcmp(edts_box + 12, "elst", 4) == 0 && edts_box[16] == 0) {
             uint32_t entry_cnt = leanav_rd_u32be(edts_box + 20);
@@ -2398,6 +2406,7 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
                 uint8_t *ep = edts_box + 24 + e * 12;
                 uint32_t seg_dur = leanav_rd_u32be(ep);
                 int32_t media_time = (int32_t)leanav_rd_u32be(ep + 4);
+                if (media_time != 0) in_has_nonzero_mt = 1;
                 if (in_mvhd_ts > 0 && out_mvhd_ts > 0 && in_mvhd_ts != out_mvhd_ts) {
                     uint64_t scaled_dur = ((uint64_t)seg_dur * (uint64_t)out_mvhd_ts + (in_mvhd_ts >> 1)) / (uint64_t)in_mvhd_ts;
                     leanav_wr_u32be(ep, (uint32_t)scaled_dur);
@@ -2410,13 +2419,21 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
         }
         size_t old_edts_p = 0, old_edts_s = 0;
         if (leanav_find_child_box(out_buf, trak_p + 8, trak_p + trak_s, "edts", &old_edts_p, &old_edts_s)) {
-            edts_delta = (int32_t)edts_len - (int32_t)old_edts_s;
-            leanav_wr_u32be(out_buf + trak_p, (uint32_t)((int32_t)trak_s + edts_delta));
-            leanav_wr_u32be(out_buf + moov_p, (uint32_t)((int32_t)moov_s + edts_delta));
-            memmove(out_buf + old_edts_p + edts_len, out_buf + old_edts_p + old_edts_s, out_n - (old_edts_p + old_edts_s));
-            memcpy(out_buf + old_edts_p, edts_box, edts_len);
-            out_n = (size_t)((int32_t)out_n + edts_delta);
-            moov_s = (size_t)((int32_t)moov_s + edts_delta);
+            int out_has_bframe_mt = 0;
+            if (old_edts_s >= 36 && memcmp(out_buf + old_edts_p + 12, "elst", 4) == 0 && out_buf[old_edts_p + 16] == 0) {
+                int32_t out_mt = (int32_t)leanav_rd_u32be(out_buf + old_edts_p + 28);
+                if (out_mt > 0) out_has_bframe_mt = 1;
+            }
+            /* Only overwrite encoder elst when source had a non-zero media_time (e.g. VFR/B-frame CTS offset) */
+            if (in_has_nonzero_mt || !out_has_bframe_mt) {
+                edts_delta = (int32_t)edts_len - (int32_t)old_edts_s;
+                leanav_wr_u32be(out_buf + trak_p, (uint32_t)((int32_t)trak_s + edts_delta));
+                leanav_wr_u32be(out_buf + moov_p, (uint32_t)((int32_t)moov_s + edts_delta));
+                memmove(out_buf + old_edts_p + edts_len, out_buf + old_edts_p + old_edts_s, out_n - (old_edts_p + old_edts_s));
+                memcpy(out_buf + old_edts_p, edts_box, edts_len);
+                out_n = (size_t)((int32_t)out_n + edts_delta);
+                moov_s = (size_t)((int32_t)moov_s + edts_delta);
+            }
         }
     }
 
@@ -5403,15 +5420,17 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         int rc = leanav_libav_stream_copy(in_path, out_path, start_ms_u32, dur_ms_u32, (int)with_audio_u32);
 #else
         char copy_cmd[8192];
-        if (with_audio_u32) {
+        if (with_audio_u32 == 2u) {
             snprintf(copy_cmd, sizeof(copy_cmd),
-                "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 -map 0:a:0? "
-                "-dn -sn -c:v copy -c:a copy %s 2>/dev/null",
+                "%s -y -v error -nostdin %s-i %s %s-c:v copy %s 2>/dev/null",
+                ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
+        } else if (with_audio_u32 != 0u) {
+            snprintf(copy_cmd, sizeof(copy_cmd),
+                "%s -y -v error -nostdin %s-i %s %s-c copy %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         } else {
             snprintf(copy_cmd, sizeof(copy_cmd),
-                "%s -y -v error -nostdin %s-i %s %s-map 0:v:0 "
-                "-dn -sn -an -c:v copy %s 2>/dev/null",
+                "%s -y -v error -nostdin %s-i %s %s-an -c copy %s 2>/dev/null",
                 ffmpeg_bin, ss_arg, q_in, t_arg, q_out);
         }
         int rc = system(copy_cmd);
@@ -5584,15 +5603,15 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     if (with_audio_u32) {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
-            "%s%s-i %s -map 0:v:0 -map 1:a:0? -map_chapters -1 -map_metadata -1 -dn -sn "
-            "%s %s%s %s -moov_size 262144 %s 2>/dev/null",
+            "%s%s-i %s -map 0:v:0 -map 1:a:0? -map_metadata 1 -map_metadata:s:v 1:s:v -map_metadata:s:a 1:s:a -map_chapters 1 -dn -sn "
+            "%s %s%s %s %s 2>/dev/null",
             ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, t_arg, q_in, v_enc_args, color_vui_args, x264_subme_suffix, a_enc_args, q_out);
     } else {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
-            "-map 0:v:0 -map_chapters -1 -map_metadata -1 -dn -sn -an "
-            "%s%s %s%s -moov_size 262144 %s 2>/dev/null",
-            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
+            "%s%s-i %s -map 0:v:0 -map_metadata 1 -map_metadata:s:v 1:s:v -map_chapters 1 -dn -sn -an "
+            "%s%s %s%s %s 2>/dev/null",
+            ffmpeg_bin, raw_pix_fmt, raw_in_color_args, dst_w, dst_h, fps_str, ss_arg, t_arg, q_in, t_arg, v_enc_args, color_vui_args, x264_subme_suffix, q_out);
     }
 
     FILE *dec_fp = popen(dec_cmd, "r");
@@ -5859,6 +5878,12 @@ static const char *leanav_resolve_ffmpeg_exec_path(void) {
     if (access("/tmp/opencode/ffmpeg_build/ffmpeg", X_OK) == 0) {
         return "/tmp/opencode/ffmpeg_build/ffmpeg";
     }
+    if (access("/usr/bin/ffmpeg", X_OK) == 0) {
+        return "/usr/bin/ffmpeg";
+    }
+    if (access("/usr/local/bin/ffmpeg", X_OK) == 0) {
+        return "/usr/local/bin/ffmpeg";
+    }
     return "ffmpeg";
 }
 
@@ -6009,9 +6034,15 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     uint32_t suppress_output
 ) {
     size_t n = lean_array_size(argv_arr);
-    if (n > 256) return 1u;
+    if (n > 2048) return 1u;
     const char *ffmpeg_bin = leanav_resolve_ffmpeg_exec_path();
     const char *out_path = lean_string_cstr(out_path_str);
+    int is_special_out = (!out_path || out_path[0] == '\0' ||
+                          strcmp(out_path, "-") == 0 ||
+                          strcmp(out_path, "/dev/null") == 0 ||
+                          strncmp(out_path, "pipe:", 5) == 0 ||
+                          strncmp(out_path, "md5:", 4) == 0);
+    int existed_before = (!is_special_out && access(out_path, F_OK) == 0) ? 1 : 0;
 
     const char **c_argv = (const char **)calloc(n + 2, sizeof(char *));
     if (!c_argv) return 1u;
@@ -6045,7 +6076,7 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
             if (suppress_output != 0u) {
-                if (!out_path || strcmp(out_path, "-") != 0) {
+                if (!out_path || (strcmp(out_path, "-") != 0 && strcmp(out_path, "md5:") != 0 && strncmp(out_path, "pipe:", 5) != 0)) {
                     dup2(devnull, STDOUT_FILENO);
                 }
                 dup2(devnull, STDERR_FILENO);
@@ -6062,11 +6093,12 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
         return 1u;
     }
     int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
-    if (!ok && out_path && out_path[0] != '\0' && strcmp(out_path, "-") != 0) {
+    if (!ok && !is_special_out && !existed_before && suppress_output != 0u) {
         unlink(out_path);
     }
     if (ok) return 0u;
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return (uint32_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return (uint32_t)(128 + WTERMSIG(status));
     return 1u;
 }
 

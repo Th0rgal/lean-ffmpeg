@@ -1019,7 +1019,8 @@ def tryFastHeaderProbeTranscode
     (statsBit ||| bannerBit)
   if validCfg.videoCodec == some .copy then
     let tDemux ← IO.monoNanosNow
-    let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0
+    let vOnlyReencodeAudio := validCfg.audioCodec == none && !validCfg.noAudio
+    let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0 vOnlyReencodeAudio
     if copyRep.ok then
       let tEnd ← IO.monoNanosNow
       let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
@@ -1084,9 +1085,22 @@ def tryFastHeaderProbeTranscode
     else
       return false
 
+def isIntrospectionFlag (s : String) : Bool :=
+  ["-version", "--version", "-h", "--help", "-?", "-help",
+   "-formats", "-muxers", "-demuxers", "-devices",
+   "-codecs", "-decoders", "-encoders", "-bsfs",
+   "-protocols", "-filters", "-pix_fmts", "-layouts",
+   "-sample_fmts", "-colors", "-L", "-buildconf", "-hwaccels"].contains s
+
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
-  let (cfg, ext, plan) := parseArgsWithPlanIR args
+  if !args.contains "-i" && !args.contains "-lavfi" && args.any isIntrospectionFlag then
+    let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
+    return rc
+  let (cfg0, ext, plan) := parseArgsWithPlanIR args
+  let cfg : CliConfig :=
+    if cfg0.inputs.isEmpty && ext.hasLavfiInput then { cfg0 with inputs := ["lavfi_graph"] }
+    else cfg0
   if plan.resources.dumpPlan then
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1
@@ -1105,14 +1119,11 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       IO.eprintln s!"Error parsing command line: {repr errs}"
     return 1
   | .ok validCfg =>
-    if validCfg.inputs.length != 1 then
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"exactly one input is supported\"}"
-        "Exactly one input is supported"
     let inPath := validCfg.inputs.headD ""
     let outPath := validCfg.output.getD ""
-    let outSafe := (outPath == "-" && validCfg.format.isSome) || isSafeLocalMediaPath outPath
-    if !isSafeLocalMediaPath inPath || !outSafe then
+    let anyUnsafeIn := plan.inputs.any (fun i => !i.safePath)
+    let outSafe := isSafeOutputTarget outPath validCfg.format.isSome
+    if anyUnsafeIn || !outSafe then
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"unsafe protocol, device node, or path traversal rejected\"}"
         "Unsafe protocol, device node, or path traversal rejected"
@@ -1128,21 +1139,39 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"unsupported\":\"-daemon/-golden\"}"
         "Unsupported execution options: -daemon/-golden"
-    if !(← System.FilePath.pathExists inPath) then
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
-        (s!"{inPath}: No such file or directory")
+    for inP in cfg0.inputs do
+      if !ext.hasLavfiFmt && !(inP.toList.contains '%') then
+        if !(← System.FilePath.pathExists inP) then
+          return ← reportCliError validCfg
+            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
+            (s!"{inP}: No such file or directory")
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
     if plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer then
-      if !validCfg.overwrite && outPath != "-" && validCfg.format != some "null" then
+      let isSpecialOut :=
+        outPath == "-" || outPath == "/dev/null" || outPath == "md5:" ||
+        strStartsWithFast outPath "md5:" || strStartsWithFast outPath "pipe:" ||
+        validCfg.format == some "null" || outPath.toList.contains '%'
+      if !validCfg.overwrite && !isSpecialOut then
         if (← System.FilePath.pathExists outPath) then
-          return ← reportCliError validCfg
-            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-            "File exists"
+          if validCfg.jsonOutput then
+            return ← reportCliError validCfg
+              "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+              "File exists"
+          else if !(args.contains "-n") then
+            if !cliQuiet validCfg.logLevel then
+              IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+            return 0
+          else
+            return ← reportCliError validCfg
+              "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+              "File exists"
       let t0Del ← IO.monoNanosNow
-      let argv := buildDelegatedFfmpegArgv plan
+      let argv := buildDelegatedFfmpegArgv plan ext.passthroughArgs
+      let stdoutPipeLike :=
+        outPath == "-" || outPath == "md5:" || strStartsWithFast outPath "pipe:" ||
+        (outPath == "/dev/null" && ext.hasLavfiInput)
       let suppress : UInt32 :=
-        if outPath == "-" && !validCfg.jsonOutput then 0
+        if stdoutPipeLike && !validCfg.jsonOutput then 0
         else if validCfg.jsonOutput || cliQuiet validCfg.logLevel || !validCfg.showStats then 1
         else 0
       let rc ← ffiExecDelegatedFfmpegC argv outPath suppress
@@ -1150,14 +1179,19 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       if rc == 0 then
         if validCfg.jsonOutput then
           let inBytes ← getFileByteSizeOr inPath 0
-          let outBytes ← if validCfg.format != some "null" && outPath != "-" then getFileByteSizeOr outPath 0 else pure 0
+          let outBytes ← if !isSpecialOut then getFileByteSizeOr outPath 0 else pure 0
           let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
           IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-delegated-faithful\",\"tier\":\"{plan.backend.tier.toString}\",\"format\":\"{jsonEscape fmtStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\",\"in_bytes\":{inBytes},\"out_bytes\":{outBytes},\"total_us\":{(t1Del - t0Del) / 1000}}"
         return 0
       else
-        return ← reportCliError validCfg
-          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
-          (s!"Delegated conversion failed! ({inPath} -> {outPath})")
+        if validCfg.jsonOutput then
+          return ← reportCliError validCfg
+            (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
+            (s!"Delegated conversion failed! ({inPath} -> {outPath})")
+        else
+          if suppress != 0 && !cliQuiet validCfg.logLevel then
+            IO.eprintln s!"Delegated conversion failed! ({inPath} -> {outPath})"
+          return rc
     let hasExplicitMp4 := validCfg.format == some "mp4"
     let lowerOut := outPath.toLower
     if !hasExplicitMp4 && !(lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v") then
@@ -1166,9 +1200,18 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         "Output must use .mp4 or .m4v"
     if !validCfg.overwrite then
       if (← System.FilePath.pathExists outPath) then
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-          "File exists"
+        if validCfg.jsonOutput then
+          return ← reportCliError validCfg
+            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+            "File exists"
+        else if !(args.contains "-n") then
+          if !cliQuiet validCfg.logLevel then
+            IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+          return 0
+        else
+          return ← reportCliError validCfg
+            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+            "File exists"
     let filterOps ← match validCfg.videoFilter with
       | some vfStr =>
         if !runtimeVideoFilterSupported vfStr then
@@ -1287,11 +1330,7 @@ def runVerifyFfi (mp4PathOpt : Option String) : IO UInt32 := do
   ]
   let corruptRejected := corruptPayloads.all fun ba =>
     !(decodeFfiMp4ProbeWord (ffiProbeMp4ContractC ba ba.size.toUSize)).ok
-  let validIsoBox := ByteArray.mk #[
-    0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D, 0, 0, 0, 0,
-    0, 0, 0, 16, 0x6D, 0x6F, 0x6F, 0x76, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 16, 0x6D, 0x64, 0x61, 0x74, 0, 0, 0, 0, 0, 0, 0, 0
-  ]
+  let validIsoBox := muxIsoMp4Track 320 180 15360 defaultAvcC1080pBytes #[]
   let mp4ProbeRes ← match mp4PathOpt with
     | some p =>
       if (← System.FilePath.pathExists p) then

@@ -119,16 +119,22 @@ def verifyPacketBounds (headerLen payloadLen bufCap expectedCrc computedCrc : UI
 def isPacketFrameValid (p : PacketFrameCheck) : Bool :=
   verifyPacketBounds p.headerLen p.payloadLen p.bufCap p.expectedCrc p.computedCrc == 1
 
-/-- Declarative safety predicate for `PacketFrameCheck`. -/
+/-- Declarative safety predicate for `PacketFrameCheck` (`0 < headerLen ≤ bufCap`, `payloadLen ≤ bufCap - headerLen`, and CRC match). -/
 def PacketFrameSafe (p : PacketFrameCheck) : Prop :=
-  (p.headerLen > 0 && p.headerLen ≤ p.bufCap && p.payloadLen ≤ p.bufCap - p.headerLen &&
-   p.expectedCrc == p.computedCrc) = true
+  0 < p.headerLen ∧ p.headerLen ≤ p.bufCap ∧
+  p.payloadLen ≤ p.bufCap - p.headerLen ∧
+  p.expectedCrc = p.computedCrc
 
 /-- Layer II Bundle 1: Media packet bounds & CRC gate (`AVGateSpec`). -/
 def packetFrameGateSpec : AVGateSpec PacketFrameCheck PacketFrameSafe where
   gate := isPacketFrameValid
-  sound p h := by unfold isPacketFrameValid verifyPacketBounds PacketFrameSafe at *; split at h <;> simp_all
-  complete p h := by unfold isPacketFrameValid verifyPacketBounds PacketFrameSafe at *; simp [h]
+  sound p h := by
+    unfold isPacketFrameValid verifyPacketBounds PacketFrameSafe at *
+    revert h; split <;> simp_all
+  complete p h := by
+    unfold isPacketFrameValid verifyPacketBounds PacketFrameSafe at *
+    rcases h with ⟨h1, h2, h3, h4⟩
+    simp [h1, h2, h3, h4]
   posWitness := ⟨12, 1024, 2048, 0xCAFEBABE, 0xCAFEBABE⟩
   negWitness := ⟨12, 4096, 2048, 0xCAFEBABE, 0xCAFEBABE⟩
   nonVacuous := rfl
@@ -230,17 +236,22 @@ def verifyTileDisjoint (off1 len1 off2 len2 cap : UInt64) : UInt8 :=
      off2 ≤ cap && len2 ≤ cap - off2 &&
      (off1 + len1 ≤ off2 || off2 + len2 ≤ off1) then 1 else 0
 
-/-- Declarative safety predicate for `TilePairCheck`. -/
+/-- Declarative safety predicate for `TilePairCheck`: both tiles lie within `[0, cap]` and are strictly non-overlapping. -/
 def TilePairSafe (t : TilePairCheck) : Prop :=
-  (t.off1 ≤ t.cap && t.len1 ≤ t.cap - t.off1 &&
-   t.off2 ≤ t.cap && t.len2 ≤ t.cap - t.off2 &&
-   (t.off1 + t.len1 ≤ t.off2 || t.off2 + t.len2 ≤ t.off1)) = true
+  t.off1 ≤ t.cap ∧ t.len1 ≤ t.cap - t.off1 ∧
+  t.off2 ≤ t.cap ∧ t.len2 ≤ t.cap - t.off2 ∧
+  (t.off1 + t.len1 ≤ t.off2 ∨ t.off2 + t.len2 ≤ t.off1)
 
 /-- Layer II Bundle 3: Disjoint parallel tile safety gate (`AVGateSpec`). -/
 def tileDisjointGateSpec : AVGateSpec TilePairCheck TilePairSafe where
   gate t := verifyTileDisjoint t.off1 t.len1 t.off2 t.len2 t.cap == 1
-  sound t h := by unfold verifyTileDisjoint TilePairSafe at *; split at h <;> simp_all
-  complete t h := by unfold verifyTileDisjoint TilePairSafe at *; simp [h]
+  sound t h := by
+    unfold verifyTileDisjoint TilePairSafe at *
+    revert h; split <;> simp_all
+  complete t h := by
+    unfold verifyTileDisjoint TilePairSafe at *
+    rcases h with ⟨h1, h2, h3, h4, h5⟩
+    simp [h1, h2, h3, h4, h5]
   posWitness := ⟨0, 4096, 4096, 4096, 8192⟩
   negWitness := ⟨0, 4096, 2048, 4096, 8192⟩
   nonVacuous := rfl
@@ -300,14 +311,19 @@ structure FrameDimCheck where
 
 /-- Declarative safety predicate for `FrameDimCheck`. -/
 def FrameDimSafe (f : FrameDimCheck) : Prop :=
-  (f.width > 0 && f.height > 0 && f.width ≤ 16384 && f.height ≤ 16384 &&
-   f.width ≤ f.stride && f.stride * f.height ≤ f.planeBytes) = true
+  0 < f.width ∧ 0 < f.height ∧ f.width ≤ 16384 ∧ f.height ≤ 16384 ∧
+  f.width ≤ f.stride ∧ f.stride * f.height ≤ f.planeBytes
 
 /-- Layer II Bundle 4: Video frame dimension & plane stride gate (`AVGateSpec`). -/
 def frameDimGateSpec : AVGateSpec FrameDimCheck FrameDimSafe where
   gate f := verifyFrameDimensions f.width f.height f.stride f.planeBytes == 1
-  sound f h := by unfold verifyFrameDimensions FrameDimSafe at *; split at h <;> simp_all
-  complete f h := by unfold verifyFrameDimensions FrameDimSafe at *; simp [h]
+  sound f h := by
+    unfold verifyFrameDimensions FrameDimSafe at *
+    revert h; split <;> simp_all
+  complete f h := by
+    unfold verifyFrameDimensions FrameDimSafe at *
+    rcases h with ⟨h1, h2, h3, h4, h5, h6⟩
+    simp [h1, h2, h3, h4, h5, h6]
   posWitness := ⟨1920, 1080, 1920, 2073600⟩
   negWitness := ⟨1920, 1080, 1920, 1024⟩
   nonVacuous := rfl
@@ -328,13 +344,18 @@ structure BitCursorCheck where
 
 /-- Declarative safety predicate for `BitCursorCheck`. -/
 def BitCursorSafe (b : BitCursorCheck) : Prop :=
-  (b.bitOffset ≤ b.totalBits && b.bitsRequested ≤ b.totalBits - b.bitOffset && b.bitsRequested ≤ 64) = true
+  b.bitOffset ≤ b.totalBits ∧ b.bitsRequested ≤ b.totalBits - b.bitOffset ∧ b.bitsRequested ≤ 64
 
 /-- Layer II Bundle 5: Bitstream cursor bounds gate (`GetBitContext` / VLC / CABAC / MSAC). -/
 def bitCursorGateSpec : AVGateSpec BitCursorCheck BitCursorSafe where
   gate b := verifyBitstreamCursor b.bitOffset b.bitsRequested b.totalBits == 1
-  sound b h := by unfold verifyBitstreamCursor BitCursorSafe at *; split at h <;> simp_all
-  complete b h := by unfold verifyBitstreamCursor BitCursorSafe at *; simp [h]
+  sound b h := by
+    unfold verifyBitstreamCursor BitCursorSafe at *
+    revert h; split <;> simp_all
+  complete b h := by
+    unfold verifyBitstreamCursor BitCursorSafe at *
+    rcases h with ⟨h1, h2, h3⟩
+    simp [h1, h2, h3]
   posWitness := ⟨64, 32, 1024⟩
   negWitness := ⟨1000, 32, 1024⟩
   nonVacuous := rfl
@@ -390,15 +411,25 @@ def isHwDmaValid (h : HwDmaCheck) : Bool :=
   verifyHwDmaZeroCopy h.backendCode h.srcDevice h.dstDevice h.srcAlloc h.dstAlloc
     h.dmaAttested h.noCpuCopyAttested h.syncAttested == 1
 
-/-- Declarative safety predicate for `HwDmaCheck`. -/
+/-- Declarative safety predicate for `HwDmaCheck` (valid hardware backend, unified device/allocation identity, and DMA/no-copy/sync attestation). -/
 def HwDmaSafe (h : HwDmaCheck) : Prop :=
-  isHwDmaValid h = true
+  ((h.backendCode = 1 ∨ h.backendCode = 2) ∨ h.backendCode = 3) ∧
+  0 < h.srcDevice ∧ h.srcDevice = h.dstDevice ∧
+  0 < h.srcAlloc ∧ h.srcAlloc = h.dstAlloc ∧
+  h.dmaAttested = 1 ∧ h.noCpuCopyAttested = 1 ∧ h.syncAttested = 1
 
 /-- Layer II Bundle 6: Hardware DMA Zero-Copy gate (`AVGateSpec`). -/
 def hwDmaGateSpec : AVGateSpec HwDmaCheck HwDmaSafe where
   gate := isHwDmaValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound h hg := by
+    unfold isHwDmaValid verifyHwDmaZeroCopy HwDmaSafe at *
+    revert hg; split
+    · intro _; simp_all; rcases ‹_› with ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩; simp_all
+    · simp_all
+  complete h hs := by
+    unfold isHwDmaValid verifyHwDmaZeroCopy HwDmaSafe at *
+    rcases hs with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
+    simp_all
   posWitness := ⟨1, 0x1000, 0x1000, 0xCAFE0000, 0xCAFE0000, 1, 1, 1⟩
   negWitness := ⟨1, 0x1000, 0x2000, 0xCAFE0000, 0xCAFE0000, 1, 1, 1⟩
   nonVacuous := rfl
@@ -440,13 +471,20 @@ def isCliInvokeValid (c : CliInvokeCheck) : Bool :=
 
 /-- Declarative safety predicate for `CliInvokeCheck`. -/
 def CliInvokeSafe (c : CliInvokeCheck) : Prop :=
-  isCliInvokeValid c = true
+  c.hasInput = 1 ∧ c.hasOutput = 1 ∧
+  c.unknownFlagCount = 0 ∧ c.unsupportedCodecCount = 0 ∧
+  (c.copyMode = 0 ∨ c.filterCount = 0)
 
 /-- Layer II Bundle 7: Fail-Closed CLI Invocation gate (`AVGateSpec`). -/
 def cliInvokeGateSpec : AVGateSpec CliInvokeCheck CliInvokeSafe where
   gate := isCliInvokeValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound c hg := by
+    unfold isCliInvokeValid verifyCliInvocation CliInvokeSafe at *
+    revert hg; split <;> simp_all
+  complete c hs := by
+    unfold isCliInvokeValid verifyCliInvocation CliInvokeSafe at *
+    rcases hs with ⟨h1, h2, h3, h4, h5⟩
+    simp [h1, h2, h3, h4, h5]
   posWitness := ⟨1, 1, 0, 0, 1, 0⟩
   negWitness := ⟨1, 1, 0, 0, 1, 2⟩
   nonVacuous := rfl
@@ -484,13 +522,18 @@ def isEncoderLoopValid (e : EncoderLoopCheck) : Bool :=
 
 /-- Declarative safety predicate for `EncoderLoopCheck`. -/
 def EncoderLoopSafe (e : EncoderLoopCheck) : Prop :=
-  isEncoderLoopValid e = true
+  0 < e.bitstreamBytes ∧ e.reconDigest = e.decodedDigest ∧ e.maxPixelErr ≤ e.allowedMaxErr
 
 /-- Layer II Bundle 8: In-Loop Encoder-Decoder Agreement gate (`AVGateSpec`). -/
 def encoderLoopGateSpec : AVGateSpec EncoderLoopCheck EncoderLoopSafe where
   gate := isEncoderLoopValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound e hg := by
+    unfold isEncoderLoopValid verifyEncoderLoop EncoderLoopSafe at *
+    revert hg; split <;> simp_all
+  complete e hs := by
+    unfold isEncoderLoopValid verifyEncoderLoop EncoderLoopSafe at *
+    rcases hs with ⟨h1, h2, h3⟩
+    simp [h1, h2, h3]
   posWitness := ⟨4096, 0x123456789ABCDEF0, 0x123456789ABCDEF0, 0, 0⟩
   negWitness := ⟨4096, 0x123456789ABCDEF0, 0x123456789ABCDEF1, 0, 0⟩
   nonVacuous := rfl
@@ -538,13 +581,22 @@ def isVisualFidelityValid (v : VisualFidelityCheck) : Bool :=
 
 /-- Declarative safety predicate for `VisualFidelityCheck`. -/
 def VisualFidelitySafe (v : VisualFidelityCheck) : Prop :=
-  isVisualFidelityValid v = true
+  0 < v.pixelCount ∧
+  17 ≤ v.lumaMean ∧ v.lumaMean ≤ 250 ∧
+  0 < v.lumaVariance ∧
+  v.sadError ≤ v.maxSadBound ∧
+  v.decodeErrors = 0
 
 /-- Layer II Bundle 9: Pixel-Domain Visual Fidelity & Non-Black Frame gate (`AVGateSpec`). -/
 def visualFidelityGateSpec : AVGateSpec VisualFidelityCheck VisualFidelitySafe where
   gate := isVisualFidelityValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound v hg := by
+    unfold isVisualFidelityValid verifyVisualFidelity VisualFidelitySafe at *
+    revert hg; split <;> simp_all
+  complete v hs := by
+    unfold isVisualFidelityValid verifyVisualFidelity VisualFidelitySafe at *
+    rcases hs with ⟨h1, h2, h3, h4, h5, h6⟩
+    simp [h1, h2, h3, h4, h5, h6]
   posWitness := ⟨2073600, 118, 1420, 412000, 4147200, 0⟩
   negWitness := ⟨2073600, 0, 0, 0, 4147200, 0⟩
   nonVacuous := rfl
@@ -609,13 +661,25 @@ def isMp4ContainerSyncValid (m : Mp4ContainerSyncCheck) : Bool :=
 
 /-- Declarative safety predicate for `Mp4ContainerSyncCheck`. -/
 def Mp4ContainerSyncSafe (m : Mp4ContainerSyncCheck) : Prop :=
-  isMp4ContainerSyncValid m = true
+  let durDiff := if m.mvhdDurationMs ≥ m.videoDurationMs then m.mvhdDurationMs - m.videoDurationMs else m.videoDurationMs - m.mvhdDurationMs
+  0 < m.tkhdWidth ∧ 0 < m.tkhdHeight ∧
+  m.spsWidth = m.tkhdWidth ∧ m.spsHeight = m.tkhdHeight ∧
+  0 < m.videoDurationMs ∧
+  durDiff ≤ 100 ∧
+  m.unclippedChapterTracks = 0
 
 /-- Layer II Bundle 10: ISOBMFF Container SPS/PPS & Chapter/Duration Sync gate (`AVGateSpec`). -/
 def mp4ContainerSyncGateSpec : AVGateSpec Mp4ContainerSyncCheck Mp4ContainerSyncSafe where
   gate := isMp4ContainerSyncValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound m hg := by
+    unfold isMp4ContainerSyncValid verifyMp4ContainerSync Mp4ContainerSyncSafe at *
+    dsimp at *
+    revert hg; split <;> simp_all
+  complete m hs := by
+    unfold isMp4ContainerSyncValid verifyMp4ContainerSync Mp4ContainerSyncSafe at *
+    dsimp at *
+    rcases hs with ⟨h1, h2, h3, h4, h5, h6, h7⟩
+    simp_all
   posWitness := ⟨1920, 1080, 1920, 1080, 60018, 60018, 0⟩
   negWitness := ⟨3840, 2160, 3840, 2160, 12121632, 60018, 1⟩
   nonVacuous := rfl

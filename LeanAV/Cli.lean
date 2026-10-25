@@ -23,7 +23,7 @@ open LeanAV.Core
 
 /-! ## 1. FFmpeg-Compatible CLI Configuration -/
 
-/-- Supported codec tokens (`-c:v` / `-c:a`). -/
+/-- Supported CLI video/audio codec selectors (pure enum for O(1) kernel `DecidableEq`). -/
 inductive CliCodec where
   | copy
   | h264
@@ -37,35 +37,70 @@ inductive CliCodec where
   | flac
   | pcmS16le
   | rawvideo
+  | vp8
+  | mpeg4
+  | mpeg2video
+  | mpeg1video
+  | mjpeg
+  | png
+  | gif
+  | mp2
+  | mp3
+  | vorbis
+  | alac
+  | ac3
+  | eac3
+  | dts
+  | otherDelegated
   deriving Repr, DecidableEq, Inhabited
+
+/-- Recognise standard FFmpeg video/audio codec names for delegated execution. -/
+def isOtherFFmpegCodecName (s : String) : Bool :=
+  let cs := s.toList
+  let isPcm := ['p', 'c', 'm', '_'].isPrefixOf cs && cs.length > 4
+  let isAdpcm := ['a', 'd', 'p', 'c', 'm', '_'].isPrefixOf cs && cs.length > 6
+  isPcm || isAdpcm ||
+  ["ljpeg", "jpegls", "apng", "bmp", "pam", "pbm", "pgm", "pgmyuv", "ppm", "pnm", "targa", "tiff",
+   "dpx", "sgi", "sunrast", "pcx", "qoi", "webp", "libwebp", "libwebp_anim", "xbm", "xwd",
+   "dnxhd", "dvvideo", "flv", "flv1", "h261", "h263", "h263p", "msmpeg4", "msmpeg4v2", "msmpeg4v1",
+   "wmv1", "wmv2", "rv10", "rv20", "svq1", "qtrle", "cinepak", "msvideo1", "cljr",
+   "r210", "v210", "v308", "v408", "v410", "y41p", "yuv4", "zlib", "snow", "asv1", "asv2",
+   "roqvideo", "amv", "vc2", "dirac", "theora", "libtheora", "utvideo", "magicyuv", "cfhd",
+   "speedhq", "vnull", "wrapped_avframe", "libx264rgb", "librav1e", "prores_aw", "ffvhuff", "huffyuv",
+   "libfdk_aac", "mp2fixed", "tta", "wavpack", "wmav1", "wmav2", "truehd", "mlp",
+   "real_144", "roq_dpcm", "nellymoser", "speex", "libspeex", "amr_nb", "libopencore_amrnb", "amr_wb",
+   "g722", "g723_1", "g726", "g726le", "sbc", "aptx", "aptx_hd", "dfpwm", "sonic", "sonicls", "anull"].contains s
 
 /-- Parse a codec token string into `CliCodec` (`none` = unsupported → fail-closed). -/
 def parseCliCodec (s : String) : Option CliCodec :=
-  match s with
-  | "copy"        => some .copy
-  | "h264"        => some .h264
-  | "libx264"     => some .h264
-  | "h264_nvenc"  => some .h264
-  | "hevc"        => some .hevc
-  | "h265"        => some .hevc
-  | "libx265"     => some .hevc
-  | "hevc_nvenc"  => some .hevc
-  | "av1"         => some .av1
-  | "libaom-av1"  => some .av1
-  | "libsvtav1"   => some .av1
-  | "av1_nvenc"   => some .av1
-  | "vp9"         => some .vp9
-  | "libvpx-vp9"  => some .vp9
-  | "prores"      => some .prores
-  | "prores_ks"   => some .prores
-  | "ffv1"        => some .ffv1
-  | "aac"         => some .aac
-  | "opus"        => some .opus
-  | "libopus"     => some .opus
-  | "flac"        => some .flac
-  | "pcm_s16le"   => some .pcmS16le
-  | "rawvideo"    => some .rawvideo
-  | _             => none
+  if s == "copy" then some .copy
+  else if s == "h264" || s == "libx264" || s == "h264_nvenc" then some .h264
+  else if s == "hevc" || s == "h265" || s == "libx265" || s == "hevc_nvenc" then some .hevc
+  else if s == "av1" || s == "libaom-av1" || s == "libsvtav1" || s == "av1_nvenc" then some .av1
+  else if s == "vp9" || s == "libvpx-vp9" then some .vp9
+  else if s == "prores" || s == "prores_ks" then some .prores
+  else if s == "ffv1" then some .ffv1
+  else if s == "aac" then some .aac
+  else if s == "opus" || s == "libopus" then some .opus
+  else if s == "flac" then some .flac
+  else if s == "pcm_s16le" then some .pcmS16le
+  else if s == "rawvideo" then some .rawvideo
+  else if s == "vp8" || s == "libvpx" then some .vp8
+  else if s == "mpeg4" || s == "libxvid" then some .mpeg4
+  else if s == "mpeg2video" then some .mpeg2video
+  else if s == "mpeg1video" then some .mpeg1video
+  else if s == "mjpeg" then some .mjpeg
+  else if s == "png" then some .png
+  else if s == "gif" then some .gif
+  else if s == "mp2" then some .mp2
+  else if s == "mp3" || s == "libmp3lame" then some .mp3
+  else if s == "vorbis" || s == "libvorbis" then some .vorbis
+  else if s == "alac" then some .alac
+  else if s == "ac3" || s == "ac3_fixed" then some .ac3
+  else if s == "eac3" then some .eac3
+  else if s == "dca" || s == "dts" then some .dts
+  else if isOtherFFmpegCodecName s then some .otherDelegated
+  else none
 
 /-- Exact rational seconds (`-ss`, `-t`) avoiding floating-point drift. -/
 structure CliSeconds where
@@ -241,14 +276,36 @@ def splitVideoSizeChars : List Char → List Char → Option (List Char × List 
     if c == 'x' || c == ':' then some (acc.reverse, cs)
     else splitVideoSizeChars cs (c :: acc)
 
-/-- Parse an FFmpeg `-s WxH` or `-s W:H` video size string (`"1920x1080"` -> `some (1920, 1080)`). -/
+/-- Parse an FFmpeg `-s WxH`, `-s W:H`, or standard named video size string (`"1920x1080"`, `"pal"`, `"hd720"`, `"sqcif"`). -/
 def parseVideoSizeSpec (s : String) : Option (Nat × Nat) :=
-  match splitVideoSizeChars s.toList [] with
-  | some (wChars, hChars) =>
-    match parseNatCharsLoop wChars 0 false, parseNatCharsLoop hChars 0 false with
-    | some w, some h => some (w, h)
-    | _, _ => none
-  | none => none
+  if s == "pal" then some (720, 576)
+  else if s == "ntsc" then some (720, 480)
+  else if s == "sqcif" then some (128, 96)
+  else if s == "qcif" then some (176, 144)
+  else if s == "cif" then some (352, 288)
+  else if s == "4cif" then some (704, 576)
+  else if s == "16cif" then some (1408, 1152)
+  else if s == "qqvga" then some (160, 120)
+  else if s == "qvga" then some (320, 240)
+  else if s == "vga" then some (640, 480)
+  else if s == "svga" then some (800, 600)
+  else if s == "xga" then some (1024, 768)
+  else if s == "uxga" then some (1600, 1200)
+  else if s == "qxga" then some (2048, 1536)
+  else if s == "sxga" then some (1280, 1024)
+  else if s == "hd480" then some (852, 480)
+  else if s == "hd720" then some (1280, 720)
+  else if s == "hd1080" then some (1920, 1080)
+  else if s == "2k" then some (2048, 1080)
+  else if s == "4k" || s == "uhd2160" then some (3840, 2160)
+  else if s == "uhd4320" then some (7680, 4320)
+  else
+    match splitVideoSizeChars s.toList [] with
+    | some (wChars, hChars) =>
+      match parseNatCharsLoop wChars 0 false, parseNatCharsLoop hChars 0 false with
+      | some w, some h => some (w, h)
+      | _, _ => none
+    | none => none
 
 /--
   Resolve proportional scale dimensions (`scale=W:-1` / `scale=W:-2` represented as `(w, 0)`,
@@ -273,28 +330,72 @@ def CliConfig.fail (cfg : CliConfig) (e : CliError) : CliConfig :=
 
 /-- Supported `-f` container formats. -/
 def supportedFormat (s : String) : Bool :=
-  ["mp4", "mov", "ipod", "m4a", "matroska", "mkv", "webm", "mpegts", "avi", "mp3",
-   "h264", "hevc", "av1", "ivf", "wav", "adts", "ogg", "flac", "null", "framecrc", "md5", "rawvideo"].contains s
+  ["mp4", "matroska", "mkv", "webm", "mov", "wav", "flac", "ogg", "mpegts", "ts", "ivf",
+   "null", "framecrc", "framemd5", "md5", "crc", "rawvideo", "s16le", "image2", "lavfi",
+   "m4v", "3gp", "3g2", "ipod", "m4a", "f4v", "ismv", "psp", "mka", "mks",
+   "m2ts", "mts", "mpeg", "mpg", "vob", "svcd", "dvd", "mpeg1video", "mpeg2video", "m2v",
+   "avi", "asf", "wmv", "wma", "flv", "swf", "rm", "nut", "gxf", "mxf", "mxf_d10", "mxf_opatom",
+   "wtv", "dv", "roq", "smjpeg", "wc3movie", "film_cpk", "segafilm",
+   "w64", "rf64", "aiff", "aif", "au", "caf", "voc", "sox", "ircam", "avr", "ast", "oma",
+   "ac3", "eac3", "dts", "truehd", "mlp", "adts", "aac", "latm", "mp2", "mp3",
+   "oga", "ogv", "opus", "spx", "tta", "wv", "ape", "amr", "g722", "g723_1", "g726", "g726le",
+   "sbc", "dfpwm", "rso", "mmf", "aea", "ilbc", "adx", "flm",
+   "s16be", "s24le", "s24be", "s32le", "s32be", "s8", "u8",
+   "u16le", "u16be", "u24le", "u24be", "u32le", "u32be", "f32le", "f32be", "f64le", "f64be", "alaw", "mulaw", "vidc",
+   "h264", "hevc", "av1", "mjpeg", "dnxhd", "h261", "h263", "yuv4mpegpipe", "y4m",
+   "image2pipe", "apng", "gif", "webp",
+   "srt", "subrip", "webvtt", "vtt", "ass", "ssa", "jacosub", "microdvd", "mpl2", "pjs",
+   "realtext", "sami", "scc", "stl", "subviewer", "ttml", "vplayer", "lrc",
+   "ffmetadata", "hash", "framehash",
+   "tee", "fifo", "segment", "stream_segment", "hls", "dash"].contains s
 
 /-- Supported `-preset` encoder tokens. -/
 def supportedPreset (s : String) : Bool :=
   ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
-   "slow", "slower", "veryslow", "p1", "p2", "p3", "p4", "p5", "p6", "p7",
+   "slow", "slower", "veryslow", "placebo", "default", "hq", "ll", "llhq", "llhp",
+   "p1", "p2", "p3", "p4", "p5", "p6", "p7",
    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"].contains s
 
-/-- Supported `-pix_fmt` tokens. -/
+/-- Pixel formats natively handled by the in-process MP4 SIMD pipeline. -/
+def nativeMp4PixFmt (s : String) : Bool :=
+  s == "yuv420p" || s == "yuv420p10le" || s == "p010le"
+
+/-- Supported `-pix_fmt` tokens across native and delegated execution. -/
 def supportedPixFmt (s : String) : Bool :=
-  ["yuv420p", "yuv420p10le", "p010le"].contains s
+  nativeMp4PixFmt s ||
+  ["nv12", "yuv422p", "yuv444p", "yuv410p", "yuv411p", "yuv440p",
+   "yuvj420p", "yuvj422p", "yuvj444p", "yuvj411p", "yuvj440p",
+   "yuva420p", "yuva422p", "yuva444p",
+   "yuv420p9le", "yuv420p9be", "yuv422p9le", "yuv422p9be", "yuv444p9le", "yuv444p9be",
+   "yuv420p10be", "yuv422p10le", "yuv422p10be", "yuv444p10le", "yuv444p10be",
+   "yuv420p12le", "yuv420p12be", "yuv422p12le", "yuv422p12be", "yuv444p12le", "yuv444p12be",
+   "yuv420p14le", "yuv420p14be", "yuv422p14le", "yuv422p14be", "yuv444p14le", "yuv444p14be",
+   "yuv420p16le", "yuv420p16be", "yuv422p16le", "yuv422p16be", "yuv444p16le", "yuv444p16be",
+   "nv21", "nv16", "nv24", "nv42", "p010be", "p016le", "p016be",
+   "gray", "gray8", "ya8", "gray9le", "gray9be", "gray10le", "gray10be",
+   "gray12le", "gray12be", "gray14le", "gray14be", "gray16le", "gray16be", "ya16le", "ya16be",
+   "monow", "monob", "pal8",
+   "rgb24", "bgr24", "argb", "rgba", "abgr", "bgra", "0rgb", "rgb0", "0bgr", "bgr0",
+   "rgb32", "bgr32", "rgb565", "bgr565", "rgb555", "bgr555", "rgb444", "bgr444",
+   "rgb48le", "rgb48be", "bgr48le", "bgr48be", "rgba64le", "rgba64be", "bgra64le", "bgra64be",
+   "rgb565le", "rgb565be", "rgb555le", "rgb555be", "rgb444le", "rgb444be",
+   "bgr565le", "bgr565be", "bgr555le", "bgr555be", "bgr444le", "bgr444be",
+   "rgb8", "bgr8", "rgb4_byte", "bgr4_byte", "rgb4", "bgr4",
+   "uyvy422", "yuyv422", "yvyu422", "uyyv411",
+   "gbrp", "gbrp9le", "gbrp9be", "gbrp10le", "gbrp10be", "gbrp12le", "gbrp12be",
+   "gbrp14le", "gbrp14be", "gbrp16le", "gbrp16be",
+   "gbrap", "gbrap10le", "gbrap10be", "gbrap12le", "gbrap12be", "gbrap16le", "gbrap16be",
+   "xyz12le", "xyz12be", "ayuv64le", "ayuv64be"].contains s
 
 /-- Supported `-loglevel` / `-v` tokens. -/
 def supportedLogLevel (s : String) : Bool :=
   ["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace",
    "-8", "0", "8", "16", "24", "32", "40", "48", "56"].contains s
 
-/-- Check if a string is a valid non-negative integer or decimal (`"23"`, `"22.6"`). -/
+/-- Check if a string is a valid non-negative integer or decimal (`"23"`, `"22.6"`, up to `63` for VP9/AV1). -/
 def isValidCrfSpec (s : String) : Bool :=
   match parseCliSeconds s with
-  | some sec => sec.den > 0 && sec.num <= 51 * sec.den
+  | some sec => sec.den > 0 && sec.num <= 63 * sec.den
   | none => false
 
 /-- Check if a string is a valid bitrate token (`"4M"`, `"4500k"`, `"192k"`, `"5000000"`). -/
@@ -329,193 +430,154 @@ def isValidFrameRateSpec (s : String) : Bool :=
 
 /-- Flags that consume exactly one following argument. -/
 def flagTakesValue (s : String) : Bool :=
-  ["-i", "-c", "-c:v", "-vcodec", "-c:a", "-acodec", "-vf", "-af", "-s",
-   "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes",
-   "-ar", "-ac", "-pix_fmt", "-loglevel", "-v", "-threads",
-   "-preset", "-crf", "-bf", "-g", "-r", "-b:v", "-b:a", "-movflags"].contains s
+  ["-i", "-c", "-codec", "-c:v", "-vcodec", "-codec:v", "-c:a", "-acodec", "-codec:a",
+   "-vf", "-filter:v", "-af", "-filter:a", "-s", "-video_size",
+   "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes", "-frames",
+   "-ar", "-ac", "-pix_fmt", "-pixel_format", "-loglevel", "-v", "-threads",
+   "-preset", "-crf", "-bf", "-g", "-r", "-framerate", "-b:v", "-vb", "-b", "-b:a", "-ab", "-movflags"].contains s
 
-/-- Recursive FFmpeg argv parser. -/
-def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
-  match args with
-  | [] => cfg
-  | "-y" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with overwrite := true }
-  | "-n" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with overwrite := false }
-  | "--json" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with jsonOutput := true }
-  | "-json" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with jsonOutput := true }
-  | "-hide_banner" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with hideBanner := true }
-  | "-stats" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with showStats := true }
-  | "-nostats" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with showStats := false }
-  | "-nostdin" :: rest =>
-    parseFFmpegArgsLoop rest cfg
-  | "-vn" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with noVideo := true }
-  | "-an" :: rest =>
-    parseFFmpegArgsLoop rest { cfg with noAudio := true }
-  | "-sn" :: rest =>
-    parseFFmpegArgsLoop rest cfg
-  | "-dn" :: rest =>
-    parseFFmpegArgsLoop rest cfg
-  | "-s" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseVideoSizeSpec value with
-      | some sz => { cfg with videoSize := some sz }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-s " ++ value))
-  | "-loglevel" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-loglevel")
-      else if supportedLogLevel value then
-        let quietLike := ["quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"].contains value
-        { cfg with
-          logLevel := value
-          showStats := if quietLike then false else cfg.showStats
-          hideBanner := if quietLike then true else cfg.hideBanner }
-      else cfg.fail (.unsupportedCodecOrFlag ("-loglevel " ++ value))
-  | "-v" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-v")
-      else if supportedLogLevel value then
-        let quietLike := ["quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"].contains value
-        { cfg with
-          logLevel := value
-          showStats := if quietLike then false else cfg.showStats
-          hideBanner := if quietLike then true else cfg.hideBanner }
-      else cfg.fail (.unsupportedCodecOrFlag ("-v " ++ value))
-  | "-threads" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseNonNegNatSpec value with
-      | some n => { cfg with threads := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-threads " ++ value))
-  | "-preset" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if supportedPreset value then { cfg with preset := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-preset " ++ value))
-  | "-crf" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if isValidCrfSpec value then { cfg with crf := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-crf " ++ value))
-  | "-bf" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseNonNegNatSpec value with
-      | some n => { cfg with bFrames := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-bf " ++ value))
-  | "-g" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parsePosNatSpec value with
-      | some n => { cfg with gopSize := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-g " ++ value))
-  | "-r" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if isValidFrameRateSpec value then { cfg with frameRate := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-r " ++ value))
-  | "-b:v" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if isValidBitrateSpec value then { cfg with videoBitrate := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-b:v " ++ value))
-  | "-b:a" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if isValidBitrateSpec value then { cfg with audioBitrate := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-b:a " ++ value))
-  | "-movflags" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-movflags")
-      else { cfg with movflags := some value }
-  | "-i" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-i")
-      else { cfg with inputs := cfg.inputs ++ [value] }
-  | "-c" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "copy" then { cfg with videoCodec := some .copy, audioCodec := some .copy }
-      else cfg.fail (.unsupportedCodecOrFlag ("-c " ++ value))
-  | "-c:v" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
+/-- Apply a 1-value CLI flag `(flag, value)` to `CliConfig`. -/
+def applyCliFlagValue (flag value : String) (cfg : CliConfig) : CliConfig :=
+  if flag == "-i" then
+    if value == "" then cfg.fail (.emptyValue "-i")
+    else { cfg with inputs := cfg.inputs ++ [value] }
+  else if flag == "-c" || flag == "-codec" then
+    if value == "copy" then { cfg with videoCodec := some .copy, audioCodec := some .copy }
+    else
       match parseCliCodec value with
       | some c => { cfg with videoCodec := some c }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-c:v " ++ value))
-  | "-vcodec" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseCliCodec value with
-      | some c => { cfg with videoCodec := some c }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-vcodec " ++ value))
-  | "-c:a" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseCliCodec value with
-      | some c => { cfg with audioCodec := some c }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-c:a " ++ value))
-  | "-acodec" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseCliCodec value with
-      | some c => { cfg with audioCodec := some c }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-acodec " ++ value))
-  | "-frames:v" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parsePosNatSpec value with
-      | some n => { cfg with videoFrames := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-frames:v " ++ value))
-  | "-vframes" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parsePosNatSpec value with
-      | some n => { cfg with videoFrames := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-vframes " ++ value))
-  | "-ar" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parsePosNatSpec value with
-      | some n => { cfg with audioRate := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-ar " ++ value))
-  | "-ac" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parsePosNatSpec value with
-      | some n => { cfg with audioChannels := some n }
-      | none => cfg.fail (.unsupportedCodecOrFlag ("-ac " ++ value))
-  | "-pix_fmt" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if supportedPixFmt value then { cfg with pixelFormat := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-pix_fmt " ++ value))
-  | "-vf" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-vf")
-      else { cfg with videoFilter := some value }
-  | "-af" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-af")
-      else { cfg with audioFilter := some value }
-  | "-ss" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseCliSeconds value with
-      | some sec => { cfg with startSec := some sec }
-      | none => cfg.fail (.invalidSeconds "-ss" value)
-  | "-t" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      match parseCliSeconds value with
-      | some sec => { cfg with durationSec := some sec }
-      | none => cfg.fail (.invalidSeconds "-t" value)
-  | "-f" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if supportedFormat value then { cfg with format := some value }
-      else cfg.fail (.unsupportedCodecOrFlag ("-f " ++ value))
-  | "-daemon" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-daemon")
-      else { cfg with daemon := some value }
-  | "-golden" :: value :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if value == "" then cfg.fail (.emptyValue "-golden")
-      else { cfg with golden := some value }
-  | arg :: rest =>
-    parseFFmpegArgsLoop rest <|
-      if flagTakesValue arg then cfg.fail (.missingValue arg)
-      else if arg.toList.head? == some '-' && arg != "-" then cfg.fail (.unsupportedCodecOrFlag arg)
-      else
+      | none => cfg.fail (.unsupportedCodecOrFlag ("-c " ++ value))
+  else if flag == "-c:v" || flag == "-vcodec" || flag == "-codec:v" then
+    match parseCliCodec value with
+    | some c => { cfg with videoCodec := some c }
+    | none => cfg.fail (.unsupportedCodecOrFlag (flag ++ " " ++ value))
+  else if flag == "-c:a" || flag == "-acodec" || flag == "-codec:a" then
+    match parseCliCodec value with
+    | some c => { cfg with audioCodec := some c }
+    | none => cfg.fail (.unsupportedCodecOrFlag (flag ++ " " ++ value))
+  else if flag == "-vf" || flag == "-filter:v" then
+    if value == "" then cfg.fail (.emptyValue "-vf")
+    else { cfg with videoFilter := some value }
+  else if flag == "-af" || flag == "-filter:a" then
+    if value == "" then cfg.fail (.emptyValue "-af")
+    else { cfg with audioFilter := some value }
+  else if flag == "-s" || flag == "-video_size" then
+    match parseVideoSizeSpec value with
+    | some sz => { cfg with videoSize := some sz }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-s " ++ value))
+  else if flag == "-ss" then
+    match parseCliSeconds value with
+    | some sec => { cfg with startSec := some sec }
+    | none => cfg.fail (.invalidSeconds "-ss" value)
+  else if flag == "-t" then
+    match parseCliSeconds value with
+    | some sec => { cfg with durationSec := some sec }
+    | none => cfg.fail (.invalidSeconds "-t" value)
+  else if flag == "-f" then
+    if supportedFormat value then { cfg with format := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-f " ++ value))
+  else if flag == "-preset" then
+    if supportedPreset value then { cfg with preset := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-preset " ++ value))
+  else if flag == "-crf" then
+    if isValidCrfSpec value then { cfg with crf := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-crf " ++ value))
+  else if flag == "-b:v" || flag == "-vb" || flag == "-b" then
+    if isValidBitrateSpec value then { cfg with videoBitrate := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-b:v " ++ value))
+  else if flag == "-b:a" || flag == "-ab" then
+    if isValidBitrateSpec value then { cfg with audioBitrate := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-b:a " ++ value))
+  else if flag == "-r" || flag == "-framerate" then
+    if isValidFrameRateSpec value then { cfg with frameRate := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-r " ++ value))
+  else if flag == "-pix_fmt" || flag == "-pixel_format" then
+    if supportedPixFmt value then { cfg with pixelFormat := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-pix_fmt " ++ value))
+  else if flag == "-loglevel" || flag == "-v" then
+    if value == "" then cfg.fail (.emptyValue flag)
+    else if supportedLogLevel value then
+      let quietLike := ["quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"].contains value
+      { cfg with
+        logLevel := value
+        showStats := if quietLike then false else cfg.showStats
+        hideBanner := if quietLike then true else cfg.hideBanner }
+    else cfg.fail (.unsupportedCodecOrFlag (flag ++ " " ++ value))
+  else if flag == "-threads" then
+    match parseNonNegNatSpec value with
+    | some n => { cfg with threads := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-threads " ++ value))
+  else if flag == "-bf" then
+    match parseNonNegNatSpec value with
+    | some n => { cfg with bFrames := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-bf " ++ value))
+  else if flag == "-g" then
+    match parsePosNatSpec value with
+    | some n => { cfg with gopSize := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-g " ++ value))
+  else if flag == "-frames:v" || flag == "-vframes" || flag == "-frames" then
+    match parsePosNatSpec value with
+    | some n => { cfg with videoFrames := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag (flag ++ " " ++ value))
+  else if flag == "-ar" then
+    match parsePosNatSpec value with
+    | some n => { cfg with audioRate := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-ar " ++ value))
+  else if flag == "-ac" then
+    match parsePosNatSpec value with
+    | some n => { cfg with audioChannels := some n }
+    | none => cfg.fail (.unsupportedCodecOrFlag ("-ac " ++ value))
+  else if flag == "-movflags" then
+    if value == "" then cfg.fail (.emptyValue "-movflags")
+    else { cfg with movflags := some value }
+  else if flag == "-daemon" then
+    if value == "" then cfg.fail (.emptyValue "-daemon")
+    else { cfg with daemon := some value }
+  else if flag == "-golden" then
+    if value == "" then cfg.fail (.emptyValue "-golden")
+    else { cfg with golden := some value }
+  else
+    cfg.fail (.unsupportedCodecOrFlag flag)
+
+/-- Linear `List.rec` FFmpeg argv parser (avoids `List.brecOn` exponential kernel unfolding). -/
+def parseFFmpegArgsStep : List String → Option String → CliConfig → CliConfig
+  | [], none, cfg => cfg
+  | [], some flag, cfg => cfg.fail (.missingValue flag)
+  | value :: rest, some flag, cfg =>
+    parseFFmpegArgsStep rest none (applyCliFlagValue flag value cfg)
+  | arg :: rest, none, cfg =>
+    if arg == "-y" then
+      parseFFmpegArgsStep rest none { cfg with overwrite := true }
+    else if arg == "-n" then
+      parseFFmpegArgsStep rest none { cfg with overwrite := false }
+    else if arg == "--json" || arg == "-json" then
+      parseFFmpegArgsStep rest none { cfg with jsonOutput := true }
+    else if arg == "-hide_banner" then
+      parseFFmpegArgsStep rest none { cfg with hideBanner := true }
+    else if arg == "-stats" then
+      parseFFmpegArgsStep rest none { cfg with showStats := true }
+    else if arg == "-nostats" then
+      parseFFmpegArgsStep rest none { cfg with showStats := false }
+    else if arg == "-nostdin" || arg == "-sn" || arg == "-dn" then
+      parseFFmpegArgsStep rest none cfg
+    else if arg == "-vn" then
+      parseFFmpegArgsStep rest none { cfg with noVideo := true }
+    else if arg == "-an" then
+      parseFFmpegArgsStep rest none { cfg with noAudio := true }
+    else if flagTakesValue arg then
+      parseFFmpegArgsStep rest (some arg) cfg
+    else if arg.toList.head? == some '-' && arg != "-" then
+      parseFFmpegArgsStep rest none (cfg.fail (.unsupportedCodecOrFlag arg))
+    else
+      let cfg' :=
         match cfg.output with
         | none => if arg == "" then cfg.fail (.emptyValue "output") else { cfg with output := some arg }
         | some prev => cfg.fail (.multipleOutputs prev arg)
+      parseFFmpegArgsStep rest none cfg'
+
+/-- Recursive FFmpeg argv parser. -/
+def parseFFmpegArgsLoop (args : List String) (cfg : CliConfig) : CliConfig :=
+  parseFFmpegArgsStep args none cfg
 
 /-- Parse an FFmpeg-style argv list into a `CliConfig` (errors accumulated, never silently dropped). -/
 def parseFFmpegArgs (args : List String) : CliConfig :=
@@ -671,7 +733,9 @@ theorem cli_encoder_options_retained_and_invalid_rejected :
     badFlag.errors ≠ [] ∧
     supportedPixFmt "yuv420p" = true ∧
     supportedPixFmt "yuv420p10le" = true ∧
-    supportedPixFmt "nv12" = false := by
+    nativeMp4PixFmt "nv12" = false ∧
+    supportedPixFmt "nv12" = true ∧
+    supportedPixFmt "bogus_pix_fmt" = false := by
   decide
 
 end LeanAV.Cli

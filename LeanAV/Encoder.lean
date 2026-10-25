@@ -1156,13 +1156,18 @@ structure CertifiedPixelTranscodeReport where
 -/
 def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4TrackDemux)
     (dstW dstH : Nat) (startMs durMs : UInt32 := 0)
-    (codecCode : UInt32 := 1) (withAudio : Bool := true) (filterFlags : UInt32 := 0) :
+    (codecCode : UInt32 := 1) (withAudio : Bool := true) (filterFlags : UInt32 := 0)
+    (copyVideoOnlyAudioReencode : Bool := false) :
     IO CertifiedPixelTranscodeReport := do
+  let audioMode : UInt32 :=
+    if !withAudio then 0
+    else if codecCode == 0 && copyVideoOnlyAudioReencode then 2
+    else 1
   let packed ← transcodeMp4GeneralVerifiedC
     inPath outPath
     demux.width.toUInt32 demux.height.toUInt32
     dstW.toUInt32 dstH.toUInt32
-    startMs durMs codecCode (if withAudio then 1 else 0) filterFlags
+    startMs durMs codecCode audioMode filterFlags
   let acceptPacked ← getLastAcceptanceMetricsC ()
   let cOk := ((packed >>> 63) &&& 1) == 1
   let frames := ((packed >>> 48) &&& 0x7FFF).toNat
@@ -1183,8 +1188,11 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
     verifyMp4ContainerSync dstW.toUInt32 dstH.toUInt32 dstW.toUInt32 dstH.toUInt32 expectedDurMs expectedDurMs 0 == 1
   let acceptOk := cOk &&
     LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 realMaxSad maxAllowedSad realDistLtBlack realPsnrX10 lVar == 1
+  let allOk := vfOk && syncOk && acceptOk
+  if !allOk && outPath != "" && outPath != "-" && outPath != "/dev/null" then
+    try IO.FS.removeFile outPath catch _ => pure ()
   return {
-    ok := vfOk && syncOk && acceptOk
+    ok := allOk
     framesDecoded := frames
     dstWidth := dstW
     dstHeight := dstH

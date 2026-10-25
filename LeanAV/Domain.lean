@@ -265,6 +265,17 @@ theorem pruneContainerTracks_strips_lawrence_3h_chapter_track :
     pruneContainerTracks 60018 [vTrack, aTrack, cTrack] = [vTrack, aTrack] := by
   decide
 
+/-- Universal Theorem (Bug 2 Prevention): Every track retained by `pruneContainerTracks` is guaranteed
+    not to be `binData` and has a track duration bounded by `mvhdDurMs + 100`. -/
+theorem pruneContainerTracks_all_retainable (mvhdDurMs : Nat) (tracks : List ContainerTrackDesc)
+    (t : ContainerTrackDesc) (hMem : t ∈ pruneContainerTracks mvhdDurMs tracks) :
+    t.handler ≠ .binData ∧ t.tkhdDurMs ≤ mvhdDurMs + 100 := by
+  unfold pruneContainerTracks isTrackRetainable at hMem
+  rw [List.mem_filter] at hMem
+  rcases hMem with ⟨_, hPred⟩
+  rw [Bool.and_eq_true, bne_iff_ne, decide_eq_true_iff] at hPred
+  exact hPred
+
 /-! ## 4. Audio 6ch -> 2ch Downmix & Channel Layout Gate (`ValidAudioChannelMask`, Preventing Bug 3) -/
 
 /-- Standard ITU/FFmpeg channel layout masks (`AV_CH_LAYOUT_MONO = 4`, `STEREO = 3`, `5POINT1 = 0x3F`, `5POINT1_BACK = 0x60F`). -/
@@ -365,13 +376,25 @@ def isFFmpegAcceptanceValid (c : FFmpegAcceptanceCheck) : Bool :=
 
 /-- Declarative safety predicate for `FFmpegAcceptanceCheck`. -/
 def FFmpegAcceptanceSafe (c : FFmpegAcceptanceCheck) : Prop :=
-  isFFmpegAcceptanceValid c = true
+  c.decodeErrors = 0 ∧
+  c.dimsAndLayoutMatch = 1 ∧
+  c.unclippedChapters = 0 ∧
+  c.durDiffMs ≤ 100 ∧
+  c.maxBlockSad16x16 ≤ c.maxAllowedBlockSad ∧
+  c.distToRefLtDistToBlack = 1 ∧
+  350 ≤ c.psnrDbX10 ∧
+  0 < c.lumaVariance
 
 /-- Layer II Bundle 11: Two-Tier FFmpeg Bounded Acceptance Oracle (`AVGateSpec`). -/
 def ffmpegAcceptanceGateSpec : AVGateSpec FFmpegAcceptanceCheck FFmpegAcceptanceSafe where
   gate := isFFmpegAcceptanceValid
-  sound _ hg := hg
-  complete _ hs := hs
+  sound c hg := by
+    unfold isFFmpegAcceptanceValid verifyFFmpegAcceptance FFmpegAcceptanceSafe at *
+    revert hg; split <;> simp_all
+  complete c hs := by
+    unfold isFFmpegAcceptanceValid verifyFFmpegAcceptance FFmpegAcceptanceSafe at *
+    rcases hs with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
+    simp [h1, h2, h3, h4, h5, h6, h7, h8]
   posWitness := ⟨0, 1, 0, 12, 1024, 4096, 1, 412, 1584⟩
   negWitness := ⟨0, 1, 0, 12, 16384, 4096, 0, 120, 0⟩
   nonVacuous := rfl
