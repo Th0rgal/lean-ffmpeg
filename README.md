@@ -30,24 +30,9 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 ## Declarative Formal Specifications (`AVGateSpec`) & Zero-Trust Audit (`turbo-lean`)
 
-Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`). All **15** `LeanAV/*.lean` modules pass `turbo-lean --json audit-spec` (`69a8d19`):
+Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-| Audited Module (`turbo-lean --json audit-spec`) | `non_vacuous_and_tight` Specs | `vacuous` | `trivial` | `shadowed` | `sorryAx` |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| [`LeanAV/Format.lean`](LeanAV/Format.lean) (ISOBMFF / MP4 / CMAF / HDR10 / CENC) | **`47 / 47` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Video.lean`](LeanAV/Video.lean) (H.264 / HEVC / AV1 / ProRes / FFV1 / DPB) | **`27 / 27` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Spec.lean`](LeanAV/Spec.lean) (9 `AVGateSpec` gates + 5 conservation laws) | **`23 / 23` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/NativeKernels.lean`](LeanAV/NativeKernels.lean) (12 distinct `LNIR_WIRE_V1` kernels + TV) | **`19 / 19` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Bitstream.lean`](LeanAV/Bitstream.lean) (Exp-Golomb / Rice / CABAC / MSAC / `BitM`) | **`13 / 13` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Audio.lean`](LeanAV/Audio.lean) (FLAC LPC & Rice / AAC ADTS & ASC / Opus) | **`12 / 12` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Scale.lean`](LeanAV/Scale.lean) (2x2 / 3x3 / Bicubic downscale / BT.2020 PQ10) | **`12 / 12` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Core.lean`](LeanAV/Core.lean) (`AVRational` / `Plane` SIMD / `rescaleTimestamp`) | **`11 / 11` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/PlanIR.lean`](LeanAV/PlanIR.lean) (`MediaPlanIR` + protocol safety + FFI) | **`11 / 11` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Domain.lean`](LeanAV/Domain.lean) (`FFmpegAcceptanceSafe` + track pruning) | **`8 / 8` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Encoder.lean`](LeanAV/Encoder.lean) (zero-copy DMA / disjoint tiles / RDO) | **`8 / 8` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Cli.lean`](LeanAV/Cli.lean) (`CliConfig` fail-closed + fractional seconds) | **`6 / 6` (`100%`)** | `0` | `0` | `0` | `0` |
-| [`LeanAV/Filter.lean`](LeanAV/Filter.lean) (`evalFusedLumaPoint` + BoxBlur + Flip + Denoise) | **`5 / 5` (`100%`)** | `0` | `0` | `0` | `0` |
-| **Total (`15 / 15` `LeanAV/*.lean` modules)** | **`202 / 202` (`100%`)** | **`0`** | **`0`** | **`0`** | **`0`** |
+All **15** `LeanAV/*.lean` modules (**`202 / 202` specifications**) pass `turbo-lean --json audit-spec` (`69a8d19`) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,079`** kernel-checked declarations (`Format`: 47, `Video`: 27, `Spec`: 23, `NativeKernels`: 19, `Bitstream`: 13, `Audio`: 12, `Scale`: 12, `Core`: 11, `PlanIR`: 11, `Domain`: 8, `Encoder`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 

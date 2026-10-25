@@ -7,67 +7,48 @@ package «lean-ffmpeg» where
 
 require «lean-sys» from "../lean-sys"
 
-def hasBrewLibav : Bool :=
-  run_io do
-    let incOk ← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists
-    let libOk ← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists
-    return incOk && libOk
-
-def hasLinuxLibavX86 : Bool :=
-  run_io do
-    let inc1 ← ("/usr/include/x86_64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
-    let inc2 ← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists
-    let libOk ← ("/usr/lib/x86_64-linux-gnu/libavformat.so" : FilePath).pathExists
-    return (inc1 || inc2) && libOk
-
-def hasLinuxLibavArm64 : Bool :=
-  run_io do
-    let inc1 ← ("/usr/include/aarch64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
-    let inc2 ← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists
-    let libOk ← ("/usr/lib/aarch64-linux-gnu/libavformat.so" : FilePath).pathExists
-    return (inc1 || inc2) && libOk
-
-def hasCpuAvx2 : Bool :=
-  run_io do
-    let cpuInfo : FilePath := "/proc/cpuinfo"
-    if !(← cpuInfo.pathExists) then
-      return false
-    let txt ← IO.FS.readFile cpuInfo
-    return (txt.splitOn "avx2").length > 1
-
-target leanav_simd_kernels_o pkg : FilePath := do
-  let oFile := pkg.buildDir / "c" / "leanav_simd_kernels.o"
-  let srcJob ← inputTextFile <| pkg.dir / "c" / "leanav_simd_kernels.c"
+extern_lib libleanav_dsp pkg := do
+  let simdOFile := pkg.buildDir / "c" / "leanav_simd_kernels.o"
+  let simdSrcJob ← inputTextFile <| pkg.dir / "c" / "leanav_simd_kernels.c"
   let leanIncludeDir ← getLeanIncludeDir
   let cDir := pkg.dir / "c"
+  let brewIncOk ← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists
+  let brewLibOk ← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists
+  let linuxX86Inc ← ("/usr/include/x86_64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
+  let linuxArmInc ← ("/usr/include/aarch64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists
+  let linuxGenInc ← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists
+  let linuxX86Lib ← ("/usr/lib/x86_64-linux-gnu/libavformat.so" : FilePath).pathExists
+  let linuxArmLib ← ("/usr/lib/aarch64-linux-gnu/libavformat.so" : FilePath).pathExists
   let mut incFlags : Array String := #["-I", leanIncludeDir.toString, "-I", cDir.toString]
-  if hasBrewLibav then
+  if brewIncOk && brewLibOk then
     incFlags := incFlags ++ #["-I", "/opt/homebrew/include", "-DLEANAV_ENABLE_LIBAV=1"]
-  else if hasLinuxLibavX86 || hasLinuxLibavArm64 then
+  else if (linuxX86Inc || linuxGenInc) && linuxX86Lib then
     incFlags := incFlags ++ #["-DLEANAV_ENABLE_LIBAV=1"]
+  else if (linuxArmInc || linuxGenInc) && linuxArmLib then
+    incFlags := incFlags ++ #["-DLEANAV_ENABLE_LIBAV=1"]
+  let cpuInfo : FilePath := "/proc/cpuinfo"
+  let hasAvx2 : Bool ← if ← cpuInfo.pathExists then
+    let txt ← IO.FS.readFile cpuInfo
+    pure (decide ((txt.splitOn "avx2").length > 1))
+  else
+    pure false
   let mut optFlags : Array String := #["-O3", "-fPIC", "-Wno-deprecated-declarations"]
   if !System.Platform.isOSX then
-    if hasCpuAvx2 then
+    if hasAvx2 then
       optFlags := optFlags ++ #["-mavx2", "-mfma"]
     else
       optFlags := optFlags ++ #["-msse4.2"]
-  buildO oFile srcJob incFlags optFlags "cc"
-
-target leanav_lnir_kernels_o pkg : FilePath := do
-  let oFile := pkg.buildDir / "c" / "leanav_lnir_kernels.o"
+  let simdO ← buildO simdOFile simdSrcJob incFlags optFlags "cc"
+  let lnirOFile := pkg.buildDir / "c" / "leanav_lnir_kernels.o"
   let llName := if System.Platform.isOSX then "leanav_lnir_arm64.ll" else "leanav_lnir_x86_64.ll"
-  let srcJob ← inputTextFile <| pkg.dir / "c" / llName
-  let mut optFlags : Array String := #["-O3", "-fPIC", "-Wno-override-module"]
+  let lnirSrcJob ← inputTextFile <| pkg.dir / "c" / llName
+  let mut lnirOptFlags : Array String := #["-O3", "-fPIC", "-Wno-override-module"]
   if !System.Platform.isOSX then
-    if hasCpuAvx2 then
-      optFlags := optFlags ++ #["-mavx2", "-mfma"]
+    if hasAvx2 then
+      lnirOptFlags := lnirOptFlags ++ #["-mavx2", "-mfma"]
     else
-      optFlags := optFlags ++ #["-msse4.2"]
-  buildO oFile srcJob #[] optFlags "clang"
-
-extern_lib libleanav_dsp pkg := do
-  let simdO ← leanav_simd_kernels_o.fetch
-  let lnirO ← leanav_lnir_kernels_o.fetch
+      lnirOptFlags := lnirOptFlags ++ #["-msse4.2"]
+  let lnirO ← buildO lnirOFile lnirSrcJob #[] lnirOptFlags "clang"
   let name := nameToStaticLib "leanav_dsp"
   buildStaticLib (pkg.staticLibDir / name) #[simdO, lnirO]
 
@@ -80,12 +61,4 @@ lean_lib «LeanAV» where
 lean_exe «lffmpeg» where
   root := `LeanAV.Main
   supportInterpreter := false
-  moreLinkArgs :=
-    if System.Platform.isOSX && hasBrewLibav then
-      #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"]
-    else if !System.Platform.isOSX && (hasLinuxLibavX86 || hasLinuxLibavArm64) then
-      #["-lavformat", "-lavcodec", "-lswresample", "-lavutil", "-lpthread"]
-    else if System.Platform.isOSX then
-      #[]
-    else
-      #["-lpthread"]
+  moreLinkArgs := if System.Platform.isOSX then (if (run_io do return (← ("/opt/homebrew/include/libavformat/avformat.h" : FilePath).pathExists) && (← ("/opt/homebrew/lib/libavformat.dylib" : FilePath).pathExists)) then #["-L/opt/homebrew/lib", "-Wl,-rpath,/opt/homebrew/lib", "-lavformat", "-lavcodec", "-lswresample", "-lavutil"] else #[]) else (if (run_io do return ((← ("/usr/include/x86_64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists) || (← ("/usr/include/aarch64-linux-gnu/libavformat/avformat.h" : FilePath).pathExists) || (← ("/usr/include/libavformat/avformat.h" : FilePath).pathExists)) && ((← ("/usr/lib/x86_64-linux-gnu/libavformat.so" : FilePath).pathExists) || (← ("/usr/lib/aarch64-linux-gnu/libavformat.so" : FilePath).pathExists))) then #["-lavformat", "-lavcodec", "-lswresample", "-lavutil", "-lpthread"] else #["-lpthread"])

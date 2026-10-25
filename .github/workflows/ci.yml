@@ -18,16 +18,14 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install FFmpeg runtime and libav headers
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libavformat-dev libavcodec-dev libswresample-dev libavutil-dev clang
-      - name: Turbo Lean incremental build
+      - name: Build
+        run: lake build
+      - name: Install & cache turbo-lean
         uses: Th0rgal/turbo-lean@69a8d1929170dd3510f864c342fcec0d1c390f5e
         with:
           project-dir: "."
-          command: build
-          seed-shards: "true"
-          mode: trusted
-      - name: Build
-        run: lake build
-      - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
+          command: cache-only
+      - name: Zero-Trust Spec Audit & LNIR Certificate Verification (turbo-lean)
         run: |
           python3 - <<'PY'
           import glob, json, subprocess, sys
@@ -38,6 +36,8 @@ jobs:
               if not data.get("ok") or data.get("vacuous_specs", 0) != 0 or data.get("trivial_specs", 0) != 0:
                   sys.exit(1)
           PY
+          turbo-lean native-validate-tv c/leanav_lnir_kernels.lnir --samples 64
+          turbo-lean native-verify-certs c/leanav_lnir_kernels.lnir
       - name: Self-test & C-ABI / LNIR Kernel Verification
         run: |
           .lake/build/bin/lffmpeg self-test

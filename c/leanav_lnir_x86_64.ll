@@ -1,7 +1,5 @@
 ; ModuleID = 'LeanAV.DSP.Kernels.optimized'
 source_filename = "LeanAV.DSP.Kernels.lean"
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
 
 ; --- LeanNative Runtime Intrinsics & C ABI Entrypoints ---
 declare i1 @llvm.expect.i1(i1, i1) #2
@@ -958,9 +956,9 @@ entry:
   ret ptr %ret
 }
 
-attributes #0 = { nounwind uwtable "target-cpu"="x86-64-v2" "target-features"="+pclmul,+avx2" }
+attributes #0 = { nounwind uwtable "target-cpu"="x86-64-v2" }
 attributes #1 = { noinline nounwind optnone uwtable }
-attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }
+attributes #2 = { nofree nosync nounwind willreturn }
 
 !llvm.ident = !{!4}
 !0 = distinct !{!0, !1, !7, !8}

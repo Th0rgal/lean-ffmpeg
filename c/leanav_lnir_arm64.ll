@@ -1,7 +1,5 @@
 ; ModuleID = 'LeanAV.DSP.Kernels.optimized'
 source_filename = "LeanAV.DSP.Kernels.lean"
-target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
-target triple = "aarch64-unknown-linux-gnu"
 
 ; --- LeanNative Runtime Intrinsics & C ABI Entrypoints ---
 declare i1 @llvm.expect.i1(i1, i1) #2
@@ -959,9 +957,9 @@ entry:
   ret ptr %ret
 }
 
-attributes #0 = { nounwind uwtable "target-cpu"="apple-m3" "target-features"="+neon,+aes,+sha3" }
+attributes #0 = { nounwind uwtable "target-cpu"="apple-m1" }
 attributes #1 = { noinline nounwind optnone uwtable }
-attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }
+attributes #2 = { nofree nosync nounwind willreturn }
 
 !llvm.ident = !{!4}
 !0 = distinct !{!0, !1, !7, !8}
