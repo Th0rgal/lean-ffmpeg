@@ -3568,6 +3568,15 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
  *    so 16/32/64-byte vector loads at the end of the last row never read out-of-bounds).
  * 4. If `require_exclusive != 0`, verifies `lean_is_exclusive(ba)` (`m_rc == 1`) before any in-place mutation.
  */
+extern uint32_t leanav_lean_verify_plane_ffi_contract(
+    size_t actual_cap,
+    size_t w,
+    size_t h,
+    size_t stride,
+    size_t bytes_per_sample,
+    size_t simd_vec_bytes
+);
+
 LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
     b_lean_obj_arg ba,
     size_t w,
@@ -3577,18 +3586,10 @@ LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
     size_t simd_vec_bytes,
     uint32_t require_exclusive
 ) {
-    if (w == 0 || h == 0 || (bytes_per_sample != 1 && bytes_per_sample != 2 && bytes_per_sample != 4 && bytes_per_sample != 8)) return 0u;
-    if (simd_vec_bytes == 0 || simd_vec_bytes > 64) return 0u;
-    if ((stride & 63u) != 0u) return 0u;
-    if (w > SIZE_MAX / bytes_per_sample) return 0u;
-    size_t row_bytes = w * bytes_per_sample;
-    if (row_bytes > stride) return 0u;
-    if (h > (SIZE_MAX - 64u) / stride) return 0u;
-    size_t req_cap = stride * h + 64u;
-    size_t actual_cap = lean_sarray_size(ba);
-    if (actual_cap < req_cap) return 0u;
     if (require_exclusive != 0u && !lean_is_exclusive((lean_object *)ba)) return 0u;
-    return 1u;
+    return leanav_lean_verify_plane_ffi_contract(
+        lean_sarray_size(ba), w, h, stride, bytes_per_sample, simd_vec_bytes
+    );
 }
 
 /*
@@ -3672,351 +3673,103 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
  */
 #include "leanav_lnir_kernels.h"
 
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias_ba(
-    lean_obj_arg ba,
-    uint64_t gain,
-    uint64_t bias
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_unary_ba(
+    uint32_t kernel_id,
+    lean_obj_arg ba0,
+    uint64_t arg0,
+    uint64_t arg1
 ) {
-    size_t init_sz = lean_sarray_size(ba);
+    size_t init_sz = lean_sarray_size(ba0);
     if (init_sz == 0 || (init_sz & 7u) != 0u) {
-        return ba;
+        return ba0;
     }
-    if (!lean_is_exclusive(ba)) {
-        ba = lean_copy_byte_array(ba);
+    if (!lean_is_exclusive(ba0)) {
+        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
     }
-    lean_sarray_object *s = lean_to_sarray(ba);
-    size_t byte_sz = s->m_size;
+    lean_sarray_object *s0 = lean_to_sarray(ba0);
+    size_t byte_sz = s0->m_size;
     size_t n_lanes = byte_sz >> 3;
-    s->m_size = n_lanes;
-    void *out = swscale_luma_gain_bias_simd(ba, gain, bias);
-    (void)out;
-    s->m_size = byte_sz;
-    return ba;
+    s0->m_size = n_lanes;
+    switch (kernel_id) {
+        case 0u: (void)swscale_luma_gain_bias_simd(ba0, arg0, arg1); break;
+        case 1u: (void)prores_qscale_map_simd(ba0); break;
+        case 2u: (void)boxblur_div9_recip_shift_simd(ba0); break;
+        case 3u: (void)pq10_studio_clamp_select_simd(ba0); break;
+        default: break;
+    }
+    s0->m_size = byte_sz;
+    return ba0;
 }
 
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_pq10_studio_clamp_ba(
-    lean_obj_arg ba
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_binary_ba(
+    uint32_t kernel_id,
+    lean_obj_arg ba0,
+    b_lean_obj_arg ba1
 ) {
-    size_t init_sz = lean_sarray_size(ba);
-    if (init_sz == 0 || (init_sz & 7u) != 0u) {
-        return ba;
+    size_t sz0 = lean_sarray_size(ba0);
+    size_t sz1 = lean_sarray_size(ba1);
+    size_t min_sz = (sz0 < sz1) ? sz0 : sz1;
+    size_t n_lanes = min_sz >> 3;
+    if (n_lanes == 0) {
+        lean_dec(ba0);
+        return lean_alloc_sarray(1, 0, 0);
     }
-    if (!lean_is_exclusive(ba)) {
-        ba = lean_copy_byte_array(ba);
+    if (!lean_is_exclusive(ba0) || (const void *)ba0 == (const void *)ba1) {
+        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
     }
-    lean_sarray_object *s = lean_to_sarray(ba);
-    size_t byte_sz = s->m_size;
-    size_t n_lanes = byte_sz >> 3;
-    s->m_size = n_lanes;
-    void *out = pq10_studio_clamp_select_simd(ba);
-    (void)out;
-    s->m_size = byte_sz;
-    return ba;
+    lean_sarray_object *s0 = lean_to_sarray(ba0);
+    s0->m_size = n_lanes;
+    switch (kernel_id) {
+        case 0u: (void)flac_lpc_autocorr_dot_simd(ba0, (void *)ba1); break;
+        case 1u: (void)opus_celt_pvq_mix_saxpy_gpu(ba0, (void *)ba1); break;
+        case 2u: (void)bframe_bipred_blend_gpu(ba0, (void *)ba1); break;
+        case 3u: (void)hevc_sao_band_offset_add_gpu(ba0, (void *)ba1); break;
+        case 4u: (void)aac_imdct_window_mul_gpu(ba0, (void *)ba1); break;
+        default: break;
+    }
+    s0->m_size = n_lanes << 3;
+    return ba0;
 }
 
-static uint64_t *leanav_lnir_alloc_sarray_from_lean(b_lean_obj_arg arr, size_t *out_len) {
-    size_t n = lean_array_size(arr);
-    if (out_len) *out_len = n;
-    uint64_t *buf = (uint64_t *)calloc(3 + (n > 0 ? n : 1), sizeof(uint64_t));
-    if (!buf) return NULL;
-    *((int32_t *)&buf[0]) = 1; /* m_rc = 1 (exclusive) */
-    buf[1] = (uint64_t)n;      /* m_size */
-    buf[2] = (uint64_t)n;      /* m_capacity */
-    for (size_t i = 0; i < n; i++) {
-        lean_object *elem = lean_array_get_core(arr, i);
-        buf[3 + i] = lean_unbox_uint64(elem);
-    }
-    return buf;
-}
-
-static uint64_t *leanav_lnir_alloc_sarray_raw(const int64_t *src, size_t n) {
-    uint64_t *buf = (uint64_t *)calloc(3 + (n > 0 ? n : 1), sizeof(uint64_t));
-    if (!buf) return NULL;
-    *((int32_t *)&buf[0]) = 1; /* m_rc = 1 (exclusive) */
-    buf[1] = (uint64_t)n;      /* m_size */
-    buf[2] = (uint64_t)n;      /* m_capacity */
-    for (size_t i = 0; i < n; i++) {
-        buf[3 + i] = (uint64_t)src[i];
-    }
-    return buf;
-}
-
-static lean_obj_res leanav_lnir_sarray_to_lean_array(const uint64_t *sarr, size_t fallback_n) {
-    size_t n = sarr ? (size_t)sarr[1] : fallback_n;
-    lean_object *res = lean_alloc_array(n, n);
-    for (size_t i = 0; i < n; i++) {
-        uint64_t v = sarr ? sarr[3 + i] : 0ULL;
-        lean_array_set_core(res, i, lean_box_uint64(v));
-    }
-    return res;
-}
-
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias(
-    b_lean_obj_arg xs_arr,
-    uint64_t gain,
-    uint64_t bias
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
+    uint32_t kernel_id,
+    lean_obj_arg ba0,
+    b_lean_obj_arg ba1,
+    b_lean_obj_arg ba2
 ) {
-    size_t n = 0;
-    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &n);
-    if (!in0) return lean_alloc_array(0, 0);
-    uint64_t *out = (uint64_t *)swscale_luma_gain_bias_simd(in0, gain, bias);
-    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
-    if (out && out != in0) free(out);
-    free(in0);
-    return res;
-}
-
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_opus_celt_saxpy(
-    b_lean_obj_arg xs_arr,
-    b_lean_obj_arg ys_arr
-) {
-    size_t nx = 0, ny = 0;
-    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
-    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
-    if (!in0 || !in1) {
-        free(in0);
-        free(in1);
-        return lean_alloc_array(0, 0);
+    size_t sz0 = lean_sarray_size(ba0);
+    size_t sz1 = lean_sarray_size(ba1);
+    size_t sz2 = lean_sarray_size(ba2);
+    size_t min_sz = sz0;
+    if (sz1 < min_sz) min_sz = sz1;
+    if (sz2 < min_sz) min_sz = sz2;
+    size_t n_lanes = min_sz >> 3;
+    if (n_lanes == 0) {
+        lean_dec(ba0);
+        return lean_alloc_sarray(1, 0, 0);
     }
-    size_t n = (nx < ny) ? nx : ny;
-    in0[1] = (uint64_t)n;
-    in1[1] = (uint64_t)n;
-    uint64_t *out = (uint64_t *)opus_celt_pvq_mix_saxpy_gpu(in0, in1);
-    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
-    if (out && out != in0) free(out);
-    free(in0);
-    free(in1);
-    return res;
-}
-
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_av1_wiener_3tap(
-    b_lean_obj_arg xs_arr,
-    b_lean_obj_arg ys_arr,
-    b_lean_obj_arg zs_arr
-) {
-    size_t nx = 0, ny = 0, nz = 0;
-    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
-    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
-    uint64_t *in2 = leanav_lnir_alloc_sarray_from_lean(zs_arr, &nz);
-    if (!in0 || !in1 || !in2) {
-        free(in0);
-        free(in1);
-        free(in2);
-        return lean_alloc_array(0, 0);
+    if (!lean_is_exclusive(ba0) || (const void *)ba0 == (const void *)ba1 || (const void *)ba0 == (const void *)ba2) {
+        ba0 = lean_copy_sarray(ba0, lean_sarray_capacity(ba0));
     }
-    size_t n = nx;
-    if (ny < n) n = ny;
-    if (nz < n) n = nz;
-    in0[1] = (uint64_t)n;
-    in1[1] = (uint64_t)n;
-    in2[1] = (uint64_t)n;
-    uint64_t *out = (uint64_t *)av1_wiener_3tap_sym_gpu(in0, in1, in2);
-    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
-    if (out && out != in0) free(out);
-    free(in0);
-    free(in1);
-    free(in2);
-    return res;
-}
-
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_av1_cdef_fma(
-    b_lean_obj_arg xs_arr,
-    b_lean_obj_arg ys_arr,
-    b_lean_obj_arg zs_arr
-) {
-    size_t nx = 0, ny = 0, nz = 0;
-    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &nx);
-    uint64_t *in1 = leanav_lnir_alloc_sarray_from_lean(ys_arr, &ny);
-    uint64_t *in2 = leanav_lnir_alloc_sarray_from_lean(zs_arr, &nz);
-    if (!in0 || !in1 || !in2) {
-        free(in0);
-        free(in1);
-        free(in2);
-        return lean_alloc_array(0, 0);
+    lean_object *ba2_eff = (lean_object *)ba2;
+    int copied_ba2 = 0;
+    if ((const void *)ba1 == (const void *)ba2) {
+        lean_inc(ba2_eff);
+        ba2_eff = lean_copy_sarray(ba2_eff, lean_sarray_capacity(ba2_eff));
+        copied_ba2 = 1;
     }
-    size_t n = nx;
-    if (ny < n) n = ny;
-    if (nz < n) n = nz;
-    in0[1] = (uint64_t)n;
-    in1[1] = (uint64_t)n;
-    in2[1] = (uint64_t)n;
-    uint64_t *out = (uint64_t *)av1_cdef_fma_blend_gpu(in0, in1, in2);
-    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
-    if (out && out != in0) free(out);
-    free(in0);
-    free(in1);
-    free(in2);
-    return res;
-}
-
-LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_pq10_studio_clamp(
-    b_lean_obj_arg xs_arr
-) {
-    size_t n = 0;
-    uint64_t *in0 = leanav_lnir_alloc_sarray_from_lean(xs_arr, &n);
-    if (!in0) return lean_alloc_array(0, 0);
-    uint64_t *out = (uint64_t *)pq10_studio_clamp_select_simd(in0);
-    lean_obj_res res = leanav_lnir_sarray_to_lean_array(out, n);
-    if (out && out != in0) free(out);
-    free(in0);
-    return res;
-}
-
-/*
- * Execute all 12 `lean-native-core`-compiled LNIR DSP kernels (`c/leanav_lnir_kernels.h`)
- * on adversarial 8-lane vectors and verify bit-exact equality against reference semantics.
- */
-LEAN_EXPORT uint32_t leanav_c_verify_compiled_lnir_suite(lean_obj_arg unit_arg) {
-    (void)unit_arg;
-    const size_t N = 8;
-    const int64_t vA[8] = { 0, 16, 63, 64, 128, 512, 940, 1023 };
-    const int64_t vB[8] = { 3, -5, 10, 20, -15, 7, 4, 2 };
-    const int64_t vC[8] = { 100, 200, 50, -30, 12, 0, 64, 999 };
-    int ok = 1;
-
-    /* 1. swscale_luma_gain_bias_simd */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *out = (uint64_t *)swscale_luma_gain_bias_simd(b0, 5ULL, (uint64_t)(-12LL));
-        for (size_t i = 0; i < N; i++) {
-            int64_t exp = vA[i] * 5 - 12;
-            if ((int64_t)out[3 + i] != exp) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
+    lean_sarray_object *s0 = lean_to_sarray(ba0);
+    s0->m_size = n_lanes;
+    switch (kernel_id) {
+        case 0u: (void)av1_wiener_3tap_sym_gpu(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 1u: (void)av1_cdef_fma_blend_gpu(ba0, (void *)ba1, (void *)ba2_eff); break;
+        default: break;
     }
-    /* 2. flac_lpc_autocorr_dot_simd (tests C_inc + K_dot + C_dec COW path) */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *out = (uint64_t *)flac_lpc_autocorr_dot_simd(b0, b1);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] * vB[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
+    s0->m_size = n_lanes << 3;
+    if (copied_ba2) {
+        lean_dec(ba2_eff);
     }
-    /* 3. opus_celt_pvq_mix_saxpy_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *out = (uint64_t *)opus_celt_pvq_mix_saxpy_gpu(b0, b1);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != 4 * vA[i] + vB[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-    }
-    /* 4. av1_wiener_3tap_sym_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *b2 = leanav_lnir_alloc_sarray_raw(vC, N);
-        uint64_t *out = (uint64_t *)av1_wiener_3tap_sym_gpu(b0, b1, b2);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != 3 * vA[i] + 10 * vB[i] + 3 * vC[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-        free(b2);
-    }
-    /* 5. av1_cdef_fma_blend_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *b2 = leanav_lnir_alloc_sarray_raw(vC, N);
-        uint64_t *out = (uint64_t *)av1_cdef_fma_blend_gpu(b0, b1, b2);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] * vB[i] + vC[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-        free(b2);
-    }
-    /* 6. h264_idct_tuple_accum_sroa */
-    {
-        uint64_t got = h264_idct_tuple_accum_sroa(16ULL, 7ULL);
-        uint64_t exp = 7ULL;
-        for (uint64_t i = 0; i < 16ULL; i++) {
-            exp = (exp + i) + (i * 2ULL);
-        }
-        if (got != exp) ok = 0;
-    }
-    /* 7. bframe_bipred_blend_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vC, N);
-        uint64_t *out = (uint64_t *)bframe_bipred_blend_gpu(b0, b1);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] + vC[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-    }
-    /* 8. hevc_sao_band_offset_add_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *out = (uint64_t *)hevc_sao_band_offset_add_gpu(b0, b1);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] + vB[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-    }
-    /* 9. aac_imdct_window_mul_gpu */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *b1 = leanav_lnir_alloc_sarray_raw(vB, N);
-        uint64_t *out = (uint64_t *)aac_imdct_window_mul_gpu(b0, b1);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] * vB[i]) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-        free(b1);
-    }
-    /* 10. prores_qscale_map_simd */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *out = (uint64_t *)prores_qscale_map_simd(b0);
-        for (size_t i = 0; i < N; i++) {
-            if ((int64_t)out[3 + i] != vA[i] * 16 + 8) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-    }
-    /* 11. boxblur_div9_recip_shift_simd */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *out = (uint64_t *)boxblur_div9_recip_shift_simd(b0);
-        for (size_t i = 0; i < N; i++) {
-            uint64_t u = (uint64_t)vA[i];
-            uint64_t exp = ((u + 4ULL) * 7282ULL) >> 16;
-            if (out[3 + i] != exp || exp != (u + 4ULL) / 9ULL) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-    }
-    /* 12. pq10_studio_clamp_select_simd */
-    {
-        uint64_t *b0 = leanav_lnir_alloc_sarray_raw(vA, N);
-        uint64_t *out = (uint64_t *)pq10_studio_clamp_select_simd(b0);
-        for (size_t i = 0; i < N; i++) {
-            uint64_t u = (uint64_t)vA[i];
-            uint64_t exp = (u < 64ULL) ? 64ULL : ((u > 940ULL) ? 940ULL : u);
-            if (out[3 + i] != exp) ok = 0;
-        }
-        if (out != b0) free(out);
-        free(b0);
-    }
-    return ok ? 1u : 0u;
+    return ba0;
 }
 
 

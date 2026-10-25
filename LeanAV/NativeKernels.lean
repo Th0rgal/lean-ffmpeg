@@ -591,7 +591,8 @@ def verifyLnirSArrayContract (byteSize minLanes : Nat) (isExclusive requireExclu
   decide (0 < byteSize ∧ byteSize % 8 = 0 ∧ minLanes * 8 ≤ byteSize ∧ (requireExclusive = true → isExclusive = true))
 
 /-- Universal Theorem (`verifyLnirSArrayContract_sound`):
-    If `verifyLnirSArrayContract` succeeds, the `ByteArray` has positive 8-byte-aligned capacity for `minLanes` 64-bit lanes and satisfies exclusivity. -/
+    If `verifyLnirSArrayContract` succeeds, the `ByteArray` has positive 8-byte-aligned capacity
+    for `minLanes` 64-bit lanes and satisfies exclusivity. -/
 theorem verifyLnirSArrayContract_sound (byteSize minLanes : Nat) (isExclusive requireExclusive : Bool)
     (h : verifyLnirSArrayContract byteSize minLanes isExclusive requireExclusive = true) :
     0 < byteSize ∧ byteSize % 8 = 0 ∧ minLanes * 8 ≤ byteSize ∧ (requireExclusive = true → isExclusive = true) := by
@@ -631,58 +632,111 @@ def unpackInt64LanesLe (ba : ByteArray) : List Int64 := Id.run do
     out := out.push (Int64.ofUInt64 u)
   return out.toList
 
+/-- Pure Lean 10-bit PQ studio range (`[64, 940]`) clamp over `Nat`. -/
+@[inline]
+def specPq10StudioClampNat (u : Nat) : Nat :=
+  if u < 64 then 64 else if 940 < u then 940 else u
+
+/-- Universal Theorem (`specPq10StudioClampNat_bounds_and_idempotent`):
+    For any `u : Nat`, `specPq10StudioClampNat u` lies within `[64, 940]` and is idempotent. -/
+theorem specPq10StudioClampNat_bounds_and_idempotent (u : Nat) :
+    64 ≤ specPq10StudioClampNat u ∧
+    specPq10StudioClampNat u ≤ 940 ∧
+    specPq10StudioClampNat (specPq10StudioClampNat u) = specPq10StudioClampNat u := by
+  by_cases h1 : u < 64
+  · simp [specPq10StudioClampNat, h1]
+  · by_cases h2 : 940 < u <;> simp [specPq10StudioClampNat, h1, h2] <;> omega
+
 /-! ## C-ABI Runtime Bridge to `lean-native-core`-Compiled Machine Code (`c/libleanav_lnir.o`) -/
 
-/-- Execute all 12 `lean-native-core`-compiled LNIR DSP kernels linked in `libleanav_dsp.a`
-    over an adversarial test suite in C, returning `1` iff every compiled machine-code symbol
-    matches the exact LNIR semantics bit-for-bit. -/
-@[extern "leanav_c_verify_compiled_lnir_suite"]
-opaque verifyCompiledLnirSuiteC : Unit → UInt32
-
-/-- Invoke `lean-native-core`-compiled `@h264_idct_tuple_accum_sroa(blocks, dcInit)` directly over C-ABI (zero C wrapper). -/
+/-- Invoke `lean-native-core`-compiled `@h264_idct_tuple_accum_sroa(blocks, dcInit)` directly over C-ABI. -/
 @[extern "h264_idct_tuple_accum_sroa"]
 opaque execLnirH264IdctTupleSroaC (blocks : UInt64) (dcInit : UInt64) : UInt64
 
-/-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` in-place on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
-@[extern "leanav_c_exec_lnir_swscale_gain_bias_ba"]
-opaque execLnirSwscaleGainBiasBaC (ba : ByteArray) (gain : Int64) (bias : Int64) : ByteArray
+/-- Zero-copy `ByteArray` unary LNIR dispatcher
+    (`0=swscale_gain_bias`, `1=prores_qscale`, `2=boxblur_div9_recip`, `3=pq10_studio_clamp`). -/
+@[extern "leanav_c_exec_lnir_unary_ba"]
+opaque execLnirUnaryBaC (kernelId : UInt32) (ba0 : ByteArray) (arg0 : UInt64) (arg1 : UInt64) : ByteArray
 
-/-- Invoke `lean-native-core`-compiled `pq10_studio_clamp_select_simd` in-place on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
-@[extern "leanav_c_exec_lnir_pq10_studio_clamp_ba"]
-opaque execLnirPq10StudioClampBaC (ba : ByteArray) : ByteArray
+/-- Zero-copy `ByteArray` binary LNIR dispatcher
+    (`0=flac_lpc_dot`, `1=opus_celt_saxpy`, `2=bframe_bipred`, `3=hevc_sao_add`, `4=aac_imdct_mul`). -/
+@[extern "leanav_c_exec_lnir_binary_ba"]
+opaque execLnirBinaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) : ByteArray
 
-/-- Contract-guarded zero-copy `ByteArray` wrapper for `swscale_luma_gain_bias_simd`: enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
+/-- Zero-copy `ByteArray` ternary LNIR dispatcher (`0=av1_wiener_3tap`, `1=av1_cdef_fma`). -/
+@[extern "leanav_c_exec_lnir_ternary_ba"]
+opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) (ba2 : @& ByteArray) : ByteArray
+
+/-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` in-place
+    on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
+@[inline]
+def execLnirSwscaleGainBiasBaC (ba : ByteArray) (gain : Int64) (bias : Int64) : ByteArray :=
+  execLnirUnaryBaC 0 ba gain.toUInt64 bias.toUInt64
+
+/-- Invoke `lean-native-core`-compiled `pq10_studio_clamp_select_simd` in-place
+    on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
+@[inline]
+def execLnirPq10StudioClampBaC (ba : ByteArray) : ByteArray :=
+  execLnirUnaryBaC 3 ba 0 0
+
+/-- Contract-guarded zero-copy `ByteArray` wrapper for `swscale_luma_gain_bias_simd`:
+    enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
 def execLnirSwscaleGainBiasBaChecked (ba : ByteArray) (minLanes : Nat) (gain : Int64) (bias : Int64) : Option ByteArray :=
   if verifyLnirSArrayContract ba.size minLanes true true then
     some (execLnirSwscaleGainBiasBaC ba gain bias)
   else
     none
 
-/-- Contract-guarded zero-copy `ByteArray` wrapper for `pq10_studio_clamp_select_simd`: enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
+/-- Contract-guarded zero-copy `ByteArray` wrapper for `pq10_studio_clamp_select_simd`:
+    enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
 def execLnirPq10StudioClampBaChecked (ba : ByteArray) (minLanes : Nat) : Option ByteArray :=
   if verifyLnirSArrayContract ba.size minLanes true true then
     some (execLnirPq10StudioClampBaC ba)
   else
     none
 
-/-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` on an `Array Int64` buffer. -/
-@[extern "leanav_c_exec_lnir_swscale_gain_bias"]
-opaque execLnirSwscaleGainBiasC (xs : @& Array Int64) (gain : Int64) (bias : Int64) : Array Int64
+/-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` on an `Array Int64` buffer via zero-copy `ByteArray` packing. -/
+def execLnirSwscaleGainBiasC (xs : Array Int64) (gain : Int64) (bias : Int64) : Array Int64 :=
+  (unpackInt64LanesLe (execLnirUnaryBaC 0 (packInt64LanesLe xs.toList) gain.toUInt64 bias.toUInt64)).toArray
 
-/-- Invoke `lean-native-core`-compiled `opus_celt_pvq_mix_saxpy_gpu` on two `Array Int64` buffers. -/
-@[extern "leanav_c_exec_lnir_opus_celt_saxpy"]
-opaque execLnirOpusCeltSaxpyC (xs : @& Array Int64) (ys : @& Array Int64) : Array Int64
+/-- Invoke `lean-native-core`-compiled `opus_celt_pvq_mix_saxpy_gpu` on two `Array Int64` buffers via zero-copy `ByteArray` packing. -/
+def execLnirOpusCeltSaxpyC (xs : Array Int64) (ys : Array Int64) : Array Int64 :=
+  (unpackInt64LanesLe (execLnirBinaryBaC 1 (packInt64LanesLe xs.toList) (packInt64LanesLe ys.toList))).toArray
 
-/-- Invoke `lean-native-core`-compiled `av1_wiener_3tap_sym_gpu` on three `Array Int64` buffers. -/
-@[extern "leanav_c_exec_lnir_av1_wiener_3tap"]
-opaque execLnirAv1Wiener3TapC (xs : @& Array Int64) (ys : @& Array Int64) (zs : @& Array Int64) : Array Int64
+/-- Invoke `lean-native-core`-compiled `av1_wiener_3tap_sym_gpu` on three `Array Int64` buffers via zero-copy `ByteArray` packing. -/
+def execLnirAv1Wiener3TapC (xs : Array Int64) (ys : Array Int64) (zs : Array Int64) : Array Int64 :=
+  (unpackInt64LanesLe (execLnirTernaryBaC 0 (packInt64LanesLe xs.toList) (packInt64LanesLe ys.toList) (packInt64LanesLe zs.toList))).toArray
 
-/-- Invoke `lean-native-core`-compiled `av1_cdef_fma_blend_gpu` on three `Array Int64` buffers. -/
-@[extern "leanav_c_exec_lnir_av1_cdef_fma"]
-opaque execLnirAv1CdefFmaC (xs : @& Array Int64) (ys : @& Array Int64) (zs : @& Array Int64) : Array Int64
+/-- Invoke `lean-native-core`-compiled `av1_cdef_fma_blend_gpu` on three `Array Int64` buffers via zero-copy `ByteArray` packing. -/
+def execLnirAv1CdefFmaC (xs : Array Int64) (ys : Array Int64) (zs : Array Int64) : Array Int64 :=
+  (unpackInt64LanesLe (execLnirTernaryBaC 1 (packInt64LanesLe xs.toList) (packInt64LanesLe ys.toList) (packInt64LanesLe zs.toList))).toArray
 
-/-- Invoke `lean-native-core`-compiled `pq10_studio_clamp_select_simd` on an `Array Int64` buffer. -/
-@[extern "leanav_c_exec_lnir_pq10_studio_clamp"]
-opaque execLnirPq10StudioClampC (xs : @& Array Int64) : Array Int64
+/-- Invoke `lean-native-core`-compiled `pq10_studio_clamp_select_simd` on an `Array Int64` buffer via zero-copy `ByteArray` packing. -/
+def execLnirPq10StudioClampC (xs : Array Int64) : Array Int64 :=
+  (unpackInt64LanesLe (execLnirUnaryBaC 3 (packInt64LanesLe xs.toList) 0 0)).toArray
+
+/-- Execute all 12 `lean-native-core`-compiled LNIR DSP kernels linked in `libleanav_dsp.a`
+    directly from Lean 4 over adversarial 8-lane vectors, returning `1` iff every compiled
+    machine-code symbol matches the formal `evalLnirKernel` / `leanSpecH264IdctTupleAccumSroa` semantics bit-for-bit. -/
+def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
+  let vA : List Int64 := [0, 16, 63, 64, 128, 512, 940, 1023]
+  let vB : List Int64 := [3, -5, 10, 20, -15, 7, 4, 2]
+  let vC : List Int64 := [100, 200, 50, -30, 12, 0, 64, 999]
+  let baA := packInt64LanesLe vA
+  let baB := packInt64LanesLe vB
+  let baC := packInt64LanesLe vC
+  let ok1 := unpackInt64LanesLe (execLnirUnaryBaC 0 baA 5 ((-12 : Int64).toUInt64)) == evalLnirKernel (.gainBias 5 (-12)) vA [] []
+  let ok2 := unpackInt64LanesLe (execLnirBinaryBaC 0 baA baB) == evalLnirKernel .dotPairwise vA vB []
+  let ok3 := unpackInt64LanesLe (execLnirBinaryBaC 1 baA baB) == evalLnirKernel (.saxpy 4) vA vB []
+  let ok4 := unpackInt64LanesLe (execLnirTernaryBaC 0 baA baB baC) == evalLnirKernel .wiener3TapSym vA vB vC
+  let ok5 := unpackInt64LanesLe (execLnirTernaryBaC 1 baA baB baC) == evalLnirKernel .fmaBlend vA vB vC
+  let ok6 := execLnirH264IdctTupleSroaC 16 7 == leanSpecH264IdctTupleAccumSroa 16 7
+  let ok7 := unpackInt64LanesLe (execLnirBinaryBaC 2 baA baC) == evalLnirKernel (.saxpy 1) vA vC []
+  let ok8 := unpackInt64LanesLe (execLnirBinaryBaC 3 baA baB) == evalLnirKernel .zipAdd vA vB []
+  let ok9 := unpackInt64LanesLe (execLnirBinaryBaC 4 baA baB) == evalLnirKernel .zipMul vA vB []
+  let ok10 := unpackInt64LanesLe (execLnirUnaryBaC 1 baA 0 0) == evalLnirKernel (.mapScaleAdd 16 8) vA [] []
+  let ok11 := unpackInt64LanesLe (execLnirUnaryBaC 2 baA 0 0) == evalLnirKernel .boxBlurDiv9Recip vA [] []
+  let ok12 := unpackInt64LanesLe (execLnirUnaryBaC 3 baA 0 0) == evalLnirKernel .pq10StudioClamp vA [] []
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 then 1 else 0
 
 end LeanAV.NativeKernels

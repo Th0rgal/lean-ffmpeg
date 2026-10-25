@@ -1222,6 +1222,39 @@ def runCertifiedPixelTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Track
 
 /-! ## 9. Wave 51 (P4): Certified C-ABI / FFI Plane Contract Guard (`verifyPlaneFfiContractC`) -/
 
+/-- Pure Lean 4 plane FFI geometry & bounds contract predicate over unbounded `Nat` values. -/
+def checkPlaneFfiGeometry (actualCap w h stride bytesPerSample simdVecBytes : Nat) : Bool :=
+  decide (
+    0 < w ∧ 0 < h ∧
+    (bytesPerSample = 1 ∨ bytesPerSample = 2 ∨ bytesPerSample = 4 ∨ bytesPerSample = 8) ∧
+    0 < simdVecBytes ∧ simdVecBytes ≤ 64 ∧
+    stride % 64 = 0 ∧
+    w * bytesPerSample ≤ stride ∧
+    stride * h + 64 ≤ actualCap
+  )
+
+/-- Universal Theorem (`checkPlaneFfiGeometry_sound`):
+    If `checkPlaneFfiGeometry` returns `true`, all plane dimensions, sample widths, 64-byte stride
+    alignment, and 64-byte SIMD tail-padding bounds hold without overflow. -/
+theorem checkPlaneFfiGeometry_sound (actualCap w h stride bytesPerSample simdVecBytes : Nat)
+    (hOk : checkPlaneFfiGeometry actualCap w h stride bytesPerSample simdVecBytes = true) :
+    0 < w ∧ 0 < h ∧
+    (bytesPerSample = 1 ∨ bytesPerSample = 2 ∨ bytesPerSample = 4 ∨ bytesPerSample = 8) ∧
+    0 < simdVecBytes ∧ simdVecBytes ≤ 64 ∧
+    stride % 64 = 0 ∧
+    w * bytesPerSample ≤ stride ∧
+    stride * h + 64 ≤ actualCap := by
+  exact of_decide_eq_true hOk
+
+/-- Exported pure Lean 4 C-ABI entrypoint (`leanav_lean_verify_plane_ffi_contract`) invoked by `leanav_c_verify_plane_ffi_contract`. -/
+@[export leanav_lean_verify_plane_ffi_contract]
+def verifyPlaneFfiContractExport
+    (actualCap w h stride bytesPerSample simdVecBytes : USize) : UInt32 :=
+  if checkPlaneFfiGeometry actualCap.toNat w.toNat h.toNat stride.toNat bytesPerSample.toNat simdVecBytes.toNat then
+    1
+  else
+    0
+
 @[extern "leanav_c_verify_plane_ffi_contract"]
 opaque verifyPlaneFfiContractC
     (ba : @& ByteArray) (w h stride bytesPerSample simdVecBytes : USize) (requireExclusive : UInt32) : UInt32
