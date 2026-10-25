@@ -12,7 +12,7 @@ Baseline references:
 - initial commit: `386c07663a214aba2fbbf563abb561a08ddc8d52`;
 - Lean toolchain: `leanprover/lean4:v4.31.0`;
 - `lean-sys` pinned to commit `9a3fda9180d8e9a2e429ca38046b74467f68866b`;
-- `turbo-lean` (including `lean-native-core`) pinned to commit `69a8d1929170dd3510f864c342fcec0d1c390f5e`;
+- `turbo-lean` (including built-in `LeanNative` / `lean-native-core`) pinned to commit `23e426fa99438c81d34e3167a955dbe3958a060d`;
 - reference FFmpeg pinned in the generated capability registry with binary SHA-256, build configuration, and shared library metadata;
 - Maxwell governor: `https://github.com/Th0rgal/maxwell`.
 
