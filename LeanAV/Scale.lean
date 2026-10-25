@@ -773,9 +773,12 @@ def tonemapPq10ToBt709Sdr8 (y10 : UInt16) : UInt8 :=
     let out := 16 + Nat.min 219 yOff
     out.toUInt8
 
-@[export leanav_c_tonemap_pq10_to_bt709_u8]
-def tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8 :=
+@[export leanav_lean_tonemap_pq10_to_bt709_u8]
+def tonemapPq10ToBt709Sdr8Export (y10 : UInt16) : UInt8 :=
   tonemapPq10ToBt709Sdr8 y10
+
+@[extern "leanav_c_tonemap_pq10_to_bt709_u8"]
+opaque tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8
 
 /--
   Theorem (Wave 52): `tonemapPq10ToBt709Sdr8` maps studio black (`≤ 64`) to `16`, peak white (`≥ 940`) to `235`,

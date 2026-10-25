@@ -651,6 +651,20 @@ opaque execLnirSwscaleGainBiasBaC (ba : ByteArray) (gain : Int64) (bias : Int64)
 @[extern "leanav_c_exec_lnir_pq10_studio_clamp_ba"]
 opaque execLnirPq10StudioClampBaC (ba : ByteArray) : ByteArray
 
+/-- Contract-guarded zero-copy `ByteArray` wrapper for `swscale_luma_gain_bias_simd`: enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
+def execLnirSwscaleGainBiasBaChecked (ba : ByteArray) (minLanes : Nat) (gain : Int64) (bias : Int64) : Option ByteArray :=
+  if verifyLnirSArrayContract ba.size minLanes true true then
+    some (execLnirSwscaleGainBiasBaC ba gain bias)
+  else
+    none
+
+/-- Contract-guarded zero-copy `ByteArray` wrapper for `pq10_studio_clamp_select_simd`: enforces `verifyLnirSArrayContract` before calling the LLVM kernel. -/
+def execLnirPq10StudioClampBaChecked (ba : ByteArray) (minLanes : Nat) : Option ByteArray :=
+  if verifyLnirSArrayContract ba.size minLanes true true then
+    some (execLnirPq10StudioClampBaC ba)
+  else
+    none
+
 /-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` on an `Array Int64` buffer. -/
 @[extern "leanav_c_exec_lnir_swscale_gain_bias"]
 opaque execLnirSwscaleGainBiasC (xs : @& Array Int64) (gain : Int64) (bias : Int64) : Array Int64

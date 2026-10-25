@@ -1097,6 +1097,7 @@ def isIntrospectionFlag (s : String) : Bool :=
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
   if !args.contains "-i" && !args.contains "-lavfi" && args.any isIntrospectionFlag then
+    if !verifyExecArgvHygiene args then return 1
     let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
     return rc
   let (cfg0, ext, plan) := parseArgsWithPlanIR args
@@ -1176,7 +1177,11 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         if stdoutPipeLike && !validCfg.jsonOutput then 0
         else if validCfg.jsonOutput || cliQuiet validCfg.logLevel || !validCfg.showStats then 1
         else 0
-      let rc ← ffiExecDelegatedFfmpegC argv outPath suppress
+      let rc ←
+        if verifyExecArgvHygiene argv.toList then
+          ffiExecDelegatedFfmpegC argv outPath suppress
+        else
+          pure 1
       let t1Del ← IO.monoNanosNow
       if rc == 0 then
         if validCfg.jsonOutput then
@@ -1409,11 +1414,12 @@ def runVerifyKernels : IO UInt32 := do
   let lnirClampOk :=
     (execLnirPq10StudioClampC vX.toArray).toList == evalLnirKernel .pq10StudioClamp vX [] []
   let baX := packInt64LanesLe vX
+  let badBa := ByteArray.mk #[1, 2, 3, 4, 5, 6, 7]
   let lnirZeroCopyBaOk :=
-    verifyLnirSArrayContract baX.size 8 true true &&
-    !verifyLnirSArrayContract 0 8 true true &&
-    unpackInt64LanesLe (execLnirSwscaleGainBiasBaC (packInt64LanesLe vX) 5 (-12)) == evalLnirKernel (.gainBias 5 (-12)) vX [] [] &&
-    unpackInt64LanesLe (execLnirPq10StudioClampBaC (packInt64LanesLe vX)) == evalLnirKernel .pq10StudioClamp vX [] []
+    (execLnirSwscaleGainBiasBaChecked badBa 8 5 (-12)).isNone &&
+    (execLnirPq10StudioClampBaChecked badBa 8).isNone &&
+    (execLnirSwscaleGainBiasBaChecked baX 8 5 (-12)).map unpackInt64LanesLe == some (evalLnirKernel (.gainBias 5 (-12)) vX [] []) &&
+    (execLnirPq10StudioClampBaChecked (packInt64LanesLe vX) 8).map unpackInt64LanesLe == some (evalLnirKernel .pq10StudioClamp vX [] [])
   let lnirCompiledOk :=
     lnirSuiteOk && lnirSroaOk && lnirSwscaleOk && lnirSaxpyOk && lnirWienerOk && lnirCdefOk && lnirClampOk && lnirZeroCopyBaOk
 

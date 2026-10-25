@@ -56,9 +56,9 @@ Every capability in the registry and in [`LeanAV.PlanIR.BackendTier`](../LeanAV/
 ### Phase 5 (Wave G): Pinned C-ABI FFI Facade, Memory Ownership & Cancellation
 - **Contract**: [`docs/contracts/phase5-ffi-abi-boundary.json`](contracts/phase5-ffi-abi-boundary.json).
 - **Direct Lean 4 `@[export]` & C-ABI Implementation**:
-  - `leanav_c_ffi_abi_version` (`0x00010005`, exported directly from Lean 4 in [`LeanAV/PlanIR.lean`](../LeanAV/PlanIR.lean))
-  - `leanav_c_ffi_probe_mp4_contract` (pure Lean 4 bounded MP4 box probe `ffiProbeMp4ContractPure` exported directly to C-ABI)
-  - `leanav_c_ffi_cancel_gate` (exported directly from Lean 4 `specFfiCancelGate` with zero model-code gap)
+  - `leanav_c_ffi_abi_version` (`0x00010005`, forwarded to `@[export leanav_lean_ffi_abi_version]` in [`LeanAV/PlanIR.lean`](../LeanAV/PlanIR.lean))
+  - `leanav_c_ffi_probe_mp4_contract` (pure Lean 4 bounded MP4 box probe `ffiProbeMp4ContractPure` via `@[export leanav_lean_ffi_probe_mp4_contract]` with a borrowed `b_lean_obj_arg` C-ABI shim preserving caller reference counts)
+  - `leanav_c_ffi_cancel_gate` (`__ATOMIC_SEQ_CST` fence in C followed by `@[export leanav_lean_ffi_cancel_gate]` / `specFfiCancelGate` with zero model-code gap)
   - `leanav_c_verify_plane_ffi_contract` (64-byte stride alignment + 64-byte tail SIMD padding)
   - `leanav_c_mc_bipred_plane` and `leanav_c_xor_residual_plane` wired as `@[extern]` in [`LeanAV/Video.lean`](../LeanAV/Video.lean)
 - **CLI Verification**: `lffmpeg verify-ffi`.

@@ -1872,19 +1872,13 @@ static void leanav_scale_plane_bilinear_u16_raw_with_tabs(
 }
 
 /*
- * Exact C-ABI implementation of `tonemapPq10ToBt709Sdr8` in `LeanAV/Scale.lean`:
- * Maps a 10-bit PQ code value `y10 ∈ [0, 1023]` into 8-bit BT.709 studio range `[16, 235]`.
+ * Direct C-ABI call to the verified Lean 4 `@[export]` function `leanav_lean_tonemap_pq10_to_bt709_u8`
+ * (`tonemapPq10ToBt709Sdr8` in `LeanAV/Scale.lean`): zero duplicated C formula.
  */
-static inline uint8_t leanav_tonemap_pq10_to_bt709_u8(uint16_t y10) {
-    uint32_t v = (uint32_t)y10;
-    if (v <= 64u) return 16u;
-    if (v >= 940u) return 235u;
-    uint32_t x = v - 64u;
-    uint32_t num = x * (219u * 480u + x * 219u);
-    uint32_t den = 876u * 480u + x * 876u;
-    uint32_t y_off = num / den;
-    if (y_off > 219u) y_off = 219u;
-    return (uint8_t)(16u + y_off);
+extern uint8_t leanav_lean_tonemap_pq10_to_bt709_u8(uint16_t y10);
+
+LEAN_EXPORT uint8_t leanav_c_tonemap_pq10_to_bt709_u8(uint16_t y10) {
+    return leanav_lean_tonemap_pq10_to_bt709_u8(y10);
 }
 
 /*
@@ -1898,7 +1892,7 @@ static pthread_once_t leanav_tm_lut_once = PTHREAD_ONCE_INIT;
 
 static void leanav_tm_lut_init(void) {
     for (uint32_t yn = 0; yn < 256; yn++) {
-        leanav_tm_lut[yn] = leanav_tonemap_pq10_to_bt709_u8((uint16_t)(yn << 2));
+        leanav_tm_lut[yn] = leanav_lean_tonemap_pq10_to_bt709_u8((uint16_t)(yn << 2));
     }
 }
 
@@ -3034,11 +3028,30 @@ static const char *leanav_resolve_ffmpeg_exec_path(void) {
     return "ffmpeg";
 }
 
+static pthread_once_t leanav_ld_env_once = PTHREAD_ONCE_INIT;
+
+static void leanav_init_ld_env(void) {
+    if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
+        const char *old_ld = getenv("LD_LIBRARY_PATH");
+        char ld_buf[4096];
+        if (old_ld && old_ld[0] != '\0') {
+            snprintf(ld_buf, sizeof(ld_buf),
+                "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
+                old_ld);
+        } else {
+            snprintf(ld_buf, sizeof(ld_buf),
+                "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
+        }
+        setenv("LD_LIBRARY_PATH", ld_buf, 1);
+    }
+}
+
 static uint32_t leanav_exec_ffmpeg_argv(
     const char *const *c_argv,
     const char *out_path,
     uint32_t suppress_output
 ) {
+    pthread_once(&leanav_ld_env_once, leanav_init_ld_env);
     const char *ffmpeg_bin = c_argv[0];
     int is_special_out = (!out_path || out_path[0] == '\0' ||
                           strcmp(out_path, "-") == 0 ||
@@ -3052,19 +3065,6 @@ static uint32_t leanav_exec_ffmpeg_argv(
         return 1u;
     }
     if (pid == 0) {
-        if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
-            const char *old_ld = getenv("LD_LIBRARY_PATH");
-            char ld_buf[4096];
-            if (old_ld && old_ld[0] != '\0') {
-                snprintf(ld_buf, sizeof(ld_buf),
-                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
-                    old_ld);
-            } else {
-                snprintf(ld_buf, sizeof(ld_buf),
-                    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
-            }
-            setenv("LD_LIBRARY_PATH", ld_buf, 1);
-        }
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
@@ -3097,8 +3097,7 @@ static uint32_t leanav_exec_ffmpeg_argv(
 /*
  * Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`leanav_c_transcode_mp4_general_verified`):
  * Supports:
- * - Lossless keyframe-aligned stream copy / remux (`codec_id_u32 == 0`) with `-ss`/`-t` seek/trim,
- *   automatic chapter-track stripping (`-map_chapters -1 -dn`), and 6ch->2ch AAC downmix fallback,
+ * - Lossless keyframe-aligned stream copy / remux (`codec_id_u32 == 0`) with `-ss`/`-t` seek/trim via direct `fork` + `execvp`,
  * - Arbitrary pixel-domain scaling (`2x2` AVX2/NEON SIMD, `3x3` 4K->720p reciprocal box, or general Q8 bilinear),
  * - Pixel-domain color/tonemap filters (`filter_flags_u32`),
  * - Hardware encoder auto-detection (`h264_videotoolbox` / `hevc_videotoolbox` on Apple M2,
@@ -3159,7 +3158,6 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         argv[ai] = NULL;
         uint32_t rc = leanav_exec_ffmpeg_argv(argv, out_path, 1u);
         if (rc != 0u) {
-            unlink(out_path);
             return 0;
         }
         g_last_max_block_sad_16x16 = 0;
@@ -3594,10 +3592,40 @@ LEAN_EXPORT uint32_t leanav_c_verify_plane_ffi_contract(
 }
 
 /*
+ * Phase 5 (Wave G): Borrowed-ABI C shims delegating to pure Lean 4 `@[export]` functions in `LeanAV/PlanIR.lean`.
+ * Preserves the exact `0x00010005` C-ABI contract (`b_lean_obj_arg` borrowed `ByteArray` on `leanav_c_ffi_probe_mp4_contract`
+ * via `lean_inc(ba)` and `__ATOMIC_SEQ_CST` fence on `leanav_c_ffi_cancel_gate`).
+ */
+extern uint32_t leanav_lean_ffi_abi_version(lean_obj_arg unit);
+extern uint32_t leanav_lean_ffi_cancel_gate(uint32_t cancel_flag, uint32_t frames_done, uint32_t max_frames);
+extern uint64_t leanav_lean_ffi_probe_mp4_contract(lean_obj_arg ba, size_t max_read_bytes);
+
+LEAN_EXPORT uint32_t leanav_c_ffi_abi_version(lean_obj_arg unit) {
+    return leanav_lean_ffi_abi_version(unit);
+}
+
+LEAN_EXPORT uint32_t leanav_c_ffi_cancel_gate(
+    uint32_t cancel_flag,
+    uint32_t frames_done,
+    uint32_t max_frames
+) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return leanav_lean_ffi_cancel_gate(cancel_flag, frames_done, max_frames);
+}
+
+LEAN_EXPORT uint64_t leanav_c_ffi_probe_mp4_contract(
+    b_lean_obj_arg ba,
+    size_t max_read_bytes
+) {
+    lean_inc(ba);
+    return leanav_lean_ffi_probe_mp4_contract(ba, max_read_bytes);
+}
+
+/*
  * Phase 4 (Waves E/F): Structured-Argv Delegated Execution (`leanav_c_exec_delegated_ffmpeg`):
  * Executes the reference FFmpeg binary via `fork()` + `execvp()` with a structured `Array String`
  * (zero shell interpolation), redirecting stdin from `/dev/null` and optionally suppressing stderr/stdout.
- * If the child exits nonzero and `out_path` is a non-empty regular file path (`!= "-"`), unlinks `out_path`.
+ * Enforces `verifyExecArgvHygiene` at the C boundary (rejecting empty tokens or embedded NUL bytes).
  */
 LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     b_lean_obj_arg argv_arr,
@@ -3615,7 +3643,8 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
     for (size_t i = 0; i < n; i++) {
         lean_object *elem = lean_array_get_core(argv_arr, i);
         const char *tok = lean_string_cstr(elem);
-        if (!tok || tok[0] == '\0') {
+        size_t str_sz = lean_string_size(elem);
+        if (!tok || str_sz <= 1 || strlen(tok) + 1 != str_sz) {
             free(c_argv);
             return 1u;
         }
@@ -3637,7 +3666,7 @@ LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
  *   offset 24 (i64): m_data[m_size]
  * Because Lean 4's `lean_sarray_object` (`ByteArray`) has the exact same 24-byte header
  * layout (`m_rc` at 0, `m_size` at 8, `m_capacity` at 16, `m_data` at 24), an exclusive
- * `ByteArray` (`m_rc == 1`, `byte_size % 8 == 0`) can be passed directly in-place to
+ * `ByteArray` (`m_rc == 1`, `byte_size > 0 && byte_size % 8 == 0`) can be passed directly in-place to
  * `lean-native-core` LLVM kernels with zero `malloc` by scaling `m_size >>= 3` before the call
  * and restoring `m_size <<= 3` upon return.
  */
@@ -3648,6 +3677,10 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias_ba(
     uint64_t gain,
     uint64_t bias
 ) {
+    size_t init_sz = lean_sarray_size(ba);
+    if (init_sz == 0 || (init_sz & 7u) != 0u) {
+        return ba;
+    }
     if (!lean_is_exclusive(ba)) {
         ba = lean_copy_byte_array(ba);
     }
@@ -3664,6 +3697,10 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_swscale_gain_bias_ba(
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_pq10_studio_clamp_ba(
     lean_obj_arg ba
 ) {
+    size_t init_sz = lean_sarray_size(ba);
+    if (init_sz == 0 || (init_sz & 7u) != 0u) {
+        return ba;
+    }
     if (!lean_is_exclusive(ba)) {
         ba = lean_copy_byte_array(ba);
     }

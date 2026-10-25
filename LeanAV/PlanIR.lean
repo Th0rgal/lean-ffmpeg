@@ -1263,41 +1263,56 @@ def serializePlanIRJson (plan : MediaPlanIR) : String :=
   let p7 := s!"\"error_count\":{plan.errors.length}}"
   p0 ++ p1a ++ p1b ++ p2 ++ p3 ++ p4 ++ p5a ++ p5b ++ p6a ++ p6b ++ p7
 
-/-- Build the structured `Array String` argv for `delegated_faithful` FFmpeg execution (zero shell interpolation). -/
+/-- Shell-free `execvp` argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
+def verifyExecArgvHygiene (argv : List String) : Bool :=
+  !argv.isEmpty && argv.all (fun tok => !tok.isEmpty && !(tok.contains '\x00'))
+
+/-- Build the structured `Array String` argv for `delegated_faithful` FFmpeg execution (zero shell interpolation), gated by `verifyExecArgvHygiene`. -/
 def buildDelegatedFfmpegArgv (plan : MediaPlanIR) (passthroughArgs : List String := []) : Array String :=
   if plan.outputs.isEmpty then #[]
-  else if passthroughArgs.isEmpty then
-    (renderPlanIRArgv plan true).toArray
   else
-    let hasYorN := passthroughArgs.contains "-y" || passthroughArgs.contains "-n"
-    let hasLogLevel := passthroughArgs.contains "-v" || passthroughArgs.contains "-loglevel"
-    let hasNostdin := passthroughArgs.contains "-nostdin"
-    let pre : List String :=
-      (if hasNostdin then [] else ["-nostdin"]) ++
-      (if hasYorN then [] else
-        match plan.outputs.head? with
-        | some o => if o.overwrite then ["-y"] else ["-n"]
-        | none   => []) ++
-      (if plan.resources.jsonOutput && !passthroughArgs.contains "-hide_banner" then ["-hide_banner"] else []) ++
-      (if plan.resources.jsonOutput && !passthroughArgs.contains "-nostats" then ["-nostats"] else []) ++
-      (if plan.resources.jsonOutput && !hasLogLevel then ["-v", "error"] else [])
-    (pre ++ passthroughArgs).toArray
+    let rawList : List String :=
+      if passthroughArgs.isEmpty then
+        renderPlanIRArgv plan true
+      else
+        let hasYorN := passthroughArgs.contains "-y" || passthroughArgs.contains "-n"
+        let hasLogLevel := passthroughArgs.contains "-v" || passthroughArgs.contains "-loglevel"
+        let hasNostdin := passthroughArgs.contains "-nostdin"
+        let pre : List String :=
+          (if hasNostdin then [] else ["-nostdin"]) ++
+          (if hasYorN then [] else
+            match plan.outputs.head? with
+            | some o => if o.overwrite then ["-y"] else ["-n"]
+            | none   => []) ++
+          (if plan.resources.jsonOutput && !passthroughArgs.contains "-hide_banner" then ["-hide_banner"] else []) ++
+          (if plan.resources.jsonOutput && !passthroughArgs.contains "-nostats" then ["-nostats"] else []) ++
+          (if plan.resources.jsonOutput && !hasLogLevel then ["-v", "error"] else [])
+        pre ++ passthroughArgs
+    if verifyExecArgvHygiene rawList then rawList.toArray else #[]
 
-/-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract (Direct Lean 4 `@[export]`) -/
+/-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract (Direct Lean 4 `@[export]` + Borrowed C-ABI Shim) -/
 
 /-- Pure specification of the Phase 5 cancellation & frame budget gate. -/
 def specFfiCancelGate (cancelFlag framesDone maxFrames : UInt32) : Bool :=
   cancelFlag == 0 && (maxFrames == 0 || framesDone < maxFrames)
 
-/-- Pinned Phase 5 C-ABI version (`0x00010005`), exported directly from Lean 4 to C-ABI. -/
-@[export leanav_c_ffi_abi_version]
-def ffiAbiVersionC (_ : Unit) : UInt32 :=
+/-- Pinned Phase 5 ABI version (`0x00010005`), exported from Lean 4 to the C-ABI shim. -/
+@[export leanav_lean_ffi_abi_version]
+def ffiAbiVersionExport (_ : Unit) : UInt32 :=
   0x00010005
 
-/-- Cooperative/preemptive cancellation & frame-budget gate, exported directly from Lean 4 to C-ABI. -/
-@[export leanav_c_ffi_cancel_gate]
-def ffiCancelGateC (cancelFlag framesDone maxFrames : UInt32) : UInt32 :=
+/-- Cooperative/preemptive cancellation & frame-budget gate, exported from Lean 4 to the C-ABI shim. -/
+@[export leanav_lean_ffi_cancel_gate]
+def ffiCancelGateExport (cancelFlag framesDone maxFrames : UInt32) : UInt32 :=
   if specFfiCancelGate cancelFlag framesDone maxFrames then 1 else 0
+
+/-- Pinned Phase 5 C-ABI version (`0x00010005`). -/
+@[extern "leanav_c_ffi_abi_version"]
+opaque ffiAbiVersionC : Unit → UInt32
+
+/-- Sequential-consistency atomic cancellation & frame-budget gate in C-ABI. -/
+@[extern "leanav_c_ffi_cancel_gate"]
+opaque ffiCancelGateC : UInt32 → UInt32 → UInt32 → UInt32
 
 /-- Read a big-endian 32-bit unsigned integer from `ba` at byte offset `pos`. -/
 def rdMp4U32Be (ba : ByteArray) (pos : Nat) : Nat :=
@@ -1409,14 +1424,14 @@ def ffiProbeMp4ContractPure (ba : ByteArray) (maxRead : Nat) : UInt64 :=
       let ts16 := if timescale > 0 && timescale <= 65535 then timescale else 15360
       ((1 : UInt64) <<< 63) ||| (width.toUInt64 <<< 32) ||| (height.toUInt64 <<< 16) ||| ts16.toUInt64
 
-/-- Bounded, zero-allocation MP4 header probe exported directly from Lean 4 to C-ABI. -/
-@[export leanav_c_ffi_probe_mp4_contract]
-def ffiProbeMp4ContractC (ba : ByteArray) (maxReadBytes : USize) : UInt64 :=
+/-- Pure Lean 4 MP4 header probe exported to the C-ABI shim (`leanav_c_ffi_probe_mp4_contract` preserves borrowed `@& ByteArray` ownership via `lean_inc`). -/
+@[export leanav_lean_ffi_probe_mp4_contract]
+def ffiProbeMp4ContractExport (ba : ByteArray) (maxReadBytes : USize) : UInt64 :=
   ffiProbeMp4ContractPure ba maxReadBytes.toNat
 
-/-- Shell-free `execvp` argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
-def verifyExecArgvHygiene (argv : List String) : Bool :=
-  !argv.isEmpty && argv.all (fun tok => !tok.isEmpty && !(tok.contains '\x00'))
+/-- Bounded, zero-allocation C-ABI MP4 header probe over borrowed `@& ByteArray`. -/
+@[extern "leanav_c_ffi_probe_mp4_contract"]
+opaque ffiProbeMp4ContractC : (@& ByteArray) → USize → UInt64
 
 /-- Structured-argv `fork` + `execvp` delegated FFmpeg runner in C-ABI (zero shell interpolation). -/
 @[extern "leanav_c_exec_delegated_ffmpeg"]
