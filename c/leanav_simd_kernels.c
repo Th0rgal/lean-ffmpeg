@@ -2352,6 +2352,8 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
  *   1 -> BT.2020 + SMPTE-2084 PQ (HDR10)
  *   2 -> BT.2020 + ARIB-STD-B67 HLG
  */
+extern uint32_t leanav_lean_classify_colr_nclx_u32(uint16_t prim, uint16_t trc, uint16_t spc);
+
 static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_in) {
     FILE *fp = fopen(in_path, "rb");
     if (fp) {
@@ -2372,8 +2374,8 @@ static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_
                             buf[i+4] == 'n' && buf[i+5] == 'c' && buf[i+6] == 'l' && (buf[i+7] == 'x' || buf[i+7] == 'c')) {
                             uint16_t prim = ((uint16_t)buf[i+8] << 8) | buf[i+9];
                             uint16_t trc  = ((uint16_t)buf[i+10] << 8) | buf[i+11];
-                            if (prim == 9 && trc == 18) { free(buf); fclose(fp); return 2; }
-                            if (prim == 9) { free(buf); fclose(fp); return 1; }
+                            uint32_t hdr_mode = leanav_lean_classify_colr_nclx_u32(prim, trc, 1) >> 24;
+                            if (hdr_mode > 0) { free(buf); fclose(fp); return (int)hdr_mode; }
                         }
                         if (buf[i] == 'm' && buf[i+1] == 'd' && buf[i+2] == 'c' && buf[i+3] == 'v') {
                             free(buf); fclose(fp); return 1;
@@ -2578,9 +2580,10 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
                 uint16_t prim = ((uint16_t)buf[bp + 12] << 8) | buf[bp + 13];
                 uint16_t trc  = ((uint16_t)buf[bp + 14] << 8) | buf[bp + 15];
                 uint16_t spc  = ((uint16_t)buf[bp + 16] << 8) | buf[bp + 17];
-                info->color_primaries = (prim == 9) ? 9 : 1;
-                info->color_trc = (trc == 16) ? 16 : (trc == 18 ? 18 : 1);
-                info->color_space = (spc == 9) ? 9 : 1;
+                uint32_t cdesc = leanav_lean_classify_colr_nclx_u32(prim, trc, spc);
+                info->color_primaries = (int)(cdesc & 0xFFu);
+                info->color_trc = (int)((cdesc >> 8) & 0xFFu);
+                info->color_space = (int)((cdesc >> 16) & 0xFFu);
             }
             if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "mdcv", &bp, &bs) && bs >= 32) {
                 /* ISO/IEC 14496-12 `mdcv` stores G, B, R, WP in 0.00002 units, max/min luminance in 0.0001 cd/m2 */

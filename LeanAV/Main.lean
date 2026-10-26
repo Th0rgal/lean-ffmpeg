@@ -788,7 +788,10 @@ def runSelfTest : IO UInt32 := do
                      rescaleElstEntryExport 1000 24000 1000 90000 24000 48000 == 0x0000BB8000015F90 &&
                      rescaleElstEntryExport 500 0xFFFFFFFF 1000 90000 24000 48000 == 0xFFFFFFFF0000AFC8 &&
                      rescaleElstEntryExport 0xFFFFFFFF 0x7FFFFFFF 2 0xFFFFFFFF 2 0xFFFFFFFF == 0x7FFFFFFFFFFFFFFF &&
-                     rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 == 0x000003E8FFFFFFFE
+                     rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 == 0x000003E8FFFFFFFE &&
+                     classifyColrNclxExport 9 16 9 == 0x01091009 &&
+                     classifyColrNclxExport 9 18 9 == 0x02091209 &&
+                     classifyColrNclxExport 1 1 1 == 0x00010101
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1

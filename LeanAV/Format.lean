@@ -3076,24 +3076,6 @@ def computeElstPresentationDuration : List ElstEntryView → UInt64
   | e :: rest => e.segmentDuration.toUInt64 + computeElstPresentationDuration rest
 
 /--
-  Rescale a v0 `elst` entry from the source movie/media timescales to the output movie/media timescales.
-  `mediaTime = 0xFFFFFFFF` (empty dwell) is preserved. Empty-dwell entries keep `mediaRateInteger = 1`.
--/
-def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : Nat) : ElstEntryView :=
-  let segDur :=
-    if srcMvhdTs == 0 || dstMvhdTs == 0 || srcMvhdTs == dstMvhdTs then e.segmentDuration.toNat
-    else (e.segmentDuration.toNat * dstMvhdTs + srcMvhdTs / 2) / srcMvhdTs
-  let medTime :=
-    if e.mediaTime >= (0x80000000 : UInt32) || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then e.mediaTime.toNat
-    else (e.mediaTime.toNat * dstMdhdTs + srcMdhdTs / 2) / srcMdhdTs
-  {
-    segmentDuration := segDur.toUInt32
-    mediaTime := medTime.toUInt32
-    mediaRateInteger := e.mediaRateInteger
-    mediaRateFraction := e.mediaRateFraction
-  }
-
-/--
   Overflow-free unboxed `UInt64` rounded rational rescaler `round(val * dstTs / srcTs)` for 32-bit
   inputs (`val, srcTs, dstTs : UInt32`). Uses quotient-remainder decomposition `val = q * srcTs + r`
   with `r < srcTs` so `r * dstTs + (srcTs >>> 1) < 2^64` never wraps `UInt64`, and saturates
@@ -3129,6 +3111,20 @@ def rescaleElstEntryExport (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMd
   rescaleElstEntryU64 segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs
 
 /--
+  Rescale a v0 `elst` entry from the source movie/media timescales to the output movie/media timescales.
+  `mediaTime = 0xFFFFFFFF` (empty dwell) is preserved. Empty-dwell entries keep `mediaRateInteger = 1`.
+-/
+def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : Nat) : ElstEntryView :=
+  let packed := rescaleElstEntryU64 e.segmentDuration e.mediaTime
+    srcMvhdTs.toUInt32 dstMvhdTs.toUInt32 srcMdhdTs.toUInt32 dstMdhdTs.toUInt32
+  {
+    segmentDuration := (packed &&& (0xFFFFFFFF : UInt64)).toUInt32
+    mediaTime := ((packed >>> 32) &&& (0xFFFFFFFF : UInt64)).toUInt32
+    mediaRateInteger := e.mediaRateInteger
+    mediaRateFraction := e.mediaRateFraction
+  }
+
+/--
   Theorem (Wave 24b): when `mvhd.timescale != mdhd.timescale`, an `elst` copied from a source movie
   (`mvhd = 1000`, `mdhd = 24000`) onto an output movie (`mvhd = 90000`, `mdhd = 24000`) rescales the
   movie-timescale `segmentDuration`, preserves the media-timescale `mediaTime` and empty dwell,
@@ -3144,6 +3140,8 @@ theorem elst_rescale_mvhd_mdhd_mismatch :
     rescaleElstEntryExport 1000 24000 1000 90000 24000 48000 = 0x0000BB8000015F90 ∧
     rescaleElstEntryExport 500 0xFFFFFFFF 1000 90000 24000 48000 = 0xFFFFFFFF0000AFC8 ∧
     rescaleElstEntryExport 0xFFFFFFFF 0x7FFFFFFF 2 0xFFFFFFFF 2 0xFFFFFFFF = 0x7FFFFFFFFFFFFFFF ∧
+    rescaleElstEntry { segmentDuration := 0xFFFFFFFF, mediaTime := 0x7FFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 } 2 0xFFFFFFFF 2 0xFFFFFFFF =
+      { segmentDuration := 0xFFFFFFFF, mediaTime := 0x7FFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 } ∧
     rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 = 0x000003E8FFFFFFFE := by
   decide
 
@@ -5359,6 +5357,26 @@ theorem mp4MetadataBoxInject_preserves_mdat_relative_offsets
   unfold shiftMp4AncestorSize shiftMp4ChunkOffset
   cases moovBeforeMdat <;> simp <;> omega
 
+/--
+  Classify an ISO/IEC 23091-2 `colr` (`nclx` / `nclc`) `(colourPrimaries, transferCharacteristics, matrixCoefficients)`
+  triple into a packed 32-bit descriptor `normPrim ||| (normTrc <<< 8) ||| (normSpc <<< 16) ||| (hdrMode <<< 24)`:
+  - `normPrim`: `9` (`bt2020`) if `prim == 9`, else `1` (`bt709`)
+  - `normTrc`: `16` (`smpte2084` PQ) if `trc == 16`, `18` (`arib-std-b67` HLG) if `trc == 18`, else `1` (`bt709`)
+  - `normSpc`: `9` (`bt2020nc`) if `spc == 9`, else `1` (`bt709`)
+  - `hdrMode`: `2` (BT.2020 HLG) if `prim == 9 && trc == 18`, `1` (BT.2020 PQ/HDR10) if `prim == 9`, else `0` (BT.709 SDR)
+-/
+@[inline]
+def classifyColrNclxU32 (prim trc spc : UInt16) : UInt32 :=
+  let normPrim : UInt32 := if prim == 9 then 9 else 1
+  let normTrc  : UInt32 := if trc == 16 then 16 else if trc == 18 then 18 else 1
+  let normSpc  : UInt32 := if spc == 9 then 9 else 1
+  let hdrMode  : UInt32 := if prim == 9 && trc == 18 then 2 else if prim == 9 then 1 else 0
+  normPrim ||| (normTrc <<< 8) ||| (normSpc <<< 16) ||| (hdrMode <<< 24)
+
+@[export leanav_lean_classify_colr_nclx_u32]
+def classifyColrNclxExport (prim trc spc : UInt16) : UInt32 :=
+  classifyColrNclxU32 prim trc spc
+
 /-- BT.2020 PQ limited-range `colr` (`nclx`) metadata fixture. -/
 def hdrBt2020PqLimited : ColrNclxView := {
   colourPrimaries := 9
@@ -5369,7 +5387,10 @@ def hdrBt2020PqLimited : ColrNclxView := {
 theorem hdr_colr_bt2020_pq_limited_roundtrip :
     decodeColrNclxBoxSpec (encodeColrNclxBoxSpec hdrBt2020PqLimited) = some hdrBt2020PqLimited ∧
     encodeColrNclxBoxSpec hdrBt2020PqLimited =
-      [0, 0, 0, 19, 99, 111, 108, 114, 110, 99, 108, 120, 0, 9, 0, 16, 0, 9, 0] := by
+      [0, 0, 0, 19, 99, 111, 108, 114, 110, 99, 108, 120, 0, 9, 0, 16, 0, 9, 0] ∧
+    classifyColrNclxExport 9 16 9 = 0x01091009 ∧
+    classifyColrNclxExport 9 18 9 = 0x02091209 ∧
+    classifyColrNclxExport 1 1 1 = 0x00010101 := by
   decide
 
 /-- HDR10 `mdcv` and `clli` static mastering luminance/light-level fixtures. -/
