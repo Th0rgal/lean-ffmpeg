@@ -3,7 +3,7 @@
  *
  * All media domain logic, codec/container parsing, ISO BMFF box patching,
  * pixel-domain scaling/tonemapping/CSC, and acceptance metrics live in pure
- * Lean 4 (`LeanAV/*.lean`). This file contains only the irreducible C glue:
+ * Lean 4 (`LeanAV/` modules). This file contains only the irreducible C glue:
  *   1. Phase 4/5 POSIX `fork` + `execvp` delegated execution shim (`leanav_c_exec_delegated_ffmpeg`).
  *   2. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
@@ -336,14 +336,14 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     uint64_t arg0,
     uint64_t arg1
 ) {
+    if (dst_w == 0 || dst_h == 0 || dst_w > 0x3FFFFFFFull || dst_h > 0x3FFFFFFFull) return lean_alloc_sarray(1, 0, 0);
     size_t total = (size_t)(dst_w * dst_h);
     lean_object *out = lean_alloc_sarray(1, total, total);
-    if (total == 0) return out;
     uint8_t *dst_ptr = lean_sarray_cptr(out);
-    uint64_t sh = (kernel_id <= 1u) ? (dst_h * 2u) : (kernel_id == 2u) ? (dst_h * 3u) : (kernel_id == 3u) ? ((dst_h * 3u) / 2u) : dst_h;
-    uint64_t mw = (kernel_id <= 1u) ? (dst_w * 2u) : (kernel_id == 2u) ? (dst_w * 3u) : (kernel_id == 3u) ? ((dst_w * 3u) / 2u) : dst_w;
+    uint64_t sh = (kernel_id <= 1u) ? (dst_h * 2u) : (kernel_id == 2u) ? (dst_h * 3u) : (kernel_id == 3u) ? ((dst_h >> 1u) * 3u + ((dst_h & 1u) ? 2u : 0u)) : dst_h;
+    uint64_t mw = (kernel_id <= 1u) ? (dst_w * 2u) : (kernel_id == 2u) ? (dst_w * 3u) : (kernel_id == 3u) ? ((dst_w >> 1u) * 3u + ((dst_w & 1u) ? 2u : 0u)) : dst_w;
     uint64_t st = (kernel_id == 4u) ? dst_w : src_stride;
-    if (st < mw || sh == 0 || (uint64_t)lean_sarray_size(src_ba) < (sh - 1u) * st + mw) { memset(dst_ptr, 0, total); return out; }
+    if (st < mw || st > 0x3FFFFFFFull || (uint64_t)lean_sarray_size(src_ba) < (sh - 1u) * st + mw) { memset(dst_ptr, 0, total); return out; }
     const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
     switch (kernel_id) {
         case 0u: lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;

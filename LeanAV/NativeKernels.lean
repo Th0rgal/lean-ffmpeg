@@ -977,6 +977,8 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
   let statsIn : ByteArray := { data := #[100, 120, 140, 160] }
   let statsOut := execLnirLumaStatsBaC statsIn 4 1
   let ok18 := (statsOut &&& 0xFFFFFFFF) == 130 && (statsOut >>> 32) == 500
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 then 1 else 0
+  let shortOddOut := execLnirScale2dBaC 3 { data := #[90] } 1 1 1 0 0
+  let ok19 := shortOddOut.size == 1 && shortOddOut.get! 0 == 0
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 then 1 else 0
 
 end LeanAV.NativeKernels
