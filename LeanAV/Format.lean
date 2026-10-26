@@ -3094,6 +3094,25 @@ def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdT
   }
 
 /--
+  Unboxed `UInt64` v0 `elst` `(segmentDuration, mediaTime)` rescaler from source movie/media timescales
+  to output movie/media timescales (`mediaTime >= 0x80000000` preserves empty dwell `0xFFFFFFFF`
+  and negative v0 media times). Packed as `segDur ||| (mediaTime <<< 32)`.
+-/
+@[inline]
+def rescaleElstEntryU64 (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : UInt32) : UInt64 :=
+  let segDur64 : UInt64 :=
+    if srcMvhdTs == 0 || dstMvhdTs == 0 || srcMvhdTs == dstMvhdTs then segDur.toUInt64
+    else (segDur.toUInt64 * dstMvhdTs.toUInt64 + (srcMvhdTs.toUInt64 >>> 1)) / srcMvhdTs.toUInt64
+  let medTime64 : UInt64 :=
+    if mediaTime >= (0x80000000 : UInt32) || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then mediaTime.toUInt64
+    else (mediaTime.toUInt64 * dstMdhdTs.toUInt64 + (srcMdhdTs.toUInt64 >>> 1)) / srcMdhdTs.toUInt64
+  (segDur64 &&& (0xFFFFFFFF : UInt64)) ||| ((medTime64 &&& (0xFFFFFFFF : UInt64)) <<< 32)
+
+@[export leanav_lean_rescale_elst_entry_u64]
+def rescaleElstEntryExport (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : UInt32) : UInt64 :=
+  rescaleElstEntryU64 segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs
+
+/--
   Theorem (Wave 24b): when `mvhd.timescale != mdhd.timescale`, an `elst` copied from a source movie
   (`mvhd = 1000`, `mdhd = 24000`) onto an output movie (`mvhd = 90000`, `mdhd = 24000`) rescales the
   movie-timescale `segmentDuration` and preserves the media-timescale `mediaTime` and the empty dwell.
@@ -3104,7 +3123,9 @@ theorem elst_rescale_mvhd_mdhd_mismatch :
     rescaleElstEntry src 1000 90000 24000 24000 =
       { segmentDuration := 90000, mediaTime := 24000, mediaRateInteger := 1, mediaRateFraction := 0 } ∧
     (rescaleElstEntry dwell 1000 90000 24000 24000).mediaTime = 0xFFFFFFFF ∧
-    (rescaleElstEntry dwell 1000 90000 24000 24000).segmentDuration = 45000 := by
+    (rescaleElstEntry dwell 1000 90000 24000 24000).segmentDuration = 45000 ∧
+    rescaleElstEntryExport 1000 24000 1000 90000 24000 48000 = 0x0000BB8000015F90 ∧
+    rescaleElstEntryExport 500 0xFFFFFFFF 1000 90000 24000 48000 = 0xFFFFFFFF0000AFC8 := by
   decide
 
 /--

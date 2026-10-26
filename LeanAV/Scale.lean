@@ -593,10 +593,11 @@ def cscChromaBt2020ToBt709Q10Export (u v : UInt8) : UInt16 :=
   u'.toUInt16 ||| (v'.toUInt16 <<< 8)
 
 /-- Compute one Q8 (`256`-scale) bilinear coordinate/fraction table entry for `dIdx < dstDim`
-    mapping `[0, dstDim) -> [0, srcDim)`, packed as `(s0 : UInt24) ||| ((s1 : UInt24) <<< 24) ||| ((fQ8 : UInt16) <<< 48)`. -/
+    mapping `[0, dstDim) -> [0, srcDim)` with `srcDim <= 0xFFFFFF` (24-bit coordinate cap),
+    packed as `(s0 : UInt24) ||| ((s1 : UInt24) <<< 24) ||| ((fQ8 : UInt16) <<< 48)`. -/
 @[inline]
 def bilinearTabEntryQ8 (dIdx srcDim dstDim : UInt32) : UInt64 :=
-  if srcDim == 0 || dstDim == 0 then 0
+  if srcDim == 0 || dstDim == 0 || srcDim > (0xFFFFFF : UInt32) || dIdx >= dstDim then 0
   else
     let srcN : UInt64 := srcDim.toUInt64
     let dstN : UInt64 := dstDim.toUInt64
@@ -629,6 +630,7 @@ theorem cscBt2020ToBt709_and_tonemap_invariants :
     cscChromaBt2020ToBt709Q10 64 192 = (61, 192) ∧
     bilinearTabEntryQ8Export 0 3840 1920 = 0x000001000000 ∧
     bilinearTabEntryQ8Export 1 3 2 = 0x0080000002000001 ∧
+    bilinearTabEntryQ8Export 0 (0x1000000 : UInt32) 1920 = 0 ∧
     tonemapLumaReinhardQ8 0 = 0 ∧
     tonemapLumaReinhardQ8 255 = 255 := by
   decide

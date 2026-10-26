@@ -2049,6 +2049,12 @@ static int leanav_locate_video_boxes(
     return 0;
 }
 
+extern uint64_t leanav_lean_rescale_elst_entry_u64(
+    uint32_t seg_dur, uint32_t media_time,
+    uint32_t src_mvhd_ts, uint32_t dst_mvhd_ts,
+    uint32_t src_mdhd_ts, uint32_t dst_mdhd_ts
+);
+
 static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *out_path, int copy_elst) {
     /* Read up to 4 MiB of header/tail from in_path to extract video stsd boxes and edts */
     FILE *fi = fopen(in_path, "rb");
@@ -2237,16 +2243,12 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
             for (uint32_t e = 0; e < entry_cnt && 24 + (e + 1) * 12 <= edts_len; e++) {
                 uint8_t *ep = edts_box + 24 + e * 12;
                 uint32_t seg_dur = leanav_rd_u32be(ep);
-                int32_t media_time = (int32_t)leanav_rd_u32be(ep + 4);
-                if (media_time != 0) in_has_nonzero_mt = 1;
-                if (in_mvhd_ts > 0 && out_mvhd_ts > 0 && in_mvhd_ts != out_mvhd_ts) {
-                    uint64_t scaled_dur = ((uint64_t)seg_dur * (uint64_t)out_mvhd_ts + (in_mvhd_ts >> 1)) / (uint64_t)in_mvhd_ts;
-                    leanav_wr_u32be(ep, (uint32_t)scaled_dur);
-                }
-                if (media_time > 0 && in_mdhd_ts > 0 && out_mdhd_ts > 0 && in_mdhd_ts != out_mdhd_ts) {
-                    int64_t scaled_mt = ((int64_t)media_time * (int64_t)out_mdhd_ts + (in_mdhd_ts >> 1)) / (int64_t)in_mdhd_ts;
-                    leanav_wr_u32be(ep + 4, (uint32_t)scaled_mt);
-                }
+                uint32_t media_time_u32 = leanav_rd_u32be(ep + 4);
+                if (media_time_u32 != 0) in_has_nonzero_mt = 1;
+                uint64_t rescaled = leanav_lean_rescale_elst_entry_u64(
+                    seg_dur, media_time_u32, in_mvhd_ts, out_mvhd_ts, in_mdhd_ts, out_mdhd_ts);
+                leanav_wr_u32be(ep, (uint32_t)(rescaled & 0xFFFFFFFFu));
+                leanav_wr_u32be(ep + 4, (uint32_t)(rescaled >> 32));
             }
         }
         size_t old_edts_p = 0, old_edts_s = 0;
