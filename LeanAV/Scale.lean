@@ -882,6 +882,20 @@ def tonemapPq10ToBt709Sdr8 (y10 : UInt16) : UInt8 :=
     let out := 16 + Nat.min 219 yOff
     out.toUInt8
 
+-- Lean 4.31 has finite decisions for Fin, but no forall-UInt8 instance.
+private instance (p : UInt8 → Prop) [DecidablePred p] : Decidable (∀ b, p b) :=
+  decidable_of_iff (∀ v : Fin 256, p ⟨⟨v⟩⟩)
+    ⟨fun h ⟨⟨v⟩⟩ => h v, fun h v => h ⟨⟨v⟩⟩⟩
+
+set_option maxRecDepth 4096 in
+set_option maxHeartbeats 2000000 in
+/-- On 8-bit input shifted to PQ10, the rational factors cancel exactly. -/
+theorem tonemapPq10ToBt709Sdr8_shl2_eq_clamp (b : UInt8) :
+    tonemapPq10ToBt709Sdr8 (b.toUInt16 <<< 2) =
+      (Nat.max 16 (Nat.min 235 b.toNat)).toUInt8 := by
+  revert b
+  decide
+
 @[export leanav_lean_tonemap_pq10_to_bt709_u8]
 def tonemapPq10ToBt709Sdr8Export (y10 : UInt16) : UInt8 :=
   tonemapPq10ToBt709Sdr8 y10
@@ -1081,6 +1095,13 @@ def scaleFrameYuv420pDown3to2Auto (src : @& ByteArray) (srcW srcH : Nat) : ByteA
     let vOut := scalePlaneDown3to2OffCSimd src (srcY + srcUv) srcCw.toUSize srcCh.toUSize
     yOut ++ uOut ++ vOut
 
+/-- Offset-aware native Q8 scaling; callers admit dimensions and footprints through the Q8 gate. -/
+@[inline]
+def scalePlaneBilinearQ8OffCSimd (src : @& ByteArray) (srcByteOff : Nat)
+    (srcW srcH dstW dstH srcStride : USize) : ByteArray :=
+  LeanAV.NativeKernels.execLnirBilinearQ8OffBaC src srcByteOff.toUInt64
+    srcW.toUInt64 srcH.toUInt64 srcStride.toUInt64 dstW.toUInt64 dstH.toUInt64
+
 /--
   Q8 bilinear native dispatch with pure Lean fallback / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
   operating on a slice `[srcOff, srcOff + srcW * srcH)` of `src : ByteArray`.
@@ -1098,8 +1119,8 @@ def scalePlaneBilinearWithTabsBytes
     return scalePlaneDown3to2OffCSimd src srcOff srcW.toUSize srcH.toUSize
   else if bilinearQ8KernelGateSpec.gate (srcOff, srcW, srcH, dstW, dstH, src.size, srcW) &&
       bilinearQ8TabsMatch srcW srcH dstW dstH xTab yTab then
-    return LeanAV.NativeKernels.execLnirBilinearQ8OffBaC src srcOff.toUInt64
-      srcW.toUInt64 srcH.toUInt64 srcW.toUInt64 dstW.toUInt64 dstH.toUInt64
+    return scalePlaneBilinearQ8OffCSimd src srcOff
+      srcW.toUSize srcH.toUSize dstW.toUSize dstH.toUSize srcW.toUSize
   else
     let total := dstW * dstH
     let mut out := ByteArray.emptyWithCapacity total
@@ -1290,6 +1311,66 @@ def applyPixelFiltersYuv420p (yBa uBa vBa : ByteArray) (filterFlags : UInt32) :
     return (yOut, uOut, vOut)
   else
     return (yOut, uBa, vBa)
+
+/-- Exact admission contract for packed filtering, including UInt64 conversion bounds. -/
+def yuv420pFilterGateSpec : AVGateSpec (Nat × Nat × Nat)
+    (fun (y, uv, cap) => y + 2 * uv ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF) where
+  gate := fun (y, uv, cap) => decide (y ≤ cap ∧ uv ≤ (cap - y) / 2 ∧ cap ≤ 0xFFFFFFFFFFFFFFFF)
+  sound := by intro ⟨y, uv, cap⟩ h; simp only [decide_eq_true_eq] at h; omega
+  complete := by intro ⟨y, uv, cap⟩ h; simp only [decide_eq_true_eq]; omega
+  posWitness := (16, 4, 24)
+  negWitness := (16, 4, 23)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission is equivalent to the complete representable packed footprint. -/
+theorem yuv420pFilterGateSpec_iff (y uv cap : Nat) :
+    yuv420pFilterGateSpec.gate (y, uv, cap) = true ↔
+      y + 2 * uv ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF :=
+  yuv420pFilterGateSpec.iff_safe (y, uv, cap)
+
+/-- Filter a packed frame in one native allocation; truncated inputs retain pure slice semantics. -/
+def applyPixelFiltersYuv420pFrameFast (src : ByteArray) (w h : Nat)
+    (filterFlags : UInt32) : ByteArray :=
+  let yLen := w * h
+  let uvLen := (w / 2) * (h / 2)
+  if yuv420pFilterGateSpec.gate (yLen, uvLen, src.size) then
+    LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC src yLen.toUInt64 uvLen.toUInt64 filterFlags
+  else
+    let (y, u, v) := applyPixelFiltersYuv420p
+      (src.extract 0 yLen) (src.extract yLen (yLen + uvLen))
+      (src.extract (yLen + uvLen) (yLen + 2 * uvLen)) filterFlags
+    y ++ u ++ v
+
+/-- Exhaustive byte-pair differential check plus vector tails and malformed-buffer cases. -/
+def verifyPixelFiltersNative : Bool := Id.run do
+  let y : ByteArray := ⟨(Array.range 256).map Nat.toUInt8⟩
+  let u : ByteArray := ⟨(Array.range 65536).map (fun i => (i / 256).toUInt8)⟩
+  let v : ByteArray := ⟨(Array.range 65536).map Nat.toUInt8⟩
+  for flags in ([0, 1, 2, 3, 0xFFFFFFFC, 0xFFFFFFFF] : List UInt32) do
+    let (ey, eu, ev) := applyPixelFiltersYuv420p y u v flags
+    let actual := LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC (y ++ u ++ v) 256 65536 flags
+    if actual.data != (ey ++ eu ++ ev).data then return false
+    for n in [0, 1, 15, 16, 17, 31, 32, 33, 255] do
+      let ys := y.extract 0 n
+      let us := y.extract 0 n
+      let vs : ByteArray := ⟨us.data.reverse⟩
+      let (ey, eu, ev) := applyPixelFiltersYuv420p ys us vs flags
+      let packed := ys ++ us ++ vs
+      let actual := LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC packed n.toUInt64 n.toUInt64 flags
+      if actual.data != (ey ++ eu ++ ev).data then return false
+    for dims in [(0, 0), (1, 1), (7, 5), (8, 8), (18, 6)] do
+      for cap in [0, 1, 17, 63, 255] do
+        let src := y.extract 0 cap
+        let yl := dims.1 * dims.2
+        let ul := (dims.1 / 2) * (dims.2 / 2)
+        let (ey, eu, ev) := applyPixelFiltersYuv420p (src.extract 0 yl)
+          (src.extract yl (yl + ul)) (src.extract (yl + ul) (yl + 2 * ul)) flags
+        if (applyPixelFiltersYuv420pFrameFast src dims.1 dims.2 flags).data != (ey ++ eu ++ ev).data then
+          return false
+  return (LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC y 257 0 3).isEmpty &&
+    (LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC y 1 128 3).isEmpty &&
+    (LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC y 0 0xFFFFFFFFFFFFFFFF 3).isEmpty
 
 /-! ## 8. Consolidated 2x2 Box-Scale, Strided SIMD Bounds, and 16x16 SAD Proofs -/
 

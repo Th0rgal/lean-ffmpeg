@@ -791,8 +791,10 @@ theorem transcodeAvcc4kTo1080pPacket_preserves_ipb_framing :
 
 /--
   Pure Lean reference specification for 4K -> 1080p HEVC (`hvc1` HVCC) I/P/B packet transcoding:
-  Emits a 4-byte Big-Endian HVCC length prefix + 2-byte ITU-T H.265 NAL header (`0x26, 0x01` for `IDR_W_RADL = 19` I-frame;
-  `0x02, 0x01` for `TRAIL_R = 1` P-frame; `0x00, 0x01` for `TRAIL_N = 0` B-frame) + 7-byte PTS/DTS/POC slice header + 4:1 downscaled payload.
+  Emits a 4-byte Big-Endian HVCC length prefix + 2-byte ITU-T H.265 NAL header
+  (`0x26, 0x01` for `IDR_W_RADL = 19` I-frame;
+  `0x02, 0x01` for `TRAIL_R = 1` P-frame; `0x00, 0x01` for `TRAIL_N = 0` B-frame)
+  + 7-byte PTS/DTS/POC slice header + 4:1 downscaled payload.
 -/
 def transcodeHvccHevc4kTo1080pPacketRef (srcBa : ByteArray) (off len : Nat)
     (frameTypeCode : UInt8) (pts dts : UInt64) : ByteArray :=
@@ -1444,9 +1446,9 @@ theorem luma16x16Acceptance_iff (x : Luma16x16AcceptanceInput) :
 
 /-- Universal soundness also identifies the exact exported metrics word. -/
 theorem luma16x16Acceptance_sound (x : Luma16x16AcceptanceInput)
-    (h : (acceptTranscodedFrameWithPrevLuma x).1 = true) :
+    (h : (LeanAV.Encoder.acceptTranscodedFrameWithPrevLuma x).1 = true) :
     Luma16x16AcceptanceSafe x ∧
-    (acceptTranscodedFrameWithPrevLuma x).2 =
+    (LeanAV.Encoder.acceptTranscodedFrameWithPrevLuma x).2 =
       packAcceptanceMetricsExport
         (computeLuma16x16SadAndSsePure x.cur x.prev x.width x.height).1
         (classifyLumaPsnrX10Export
@@ -1533,7 +1535,11 @@ def resolveFfprobeBinIO : IO String :=
   ] "ffprobe"
 
 def ffmpegSpawnEnvIO : IO (Array (String × Option String)) := do
-  let runtimeLib := "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu"
+  let runtimeLib :=
+    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:" ++
+    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:" ++
+    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:" ++
+    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu"
   let oldLd ← IO.getEnv "LD_LIBRARY_PATH"
   let newLd := match oldLd with
     | some s => if s != "" then s!"{runtimeLib}:{s}" else runtimeLib
@@ -1817,8 +1823,23 @@ theorem threadSplitGateSpec_sound (cores dec enc : Nat)
     0 < dec ∧ 0 < enc ∧ dec + enc ≤ max 2 cores :=
   threadSplitGateSpec.sound (cores, dec, enc) h
 
+/-- A positive pipe read is complete-in-one-shot iff it returns the requested byte count. -/
+def singleShotPipeReadGateSpec : AVGateSpec (Nat × Nat)
+    (fun (req, got) => 0 < req ∧ got = req) where
+  gate := fun (req, got) => decide (0 < req ∧ got = req)
+  sound := by intro ⟨req, got⟩ h; simpa using h
+  complete := by intro ⟨req, got⟩ h; simpa using h
+  posWitness := (1, 1)
+  negWitness := (1, 0)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem singleShotPipeReadGateSpec_iff (req got : Nat) :
+    singleShotPipeReadGateSpec.gate (req, got) = true ↔ 0 < req ∧ got = req :=
+  singleShotPipeReadGateSpec.iff_safe (req, got)
+
 def readExactBytesFromHandle (h : IO.FS.Handle) (n : Nat) : IO (Option ByteArray) := do
-  let first ← h.read (Nat.min n 65536).toUSize
+  let first ← h.read n.toUSize
   if first.size == n then
     return some first
   else if first.isEmpty then
@@ -1827,7 +1848,7 @@ def readExactBytesFromHandle (h : IO.FS.Handle) (n : Nat) : IO (Option ByteArray
     let mut acc := ByteArray.emptyWithCapacity n
     acc := acc ++ first
     while acc.size < n do
-      let step := Nat.min (n - acc.size) 65536
+      let step := n - acc.size
       let chunk ← h.read step.toUSize
       if chunk.isEmpty then
         return none
@@ -1947,7 +1968,8 @@ def transcodeMp4GeneralVerifiedIO
       (#["-c:v", "libsvtav1", "-preset", (if cliOpts.preset != "" then cliOpts.preset else "12"),
          "-crf", (if cliOpts.crf != "" then cliOpts.crf else "28"), "-pix_fmt", effPixFmt], "", "libsvtav1")
     else
-      (#["-c:v", "libx264", "-preset", effPreset] ++ vRateCtrl ++ #["-threads", "4", "-pix_fmt", effPixFmt], ":subme=3:threads=4:lookahead_threads=1", "libx264")
+      (#["-c:v", "libx264", "-preset", effPreset] ++ vRateCtrl ++ #["-threads", "4", "-pix_fmt", effPixFmt],
+       ":subme=3:threads=4:lookahead_threads=1", "libx264")
 
   let aEncArgs : Array String :=
     if (filterFlags &&& 8) != 0 then
@@ -1976,7 +1998,7 @@ def transcodeMp4GeneralVerifiedIO
       #["-y", "-v", "error", "-threads", "4", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
       rawInColorArgsForCs hdrCs ++
       #["-s", s!"{dstW}x{dstH}", "-r", fpsStr, "-i", "-"] ++
-      ssArgs ++ tArgs ++ #["-threads", "4", "-i", inPath]
+      ssArgs ++ tArgs ++ #["-threads", "1", "-i", inPath]
     if effWithAudio then
       base ++ #["-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
                 "-map_metadata:s:v", "1:s:v", "-map_metadata:s:a", "1:s:a",
@@ -1989,7 +2011,7 @@ def transcodeMp4GeneralVerifiedIO
 
   let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
   let needTabs : Bool :=
-    (is10bit || (filterFlags &&& 3) != 0) &&
+    (is10bit || srcW > 32768 || srcH > 32768) &&
     !(srcW == dstW && srcH == dstH) &&
     !(srcW == dstW * 2 && srcH == dstH * 2) &&
     !(srcW == dstW * 3 && srcH == dstH * 3) &&
@@ -2021,29 +2043,23 @@ def transcodeMp4GeneralVerifiedIO
   let mut psnrMin : UInt64 := 600
   let mut distLtBlackAll : UInt32 := 1
   let mut writeFailed : Bool := false
-  let mut nextFrameTaskOpt : Option (Task (Except IO.Error (Option ByteArray))) ←
-    if outputFrameLimit == 0 || framesDone < outputFrameLimit then
-      let t ← IO.asTask (prio := .dedicated) (readExactBytesFromHandle decChild.stdout frameBytes)
-      pure (some t)
-    else
-      pure none
+  let mut nextFrameTaskOpt : Option (Task (Except IO.Error (Option ByteArray))) := none
+  if outputFrameLimit == 0 || framesDone < outputFrameLimit then
+    let t ← IO.asTask (readExactBytesFromHandle decChild.stdout frameBytes)
+    nextFrameTaskOpt := some t
 
-  -- Overlap encoder dynamic-linker/codec init with decoder startup + Frame 0 decode
-  -- whenever the output path is newly created (cleaned up on zero-frame failure) or
-  -- when an un-seeked valid MP4 header has already been verified.
-  let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) ←
-    if !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0)) then
-      let ec ← IO.Process.spawn {
-        cmd := ffmpegBin
-        args := encArgs
-        stdin := .piped
-        stdout := .null
-        stderr := .null
-        env := env
-      }
-      pure (some ec)
-    else
-      pure none
+  -- Overlap encoder startup with the initial decode when the output is safe to open.
+  let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) := none
+  if !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0)) then
+    let ec ← IO.Process.spawn {
+      cmd := ffmpegBin
+      args := encArgs
+      stdin := .piped
+      stdout := .null
+      stderr := .null
+      env := env
+    }
+    encChildOpt := some ec
 
   while !writeFailed do
     if outputFrameLimit > 0 && framesDone >= outputFrameLimit then
@@ -2053,7 +2069,7 @@ def transcodeMp4GeneralVerifiedIO
     let frameRes ← IO.wait frameTask
     let some srcBuf ← (match frameRes with | .ok v => pure v | .error _ => pure none) | break
     if outputFrameLimit == 0 || framesDone + 1 < outputFrameLimit then
-      let nextTask ← IO.asTask (prio := .dedicated) (readExactBytesFromHandle decChild.stdout frameBytes)
+      let nextTask ← IO.asTask (readExactBytesFromHandle decChild.stdout frameBytes)
       nextFrameTaskOpt := some nextTask
     if encChildOpt.isNone then
       let ec ← IO.Process.spawn {
@@ -2098,13 +2114,8 @@ def transcodeMp4GeneralVerifiedIO
         else if (filterFlags &&& 3) == 0 then
           scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else
-          let uOff := srcYSz
-          let vOff := srcYSz + srcUvSz
-          let yScaled := scalePlaneBilinearWithTabsBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
-          let uScaled := scalePlaneBilinearWithTabsBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          let vScaled := scalePlaneBilinearWithTabsBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          let (yF, uF, vF) := applyPixelFiltersYuv420p yScaled uScaled vScaled filterFlags
-          yF ++ uF ++ vF
+          let scaled := scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
+          applyPixelFiltersYuv420pFrameFast scaled dstW dstH filterFlags
 
       if let some ec := encChildOpt then
         let wroteOk ← (do

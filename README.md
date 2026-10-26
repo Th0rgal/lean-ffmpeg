@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **9 LLVM 18 2D strided/reduction routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`526`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,647`** declarations (`8,618` under `v4.35.0`) and **`243 / 243` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **10 LLVM 18 2D strided/reduction/filter routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`540`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,667`** declarations (`8,667` under `v4.35.0`, `8,772` under `v4.31.0`) and **`246 / 246` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 ---
 
@@ -21,7 +21,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 | Verification Suite | Scope | Verified Result | Details |
 | :--- | :--- | :---: | :--- |
-| **Suite #0 (`tests/`)** | **61 Python unit & differential tests** + C-ABI / LNIR self-tests | **`61 / 61` (`100%`)** | `15/15` unit tests (`tests/`) + `46/46` differential tests (`tests/differential/`) + `53/53` `self-test` waves + `16/16` compiled LNIR kernels verified via FFI |
+| **Suite #0 (`tests/`)** | **63 Python unit & differential tests** + C-ABI / LNIR self-tests | **`63 / 63` (`100%`)** | `17/17` unit tests (`tests/`) + `46/46` differential tests (`tests/differential/`) + `53/53` `self-test` waves + `16/16` compiled LNIR kernels verified via FFI |
 | **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` stream signatures (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |
@@ -32,14 +32,14 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`243 / 243` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,647`** kernel-checked declarations (`Format`: 56, `Video`: 29, `NativeKernels`: 25, `Spec`: 23, `Encoder`: 22, `Scale`: 18, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`246 / 246` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,667`** kernel-checked declarations (`Format`: 56, `Video`: 29, `NativeKernels`: 25, `Spec`: 23, `Encoder`: 23, `Scale`: 20, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
 ## Build & Verification
 
 ```bash
-# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 9 2D/stats routines, and the 526-line C-ABI bridge (0 sorryAx)
+# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 10 2D/stats/filter routines, and the 540-line C-ABI bridge (0 sorryAx)
 lake build
 
 # Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
@@ -47,17 +47,17 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,647 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,667 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit all 15 formal modules in parallel with turbo-lean (243/243 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
+# Audit all 15 formal modules in parallel with turbo-lean (246/246 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
 turbo-lean --json audit-spec LeanAV/*.lean
 
 # Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
 lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
 lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
-# Run the Python unit and differential test suites (61 tests: 15 unit + 46 differential)
+# Run the Python unit and differential test suites (63 tests: 17 unit + 46 differential)
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```

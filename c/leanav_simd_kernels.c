@@ -524,3 +524,17 @@ LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
     uint64_t psnr_x10 = leanav_lean_classify_luma_psnr_x10_u64(metrics[1], metrics[2]);
     return leanav_lean_pack_acceptance_metrics_u64(metrics[0], psnr_x10, (uint32_t)metrics[3]);
 }
+
+/* Borrowed packed input; reject malformed lengths before allocation or pointer arithmetic. */
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_apply_filters_yuv420p_ba(
+    b_lean_obj_arg src_ba, uint64_t y_len, uint64_t uv_len, uint32_t flags
+) {
+    size_t cap = lean_sarray_size(src_ba);
+    if (y_len > cap || uv_len > (cap - y_len) / 2u)
+        return lean_alloc_sarray(1, 0, 0);
+    size_t total = (size_t)(y_len + 2u * uv_len);
+    lean_obj_res out = lean_alloc_sarray(1, total, total);
+    lean_native_apply_filters_yuv420p_u8(
+        lean_sarray_cptr(src_ba), lean_sarray_cptr(out), y_len, uv_len, flags);
+    return out;
+}

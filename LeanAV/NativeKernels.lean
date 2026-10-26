@@ -885,6 +885,11 @@ opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride ds
 opaque execLnirBilinearQ8OffBaC (src : @& ByteArray)
     (srcOff srcW srcH srcStride dstW dstH : UInt64) : ByteArray
 
+-- Borrowed packed Y/U/V input; invalid lengths return an empty array.
+@[extern "leanav_c_exec_lnir_apply_filters_yuv420p_ba"]
+opaque execLnirApplyFiltersYuv420pBaC (src : @& ByteArray) (yLen uvLen : UInt64)
+    (flags : UInt32) : ByteArray
+
 /-- Zero-copy fused 3-plane `YUV420P` `ByteArray` 2D LNIR dispatcher
     (`0=swscale_down2x2_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`, `5=bilinear_q8_u8`). -/
 @[extern "leanav_c_exec_lnir_scale2d_yuv420p_ba"]
