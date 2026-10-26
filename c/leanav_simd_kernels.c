@@ -9,7 +9,7 @@
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
  *      `leanav_c_ffi_probe_mp4_contract` with borrowed `lean_inc`).
  *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 16
- *      `lean-native-core`-compiled `LNIR_WIRE_V1` LLVM IR kernels (`leanav_c_exec_lnir_*_ba`).
+ *      `LNIR_WIRE_V1` kernels and 7 2D/reduction LLVM 18 routines (`leanav_c_exec_lnir_*_ba`).
  */
 #include <lean/lean.h>
 #include <stdint.h>
@@ -338,7 +338,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
 ) {
     size_t total = (size_t)(dst_w * dst_h);
     lean_object *out = lean_alloc_sarray(1, total, total);
-    if (total == 0) return out;
+    if (total == 0 || (kernel_id == 4u && lean_sarray_size(src_ba) < total)) return out;
     const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
     uint8_t *dst_ptr = lean_sarray_cptr(out);
     switch (kernel_id) {
@@ -361,7 +361,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_cdef_ba(
 ) {
     size_t total = (size_t)(w * h);
     lean_object *out = lean_alloc_sarray(1, total, total);
-    if (total == 0) return out;
+    if (total == 0 || lean_sarray_size(src_ba) < total) return out;
     lean_native_av1_cdef_filter_u8(lean_sarray_cptr(out), lean_sarray_cptr(src_ba), w, h, pri_str, damping);
     return out;
 }

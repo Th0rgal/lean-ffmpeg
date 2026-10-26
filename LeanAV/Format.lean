@@ -5971,6 +5971,22 @@ def probeMp4HdrColorspacePure (buf : @& ByteArray) : UInt32 := Id.run do
       return 1
   return 0
 
+/-- Check whether `buf` contains an explicit `colr` (`nclx`/`nclc`) box declaring SDR colorimetry (`classifyColrNclxU32 prim trc 1 >>> 24 == 0`). -/
+def hasExplicitSdrColrBoxPure (buf : @& ByteArray) : Bool := Id.run do
+  let n := buf.size
+  if n < 15 then return false
+  for i in [:n - 14] do
+    let fcc := baRdU32BE buf i
+    if fcc == 0x636F6C72 then -- 'colr'
+      let sub := baRdU32BE buf (i + 4)
+      if sub == 0x6E636C78 || sub == 0x6E636C63 then -- 'nclx' or 'nclc'
+        let prim := baRdU16BE buf (i + 8)
+        let trc  := baRdU16BE buf (i + 10)
+        let hdrMode := classifyColrNclxU32 prim trc 1 >>> 24
+        if hdrMode == 0 && prim > 0 && trc > 0 then
+          return true
+  return false
+
 /-- Pure Lean 4 nominal video frame rate `(fpsNum, fpsDen)` prober from `mdhd` timescale and `stts` sample delta. -/
 def probeMp4FpsRationalPure (buf : @& ByteArray) : Option (UInt32 × UInt32) := do
   let loc ← mp4LocateVideoBoxes buf buf.size

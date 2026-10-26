@@ -1162,6 +1162,7 @@ def measureLumaAcceptance16x16Pure
   let mut allCloserThanBlack : UInt32 := 1
   let mbStepY : Nat := if dstH >= 256 then 64 else 16
   let mbStepX : Nat := if dstW >= 256 then 64 else 16
+  let is1x1 : Bool := (srcW == dstW && srcH == dstH)
   let is2x2 : Bool := (srcW == dstW * 2 && srcH == dstH * 2)
   let is3x3 : Bool := (srcW == dstW * 3 && srcH == dstH * 3)
   let srcCap := src.size
@@ -1182,7 +1183,17 @@ def measureLumaAcceptance16x16Pure
           for y in [:16] do
             let dy := byIdx + y
             let dRowOff := dy * dstW + bxIdx
-            if is2x2 then
+            if is1x1 then
+              for x in [:16] do
+                let r := getS (dRowOff + x)
+                let d := getD (dRowOff + x)
+                let ad := (if d >= r then d - r else r - d).toUInt64
+                let bd := (if r >= 16 then r - 16 else 16 - r).toUInt64
+                blkSad := blkSad + ad
+                blkBlackSad := blkBlackSad + bd
+                blkRefSum := blkRefSum + r.toUInt64
+                totalSqErr := totalSqErr + ad * ad
+            else if is2x2 then
               let sRow0 := (dy * 2) * srcW + bxIdx * 2
               let sRow1 := sRow0 + srcW
               for x in [:16] do
@@ -1423,7 +1434,7 @@ def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
 def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
   let pureCs := probeMp4HdrColorspacePure moovBuf
   if pureCs > 0 then return pureCs
-  if !moovBuf.isEmpty && (mp4LocateVideoBoxes moovBuf moovBuf.size).isSome then
+  if hasExplicitSdrColrBoxPure moovBuf then
     return 0
   try
     let ffprobeBin ← resolveFfprobeBinIO
@@ -1562,63 +1573,13 @@ def isSpecialOutputTarget (outPath : String) : Bool :=
   outPath == "" || outPath == "-" || outPath == "/dev/null" ||
   outPath.startsWith "pipe:" || outPath.startsWith "md5:"
 
-def transcodeMp4DirectSdrFastIO
-    (ffmpegBin inPath outPath fpsStr x264SubmeSuffix : String)
-    (env : Array (String × Option String))
-    (ssArgs tArgs vEncArgs aEncArgs : Array String)
-    (inMoovBuf : ByteArray)
-    (srcW dstW srcH dstH : Nat)
-    (startMs durMs hdrCs codecId : UInt32)
-    (outputFrameLimit : UInt64)
-    (effWithAudio isSpecialOut existedBefore showStats : Bool) : IO UInt64 := do
-  let vfScaleArgs : Array String :=
-    if srcW != dstW || srcH != dstH then #["-vf", s!"scale={dstW}:{dstH}:flags=bilinear"] else #[]
-  let baseDirect : Array String :=
-    #["-y", "-v", "error", "-nostdin", "-xerror", "-hwaccel", "auto", "-threads", "0"] ++
-    ssArgs ++ tArgs ++ #["-i", inPath] ++ vfScaleArgs ++ #["-r", fpsStr]
-  let directArgs : Array String :=
-    if effWithAudio then
-      baseDirect ++ #["-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0",
-                      "-map_metadata:s:v", "0:s:v", "-map_metadata:s:a", "0:s:a",
-                      "-map_chapters", "0", "-dn", "-sn"] ++
-      vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ aEncArgs ++ #[outPath]
-    else
-      baseDirect ++ #["-map", "0:v:0", "-map_metadata", "0", "-map_metadata:s:v", "0:s:v",
-                      "-map_chapters", "0", "-dn", "-sn", "-an"] ++
-      tArgs ++ vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
-  let dChild ← IO.Process.spawn {
-    cmd := ffmpegBin
-    args := directArgs
-    stdin := .null
-    stdout := .null
-    stderr := .null
-    env := env
-  }
-  let dRc ← dChild.wait
-  let outBytes ← if !isSpecialOut then getFileSizeU64IO outPath else pure 1024
-  if dRc != 0 || (!isSpecialOut && outBytes < 256) then
-    if !isSpecialOut && !existedBefore then
-      try IO.FS.removeFile outPath catch _ => pure ()
-    return 0
-  let estFrames : UInt64 := if outputFrameLimit > 0 then outputFrameLimit else 120
-  if showStats then
-    let summaryAudio : UInt64 := if effWithAudio && outBytes > 1024 then outBytes / 10 else 0
-    let summaryVideo : UInt64 := if outBytes > summaryAudio then outBytes - summaryAudio else outBytes
-    let overheadUpct := computeMuxingOverheadMicroPctU64 summaryVideo summaryAudio outBytes
-    IO.eprintln s!"frame={estFrames} Lsize={outBytes / 1024}KiB muxing overhead: {overheadUpct / 1000000}.{overheadUpct % 1000000}%"
-  let sampleStats := LeanAV.NativeKernels.execLnirLumaStatsBaC inMoovBuf (Nat.min 4096 inMoovBuf.size).toUInt64 16
-  let sampleMean := Nat.max 64 (Nat.min 200 (sampleStats &&& 0xFF).toNat) |>.toUInt64
-  lastAcceptanceMetricsRef.set (packAcceptanceMetricsU64 64 480 1)
-  patchMp4HdrAndElstBoxesIO inPath outPath inMoovBuf false
-  return packTranscodeReportU64 estFrames (estFrames * sampleMean) (estFrames * 1500)
-
 /--
   Pure Lean 4 Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`transcodeMp4GeneralVerifiedIO`):
   Supports:
   - Lossless keyframe-aligned stream copy / remux (`codecId == 0`) with `-ss`/`-t` seek/trim via `IO.Process.spawn`,
   - Arbitrary pixel-domain scaling (`2x2`, `3x3`, `3:2`, or general Q8 bilinear) in pure Lean 4,
   - Pixel-domain color/tonemap filters (`filterFlags`) in pure Lean 4,
-  - Per-frame luma mean & spatial variance (`computeLumaStatsU8Pure`/`computeLumaStatsU16LePure`) and
+  - Per-frame luma mean & spatial variance (`computeLumaStatsU8Fast`/`computeLumaStatsU16LePure`) and
     16x16 macroblock SAD/PSNR (`measureLumaAcceptance16x16Pure`) in pure Lean 4,
   - ISO/IEC 14496-12 `colr`/`clli`/`mdcv`/`pasp`/`edts` container box patching (`patchMp4HdrAndElstBoxesIO`) in pure Lean 4.
 -/
@@ -1722,15 +1683,8 @@ def transcodeMp4GeneralVerifiedIO
   let ssArgs : Array String := if startMs > 0 then #["-ss", formatMsSec3 startMs] else #[]
   let tArgs  : Array String := if durMs > 0 then #["-t", formatMsSec3 durMs] else #[]
 
-  -- Fast Path 1: Direct single-process SDR 8-bit transcode when no custom pure-Lean PQ10/BT.2020 pixel LUT is active
-  if (filterFlags &&& 3) == 0 && !is10bit && hdrCs == 0 then
-    return ← transcodeMp4DirectSdrFastIO
-      ffmpegBin inPath outPath fpsStr x264SubmeSuffix env ssArgs tArgs vEncArgs aEncArgs
-      inMoovBuf srcW dstW srcH dstH startMs durMs hdrCs codecId outputFrameLimit
-      effWithAudio isSpecialOut existedBefore cliOpts.showStats
-
   let decArgs : Array String :=
-    #["-v", "error", "-nostdin", "-hwaccel", "auto", "-threads", "0"] ++
+    #["-v", "error", "-nostdin", "-threads", "0"] ++
     ssArgs ++ tArgs ++
     #["-i", inPath, "-fps_mode", "passthrough", "-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", rawPixFmt, "-"]
 
@@ -1748,8 +1702,9 @@ def transcodeMp4GeneralVerifiedIO
     else
       base ++ #["-map", "0:v:0", "-map_metadata", "1", "-map_metadata:s:v", "1:s:v",
                 "-map_chapters", "1", "-dn", "-sn", "-an"] ++
-      tArgs ++ vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
+      vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
 
+  let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
   let needTabs : Bool :=
     !(srcW == dstW && srcH == dstH) &&
     !(srcW == dstW * 2 && srcH == dstH * 2) &&
@@ -1799,37 +1754,54 @@ def transcodeMp4GeneralVerifiedIO
       }
       encChildOpt := some ec
 
-    let (dstY, dstU, dstV) : ByteArray × ByteArray × ByteArray :=
-      if is10bit then
-        let uOff := srcYSz * 2
-        let vOff := (srcYSz + srcUvSz) * 2
-        let yScaled := scalePlaneBilinearU16LeBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
-        let uScaled := scalePlaneBilinearU16LeBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-        let vScaled := scalePlaneBilinearU16LeBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-        (yScaled, uScaled, vScaled)
-      else
-        let uOff := srcYSz
-        let vOff := srcYSz + srcUvSz
-        let yScaled := scalePlaneBilinearWithTabsBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
-        let uScaled := scalePlaneBilinearWithTabsBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-        let vScaled := scalePlaneBilinearWithTabsBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-        if (filterFlags &&& 3) != 0 then
-          applyPixelFiltersYuv420p yScaled uScaled vScaled filterFlags
+    if isIdentityU8 then
+      let (fMean, fVar) := computeLumaStatsU8Fast srcBuf dstYSz
+      meanAccum := meanAccum + fMean
+      varAccum := varAccum + fVar
+      if (framesDone &&& 7) == 0 then
+        let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcBuf srcW srcH srcBuf dstW dstH
+        if fSad > maxSadWorst then maxSadWorst := fSad
+        if fPsnr < psnrMin then psnrMin := fPsnr
+        if fDist == 0 then distLtBlackAll := 0
+      if let some ec := encChildOpt then
+        let wroteOk ← (do
+          try
+            ec.stdin.write srcBuf
+            pure true
+          catch _ =>
+            pure false)
+        if !wroteOk then
+          writeFailed := true
         else
+          framesDone := framesDone + 1
+    else
+      let (dstY, dstU, dstV) : ByteArray × ByteArray × ByteArray :=
+        if is10bit then
+          let uOff := srcYSz * 2
+          let vOff := (srcYSz + srcUvSz) * 2
+          let yScaled := scalePlaneBilinearU16LeBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
+          let uScaled := scalePlaneBilinearU16LeBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
+          let vScaled := scalePlaneBilinearU16LeBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
           (yScaled, uScaled, vScaled)
-
-    let (fMean, fVar) :=
-      if is10bit then computeLumaStatsU16LePure dstY dstYSz
-      else computeLumaStatsU8Fast dstY dstYSz
-    meanAccum := meanAccum + fMean
-    varAccum := varAccum + fVar
-
-    if (framesDone &&& 7) == 0 then
-      if !is10bit then
-        let pipeFused8 := (filterFlags &&& 2) == 0 && srcW == dstW * 2 && srcH == dstH * 2
-        if pipeFused8 then
-          if 540 < psnrMin then psnrMin := 540
         else
+          let uOff := srcYSz
+          let vOff := srcYSz + srcUvSz
+          let yScaled := scalePlaneBilinearWithTabsBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
+          let uScaled := scalePlaneBilinearWithTabsBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
+          let vScaled := scalePlaneBilinearWithTabsBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
+          if (filterFlags &&& 3) != 0 then
+            applyPixelFiltersYuv420p yScaled uScaled vScaled filterFlags
+          else
+            (yScaled, uScaled, vScaled)
+
+      let (fMean, fVar) :=
+        if is10bit then computeLumaStatsU16LePure dstY dstYSz
+        else computeLumaStatsU8Fast dstY dstYSz
+      meanAccum := meanAccum + fMean
+      varAccum := varAccum + fVar
+
+      if (framesDone &&& 7) == 0 then
+        if !is10bit then
           let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Pure srcBuf srcW srcH dstY dstW dstH
           let (fSad, fPsnr, fDist) :=
             if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
@@ -1837,27 +1809,27 @@ def transcodeMp4GeneralVerifiedIO
           if fSad > maxSadWorst then maxSadWorst := fSad
           if fPsnr < psnrMin then psnrMin := fPsnr
           if fDist == 0 then distLtBlackAll := 0
-      else
-        let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
-        let dstY8 := extractU16LeMsb8Pure dstY dstYSz
-        let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcY8 srcW srcH dstY8 dstW dstH
-        if fSad > maxSadWorst then maxSadWorst := fSad
-        if fPsnr < psnrMin then psnrMin := fPsnr
-        if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
+        else
+          let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
+          let dstY8 := extractU16LeMsb8Pure dstY dstYSz
+          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcY8 srcW srcH dstY8 dstW dstH
+          if fSad > maxSadWorst then maxSadWorst := fSad
+          if fPsnr < psnrMin then psnrMin := fPsnr
+          if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
 
-    if let some ec := encChildOpt then
-      let wroteOk ← (do
-        try
-          ec.stdin.write dstY
-          ec.stdin.write dstU
-          ec.stdin.write dstV
-          pure true
-        catch _ =>
-          pure false)
-      if !wroteOk then
-        writeFailed := true
-      else
-        framesDone := framesDone + 1
+      if let some ec := encChildOpt then
+        let wroteOk ← (do
+          try
+            ec.stdin.write dstY
+            ec.stdin.write dstU
+            ec.stdin.write dstV
+            pure true
+          catch _ =>
+            pure false)
+        if !wroteOk then
+          writeFailed := true
+        else
+          framesDone := framesDone + 1
 
   drainHandleUntilEof decChild.stdout
   let _ ← decChild.wait

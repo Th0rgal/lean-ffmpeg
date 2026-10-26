@@ -1973,6 +1973,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.swar_bipred_avg_u8x8_eq_scalar
 #print axioms LeanAV.Video.swar_xor_u8x8_eq_scalar
 #print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_short_universal
+#print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_bad_sync_universal
 
 
 

@@ -1525,14 +1525,21 @@ def demuxMatroskaIndependentOrFallback (bytes : List UInt8) : KernelExecutionRes
   | none =>
     .fallbackDelegated "invalid_or_truncated_ebml_matroska_block"
 
+/-- Check that every 188-byte packet boundary in `s` (`0, 188, ..., s.len - 188`) starts with the `0x47` MPEG-TS sync byte. -/
+def allMpegTsSyncBytesValid (s : ByteSlice) : Bool :=
+  let nPkts := s.len / 188
+  (List.range nPkts).all (fun i => s.getByteD (i * 188) 0 == 0x47)
+
 /--
   Phase 6 Kernel 5: Verified MPEG-TS 188-Byte Packet Stream Demuxer (`demuxMpegTsIndependentOrFallback`).
-  Verifies 188-byte alignment and `0x47` sync byte before executing `demuxMpegTsPackets`,
-  or falls back explicitly.
+  Verifies 188-byte alignment and `0x47` sync byte at every 188-byte packet boundary before executing
+  `demuxMpegTsPackets`, or falls back explicitly.
 -/
 def demuxMpegTsIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (Array (UInt16 × ByteSlice)) :=
   if s.len < 188 || s.len % 188 != 0 then
     .fallbackDelegated "mpegts_length_not_multiple_of_188"
+  else if !allMpegTsSyncBytesValid s then
+    .fallbackDelegated "mpegts_missing_sync_byte_or_empty_packets"
   else
     let pkts := demuxMpegTsPackets s
     if pkts.size > 0 then
@@ -1705,6 +1712,19 @@ theorem demuxMpegTsIndependentOrFallback_rejects_short_universal (s : ByteSlice)
   unfold demuxMpegTsIndependentOrFallback
   have hCond : (s.len < 188 || s.len % 188 != 0) = true := by simp [hShort]
   simp [hCond]
+
+/--
+  Universal Theorem: `demuxMpegTsIndependentOrFallback` deterministically falls back whenever any
+  188-byte packet boundary in `s` lacks the `0x47` sync byte (`allMpegTsSyncBytesValid s = false`).
+-/
+theorem demuxMpegTsIndependentOrFallback_rejects_bad_sync_universal (s : ByteSlice)
+    (hLen : s.len ≥ 188) (hMod : s.len % 188 = 0) (hBad : allMpegTsSyncBytesValid s = false) :
+    demuxMpegTsIndependentOrFallback s = .fallbackDelegated "mpegts_missing_sync_byte_or_empty_packets" := by
+  unfold demuxMpegTsIndependentOrFallback
+  have hNotLen : (s.len < 188 || s.len % 188 != 0) = false := by
+    have h1 : ¬ (s.len < 188) := Nat.not_lt.mpr hLen
+    simp [h1, hMod]
+  simp [hNotLen, hBad]
 
 /--
   Universal Theorem: If `verifyExecArgvHygiene argv = true`, every token `tok ∈ argv`
