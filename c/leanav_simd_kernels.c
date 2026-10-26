@@ -1636,6 +1636,7 @@ static void leanav_build_bilinear_tabs(
 ) {
     tabs->ready = 0;
     if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0) return;
+    if (src_w > 0xFFFFFFu || src_h > 0xFFFFFFu || dst_w > 0xFFFFFFu || dst_h > 0xFFFFFFu) return;
     tabs->sx0 = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
     tabs->sx1 = (uint32_t *)malloc(dst_w * sizeof(uint32_t));
     tabs->fx  = (uint16_t *)malloc(dst_w * sizeof(uint16_t));

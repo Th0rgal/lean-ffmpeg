@@ -3084,7 +3084,7 @@ def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdT
     if srcMvhdTs == 0 || dstMvhdTs == 0 || srcMvhdTs == dstMvhdTs then e.segmentDuration.toNat
     else (e.segmentDuration.toNat * dstMvhdTs + srcMvhdTs / 2) / srcMvhdTs
   let medTime :=
-    if e.mediaTime == 0xFFFFFFFF || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then e.mediaTime.toNat
+    if e.mediaTime >= (0x80000000 : UInt32) || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then e.mediaTime.toNat
     else (e.mediaTime.toNat * dstMdhdTs + srcMdhdTs / 2) / srcMdhdTs
   {
     segmentDuration := segDur.toUInt32
@@ -3094,18 +3094,34 @@ def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdT
   }
 
 /--
+  Overflow-free unboxed `UInt64` rounded rational rescaler `round(val * dstTs / srcTs)` for 32-bit
+  inputs (`val, srcTs, dstTs : UInt32`). Uses quotient-remainder decomposition `val = q * srcTs + r`
+  with `r < srcTs` so `r * dstTs + (srcTs >>> 1) < 2^64` never wraps `UInt64`, and saturates
+  at `maxOut` (`0xFFFFFFFF` for unsigned `segmentDuration`, `0x7FFFFFFF` for signed `mediaTime`).
+-/
+@[inline]
+def rescaleU32SaturatingU64 (val srcTs dstTs : UInt32) (maxOut : UInt64) : UInt64 :=
+  if srcTs == 0 || dstTs == 0 || srcTs == dstTs then val.toUInt64
+  else
+    let v64 : UInt64 := val.toUInt64
+    let s64 : UInt64 := srcTs.toUInt64
+    let d64 : UInt64 := dstTs.toUInt64
+    let q : UInt64 := v64 / s64
+    let r : UInt64 := v64 % s64
+    let scaled : UInt64 := q * d64 + (r * d64 + (s64 >>> 1)) / s64
+    if scaled > maxOut then maxOut else scaled
+
+/--
   Unboxed `UInt64` v0 `elst` `(segmentDuration, mediaTime)` rescaler from source movie/media timescales
   to output movie/media timescales (`mediaTime >= 0x80000000` preserves empty dwell `0xFFFFFFFF`
   and negative v0 media times). Packed as `segDur ||| (mediaTime <<< 32)`.
 -/
 @[inline]
 def rescaleElstEntryU64 (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : UInt32) : UInt64 :=
-  let segDur64 : UInt64 :=
-    if srcMvhdTs == 0 || dstMvhdTs == 0 || srcMvhdTs == dstMvhdTs then segDur.toUInt64
-    else (segDur.toUInt64 * dstMvhdTs.toUInt64 + (srcMvhdTs.toUInt64 >>> 1)) / srcMvhdTs.toUInt64
+  let segDur64 : UInt64 := rescaleU32SaturatingU64 segDur srcMvhdTs dstMvhdTs (0xFFFFFFFF : UInt64)
   let medTime64 : UInt64 :=
-    if mediaTime >= (0x80000000 : UInt32) || srcMdhdTs == 0 || dstMdhdTs == 0 || srcMdhdTs == dstMdhdTs then mediaTime.toUInt64
-    else (mediaTime.toUInt64 * dstMdhdTs.toUInt64 + (srcMdhdTs.toUInt64 >>> 1)) / srcMdhdTs.toUInt64
+    if mediaTime >= (0x80000000 : UInt32) then mediaTime.toUInt64
+    else rescaleU32SaturatingU64 mediaTime srcMdhdTs dstMdhdTs (0x7FFFFFFF : UInt64)
   (segDur64 &&& (0xFFFFFFFF : UInt64)) ||| ((medTime64 &&& (0xFFFFFFFF : UInt64)) <<< 32)
 
 @[export leanav_lean_rescale_elst_entry_u64]
@@ -3115,7 +3131,8 @@ def rescaleElstEntryExport (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMd
 /--
   Theorem (Wave 24b): when `mvhd.timescale != mdhd.timescale`, an `elst` copied from a source movie
   (`mvhd = 1000`, `mdhd = 24000`) onto an output movie (`mvhd = 90000`, `mdhd = 24000`) rescales the
-  movie-timescale `segmentDuration` and preserves the media-timescale `mediaTime` and the empty dwell.
+  movie-timescale `segmentDuration`, preserves the media-timescale `mediaTime` and empty dwell,
+  and saturates without `UInt64` intermediate overflow on extreme 32-bit inputs (`0xFFFFFFFF`).
 -/
 theorem elst_rescale_mvhd_mdhd_mismatch :
     let src : ElstEntryView := { segmentDuration := 1000, mediaTime := 24000, mediaRateInteger := 1, mediaRateFraction := 0 }
@@ -3125,7 +3142,9 @@ theorem elst_rescale_mvhd_mdhd_mismatch :
     (rescaleElstEntry dwell 1000 90000 24000 24000).mediaTime = 0xFFFFFFFF ∧
     (rescaleElstEntry dwell 1000 90000 24000 24000).segmentDuration = 45000 ∧
     rescaleElstEntryExport 1000 24000 1000 90000 24000 48000 = 0x0000BB8000015F90 ∧
-    rescaleElstEntryExport 500 0xFFFFFFFF 1000 90000 24000 48000 = 0xFFFFFFFF0000AFC8 := by
+    rescaleElstEntryExport 500 0xFFFFFFFF 1000 90000 24000 48000 = 0xFFFFFFFF0000AFC8 ∧
+    rescaleElstEntryExport 0xFFFFFFFF 0x7FFFFFFF 2 0xFFFFFFFF 2 0xFFFFFFFF = 0x7FFFFFFFFFFFFFFF ∧
+    rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 = 0x000003E8FFFFFFFE := by
   decide
 
 /--
