@@ -8,7 +8,7 @@
  *   2. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
  *      `leanav_c_ffi_probe_mp4_contract` with borrowed `lean_inc`).
- *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 12
+ *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 16
  *      `lean-native-core`-compiled `LNIR_WIRE_V1` LLVM IR kernels (`leanav_c_exec_lnir_*_ba`).
  */
 #include <lean/lean.h>
@@ -22,6 +22,14 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+__attribute__((constructor))
+static void leanav_init_glibc_malloc_arena(void) {
+    mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
+}
+#endif
 
 static const char *leanav_resolve_ffmpeg_exec_path(void) {
     const char *env_bin = getenv("LEANAV_FFMPEG_BIN");

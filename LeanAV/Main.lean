@@ -1628,7 +1628,7 @@ def main (args : List String) : IO UInt32 := do
           pClones := pClones.push { p with data := p.data.extract 0 p.data.size }
         let wFrame : VideoFrame := { vfSrc with planes := pClones }
         workerSrcs := workerSrcs.push wFrame
-        let wt ← IO.asTask (prio := .dedicated) do
+        let wt ← IO.asTask do
           let vfWarm := scaleFn wFrame
           return vfWarm.planes[0]!.data.size + wIdx
         warmTasks := warmTasks.push wt
@@ -1641,7 +1641,7 @@ def main (args : List String) : IO UInt32 := do
         if startIdx < numFrames then
           let endIdx := Nat.min numFrames (startIdx + fPerW)
           let wVf := workerSrcs[wIdx]!
-          let t ← IO.asTask (prio := .dedicated) do
+          let t ← IO.asTask do
             let mut acc : Nat := 0
             for i in [startIdx : endIdx] do
               let vfIn : VideoFrame := { wVf with pts := i.toUInt64 }

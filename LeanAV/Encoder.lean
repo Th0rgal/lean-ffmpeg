@@ -464,31 +464,17 @@ def transcodeBatchPipelineDParallel (srcLuma : Plane2D) (numFrames : Nat) (numWo
       if let some res := transcodeFramePipelineD srcLuma pts codec numTiles 264 4 then
         out := out.push res
     return out
-  -- Warm up dedicated OS worker thread pool so worker measurements reflect steady-state task dispatch
-  if effWorkers > 1 then
-    let mut warmTasks : Array (Task (Except IO.Error Nat)) := Array.mkEmpty effWorkers
-    for wIdx in [:effWorkers] do
-      let wt ← IO.asTask (prio := .dedicated) (pure wIdx)
-      warmTasks := warmTasks.push wt
-    for wt in warmTasks do
-      let _ ← IO.ofExcept wt.get
   let framesPerWorker := (numFrames + effWorkers - 1) / effWorkers
   let mut tasks : Array (Task (Except IO.Error (Array PipelineDTranscodeResult))) := Array.mkEmpty effWorkers
   for wIdx in [:effWorkers] do
     let startIdx := wIdx * framesPerWorker
     if startIdx < numFrames then
       let endIdx := Nat.min numFrames (startIdx + framesPerWorker)
-      -- Isolate each dedicated worker's read-only 2x2 top-128-row prefix to prevent Lean `m_rc` atomic cache-line bouncing across cores
-      let workerLuma : Plane2D :=
-        if srcLuma.height > 128 && srcLuma.data.size >= 128 * srcLuma.stride then
-          { srcLuma with data := srcLuma.data.extract 0 (128 * srcLuma.stride) }
-        else
-          srcLuma
-      let t ← IO.asTask (prio := .dedicated) do
+      let t ← IO.asTask do
         let mut chunk : Array PipelineDTranscodeResult := Array.mkEmpty (endIdx - startIdx)
         for fIdx in [startIdx : endIdx] do
           let pts : UInt64 := (fIdx * 1500).toUInt64
-          if let some res := transcodeFramePipelineD workerLuma pts codec numTiles 264 4 then
+          if let some res := transcodeFramePipelineD srcLuma pts codec numTiles 264 4 then
             chunk := chunk.push res
         return chunk
       tasks := tasks.push t

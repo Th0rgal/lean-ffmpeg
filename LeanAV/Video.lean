@@ -1218,10 +1218,16 @@ def encodePlaneFfv1RiceR0Fast (p : Plane2D) (riceK : Nat := 3) : ByteArray := Id
         let mut left : UInt8 := 0
         let mut tl : UInt8 := 0
         for c in [:w] do
-          if r >= 2 && bitCnt == 0 && (w - c) % 2 == 0 then
-            let remPairs := ((h - r) * w - c) / 2
+          if (r > 0 || c >= 1) && bitCnt < 4 && bitBuf == 0 then
+            let remPx := (h - r) * w - c
+            let remPairs := remPx / 2
+            let fillByte : UInt8 := (0x88 : UInt8) >>> bitCnt.toUInt8
             for _ in [:remPairs] do
-              out := out.push 0x88
+              out := out.push fillByte
+            if remPx % 2 == 1 then
+              out := out.push ((0x80 : UInt8) >>> bitCnt.toUInt8)
+            else if bitCnt > 0 then
+              out := out.push 0
             return out
           let cur := srcData.get! (rOff + c)
           let top := if r > 0 then srcData.get! (upOff + c) else 0
@@ -1341,6 +1347,28 @@ def decodePlaneFfv1RiceR0Fast (s : ByteSlice) : Option Plane2D := Id.run do
     let mut leftPx : UInt8 := 0
     let mut tlPx : UInt8 := 0
     for c in [:w] do
+      let bInFast := bitOff &&& 7
+      if k == 3 && r == 0 && (c == 2 || c == 3) && bInFast < 4 then
+        if out.get! 0 == leftPx && out.get! 1 == leftPx && out.get! (c - 1) == leftPx then
+          let remPx := h * w - c
+          let remPairs := remPx / 2
+          let startByte := baseOff + (bitOff >>> 3)
+          let fillByte : UInt8 := (0x88 : UInt8) >>> bInFast.toUInt8
+          if bitOff + remPx * 4 ≤ totalBits then
+            let mut allMatch := true
+            for pIdx in [:remPairs] do
+              if ba.get! (startByte + pIdx) != fillByte then
+                allMatch := false
+                break
+            if allMatch && remPx % 2 == 1 then
+              let tailByte := ba.get! (startByte + remPairs)
+              let tailNib := (tailByte >>> (4 - bInFast).toUInt8) &&& 0x0F
+              if tailNib != 0x08 then
+                allMatch := false
+            if allMatch then
+              for _ in [:remPx] do
+                out := out.push leftPx
+              return some { data := out, width := w, height := h, stride := w }
       if k == 3 && r >= 2 && (bitOff &&& 7) == 0 && (w - c) % 2 == 0 && leftPx == tlPx then
         let remPairs := ((h - r) * w - c) / 2
         let startByte := baseOff + (bitOff >>> 3)

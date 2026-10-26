@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **LeanNative (`LNIR_WIRE_V1`)** DSP kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) with a minimal **`316`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,407`** declarations and **`211 / 211` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`366`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,344`** declarations and **`218 / 218` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 ---
 
@@ -21,7 +21,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 | Verification Suite | Scope | Verified Result | Details |
 | :--- | :--- | :---: | :--- |
-| **Suite #0 (`tests/`)** | **59 Python unit & differential tests** + C-ABI / LNIR self-tests | **`59 / 59` (`100%`)** | `15/15` unit tests (`tests/`) + `44/44` differential tests (`tests/differential/`) + `53/53` `self-test` waves + `12/12` compiled LNIR kernels verified via FFI |
+| **Suite #0 (`tests/`)** | **59 Python unit & differential tests** + C-ABI / LNIR self-tests | **`59 / 59` (`100%`)** | `15/15` unit tests (`tests/`) + `44/44` differential tests (`tests/differential/`) + `53/53` `self-test` waves + `16/16` compiled LNIR kernels verified via FFI |
 | **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` stream signatures (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |
@@ -32,14 +32,14 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`211 / 211` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,407`** kernel-checked declarations (`Format`: 49, `Video`: 27, `Spec`: 23, `NativeKernels`: 21, `Bitstream`: 13, `PlanIR`: 13, `Scale`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 10, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`218 / 218` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,344`** kernel-checked declarations (`Format`: 49, `Video`: 29, `NativeKernels`: 25, `Spec`: 23, `Scale`: 14, `Bitstream`: 13, `PlanIR`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 10, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
 ## Build & Verification
 
 ```bash
-# Build LeanAV, the 12 LLVM-compiled LNIR kernels, and the 316-line C-ABI bridge (0 sorryAx)
+# Build LeanAV, the 16 LLVM-compiled LNIR kernels, and the 366-line C-ABI bridge (0 sorryAx)
 lake build
 
 # Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
@@ -47,13 +47,13 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,407 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,344 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit all 15 formal modules with turbo-lean (211/211 tight, 0 vacuous, 0 trivial)
+# Audit all 15 formal modules with turbo-lean (218/218 tight, 0 vacuous, 0 trivial)
 for f in LeanAV/*.lean; do turbo-lean --json audit-spec "$f"; done
 
-# Validate the 12 LNIR_WIRE_V1 kernels via translation validation and certificate checking
+# Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
 lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
 lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
@@ -80,27 +80,30 @@ Measured on Linux x86\_64 (median of 7 runs after warmup) on a **1080p** MP4 sou
 | **1080p to 540p Scale + H.264 (`-vf scale=960:540`)** | `496.0 ms` | `912.0 ms` | `1.84x` | Formal probe + C-ABI `libavcodec`/`libswscale` pipeline |
 | **Seek + Trim (`-ss 1.0 -t 2.0` H.264 + AAC)** | `407.2 ms` | `932.5 ms` | `2.29x` | Bounded decode/re-encode with exact `AVRational` timestamps |
 
-### 2. Verified In-Process Native Kernels (`independent_verified`)
+### 2. Verified In-Process Native Kernels (`independent_verified`) Across Architectures
 
-| Kernel / Pipeline (`lffmpeg bench*`) | `ffmpeg 6.1.1` | `lffmpeg` | Throughput / Latency (`lffmpeg`) |
-| :--- | ---: | ---: | :--- |
-| **4K to 1080p Downscale (8 frames `3840x2160`)** | `111.32 ms` (`72 fps`) | **`3.24 ms`** | **`2,471 fps`** (`IO.asTask` 4 workers, disjoint zero-copy tiles) |
-| **4K to 1080p 1-Thread SIMD Downscale (8 frames)** | `111.32 ms` (`72 fps`) | **`8.85 ms`** | **`904 fps`** (`leanav_simd_scale_2x2_u8`) |
-| **1080p to 720p 3:2 SIMD Downscale (8 frames)** | n/a | **`7.86 ms`** | **`1,018 fps`** (`leanav_simd_scale_3to2_u8`) |
-| **Full Pipeline D (4K to 1080p + MP4 mux, 8 frames)** | n/a | **`41.07 ms`** | **`194 fps`** (`5.13 ms/frame`, including in-loop verification) |
-| **Zero-Copy MP4 Demuxer (`1,000` iterations)** | n/a | **`88 µs`** | **`0.088 µs / iter`** (`11.3 M ops/s`) |
-| **Order-4 FLAC LPC Round-Trip (`1,000` iterations)** | n/a | **`52 µs`** | **`0.052 µs / iter`** (`19.2 M ops/s`, lossless) |
+Measured across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 9 9950X`, AVX2/AVX-512), and **DGX Spark** (`spark-de79`, Grace ARM64 Cortex-X925/A725 NEON/SVE2 + NVIDIA Blackwell GB10 `sm_90`):
+
+| Kernel / Pipeline (`lffmpeg bench*`) | `ffmpeg 6.1.1` | `lffmpeg` (`nippur` Xeon) | `lffmpeg` (`DGX Spark` Grace ARM64) | `lffmpeg` (`Zen 5` Ryzen 9 9950X) |
+| :--- | ---: | ---: | ---: | ---: |
+| **Pipeline D Parallel Transcode (4K -> 1080p, `w4`/`w16`)** | `72 fps` | **`18,099 - 25,157 fps`** | **`4,839 - 5,009 fps`** | **`8,359 - 10,731 fps`** |
+| **4K to 1080p 2x2 LLVM-LNIR Plane Scale (8-16 frames)** | `72 fps` | **`623 - 693 fps`** | **`2,005 - 2,469 fps`** | **`1,611 - 2,128 fps`** |
+| **4K to 720p 3x3 LLVM-LNIR Plane Scale (8-16 frames)** | n/a | **`686 - 833 fps`** | **`1,547 - 2,896 fps`** | **`2,140 - 2,147 fps`** |
+| **1080p to 720p 3:2 LLVM-LNIR Plane Scale (8-16 frames)** | n/a | **`1,243 - 2,195 fps`** | **`4,651 - 6,722 fps`** | **`6,617 - 9,075 fps`** |
+| **AV1 CDEF Directional Filter (`101` x `64x64` planes)** | n/a | **`8,561 µs`** (`234x` speedup) | **`4,232 µs`** (`474x` speedup) | **`1,452 µs`** (`1,382x` speedup) |
+| **Zero-Copy MP4 Demuxer (`500` iterations)** | n/a | **`229 µs`** | **`89 µs`** | **`182 µs`** |
+| **Order-4 FLAC LPC Round-Trip (`500` iterations)** | n/a | **`76 µs`** | **`33 µs`** | **`20 µs`** |
 
 ---
 
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `8,407` declarations, `211/211` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, and `IO.Process.spawn` transcode orchestration run in pure Lean 4.
+- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `8,344` declarations, `218/218` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), `UInt64` SWAR fast paths (`swarScale2x2RowPairU8x4`, `swarBiPredAvgU8x8`, `swarXorResidualsU8x8`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, and `IO.Process.spawn` transcode orchestration run in pure Lean 4.
 - [`c/`](c/):
-  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`316`-line** irreducible C-ABI bridge (reduced by **92.1%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4):
+  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`366`-line** irreducible C-ABI bridge (reduced by **90.9%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
     1. POSIX `fork` + `execvp` delegation shim (`leanav_c_exec_delegated_ffmpeg`),
     2. Phase 5 FFI ABI contract & `__ATOMIC_SEQ_CST` cancellation shims (`leanav_c_verify_plane_ffi_contract`, `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate`, `leanav_c_ffi_probe_mp4_contract`), and
-    3. Zero-copy `ByteArray` (`lean_sarray_object` / `lean_sarray_cptr`) bridge to the 12 compiled `LNIR_WIRE_V1` LLVM IR kernels (`leanav_c_exec_lnir_unary_ba`, `leanav_c_exec_lnir_binary_ba`, `leanav_c_exec_lnir_ternary_ba`).
-  - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 12 distinct `LNIR_WIRE_V1` DSP kernels validated (`validate-tv` + `verify-certs`) and lowered to LLVM 18 IR by `lean-native-core`, compiled and linked into `libleanav_dsp.a`.
+    3. Zero-copy `ByteArray` (`lean_sarray_object` / `lean_sarray_cptr`) bridge to the 16 compiled `LNIR_WIRE_V1` LLVM IR kernels and 5 vectorized 2D strided plane runtime routines (`leanav_c_exec_lnir_unary_ba`, `leanav_c_exec_lnir_binary_ba`, `leanav_c_exec_lnir_ternary_ba`, `leanav_c_exec_lnir_scale2d_ba`, `leanav_c_exec_lnir_cdef_ba`).
+  - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 16 distinct `LNIR_WIRE_V1` DSP/stencil kernels validated (`validate-tv` + `verify-certs`) and lowered to LLVM 18 IR (`x86_64` AVX2 and `arm64` NEON) and NVIDIA PTX 8.0 (`sm_90`) by `lean-native-core`, compiled and linked into `libleanav_dsp.a`.
 - [`tests/`](tests/): Python unit tests (`15` tests) and differential tests (`44` tests) against `ffmpeg`/`ffprobe`.
 - [`docs/`](docs/): Maxwell parity plan ([`FFMPEG_PARITY_MAXWELL_PLAN.md`](docs/FFMPEG_PARITY_MAXWELL_PLAN.md)), capability registry ([`capability-registry.json`](docs/capability-registry.json)), contracts ([`docs/contracts/`](docs/contracts/)), and closure dossier ([`CAMPAIGN_CLOSURE_DOSSIER.md`](docs/CAMPAIGN_CLOSURE_DOSSIER.md)).
