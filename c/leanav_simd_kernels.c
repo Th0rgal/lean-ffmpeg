@@ -803,6 +803,20 @@ static void leanav_scale_plane_2x2_strided_accum(
     if (io_cnt) *io_cnt += cnt;
 }
 
+extern uint64_t leanav_lean_compute_luma_mean_var_packed_u64(uint64_t sum, uint64_t sum_sq, uint64_t cnt);
+
+static inline void leanav_unpack_luma_mean_var(
+    uint64_t sum,
+    uint64_t sum_sq,
+    uint64_t cnt,
+    uint64_t *out_mean,
+    uint64_t *out_var
+) {
+    uint64_t packed = leanav_lean_compute_luma_mean_var_packed_u64(sum, sum_sq, cnt);
+    *out_mean = packed & 0xFFFFFFFFULL;
+    *out_var = packed >> 32;
+}
+
 static void leanav_scale_plane_2x2_strided_with_stats(
     const uint8_t *src, int src_stride, int src_w, int src_h,
     uint8_t *dst, int dst_stride,
@@ -816,15 +830,7 @@ static void leanav_scale_plane_2x2_strided_with_stats(
         src, src_stride, src_w, src_h, dst, dst_stride,
         out_mean ? step : 0, out_mean ? &sum : NULL, out_mean ? &sum_sq : NULL, out_mean ? &cnt : NULL);
     if (out_mean && out_var) {
-        if (cnt > 0) {
-            uint64_t m = sum / cnt;
-            uint64_t msq = sum_sq / cnt;
-            *out_mean = m;
-            *out_var = (msq > m * m) ? (msq - m * m) : 0;
-        } else {
-            *out_mean = 0;
-            *out_var = 0;
-        }
+        leanav_unpack_luma_mean_var(sum, sum_sq, cnt, out_mean, out_var);
     }
 }
 
@@ -996,15 +1002,7 @@ static void leanav_scale_plane_2x2_u16_strided_with_stats(
         src, src_stride, src_w, src_h, dst, dst_stride,
         out_mean ? step : 0, out_mean ? &sum : NULL, out_mean ? &sum_sq : NULL, out_mean ? &cnt : NULL);
     if (out_mean && out_var) {
-        if (cnt > 0) {
-            uint64_t m = sum / cnt;
-            uint64_t msq = sum_sq / cnt;
-            *out_mean = m;
-            *out_var = (msq > m * m) ? (msq - m * m) : 0;
-        } else {
-            *out_mean = 0;
-            *out_var = 0;
-        }
+        leanav_unpack_luma_mean_var(sum, sum_sq, cnt, out_mean, out_var);
     }
 }
 
@@ -1031,11 +1029,7 @@ static void leanav_luma_stats_strided(
             cnt++;
         }
     }
-    if (cnt == 0) { *out_mean = 0; *out_var = 0; return; }
-    uint64_t mean = sum / cnt;
-    uint64_t msq = sum_sq / cnt;
-    *out_mean = mean;
-    *out_var = (msq > mean * mean) ? (msq - mean * mean) : 0;
+    leanav_unpack_luma_mean_var(sum, sum_sq, cnt, out_mean, out_var);
 }
 
 /*
@@ -1063,16 +1057,7 @@ static void leanav_compute_luma_stats(
         sum_sq += v * v;
         count++;
     }
-    if (count == 0) {
-        *out_mean = 0;
-        *out_var = 0;
-        return;
-    }
-    uint64_t mean = sum / count;
-    uint64_t mean_sq = sum_sq / count;
-    uint64_t var = (mean_sq > mean * mean) ? (mean_sq - mean * mean) : 0;
-    *out_mean = mean;
-    *out_var = var;
+    leanav_unpack_luma_mean_var(sum, sum_sq, (uint64_t)count, out_mean, out_var);
 }
 
 static int leanav_shell_quote_safe(const char *s, char *dst, size_t dst_cap) {
@@ -3345,11 +3330,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
                     sum_sq += v * v;
                     cnt++;
                 }
-                if (cnt > 0) {
-                    f_mean = sum / cnt;
-                    uint64_t m_sq = sum_sq / cnt;
-                    f_var = (m_sq > f_mean * f_mean) ? (m_sq - f_mean * f_mean) : 0;
-                }
+                leanav_unpack_luma_mean_var(sum, sum_sq, (uint64_t)cnt, &f_mean, &f_var);
             }
         } else if (!pipe_fused_8) {
             leanav_compute_luma_stats(dst_y, dst_y_sz, &f_mean, &f_var);

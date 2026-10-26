@@ -5565,6 +5565,39 @@ def packTranscodeReportU64 (framesDone meanAccum varAccum : UInt64) : UInt64 :=
 def packTranscodeReportExport (framesDone meanAccum varAccum : UInt64) : UInt64 :=
   packTranscodeReportU64 framesDone meanAccum varAccum
 
+/--
+  Overflow-free 64-bit luma mean and spatial variance estimator from cumulative sample sum `sum`,
+  sum of squares `sumSq`, and sample count `cnt`, packed as `(varClamped <<< 32) ||| meanClamped`:
+  - Returns `0` (`mean = 0, var = 0`) when `cnt == 0`.
+  - Computes `mean = sum / cnt` and `meanSq = sumSq / cnt`.
+  - Guards `mean * mean` against 64-bit wrap-around: if `mean > 0xFFFFFFFF`, then `mean^2 >= 2^64 > meanSq`,
+    so `var = 0`; otherwise `mean * mean` is exact in `UInt64` and
+    `var = if meanSq > mean * mean then meanSq - mean * mean else 0`.
+  - Packs `bits 0..31 = min mean 0xFFFFFFFF` and `bits 32..63 = min var 0xFFFFFFFF`.
+-/
+@[inline]
+def computeLumaMeanVarPackedU64 (sum sumSq cnt : UInt64) : UInt64 :=
+  if cnt == 0 then 0
+  else
+    let mean : UInt64 := sum / cnt
+    let meanSq : UInt64 := sumSq / cnt
+    let var : UInt64 :=
+      if mean > 0xFFFFFFFF then 0
+      else
+        let sq := mean * mean
+        if meanSq > sq then meanSq - sq else 0
+    let meanClamped : UInt64 := if mean > 0xFFFFFFFF then 0xFFFFFFFF else mean
+    let varClamped : UInt64 := if var > 0xFFFFFFFF then 0xFFFFFFFF else var
+    (varClamped <<< 32) ||| meanClamped
+
+@[export leanav_lean_compute_luma_mean_var_packed_u64]
+def computeLumaMeanVarPackedExport (sum sumSq cnt : UInt64) : UInt64 :=
+  computeLumaMeanVarPackedU64 sum sumSq cnt
+
+/--
+  Module-level HDR static metadata (`mdcv` / `clli`) roundtrip and `@[export]` C-ABI helper
+  conformance theorem for `LeanAV.Format`.
+-/
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
     decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
@@ -5591,7 +5624,11 @@ theorem hdr_static_clip_roundtrip :
     packAcceptanceMetricsExport 0x1FFFFFF 0x1FFFF 3 = 0x000001FFFFFFFFFF ∧
     packTranscodeReportExport 0 100 200 = 0 ∧
     packTranscodeReportExport 240 (240 * 82) (240 * 1500) = 0x80F00005DC000052 ∧
-    packTranscodeReportExport 1 0x1000000 0x1000000 = 0x8001FFFFFFFFFFFF := by
+    packTranscodeReportExport 1 0x1000000 0x1000000 = 0x8001FFFFFFFFFFFF ∧
+    computeLumaMeanVarPackedExport 0 0 0 = 0 ∧
+    computeLumaMeanVarPackedExport 200 24000 2 = 0x000007D000000064 ∧
+    computeLumaMeanVarPackedExport 200 12000 2 = 0x0000000000000064 ∧
+    computeLumaMeanVarPackedExport 0x100000000 0xFFFFFFFFFFFFFFFF 1 = 0x00000000FFFFFFFF := by
   decide
 
 end LeanAV.Format
