@@ -5486,6 +5486,41 @@ def computeOutputFrameLimitU64 (durMs fpsNum fpsDen : UInt32) : UInt64 :=
 def computeOutputFrameLimitExport (durMs fpsNum fpsDen : UInt32) : UInt64 :=
   computeOutputFrameLimitU64 durMs fpsNum fpsDen
 
+/--
+  ITU-R BT.500 / 8-bit luma PSNR (`0.1 dB` fixed-point `psnrDbX10`) tier classifier from cumulative
+  squared luma error `totalSqErr` and sample count `totalPix`:
+  - Returns `480` (`48.0 dB` lossless/empty baseline) when `totalPix == 0 || totalSqErr == 0`.
+  - Uses quotient-remainder decomposition `q = totalSqErr / totalPix`, `r = totalSqErr % totalPix`:
+    if `q > 20`, `MSE >= 21.0 > 20.00`, returning `300` (`30.0 dB`) without `totalSqErr * 100` overflow;
+    otherwise computes `mseX100` and classifies into `540, 481, 451, 421, 391, 361, 351, 300`.
+-/
+@[inline]
+def classifyLumaPsnrX10U64 (totalSqErr totalPix : UInt64) : UInt64 :=
+  if totalPix == 0 || totalSqErr == 0 then 480
+  else
+    let q : UInt64 := totalSqErr / totalPix
+    if q > 20 then 300
+    else
+      let r : UInt64 := totalSqErr % totalPix
+      let fracX100 : UInt64 :=
+        if r <= (0xFFFFFFFFFFFFFFFF : UInt64) / 100 then (r * 100) / totalPix
+        else
+          let f := r / (totalPix / 100)
+          if f > 99 then 99 else f
+      let mseX100 : UInt64 := q * 100 + fracX100
+      if mseX100 <= 25 then 540
+      else if mseX100 <= 100 then 481
+      else if mseX100 <= 200 then 451
+      else if mseX100 <= 400 then 421
+      else if mseX100 <= 800 then 391
+      else if mseX100 <= 1600 then 361
+      else if mseX100 <= 2000 then 351
+      else 300
+
+@[export leanav_lean_classify_luma_psnr_x10_u64]
+def classifyLumaPsnrX10Export (totalSqErr totalPix : UInt64) : UInt64 :=
+  classifyLumaPsnrX10U64 totalSqErr totalPix
+
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
     decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
@@ -5502,7 +5537,12 @@ theorem hdr_static_clip_roundtrip :
     computeOutputFrameLimitExport 1000 24000 1001 = 24 ∧
     computeOutputFrameLimitExport 2000 30 1 = 60 ∧
     computeOutputFrameLimitExport 0 24000 1001 = 0 ∧
-    computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF = 4294968 := by
+    computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF = 4294968 ∧
+    classifyLumaPsnrX10Export 0 256 = 480 ∧
+    classifyLumaPsnrX10Export 64 256 = 540 ∧
+    classifyLumaPsnrX10Export 256 256 = 481 ∧
+    classifyLumaPsnrX10Export 5120 256 = 351 ∧
+    classifyLumaPsnrX10Export 184467440737095517 256 = 300 := by
   decide
 
 end LeanAV.Format

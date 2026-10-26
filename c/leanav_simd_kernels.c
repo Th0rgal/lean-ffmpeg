@@ -1151,6 +1151,8 @@ static const char *leanav_ffprobe_bin_cmd(void) {
  * Compute real 16x16 macroblock SAD and MSE against the area-averaged source plane,
  * plus whether every non-black reference block is strictly closer to `dst_luma` than to studio-black (Y=16).
  */
+extern uint64_t leanav_lean_classify_luma_psnr_x10_u64(uint64_t total_sq_err, uint64_t total_pix);
+
 static void leanav_measure_luma_acceptance_16x16_strided(
     const uint8_t *src_luma, int src_stride, size_t src_w, size_t src_h,
     const uint8_t *dst_luma, int dst_stride, size_t dst_w, size_t dst_h,
@@ -1292,18 +1294,7 @@ static void leanav_measure_luma_acceptance_16x16_strided(
     }
     *out_max_block_sad = max_sad;
     *out_dist_lt_black = all_closer_than_black;
-    if (total_pix == 0 || total_sq_err == 0) *out_psnr_db_x10 = 480;
-    else {
-        uint64_t mse_x100 = (total_sq_err * 100ULL) / total_pix;
-        if (mse_x100 <= 25) *out_psnr_db_x10 = 540;
-        else if (mse_x100 <= 100) *out_psnr_db_x10 = 481;
-        else if (mse_x100 <= 200) *out_psnr_db_x10 = 451;
-        else if (mse_x100 <= 400) *out_psnr_db_x10 = 421;
-        else if (mse_x100 <= 800) *out_psnr_db_x10 = 391;
-        else if (mse_x100 <= 1600) *out_psnr_db_x10 = 361;
-        else if (mse_x100 <= 2000) *out_psnr_db_x10 = 351;
-        else *out_psnr_db_x10 = 300;
-    }
+    *out_psnr_db_x10 = leanav_lean_classify_luma_psnr_x10_u64(total_sq_err, total_pix);
 }
 
 static void leanav_measure_luma_acceptance_16x16(

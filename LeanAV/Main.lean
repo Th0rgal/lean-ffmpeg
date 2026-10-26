@@ -809,7 +809,12 @@ def runSelfTest : IO UInt32 := do
                      computeOutputFrameLimitExport 1000 24000 1001 == 24 &&
                      computeOutputFrameLimitExport 2000 30 1 == 60 &&
                      computeOutputFrameLimitExport 0 24000 1001 == 0 &&
-                     computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF == 4294968
+                     computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF == 4294968 &&
+                     classifyLumaPsnrX10Export 0 256 == 480 &&
+                     classifyLumaPsnrX10Export 64 256 == 540 &&
+                     classifyLumaPsnrX10Export 256 256 == 481 &&
+                     classifyLumaPsnrX10Export 5120 256 == 351 &&
+                     classifyLumaPsnrX10Export 184467440737095517 256 == 300
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1
