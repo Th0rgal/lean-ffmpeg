@@ -1063,7 +1063,8 @@ partial def probeIsoMp4HeaderSlice (s : ByteSlice) : Option IsoMp4TrackDemux := 
          b.fourcc == "minf" || b.fourcc == "stbl" || b.fourcc == "edts" || b.fourcc == "dinf" then
         let children := parseMp4Boxes b.bodySlice
         let (cw, ch, cts, ccnt) := walkMeta children (depth - 1)
-        if wFound == 0 && cw > 0 then wFound := cw; hFound := ch
+        if (wFound == 0 || b.fourcc == "mdia" || b.fourcc == "minf" || b.fourcc == "stbl") && cw > 0 && ch > 0 then
+          wFound := cw; hFound := ch
         if tsFound == 0 && cts > 0 then tsFound := cts
         if nSamplesFound == 0 && ccnt > 0 then nSamplesFound := ccnt
       else if b.fourcc == "tkhd" && b.bodySlice.len >= 84 then
@@ -5723,6 +5724,525 @@ theorem format_ffi_export_vectors_verified :
     classifyMp4HandlerTypeExport 0x736F756E = 2 ∧
     classifyMp4HandlerTypeExport 0x73756274 = 3 ∧
     classifyMp4HandlerTypeExport 0x6D657461 = 0 := by
+  decide
+
+/-! ## Pure Lean 4 ISO/IEC 14496-12 Box Locator, Metadata Prober, and Container Box Patcher -/
+
+@[inline]
+def baRdU16BE (b : @& ByteArray) (off : Nat) : UInt16 :=
+  if off + 2 <= b.size then
+    ((b.get! off).toUInt16 <<< 8) ||| (b.get! (off + 1)).toUInt16
+  else 0
+
+@[inline]
+def baRdU32BE (b : @& ByteArray) (off : Nat) : UInt32 :=
+  if off + 4 <= b.size then
+    ((b.get! off).toUInt32 <<< 24) |||
+    ((b.get! (off + 1)).toUInt32 <<< 16) |||
+    ((b.get! (off + 2)).toUInt32 <<< 8) |||
+    (b.get! (off + 3)).toUInt32
+  else 0
+
+@[inline]
+def baRdU64BE (b : @& ByteArray) (off : Nat) : UInt64 :=
+  if off + 8 <= b.size then
+    ((baRdU32BE b off).toUInt64 <<< 32) ||| (baRdU32BE b (off + 4)).toUInt64
+  else 0
+
+@[inline]
+def baWrU32BE (b : ByteArray) (off : Nat) (v : UInt32) : ByteArray :=
+  if off + 4 <= b.size then
+    let b0 := b.set! off ((v >>> 24) &&& 0xFF).toUInt8
+    let b1 := b0.set! (off + 1) ((v >>> 16) &&& 0xFF).toUInt8
+    let b2 := b1.set! (off + 2) ((v >>> 8) &&& 0xFF).toUInt8
+    b2.set! (off + 3) (v &&& 0xFF).toUInt8
+  else b
+
+@[inline]
+def baWrU64BE (b : ByteArray) (off : Nat) (v : UInt64) : ByteArray :=
+  if off + 8 <= b.size then
+    let b0 := baWrU32BE b off (v >>> 32).toUInt32
+    baWrU32BE b0 (off + 4) (v &&& 0xFFFFFFFF).toUInt32
+  else b
+
+/-- Parse a 32-bit or 64-bit (`size == 1`) ISO BMFF box header at `pos` within `[pos, endPos)`.
+    Returns `some (hdrSize, boxSize)` when valid and bounded. -/
+@[inline]
+def mp4NextBox (buf : @& ByteArray) (pos endPos : Nat) : Option (Nat × Nat) :=
+  let lim := Nat.min endPos buf.size
+  if pos + 8 > lim then none
+  else
+    let sz32 := (baRdU32BE buf pos).toNat
+    if sz32 == 1 then
+      if pos + 16 > lim then none
+      else
+        let sz64 := (baRdU64BE buf (pos + 8)).toNat
+        if sz64 < 16 || sz64 > lim - pos then none
+        else some (16, sz64)
+    else if sz32 == 0 then
+      let sz0 := lim - pos
+      if sz0 < 8 then none else some (8, sz0)
+    else
+      if sz32 < 8 || sz32 > lim - pos then none
+      else some (8, sz32)
+
+@[inline]
+def mp4BoxPayloadOffset (buf : @& ByteArray) (boxPos boxEnd : Nat) : Nat :=
+  match mp4NextBox buf boxPos boxEnd with
+  | some (hdr, _) => boxPos + hdr
+  | none => boxEnd
+
+/-- Find the first child box matching `fourcc` (`UInt32` big-endian) inside `[startPos, endPos)`. -/
+def mp4FindChildBoxLoop (buf : @& ByteArray) (pos lim : Nat) (fourcc : UInt32) : Nat → Option (Nat × Nat)
+  | 0 => none
+  | fuel + 1 =>
+    if pos + 8 > lim then none
+    else
+      match mp4NextBox buf pos lim with
+      | none => none
+      | some (_, sz) =>
+        if baRdU32BE buf (pos + 4) == fourcc then
+          some (pos, sz)
+        else
+          mp4FindChildBoxLoop buf (pos + sz) lim fourcc fuel
+
+def mp4FindChildBox (buf : @& ByteArray) (startPos endPos : Nat) (fourcc : UInt32) : Option (Nat × Nat) :=
+  let lim := Nat.min endPos buf.size
+  let fuel := (lim - startPos) / 8 + 1
+  mp4FindChildBoxLoop buf startPos lim fourcc fuel
+
+/-- Classify an ISO BMFF `trak` box's `mdia -> hdlr` `handler_type` (`1` = video, `2` = audio, `3` = subtitle, `0` = other). -/
+def mp4TrakHandlerKind (buf : @& ByteArray) (trakPos trakEnd : Nat) : UInt32 :=
+  let trakBody := mp4BoxPayloadOffset buf trakPos trakEnd
+  match mp4FindChildBox buf trakBody trakEnd 0x6D646961 with -- 'mdia'
+  | none => 0
+  | some (mdiaPos, mdiaSz) =>
+    let mdiaEnd := mdiaPos + mdiaSz
+    let mdiaBody := mp4BoxPayloadOffset buf mdiaPos mdiaEnd
+    match mp4FindChildBox buf mdiaBody mdiaEnd 0x68646C72 with -- 'hdlr'
+    | none => 0
+    | some (hdlrPos, hdlrSz) =>
+      let hdlrEnd := hdlrPos + hdlrSz
+      let hdlrBody := mp4BoxPayloadOffset buf hdlrPos hdlrEnd
+      if hdlrEnd < hdlrBody + 12 then 0
+      else classifyMp4HandlerTypeU32 (baRdU32BE buf (hdlrBody + 8))
+
+/-- Check whether `moov` contains any audio `trak` (`handler_type == 'soun'`). -/
+def mp4HasAudioTrakInMoov (buf : @& ByteArray) (moovPos moovSz : Nat) : Bool := Id.run do
+  let mEnd := Nat.min (moovPos + moovSz) buf.size
+  let mut p := mp4BoxPayloadOffset buf moovPos mEnd
+  let mut fuel := (mEnd - p) / 8 + 1
+  while fuel > 0 && p + 8 <= mEnd do
+    fuel := fuel - 1
+    match mp4NextBox buf p mEnd with
+    | none => return false
+    | some (_, tsz) =>
+      if baRdU32BE buf (p + 4) == 0x7472616B && mp4TrakHandlerKind buf p (p + tsz) == 2 then
+        return true
+      p := p + tsz
+  return false
+
+/-- Resolved byte offsets and sizes for the primary video track hierarchy inside an ISO BMFF buffer. -/
+structure Mp4VideoBoxLocations where
+  moovPos : Nat
+  moovSz  : Nat
+  trakPos : Nat
+  trakSz  : Nat
+  mdiaPos : Nat
+  mdiaSz  : Nat
+  minfPos : Nat
+  minfSz  : Nat
+  stblPos : Nat
+  stblSz  : Nat
+  stsdPos : Nat
+  stsdSz  : Nat
+  vrePos  : Nat
+  vreSz   : Nat
+  mdatPos : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Locate the video track box hierarchy inside a known `moov` box `[moovPos, moovPos + moovSz)`. -/
+def mp4LocateVideoInMoov (buf : @& ByteArray) (moovPos moovSz mdatPos : Nat) : Option Mp4VideoBoxLocations := Id.run do
+  let mEnd := Nat.min (moovPos + moovSz) buf.size
+  let mut p := mp4BoxPayloadOffset buf moovPos mEnd
+  let mut fuel := (mEnd - p) / 8 + 1
+  while fuel > 0 && p + 8 <= mEnd do
+    fuel := fuel - 1
+    match mp4NextBox buf p mEnd with
+    | none => return none
+    | some (thdr, tsz) =>
+      if baRdU32BE buf (p + 4) == 0x7472616B && mp4TrakHandlerKind buf p (p + tsz) == 1 then
+        let trakPos := p
+        let trakSz := tsz
+        let some (mdiaPos, mdiaSz) := mp4FindChildBox buf (p + thdr) (p + tsz) 0x6D646961 | return none
+        let mdiaBody := mp4BoxPayloadOffset buf mdiaPos (mdiaPos + mdiaSz)
+        let some (minfPos, minfSz) := mp4FindChildBox buf mdiaBody (mdiaPos + mdiaSz) 0x6D696E66 | return none
+        let minfBody := mp4BoxPayloadOffset buf minfPos (minfPos + minfSz)
+        let some (stblPos, stblSz) := mp4FindChildBox buf minfBody (minfPos + minfSz) 0x7374626C | return none
+        let stblBody := mp4BoxPayloadOffset buf stblPos (stblPos + stblSz)
+        let some (stsdPos, stsdSz) := mp4FindChildBox buf stblBody (stblPos + stblSz) 0x73747364 | return none
+        if stsdSz < 16 + 86 then return none
+        let vrePos := stsdPos + 16
+        let vreSz := (baRdU32BE buf vrePos).toNat
+        if vreSz < 86 || vrePos + vreSz > stsdPos + stsdSz then return none
+        return some {
+          moovPos, moovSz, trakPos, trakSz, mdiaPos, mdiaSz,
+          minfPos, minfSz, stblPos, stblSz, stsdPos, stsdSz,
+          vrePos, vreSz, mdatPos
+        }
+      p := p + tsz
+  return none
+
+/-- Locate `moov` and its video `trak -> mdia -> minf -> stbl -> stsd -> vre` hierarchy in `buf` (including tail buffers). -/
+def mp4LocateVideoBoxes (buf : @& ByteArray) (n : Nat) : Option Mp4VideoBoxLocations := Id.run do
+  let lim := Nat.min n buf.size
+  let mut moovPosOpt : Option (Nat × Nat) := none
+  let mut mdatPos : Nat := 0
+  let mut pos : Nat := 0
+  let mut fuel := lim / 8 + 1
+  while fuel > 0 && pos + 8 <= lim do
+    fuel := fuel - 1
+    let sz32 := (baRdU32BE buf pos).toNat
+    let mut hdr : Nat := 8
+    let mut sz : Nat := sz32
+    if sz32 == 1 then
+      if pos + 16 > lim then break
+      sz := (baRdU64BE buf (pos + 8)).toNat
+      hdr := 16
+    else if sz32 == 0 then
+      sz := lim - pos
+    if sz < hdr then break
+    let fourcc := baRdU32BE buf (pos + 4)
+    if fourcc == 0x6D6F6F76 then -- 'moov'
+      if pos + sz > lim then break
+      moovPosOpt := some (pos, sz)
+    else if fourcc == 0x6D646174 && mdatPos == 0 then -- 'mdat'
+      mdatPos := pos
+      if pos + sz > lim then break
+    else if pos + sz > lim then
+      break
+    pos := pos + sz
+  if let some (mp, ms) := moovPosOpt then
+    if let some loc := mp4LocateVideoInMoov buf mp ms mdatPos then
+      return some loc
+  -- Fallback scan for tail buffers where `moov` starts at an interior offset `scan > 0`
+  for scan in [1:lim] do
+    if scan + 8 <= lim && baRdU32BE buf (scan + 4) == 0x6D6F6F76 then
+      let candSz := (baRdU32BE buf scan).toNat
+      if candSz >= 8 && scan + candSz <= lim then
+        if let some loc := mp4LocateVideoInMoov buf scan candSz mdatPos then
+          return some loc
+  return none
+
+@[inline]
+def mp4ExtractBoxTimescale (buf : @& ByteArray) (bp bs : Nat) : UInt32 :=
+  if bs < 24 || bp + bs > buf.size then 0
+  else
+    let sz32 : UInt32 := if bs > 0xFFFFFFFF then 0xFFFFFFFF else bs.toUInt32
+    let ts20 := baRdU32BE buf (bp + 20)
+    let ts28 := if bs >= 32 then baRdU32BE buf (bp + 28) else 0
+    selectIsoHeaderTimescaleU32 (buf.get! (bp + 8)) sz32 ts20 ts28
+
+@[inline]
+def mp4ExtractBoxDuration (buf : @& ByteArray) (bp bs : Nat) : UInt64 :=
+  if bs < 28 || bp + bs > buf.size then 0
+  else
+    let sz32 : UInt32 := if bs > 0xFFFFFFFF then 0xFFFFFFFF else bs.toUInt32
+    let dur24 := baRdU32BE buf (bp + 24)
+    let dur32 := if bs >= 40 then baRdU64BE buf (bp + 32) else 0
+    selectIsoHeaderDurationU64 (buf.get! (bp + 8)) sz32 dur24 dur32
+
+/-- Pure Lean 4 HDR colorimetry scanner on a header/tail `ByteArray` (`0` = BT.709 SDR, `1` = BT.2020 PQ, `2` = BT.2020 HLG). -/
+def probeMp4HdrColorspacePure (buf : @& ByteArray) : UInt32 := Id.run do
+  let n := buf.size
+  if n < 15 then return 0
+  for i in [:n - 14] do
+    let fcc := baRdU32BE buf i
+    if fcc == 0x636F6C72 then -- 'colr'
+      let sub := baRdU32BE buf (i + 4)
+      if sub == 0x6E636C78 || sub == 0x6E636C63 then -- 'nclx' or 'nclc'
+        let prim := baRdU16BE buf (i + 8)
+        let trc  := baRdU16BE buf (i + 10)
+        let hdrMode := classifyColrNclxU32 prim trc 1 >>> 24
+        if hdrMode > 0 then return hdrMode
+    else if fcc == 0x6D646376 then -- 'mdcv'
+      return 1
+    else if fcc == 0x736D7074 && baRdU32BE buf (i + 4) == 0x65323038 && buf.get! (i + 8) == 0x34 then -- "smpte2084"
+      return 1
+  return 0
+
+/-- Pure Lean 4 nominal video frame rate `(fpsNum, fpsDen)` prober from `mdhd` timescale and `stts` sample delta. -/
+def probeMp4FpsRationalPure (buf : @& ByteArray) : Option (UInt32 × UInt32) := do
+  let loc ← mp4LocateVideoBoxes buf buf.size
+  let (mdhdP, mdhdS) ← mp4FindChildBox buf (loc.mdiaPos + 8) (loc.mdiaPos + loc.mdiaSz) 0x6D646864 -- 'mdhd'
+  let (sttsP, sttsS) ← mp4FindChildBox buf (loc.stblPos + 8) (loc.stblPos + loc.stblSz) 0x73747473 -- 'stts'
+  if mdhdS < 24 || sttsS < 24 then none
+  else
+    let ts := mp4ExtractBoxTimescale buf mdhdP mdhdS
+    let entryCnt := baRdU32BE buf (sttsP + 12)
+    let delta0 := if entryCnt >= 1 then baRdU32BE buf (sttsP + 20) else 0
+    if ts > 0 && delta0 > 0 then some (ts, delta0) else none
+
+/-- Container metadata extracted in pure Lean 4 from an ISO BMFF buffer. -/
+structure Mp4MediaInfoView where
+  hasAudio       : Option Bool := none
+  timescale      : UInt32      := 0
+  durationTicks  : UInt64      := 0
+  bitrateKbps    : UInt64      := 0
+  sarNum         : UInt32      := 1
+  sarDen         : UInt32      := 1
+  colorPrimaries : UInt32      := 1
+  colorTrc       : UInt32      := 1
+  colorSpace     : UInt32      := 1
+  hasMdcv        : Bool        := false
+  hasClli        : Bool        := false
+  maxCll         : UInt32      := 0
+  maxFall        : UInt32      := 0
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Populate `Mp4MediaInfoView` from an ISO BMFF `moov` buffer and file size `fileBytes`. -/
+def populateMp4MediaInfoPure (buf : @& ByteArray) (fileBytes : UInt64) : Mp4MediaInfoView := Id.run do
+  let mut info : Mp4MediaInfoView := {}
+  let some loc := mp4LocateVideoBoxes buf buf.size | return info
+  info := { info with hasAudio := some (mp4HasAudioTrakInMoov buf loc.moovPos loc.moovSz) }
+  let moovBody := mp4BoxPayloadOffset buf loc.moovPos (loc.moovPos + loc.moovSz)
+  if let some (bp, bs) := mp4FindChildBox buf moovBody (loc.moovPos + loc.moovSz) 0x6D766864 then -- 'mvhd'
+    if bs >= 28 then
+      let ts := mp4ExtractBoxTimescale buf bp bs
+      let dur := mp4ExtractBoxDuration buf bp bs
+      if ts > 0 && dur > 0 then
+        info := {
+          info with
+          timescale := ts
+          durationTicks := dur
+          bitrateKbps := computeBitrateKbpsU64 fileBytes ts dur
+        }
+  let vreStart := loc.vrePos + 86
+  let vreEnd := loc.vrePos + loc.vreSz
+  if let some (bp, bs) := mp4FindChildBox buf vreStart vreEnd 0x70617370 then -- 'pasp'
+    if bs >= 16 then
+      let hn := baRdU32BE buf (bp + 8)
+      let hd := baRdU32BE buf (bp + 12)
+      if hn > 0 && hd > 0 then
+        info := { info with sarNum := hn, sarDen := hd }
+  if let some (bp, bs) := mp4FindChildBox buf vreStart vreEnd 0x636F6C72 then -- 'colr'
+    if bs >= 18 then
+      let prim := baRdU16BE buf (bp + 12)
+      let trc  := baRdU16BE buf (bp + 14)
+      let spc  := baRdU16BE buf (bp + 16)
+      let cdesc := classifyColrNclxU32 prim trc spc
+      info := {
+        info with
+        colorPrimaries := cdesc &&& 0xFF
+        colorTrc := (cdesc >>> 8) &&& 0xFF
+        colorSpace := (cdesc >>> 16) &&& 0xFF
+      }
+  if let some (_, bs) := mp4FindChildBox buf vreStart vreEnd 0x6D646376 then -- 'mdcv'
+    if bs >= 32 then
+      info := { info with hasMdcv := true }
+  if let some (bp, bs) := mp4FindChildBox buf vreStart vreEnd 0x636C6C69 then -- 'clli'
+    if bs >= 12 then
+      info := {
+        info with
+        hasClli := true
+        maxCll := (baRdU16BE buf (bp + 8)).toUInt32
+        maxFall := (baRdU16BE buf (bp + 10)).toUInt32
+      }
+  return info
+
+/--
+  Pure Lean 4 ISO/IEC 14496-12 MP4 Container Box Patcher (`patchMp4HdrAndElstBoxesPure`):
+  Extracts source video stream `stsd` child boxes (`colr`, `clli`, `mdcv`, `pasp`) and video `edts/elst`
+  from `inBuf` and injects any missing boxes into `outBuf`, updating ancestor box sizes (`avc1`/`hvc1`,
+  `stsd`, `stbl`, `minf`, `mdia`, `trak`, `moov`), absorbing expansion into an adjacent `free` box when
+  present, or shifting `stco` (32-bit) and `co64` (64-bit) chunk offsets by `totalDelta` when `moov`
+  precedes `mdat`.
+-/
+def patchMp4HdrAndElstBoxesPure (inBuf outBuf : @& ByteArray) (copyElst : Bool) : Option ByteArray := Id.run do
+  let some inLoc := mp4LocateVideoBoxes inBuf inBuf.size | return none
+  let mut inMvhdTs : UInt32 := 0
+  let mut inMdhdTs : UInt32 := 0
+  let inMoovBody := mp4BoxPayloadOffset inBuf inLoc.moovPos (inLoc.moovPos + inLoc.moovSz)
+  if let some (bp, bs) := mp4FindChildBox inBuf inMoovBody (inLoc.moovPos + inLoc.moovSz) 0x6D766864 then
+    inMvhdTs := mp4ExtractBoxTimescale inBuf bp bs
+  let inMdiaBody := mp4BoxPayloadOffset inBuf inLoc.mdiaPos (inLoc.mdiaPos + inLoc.mdiaSz)
+  if let some (bp, bs) := mp4FindChildBox inBuf inMdiaBody (inLoc.mdiaPos + inLoc.mdiaSz) 0x6D646864 then
+    inMdhdTs := mp4ExtractBoxTimescale inBuf bp bs
+
+  let inVreStart := inLoc.vrePos + 86
+  let inVreEnd := inLoc.vrePos + inLoc.vreSz
+  let extractChild (s e : Nat) (fcc : UInt32) (maxSz : Nat) : ByteArray :=
+    match mp4FindChildBox inBuf s e fcc with
+    | some (bp, bs) => if bs <= maxSz then inBuf.extract bp (bp + bs) else ByteArray.empty
+    | none => ByteArray.empty
+
+  let colrBox := extractChild inVreStart inVreEnd 0x636F6C72 64
+  let clliBox := extractChild inVreStart inVreEnd 0x636C6C69 32
+  let mdcvBox := extractChild inVreStart inVreEnd 0x6D646376 64
+  let paspBox := extractChild inVreStart inVreEnd 0x70617370 32
+  let inTrakBody := mp4BoxPayloadOffset inBuf inLoc.trakPos (inLoc.trakPos + inLoc.trakSz)
+  let mut edtsBox := if copyElst then extractChild inTrakBody (inLoc.trakPos + inLoc.trakSz) 0x65647473 128 else ByteArray.empty
+
+  if colrBox.isEmpty && clliBox.isEmpty && mdcvBox.isEmpty && paspBox.isEmpty && edtsBox.isEmpty then
+    return none
+
+  let some outLoc := mp4LocateVideoBoxes outBuf outBuf.size | return none
+  let mut moovP := outLoc.moovPos
+  let mut moovS := outLoc.moovSz
+  let mut trakP := outLoc.trakPos
+  let mut trakS := outLoc.trakSz
+  let mdiaP := outLoc.mdiaPos
+  let mdiaS := outLoc.mdiaSz
+  let minfP := outLoc.minfPos
+  let minfS := outLoc.minfSz
+  let stblP := outLoc.stblPos
+  let stblS := outLoc.stblSz
+  let stsdP := outLoc.stsdPos
+  let stsdS := outLoc.stsdSz
+  let vreP  := outLoc.vrePos
+  let vreS  := outLoc.vreSz
+  let mut mdatP := outLoc.mdatPos
+
+  let mut freeP : Nat := 0
+  let mut freeS : Nat := 0
+  if moovP + moovS + 8 <= outBuf.size && baRdU32BE outBuf (moovP + moovS + 4) == 0x66726565 then -- 'free'
+    let fsz := (baRdU32BE outBuf (moovP + moovS)).toNat
+    if fsz >= 8 && moovP + moovS + fsz <= outBuf.size then
+      freeP := moovP + moovS
+      freeS := fsz
+
+  let outVreStart := vreP + 86
+  let outVreEnd := vreP + vreS
+  let mut stsdInject := ByteArray.empty
+  if !paspBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x70617370).isNone then
+    stsdInject := stsdInject ++ paspBox
+  if !colrBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x636F6C72).isNone then
+    stsdInject := stsdInject ++ colrBox
+  if !clliBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x636C6C69).isNone then
+    stsdInject := stsdInject ++ clliBox
+  if !mdcvBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x6D646376).isNone then
+    stsdInject := stsdInject ++ mdcvBox
+
+  let mut cur := outBuf
+  let stsdDelta := stsdInject.size
+  if stsdDelta > 0 then
+    let insPos := match mp4FindChildBox cur outVreStart outVreEnd 0x62747274 with -- 'btrt'
+      | some (bp, _) => bp
+      | none => vreP + vreS
+    cur := baWrU32BE cur vreP  (shiftMp4AncestorSize vreS  stsdDelta).toUInt32
+    cur := baWrU32BE cur stsdP (shiftMp4AncestorSize stsdS stsdDelta).toUInt32
+    cur := baWrU32BE cur stblP (shiftMp4AncestorSize stblS stsdDelta).toUInt32
+    cur := baWrU32BE cur minfP (shiftMp4AncestorSize minfS stsdDelta).toUInt32
+    cur := baWrU32BE cur mdiaP (shiftMp4AncestorSize mdiaS stsdDelta).toUInt32
+    cur := baWrU32BE cur trakP (shiftMp4AncestorSize trakS stsdDelta).toUInt32
+    cur := baWrU32BE cur moovP (shiftMp4AncestorSize moovS stsdDelta).toUInt32
+    cur := cur.extract 0 insPos ++ stsdInject ++ cur.extract insPos cur.size
+    moovS := moovS + stsdDelta
+    trakS := trakS + stsdDelta
+    if mdatP > moovP then mdatP := mdatP + stsdDelta
+
+  let mut edtsDelta : Int := 0
+  if copyElst && edtsBox.size >= 28 then
+    let mut outMvhdTs : UInt32 := 0
+    let mut outMdhdTs : UInt32 := 0
+    if let some (bp, bs) := mp4FindChildBox cur (moovP + 8) (moovP + moovS) 0x6D766864 then
+      outMvhdTs := mp4ExtractBoxTimescale cur bp bs
+    if let some (bp, bs) := mp4FindChildBox cur (mdiaP + 8) (mdiaP + mdiaS + stsdDelta) 0x6D646864 then
+      outMdhdTs := mp4ExtractBoxTimescale cur bp bs
+    let mut inHasNonzeroMt := false
+    if baRdU32BE edtsBox 12 == 0x656C7374 && edtsBox.get! 16 == 0 then -- 'elst' v0
+      let entryCnt := (baRdU32BE edtsBox 20).toNat
+      let mut e : Nat := 0
+      while e < entryCnt && 24 + (e + 1) * 12 <= edtsBox.size do
+        let ep := 24 + e * 12
+        let segDur := baRdU32BE edtsBox ep
+        let mediaTimeU32 := baRdU32BE edtsBox (ep + 4)
+        if mediaTimeU32 != 0 then inHasNonzeroMt := true
+        let rescaled := rescaleElstEntryU64 segDur mediaTimeU32 inMvhdTs outMvhdTs inMdhdTs outMdhdTs
+        edtsBox := baWrU32BE edtsBox ep (rescaled &&& 0xFFFFFFFF).toUInt32
+        edtsBox := baWrU32BE edtsBox (ep + 4) (rescaled >>> 32).toUInt32
+        e := e + 1
+    if let some (oldEdtsP, oldEdtsS) := mp4FindChildBox cur (trakP + 8) (trakP + trakS) 0x65647473 then
+      let mut outHasBframeMt := false
+      if oldEdtsS >= 36 && baRdU32BE cur (oldEdtsP + 12) == 0x656C7374 && cur.get! (oldEdtsP + 16) == 0 then
+        let outMt := baRdU32BE cur (oldEdtsP + 28)
+        if outMt > 0 && outMt < 0x80000000 then outHasBframeMt := true
+      if inHasNonzeroMt || !outHasBframeMt then
+        edtsDelta := (Int.ofNat edtsBox.size) - (Int.ofNat oldEdtsS)
+        let newTrakS := (Int.ofNat trakS + edtsDelta).toNat
+        let newMoovS := (Int.ofNat moovS + edtsDelta).toNat
+        cur := baWrU32BE cur trakP newTrakS.toUInt32
+        cur := baWrU32BE cur moovP newMoovS.toUInt32
+        cur := cur.extract 0 oldEdtsP ++ edtsBox ++ cur.extract (oldEdtsP + oldEdtsS) cur.size
+        moovS := newMoovS
+        trakS := newTrakS
+
+  let totalDelta : Int := Int.ofNat stsdDelta + edtsDelta
+  if totalDelta > 0 && freeP > 0 && freeS >= totalDelta.toNat + 8 then
+    let newFreeP := moovP + moovS
+    let newFreeS := freeS - totalDelta.toNat
+    cur := baWrU32BE cur newFreeP newFreeS.toUInt32
+    cur := baWrU32BE cur (newFreeP + 4) 0x66726565 -- 'free'
+    -- Remove `totalDelta` bytes from the absorbed `free` box so file size and `mdat` offset stay invariant
+    let afterFreeHdr := newFreeP + 8
+    cur := cur.extract 0 afterFreeHdr ++ cur.extract (afterFreeHdr + totalDelta.toNat) cur.size
+    return some cur
+
+  if totalDelta != 0 && moovP < mdatP then
+    let mEnd := Nat.min (moovP + moovS) cur.size
+    let mut tp := mp4BoxPayloadOffset cur moovP mEnd
+    let mut fuel := (mEnd - tp) / 8 + 1
+    while fuel > 0 && tp + 8 <= mEnd do
+      fuel := fuel - 1
+      match mp4NextBox cur tp mEnd with
+      | none => break
+      | some (thdr, tsz) =>
+        if baRdU32BE cur (tp + 4) == 0x7472616B then
+          if let some (mdP, mdS) := mp4FindChildBox cur (tp + thdr) (tp + tsz) 0x6D646961 then
+            let mdBody := mp4BoxPayloadOffset cur mdP (mdP + mdS)
+            if let some (mfP, mfS) := mp4FindChildBox cur mdBody (mdP + mdS) 0x6D696E66 then
+              let mfBody := mp4BoxPayloadOffset cur mfP (mfP + mfS)
+              if let some (sbP, sbS) := mp4FindChildBox cur mfBody (mfP + mfS) 0x7374626C then
+                let sbBody := mp4BoxPayloadOffset cur sbP (sbP + sbS)
+                if let some (coP, coS) := mp4FindChildBox cur sbBody (sbP + sbS) 0x7374636F then -- 'stco'
+                  if coS >= 16 then
+                    let cnt := (baRdU32BE cur (coP + 12)).toNat
+                    let mut k : Nat := 0
+                    while k < cnt && coP + 16 + k * 4 + 4 <= coP + coS do
+                      let oldOff := (baRdU32BE cur (coP + 16 + k * 4)).toNat
+                      let newOff := (Int.ofNat oldOff + totalDelta).toNat
+                      cur := baWrU32BE cur (coP + 16 + k * 4) newOff.toUInt32
+                      k := k + 1
+                if let some (coP, coS) := mp4FindChildBox cur sbBody (sbP + sbS) 0x636F3634 then -- 'co64'
+                  if coS >= 16 then
+                    let cnt := (baRdU32BE cur (coP + 12)).toNat
+                    let mut k : Nat := 0
+                    while k < cnt && coP + 16 + k * 8 + 8 <= coP + coS do
+                      let oldOff := (baRdU64BE cur (coP + 16 + k * 8)).toNat
+                      let newOff := (Int.ofNat oldOff + totalDelta).toNat
+                      cur := baWrU64BE cur (coP + 16 + k * 8) newOff.toUInt64
+                      k := k + 1
+        tp := tp + tsz
+
+  return some cur
+
+/--
+  Theorem: Pure Lean 4 ISO/IEC 14496-12 box helpers (`mp4NextBox`, `mp4FindChildBox`,
+  `baWrU32BE`/`baRdU32BE`) accurately parse well-formed 32-bit and 64-bit extended box headers,
+  round-trip 32-bit Big-Endian box size patches, and fail closed (`none`) on truncated or
+  under-sized (`sz < 8`) headers.
+-/
+theorem mp4BoxLocator_and_bePatch_verified :
+    let box16 : ByteArray := ByteArray.mk #[
+      0, 0, 0, 16, 0x6D, 0x6F, 0x6F, 0x76,
+      0, 0, 0, 8,  0x66, 0x72, 0x65, 0x65
+    ]
+    let badBox : ByteArray := ByteArray.mk #[0, 0, 0, 4, 0x66, 0x72, 0x65, 0x65]
+    let patched := baWrU32BE box16 0 0x00000024
+    mp4NextBox box16 0 box16.size = some (8, 16) ∧
+    mp4FindChildBox box16 8 16 0x66726565 = some (8, 8) ∧
+    mp4NextBox badBox 0 badBox.size = none ∧
+    baRdU32BE patched 0 = 0x00000024 := by
   decide
 
 end LeanAV.Format

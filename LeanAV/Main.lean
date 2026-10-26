@@ -1943,10 +1943,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.PlanIR.ffiProbeMp4ContractPure_rejects_short_universal
 #print axioms LeanAV.NativeKernels.verifyLnirSArrayContract_sound
 #print axioms LeanAV.Cli.cliSecondsToMillis_zero_den_universal
-
-
-
-
-
+#print axioms LeanAV.Format.mp4BoxLocator_and_bePatch_verified
+#print axioms LeanAV.Encoder.measurePlanesAcceptance_and_lumaStats_verified
 
 

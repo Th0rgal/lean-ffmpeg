@@ -423,18 +423,17 @@ def scalePlaneDown2x2FusedEqBytesSimd (src : ByteArray) (srcW srcH srcStride : N
   return out
 
 /--
-  Fast C-ABI SIMD 2x2 Box Downscale (`leanav_c_scale_plane_down_2x2`):
-  Uses 256-bit AVX2 (`_mm256_maddubs_epi16`) or 128-bit ARM64 NEON (`vpaddlq_u8` + `vshrn_n_u16`)
-  and falls back to pure Lean `scalePlaneDown2x2BytesSimd` in the kernel interpreter.
+  Pure Lean 4 flat-`ByteArray` 2x2 Box Downscale (`scalePlaneDown2x2CSimd`):
+  Delegates directly to `scalePlaneDown2x2BytesSimd`.
 -/
-@[extern "leanav_c_scale_plane_down_2x2"]
+@[inline]
 def scalePlaneDown2x2CSimd (src : @& ByteArray) (srcW srcH srcStride : USize) : ByteArray :=
   scalePlaneDown2x2BytesSimd src srcW.toNat srcH.toNat srcStride.toNat
 
 /--
-  Fast C-ABI SIMD Fused 2x2 Box Downscale + Q8 Contrast/Brightness (`leanav_c_scale_plane_down_2x2_fused_eq`).
+  Pure Lean 4 flat-`ByteArray` Fused 2x2 Box Downscale + Q8 Contrast/Brightness (`scalePlaneDown2x2FusedEqCSimd`).
 -/
-@[extern "leanav_c_scale_plane_down_2x2_fused_eq"]
+@[inline]
 def scalePlaneDown2x2FusedEqCSimd (src : @& ByteArray) (srcW srcH srcStride : USize)
     (contrastQ8 brightness : UInt32) : ByteArray :=
   scalePlaneDown2x2FusedEqBytesSimd src srcW.toNat srcH.toNat srcStride.toNat
@@ -506,8 +505,8 @@ def scalePlaneDown3x3Bytes (src : ByteArray) (srcW srcH st : Nat) : ByteArray :=
       out := out.push ((((sum9 + 4) * 7282) >>> 16).toUInt8)
   return out
 
-/-- Fast C-ABI SIMD 3x3 Box Downscale (`leanav_c_scale_plane_down_3x3`, e.g. 4K `3840x2160` -> 720p `1280x720`). -/
-@[extern "leanav_c_scale_plane_down_3x3"]
+/-- Pure Lean 4 flat-`ByteArray` 3x3 Box Downscale (`scalePlaneDown3x3CSimd`, e.g. 4K `3840x2160` -> 720p `1280x720`). -/
+@[inline]
 def scalePlaneDown3x3CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
   scalePlaneDown3x3Bytes src srcW.toNat srcH.toNat srcW.toNat
 
@@ -555,8 +554,8 @@ def scalePlaneDown3to2Bytes (src : ByteArray) (srcW srcH : Nat) : ByteArray := I
     byIdx := byIdx + 2
   return out
 
-/-- Fast C-ABI SIMD 3:2 Block Downscale (`leanav_c_scale_plane_down_3to2`, e.g. 1080p `1920x1080` -> 720p `1280x720`). -/
-@[extern "leanav_c_scale_plane_down_3to2"]
+/-- Pure Lean 4 flat-`ByteArray` 3:2 Block Downscale (`scalePlaneDown3to2CSimd`, e.g. 1080p `1920x1080` -> 720p `1280x720`). -/
+@[inline]
 def scalePlaneDown3to2CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
   scalePlaneDown3to2Bytes src srcW.toNat srcH.toNat
 
@@ -830,6 +829,145 @@ theorem pq10Tonemap_and_bicubic2x2_verified :
     tonemapPq10ToBt709Sdr8 1023 = 235 ∧
     evalBicubic4TapMidpoint 10 120 140 250 = 130 := by
   decide
+
+/-- Precompute Q8 bilinear coordinate/fraction lookup table `Array UInt64` for `[0, dstDim) -> [0, srcDim)`. -/
+def buildBilinearTabQ8 (srcDim dstDim : Nat) : Array UInt64 := Id.run do
+  let mut tab := Array.mkEmpty dstDim
+  let s32 := srcDim.toUInt32
+  let d32 := dstDim.toUInt32
+  for dIdx in [:dstDim] do
+    tab := tab.push (bilinearTabEntryQ8 dIdx.toUInt32 s32 d32)
+  return tab
+
+/--
+  Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
+  operating on a slice `[srcOff, srcOff + srcW * srcH)` of `src : ByteArray`.
+-/
+def scalePlaneBilinearWithTabsBytes
+    (src : @& ByteArray) (srcOff srcW srcH dstW dstH : Nat)
+    (xTab yTab : @& Array UInt64) : ByteArray := Id.run do
+  let pSlice := src.extract srcOff (srcOff + srcW * srcH)
+  if srcW == dstW && srcH == dstH then
+    return pSlice
+  else if srcW == dstW * 2 && srcH == dstH * 2 then
+    return scalePlaneDown2x2BytesSimd pSlice srcW srcH srcW
+  else if srcW == dstW * 3 && srcH == dstH * 3 then
+    return scalePlaneDown3x3Bytes pSlice srcW srcH srcW
+  else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
+    return scalePlaneDown3to2Bytes pSlice srcW srcH
+  else
+    let total := dstW * dstH
+    let mut out := ByteArray.emptyWithCapacity total
+    let cap := pSlice.size
+    let getB (idx : Nat) : Nat := if idx < cap then (pSlice.get! idx).toNat else 0
+    for dy in [:dstH] do
+      let ey := yTab.getD dy 0
+      let sy0 := (ey &&& 0xFFFFFF).toNat
+      let sy1 := ((ey >>> 24) &&& 0xFFFFFF).toNat
+      let fy  := ((ey >>> 48) &&& 0xFF).toNat
+      let ify := 256 - fy
+      let r0 := sy0 * srcW
+      let r1 := sy1 * srcW
+      for dx in [:dstW] do
+        let ex := xTab.getD dx 0
+        let sx0 := (ex &&& 0xFFFFFF).toNat
+        let sx1 := ((ex >>> 24) &&& 0xFFFFFF).toNat
+        let fx  := ((ex >>> 48) &&& 0xFF).toNat
+        let ifx := 256 - fx
+        let top := ifx * getB (r0 + sx0) + fx * getB (r0 + sx1)
+        let bot := ifx * getB (r1 + sx0) + fx * getB (r1 + sx1)
+        let val := (ify * top + fy * bot + 32768) >>> 16
+        out := out.push (Nat.min 255 val).toUInt8
+    return out
+
+/--
+  Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3) 16-bit little-endian (`yuv420p10le`)
+  plane scaler operating on `[srcByteOff, srcByteOff + srcW * srcH * 2)` of `src : ByteArray`.
+-/
+def scalePlaneBilinearU16LeBytes
+    (src : @& ByteArray) (srcByteOff srcW srcH dstW dstH : Nat)
+    (xTab yTab : @& Array UInt64) : ByteArray := Id.run do
+  let byteLen := srcW * srcH * 2
+  if srcW == dstW && srcH == dstH then
+    return src.extract srcByteOff (srcByteOff + byteLen)
+  let cap := src.size
+  let getU16 (pxIdx : Nat) : Nat :=
+    let bOff := srcByteOff + pxIdx * 2
+    if bOff + 1 < cap then
+      (src.get! bOff).toNat ||| (((src.get! (bOff + 1)).toNat) <<< 8)
+    else 0
+  let mut out := ByteArray.emptyWithCapacity (dstW * dstH * 2)
+  if srcW == dstW * 2 && srcH == dstH * 2 then
+    for dy in [:dstH] do
+      let r0 := (dy * 2) * srcW
+      let r1 := r0 + srcW
+      for dx in [:dstW] do
+        let sx := dx * 2
+        let avg := (getU16 (r0 + sx) + getU16 (r0 + sx + 1) + getU16 (r1 + sx) + getU16 (r1 + sx + 1) + 2) >>> 2
+        out := (out.push (avg &&& 0xFF).toUInt8).push ((avg >>> 8) &&& 0xFF).toUInt8
+    return out
+  else if srcW == dstW * 3 && srcH == dstH * 3 then
+    for dy in [:dstH] do
+      let r0 := (dy * 3) * srcW
+      let r1 := r0 + srcW
+      let r2 := r1 + srcW
+      for dx in [:dstW] do
+        let sx := dx * 3
+        let sum9 :=
+          getU16 (r0 + sx) + getU16 (r0 + sx + 1) + getU16 (r0 + sx + 2) +
+          getU16 (r1 + sx) + getU16 (r1 + sx + 1) + getU16 (r1 + sx + 2) +
+          getU16 (r2 + sx) + getU16 (r2 + sx + 1) + getU16 (r2 + sx + 2)
+        let avg := ((sum9 + 4) * 7282) >>> 16
+        out := (out.push (avg &&& 0xFF).toUInt8).push ((avg >>> 8) &&& 0xFF).toUInt8
+    return out
+  else
+    for dy in [:dstH] do
+      let ey := yTab.getD dy 0
+      let sy0 := (ey &&& 0xFFFFFF).toNat
+      let sy1 := ((ey >>> 24) &&& 0xFFFFFF).toNat
+      let fy  := ((ey >>> 48) &&& 0xFF).toNat
+      let ify := 256 - fy
+      let r0 := sy0 * srcW
+      let r1 := sy1 * srcW
+      for dx in [:dstW] do
+        let ex := xTab.getD dx 0
+        let sx0 := (ex &&& 0xFFFFFF).toNat
+        let sx1 := ((ex >>> 24) &&& 0xFFFFFF).toNat
+        let fx  := ((ex >>> 48) &&& 0xFF).toNat
+        let ifx := 256 - fx
+        let top := ifx * getU16 (r0 + sx0) + fx * getU16 (r0 + sx1)
+        let bot := ifx * getU16 (r1 + sx0) + fx * getU16 (r1 + sx1)
+        let val := Nat.min 1023 ((ify * top + fy * bot + 32768) >>> 16)
+        out := (out.push (val &&& 0xFF).toUInt8).push ((val >>> 8) &&& 0xFF).toUInt8
+    return out
+
+/--
+  Pure Lean 4 pixel filter stage (`applyPixelFiltersYuv420p`) for YUV420p planes:
+  - `filterFlags &&& 2 != 0`: applies ST.2084 PQ10 -> BT.709 OETF highlight tonemap (`tonemapPq10ToBt709Sdr8`) on `yBa`.
+  - `filterFlags &&& 1 != 0`: applies BT.2020 -> BT.709 Q10 chroma cross-matrix (`cscChromaBt2020ToBt709Q10`) on `uBa, vBa`.
+-/
+def applyPixelFiltersYuv420p (yBa uBa vBa : ByteArray) (filterFlags : UInt32) :
+    ByteArray × ByteArray × ByteArray := Id.run do
+  let yOut :=
+    if (filterFlags &&& 2) != 0 then Id.run do
+      let n := yBa.size
+      let mut yb := ByteArray.emptyWithCapacity n
+      for i in [:n] do
+        let b := yBa.get! i
+        yb := yb.push (tonemapPq10ToBt709Sdr8 (b.toUInt16 <<< 2))
+      return yb
+    else yBa
+  if (filterFlags &&& 1) != 0 then
+    let uvLen := Nat.min uBa.size vBa.size
+    let mut uOut := ByteArray.emptyWithCapacity uvLen
+    let mut vOut := ByteArray.emptyWithCapacity uvLen
+    for i in [:uvLen] do
+      let (u', v') := cscChromaBt2020ToBt709Q10 (uBa.get! i) (vBa.get! i)
+      uOut := uOut.push u'
+      vOut := vOut.push v'
+    return (yOut, uOut, vOut)
+  else
+    return (yOut, uBa, vBa)
 
 /-! ## 8. Consolidated 2x2 Box-Scale, Strided SIMD Bounds, and 16x16 SAD Proofs -/
 

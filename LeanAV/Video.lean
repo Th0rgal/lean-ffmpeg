@@ -1748,32 +1748,32 @@ def xorResidualBytesRef (a b : ByteArray) (n : Nat) : ByteArray :=
       (aList.getD i 0) ^^^ (bList.getD i 0))
   { data := outList.toArray }
 
-/-- Fast flat-`ByteArray` B-frame bi-predictive plane kernel (`mcBiPredBytesSimd`),
-    backed at runtime by AVX2/NEON `leanav_c_mc_bipred_plane`. -/
-@[extern "leanav_c_mc_bipred_plane"]
+/-- Pure Lean 4 flat-`ByteArray` B-frame bi-predictive plane kernel (`mcBiPredBytesSimd`). -/
+@[inline]
 def mcBiPredBytesSimd (l0 : @& ByteArray) (l1 : @& ByteArray) (nBytes : USize) : ByteArray := Id.run do
-  let n := nBytes.toNat
-  let mut out := ByteArray.emptyWithCapacity n
-  let cap0 := l0.size
-  let cap1 := l1.size
+  let nTotal := nBytes.toNat
+  let n := Nat.min nTotal (Nat.min l0.size l1.size)
+  let mut out := ByteArray.emptyWithCapacity nTotal
   for i in [:n] do
-    let b0 : UInt16 := if i < cap0 then (l0.get! i).toUInt16 else 0
-    let b1 : UInt16 := if i < cap1 then (l1.get! i).toUInt16 else 0
+    let b0 : UInt16 := (l0.get! i).toUInt16
+    let b1 : UInt16 := (l1.get! i).toUInt16
     out := out.push (((b0 + b1 + 1) >>> 1).toUInt8)
+  for _ in [n:nTotal] do
+    out := out.push 0
   return out
 
-/-- Fast flat-`ByteArray` inter-frame residual plane kernel (`xorResidualBytesSimd`),
-    backed at runtime by AVX2/NEON `leanav_c_xor_residual_plane`. -/
-@[extern "leanav_c_xor_residual_plane"]
+/-- Pure Lean 4 flat-`ByteArray` inter-frame residual plane kernel (`xorResidualBytesSimd`). -/
+@[inline]
 def xorResidualBytesSimd (a : @& ByteArray) (b : @& ByteArray) (nBytes : USize) : ByteArray := Id.run do
-  let n := nBytes.toNat
-  let mut out := ByteArray.emptyWithCapacity n
-  let capA := a.size
-  let capB := b.size
+  let nTotal := nBytes.toNat
+  let n := Nat.min nTotal (Nat.min a.size b.size)
+  let mut out := ByteArray.emptyWithCapacity nTotal
   for i in [:n] do
-    let ba := if i < capA then a.get! i else 0
-    let bb := if i < capB then b.get! i else 0
+    let ba := a.get! i
+    let bb := b.get! i
     out := out.push (ba ^^^ bb)
+  for _ in [n:nTotal] do
+    out := out.push 0
   return out
 
 /-- Pure Lean reference B-frame bi-predictive 2D plane predictor (`mcBiPredPlaneRef`). -/
