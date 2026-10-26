@@ -779,7 +779,9 @@ def runSelfTest : IO UInt32 := do
   -- 60. Wave 52: In-Process `lean-native-core`-Compiled 12-Kernel LNIR C-ABI Suite & 10-Bit 3x3 Reciprocal Scaling Gate
   let w52P010Out := evalLnirKernel .fmaBlend [512, 1023] [64, 64] [0, 32768]
   let w52BoxU10Ok := fastBox3x3DownscaleU10Sum 9207 == specBox3x3DownscaleU10Sum 9207 &&
-                     specBox3x3DownscaleU10Sum 9207 == 1023
+                     specBox3x3DownscaleU10Sum 9207 == 1023 &&
+                     cscChromaBt2020ToBt709Q10Export 128 128 == 0x8080 &&
+                     cscChromaBt2020ToBt709Q10Export 64 192 == (61 ||| (192 <<< 8))
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1

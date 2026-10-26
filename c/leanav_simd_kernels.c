@@ -1775,10 +1775,12 @@ static void leanav_scale_plane_bilinear_u16_raw_with_tabs(
 }
 
 /*
- * Direct C-ABI call to the verified Lean 4 `@[export]` function `leanav_lean_tonemap_pq10_to_bt709_u8`
- * (`tonemapPq10ToBt709Sdr8` in `LeanAV/Scale.lean`): zero duplicated C formula.
+ * Direct C-ABI calls to the verified Lean 4 `@[export]` functions in `LeanAV/Scale.lean`:
+ * - `leanav_lean_tonemap_pq10_to_bt709_u8` (`tonemapPq10ToBt709Sdr8Export`)
+ * - `leanav_lean_csc_chroma_bt2020_to_bt709_u16` (`cscChromaBt2020ToBt709Q10Export`)
  */
 extern uint8_t leanav_lean_tonemap_pq10_to_bt709_u8(uint16_t y10);
+extern uint16_t leanav_lean_csc_chroma_bt2020_to_bt709_u16(uint8_t u, uint8_t v);
 
 /*
  * BT.2020 -> BT.709 Q10 Chroma Re-matrixing + Optional Luma Contrast/Brightness LUT (`filter_flags`):
@@ -1899,12 +1901,9 @@ static void leanav_apply_pixel_filters_strided(
             }
 #endif
             for (; i < uv_w; i++) {
-                int32_t u0 = (int32_t)u_row[i] - 128;
-                int32_t v0 = (int32_t)v_row[i] - 128;
-                int32_t u_out = 128 + ((1004 * u0 - 74 * v0 + 512) >> 10);
-                int32_t v_out = 128 + ((-42 * u0 + 986 * v0 + 512) >> 10);
-                u_row[i] = clamp_u8_i32(u_out);
-                v_row[i] = clamp_u8_i32(v_out);
+                uint16_t uv_packed = leanav_lean_csc_chroma_bt2020_to_bt709_u16(u_row[i], v_row[i]);
+                u_row[i] = (uint8_t)(uv_packed & 0xFFu);
+                v_row[i] = (uint8_t)(uv_packed >> 8);
             }
         }
     }

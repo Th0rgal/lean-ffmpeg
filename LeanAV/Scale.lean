@@ -587,6 +587,11 @@ def cscChromaBt2020ToBt709Q10 (u v : UInt8) : UInt8 × UInt8 :=
   let vOut : Int32 := (128 : Int32) + (((-42 : Int32) * u0 + 986 * v0 + 512) >>> 10)
   (clipUInt8 uOut, clipUInt8 vOut)
 
+@[export leanav_lean_csc_chroma_bt2020_to_bt709_u16]
+def cscChromaBt2020ToBt709Q10Export (u v : UInt8) : UInt16 :=
+  let (u', v') := cscChromaBt2020ToBt709Q10 u v
+  u'.toUInt16 ||| (v'.toUInt16 <<< 8)
+
 /-- Reinhard-style fixed-point HDR-to-SDR luma tonemapper (`tonemapLumaReinhardQ8`):
     Maps `[0, 255]` luma with highlight knee compression `y' = clipUInt8((y * 320 * 255) / (256 * 255 + y * 64))`. -/
 @[inline]
@@ -596,10 +601,13 @@ def tonemapLumaReinhardQ8 (y : UInt8) : UInt8 :=
   let den := 65280 + yn * 64
   clipUInt8 (Int32.ofNat (num / den))
 
-/-- Theorem (Wave B3): Neutral achromatic chroma `(128, 128)` is a fixed point of `cscChromaBt2020ToBt709Q10`,
-    and `tonemapLumaReinhardQ8` maps `0 -> 0` and `255 -> 255` monotonically. -/
+/-- Theorem (Wave B3): Neutral achromatic chroma `(128, 128)` is a fixed point of `cscChromaBt2020ToBt709Q10`
+    and `cscChromaBt2020ToBt709Q10Export`, off-axis `(64, 192)` maps to `(61, 192)`, and `tonemapLumaReinhardQ8`
+    maps `0 -> 0` and `255 -> 255`. -/
 theorem cscBt2020ToBt709_and_tonemap_invariants :
     cscChromaBt2020ToBt709Q10 128 128 = (128, 128) ∧
+    cscChromaBt2020ToBt709Q10Export 128 128 = 0x8080 ∧
+    cscChromaBt2020ToBt709Q10 64 192 = (61, 192) ∧
     tonemapLumaReinhardQ8 0 = 0 ∧
     tonemapLumaReinhardQ8 255 = 255 := by
   decide
