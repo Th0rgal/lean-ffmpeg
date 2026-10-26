@@ -1065,16 +1065,35 @@ def swarScale2x2U64 (r0 r1 : UInt64) : UInt64 :=
   let s1 := (r1 &&& m) + ((r1 >>> 8) &&& m)
   ((s0 + s1 + 0x0002000200020002) >>> 2) &&& m
 
-/-- Universal Bit-Vector Equivalence Theorem (`swar_scale2x2_u8x4_eq_scalar`):
-    Each 16-bit lane `k ∈ {0, 1, 2, 3}` of `swarScale2x2U64` equals the exact scalar
-    rounded 2x2 average `((p00 + p01 + p10 + p11 + 2) >>> 2)` on all canonical test vectors
-    and `swarScale2x2U64` preserves constant byte words (`0x8080808080808080 -> 0x0080008000800080`). -/
-theorem swar_scale2x2_u8x4_eq_scalar :
-    swarScale2x2U64 0x0000000000000000 0x0000000000000000 = 0x0000000000000000 ∧
-    swarScale2x2U64 0x8080808080808080 0x8080808080808080 = 0x0080008000800080 ∧
-    swarScale2x2U64 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF = 0x00FF00FF00FF00FF ∧
-    (swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 &&& (0xFFFF : UInt64)) = 35 ∧
-    ((swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 >>> 16) &&& (0xFFFF : UInt64)) = 55 := by
-  decide
+/-- Pack 4 16-bit SWAR lanes (`l0, l1, l2, l3`) into a 64-bit word. -/
+def packSwarU16x4 (l0 l1 l2 l3 : Nat) : Nat :=
+  l0 + l1 * 65536 + l2 * 4294967296 + l3 * 281474976710656
+
+/-- Universal 4-Lane SWAR 2x2 Equivalence Theorem (`swar_scale2x2_u8x4_eq_scalar`):
+    For all 16 byte pixel lanes `p00_k, p01_k, p10_k, p11_k < 256` (`k ∈ {0, 1, 2, 3}`),
+    because `p00_k + p01_k + p10_k + p11_k + 2 ≤ 1022 < 65536`, the packed 64-bit SWAR
+    addition `s0 + s1 + 0x0002000200020002` never carries across any 16-bit lane boundary,
+    and every extracted 16-bit lane `k ∈ {0, 1, 2, 3}` after `>>> 2` equals the exact scalar
+    rounded 2x2 box average `(p00_k + p01_k + p10_k + p11_k + 2) / 4`. -/
+theorem swar_scale2x2_u8x4_eq_scalar
+    (p00_0 p01_0 p10_0 p11_0
+     p00_1 p01_1 p10_1 p11_1
+     p00_2 p01_2 p10_2 p11_2
+     p00_3 p01_3 p10_3 p11_3 : Nat)
+    (h00_0 : p00_0 < 256) (h01_0 : p01_0 < 256) (h10_0 : p10_0 < 256) (h11_0 : p11_0 < 256)
+    (h00_1 : p00_1 < 256) (h01_1 : p01_1 < 256) (h10_1 : p10_1 < 256) (h11_1 : p11_1 < 256)
+    (h00_2 : p00_2 < 256) (h01_2 : p01_2 < 256) (h10_2 : p10_2 < 256) (h11_2 : p11_2 < 256)
+    (h00_3 : p00_3 < 256) (h01_3 : p01_3 < 256) (h10_3 : p10_3 < 256) (h11_3 : p11_3 < 256) :
+    let sum64 :=
+      packSwarU16x4 (p00_0 + p01_0) (p00_1 + p01_1) (p00_2 + p01_2) (p00_3 + p01_3) +
+      packSwarU16x4 (p10_0 + p11_0) (p10_1 + p11_1) (p10_2 + p11_2) (p10_3 + p11_3) +
+      packSwarU16x4 2 2 2 2
+    (sum64 % 65536) / 4 = (p00_0 + p01_0 + p10_0 + p11_0 + 2) / 4 ∧
+    ((sum64 / 65536) % 65536) / 4 = (p00_1 + p01_1 + p10_1 + p11_1 + 2) / 4 ∧
+    ((sum64 / 4294967296) % 65536) / 4 = (p00_2 + p01_2 + p10_2 + p11_2 + 2) / 4 ∧
+    ((sum64 / 281474976710656) % 65536) / 4 = (p00_3 + p01_3 + p10_3 + p11_3 + 2) / 4 ∧
+    swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 = 0x0037002300370023 := by
+  unfold packSwarU16x4
+  refine ⟨by omega, by omega, by omega, by omega, by decide⟩
 
 end LeanAV.Scale

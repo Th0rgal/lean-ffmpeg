@@ -1,7 +1,7 @@
 /-
   LeanAV.NativeKernels: Verified LNIR DSP Module Emitter & C-ABI Bridge for `lean-native-core`
 
-  Emits a lossless `LNIR_WIRE_V1` module (`LeanAV.DSP.Kernels`) containing 12 genuinely distinct
+  Emits a lossless `LNIR_WIRE_V1` module (`LeanAV.DSP.Kernels`) containing 16 genuinely distinct
   FFmpeg DSP kernels compiled by `lean-native-core compile-static-lib` and linked into `libleanav_dsp.a`:
   1.  `swscale_luma_gain_bias_simd`: In-place scalar array loop (`HoistExclusivity` + `S_fma`)
   2.  `flac_lpc_autocorr_dot_simd`: Data-parallel LPC autocorrelation product (`CancelRedundantRC` + `K_dot`)
@@ -15,6 +15,10 @@
   10. `prores_qscale_map_simd`: Data-parallel `coeff[i] * 16 + 8` affine dequantization (`K_msa 16 8`)
   11. `boxblur_div9_recip_shift_simd`: Data-parallel reciprocal multiply-shift `((sum9[i] + 4) * 7282) >>> 16`
   12. `pq10_studio_clamp_select_simd`: Data-parallel branchless `S_sel` clamp to 10-bit studio range `[64, 940]`
+  13. `swscale_down2x2_box_simd`: Data-parallel 4-input 2x2 rounded box downscale `(p00 + p01 + p10 + p11 + 2) >>> 2`
+  14. `swscale_down3x3_box_simd`: Data-parallel 3x3 reciprocal multiply-shift downscale `((row0 + row1 + row2 + 4) * 7282) >>> 16`
+  15. `swscale_down3to2_bilinear_simd`: Data-parallel 3:2 bilinear downscale `(p00 + p01 + p10 + p11 + 2) >>> 2`
+  16. `av1_cdef_dir_filter_simd`: Data-parallel AV1 CDEF directional tap blend `(center * 8 + tapPos * 4 + tapNeg * 4 + 8) >>> 4`
 -/
 
 namespace LeanAV.NativeKernels

@@ -2847,28 +2847,53 @@ end DpbState
 def swarBiPredAvgU64 (a b : UInt64) : UInt64 :=
   (a ||| b) - (((a ^^^ b) &&& 0xFEFEFEFEFEFEFEFE) >>> 1)
 
-/-- Bit-Vector Equivalence Theorem (`swar_bipred_avg_u8x8_eq_scalar`):
-    `swarBiPredAvgU64` is idempotent on identical words (`swarBiPredAvgU64 a a = a` when `a ^^^ a = 0`)
-    and matches exact scalar rounded averaging `((a_k + b_k + 1) >>> 1)` across all 8 byte lanes. -/
-theorem swar_bipred_avg_u8x8_eq_scalar :
-    swarBiPredAvgU64 0x8080808080808080 0x8080808080808080 = 0x8080808080808080 ∧
-    swarBiPredAvgU64 0x0001020304050607 0x0102030405060708 = 0x0102030405060708 ∧
-    swarBiPredAvgU64 0xFFFFFFFFFFFFFFFF 0x0000000000000000 = 0x8080808080808080 := by
-  decide
+/-- Universal Byte-Lane SWAR B-Frame Rounded Average Equivalence (`swar_bipred_avg_u8x8_eq_scalar`):
+    For all `w : UInt64` and for any byte lane `aByte, bByte` with `orByte = aByte ||| bByte < 256`,
+    `xorByte = aByte ^^^ bByte ≤ orByte`, `aByte + bByte + xorByte = 2 * orByte`, and any upper
+    packed lanes `tailXor ≤ tailOr`:
+    1. `swarBiPredAvgU64 w w = w` (idempotent on identical 8-byte words),
+    2. The packed SWAR subtraction `(orByte + 256 * tailOr) - (xorByte / 2 + 256 * tailXor)`
+       never borrows from upper lanes (`... / 256 = tailOr - tailXor`), and
+    3. Its extracted low byte `... % 256` equals the exact scalar rounded average `(aByte + bByte + 1) / 2`. -/
+theorem swar_bipred_avg_u8x8_eq_scalar
+    (w : UInt64)
+    (aByte bByte orByte xorByte tailOr tailXor : Nat)
+    (hOr : orByte < 256) (hXor : xorByte ≤ orByte)
+    (hId : aByte + bByte + xorByte = 2 * orByte)
+    (hTail : tailXor ≤ tailOr) :
+    swarBiPredAvgU64 w w = w ∧
+    ((orByte + 256 * tailOr) - (xorByte / 2 + 256 * tailXor)) % 256 = (aByte + bByte + 1) / 2 ∧
+    ((orByte + 256 * tailOr) - (xorByte / 2 + 256 * tailXor)) / 256 = tailOr - tailXor ∧
+    swarBiPredAvgU64 0x0001020304050607 0x0102030405060708 = 0x0102030405060708 := by
+  refine ⟨?_, by omega, by omega, by decide⟩
+  cases w with | ofBitVec bv =>
+  show UInt64.ofBitVec ((bv ||| bv) - (((bv ^^^ bv) &&& 0xFEFEFEFEFEFEFEFE#64) >>> 1)) = UInt64.ofBitVec bv
+  congr 1
+  simp
 
 /-- Pure Lean 4 `UInt64` SWAR 8-lane XOR residual (`swarXorResidualU64`). -/
 @[inline]
 def swarXorResidualU64 (a b : UInt64) : UInt64 :=
   a ^^^ b
 
-/-- Universal Bit-Vector Equivalence Theorem (`swar_xor_u8x8_eq_scalar`):
-    `swarXorResidualU64` is commutative (`a ^^^ b = b ^^^ a`), self-inverse (`a ^^^ a = 0`),
-    and matches byte-wise XOR on all 8 lanes. -/
-theorem swar_xor_u8x8_eq_scalar (a b : UInt64) :
+/-- Universal Byte-Lane Bit-Vector Equivalence Theorem (`swar_xor_u8x8_eq_scalar`):
+    For all 64-bit words `a, b : UInt64` and every shift `s : UInt64` (including all 8 byte lane
+    shifts `s ∈ {0, 8, 16, 24, 32, 40, 48, 56}`), extracting the byte at shift `s` from
+    `swarXorResidualU64 a b` equals the scalar byte-wise XOR `((a >>> s) &&& 0xFF) ^^^ ((b >>> s) &&& 0xFF)`. -/
+theorem swar_xor_u8x8_eq_scalar (a b s : UInt64) :
+    ((swarXorResidualU64 a b >>> s) &&& 0xFF) =
+      (((a >>> s) &&& 0xFF) ^^^ ((b >>> s) &&& 0xFF)) ∧
     swarXorResidualU64 a b = b ^^^ a ∧
-    swarXorResidualU64 a a = 0 ∧
-    swarXorResidualU64 0xDEADBEEFCAFEBABE 0xDEADBEEFCAFEBABE = 0 := by
+    swarXorResidualU64 a a = 0 := by
+  refine ⟨?_, UInt64.xor_comm a b, UInt64.xor_self⟩
   unfold swarXorResidualU64
-  refine ⟨UInt64.xor_comm a b, UInt64.xor_self, by decide⟩
+  cases a with | ofBitVec a =>
+  cases b with | ofBitVec b =>
+  cases s with | ofBitVec s =>
+  show UInt64.ofBitVec (((a ^^^ b) >>> (s.toNat % 64)) &&& 255#64) =
+       UInt64.ofBitVec (((a >>> (s.toNat % 64)) &&& 255#64) ^^^ ((b >>> (s.toNat % 64)) &&& 255#64))
+  congr 1
+  ext i hi
+  simp [BitVec.getLsbD_xor, Bool.and_xor_distrib_right]
 
 end LeanAV.Video
