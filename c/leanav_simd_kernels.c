@@ -2814,17 +2814,20 @@ static void leanav_print_ffmpeg_stats(
     fflush(stderr);
 }
 
+extern uint64_t leanav_lean_compute_muxing_overhead_micro_pct_u64(
+    uint64_t video_bytes, uint64_t audio_bytes, uint64_t total_bytes
+);
+
 static void leanav_print_ffmpeg_summary(uint64_t video_bytes, uint64_t audio_bytes, uint64_t total_bytes) {
     if (!g_ui_show_stats) return;
-    double overhead = (video_bytes + audio_bytes > 0)
-        ? (100.0 * (double)((int64_t)total_bytes - (int64_t)(video_bytes + audio_bytes)) / (double)(video_bytes + audio_bytes))
-        : 0.0;
-    if (overhead < 0.0) overhead = 0.0;
+    uint64_t overhead_upct =
+        leanav_lean_compute_muxing_overhead_micro_pct_u64(video_bytes, audio_bytes, total_bytes);
     leanav_cprint(stderr, LEANAV_C_MUX, "[out#0/mp4 @ 0x%lx] ", (unsigned long)0x200000000UL);
-    fprintf(stderr, "video:%lluKiB audio:%lluKiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: %.6f%%\n",
+    fprintf(stderr, "video:%lluKiB audio:%lluKiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: %llu.%06llu%%\n",
         (unsigned long long)(video_bytes / 1024ULL),
         (unsigned long long)(audio_bytes / 1024ULL),
-        overhead);
+        (unsigned long long)(overhead_upct / 1000000ULL),
+        (unsigned long long)(overhead_upct % 1000000ULL));
     fflush(stderr);
 }
 

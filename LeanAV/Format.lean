@@ -5408,10 +5408,7 @@ def hdrBt2020PqLimited : ColrNclxView := {
 theorem hdr_colr_bt2020_pq_limited_roundtrip :
     decodeColrNclxBoxSpec (encodeColrNclxBoxSpec hdrBt2020PqLimited) = some hdrBt2020PqLimited ∧
     encodeColrNclxBoxSpec hdrBt2020PqLimited =
-      [0, 0, 0, 19, 99, 111, 108, 114, 110, 99, 108, 120, 0, 9, 0, 16, 0, 9, 0] ∧
-    classifyColrNclxExport 9 16 9 = 0x01091009 ∧
-    classifyColrNclxExport 9 18 9 = 0x02091209 ∧
-    classifyColrNclxExport 1 1 1 = 0x00010101 := by
+      [0, 0, 0, 19, 99, 111, 108, 114, 110, 99, 108, 120, 0, 9, 0, 16, 0, 9, 0] := by
   decide
 
 /-- HDR10 `mdcv` and `clli` static mastering luminance/light-level fixtures. -/
@@ -5631,12 +5628,42 @@ def computeBitrateKbpsExport (fileBytes : UInt64) (timescale : UInt32) (duration
   computeBitrateKbpsU64 fileBytes timescale durationTicks
 
 /--
-  Module-level HDR static metadata (`mdcv` / `clli`) roundtrip and `@[export]` C-ABI helper
-  conformance theorem for `LeanAV.Format`.
+  Overflow-free muxing overhead estimator in micro-percent (`10^-6 %`, i.e., `1000000 = 1.000000%`)
+  for `leanav_print_ffmpeg_summary`:
+  - Returns `0` when `videoBytes + audioBytes == 0` or `totalBytes <= videoBytes + audioBytes`.
+  - Evaluates `round(((totalBytes - (videoBytes + audioBytes)) * 100000000) / (videoBytes + audioBytes))`
+    in arbitrary-precision `Nat`, eliminating 64-bit `videoBytes + audioBytes` addition wrap-around
+    and signed `(int64_t)totalBytes - (int64_t)(videoBytes + audioBytes)` overflow UB in C.
 -/
+@[inline]
+def computeMuxingOverheadMicroPctU64 (videoBytes audioBytes totalBytes : UInt64) : UInt64 :=
+  let payload : Nat := videoBytes.toNat + audioBytes.toNat
+  let total : Nat := totalBytes.toNat
+  if payload == 0 || total <= payload then 0
+  else
+    let extra : Nat := total - payload
+    let num : Nat := extra * 100000000
+    let microPct : Nat := (num + payload / 2) / payload
+    if microPct > 0xFFFFFFFFFFFFFFFF then 0xFFFFFFFFFFFFFFFF
+    else microPct.toUInt64
+
+@[export leanav_lean_compute_muxing_overhead_micro_pct_u64]
+def computeMuxingOverheadMicroPctExport (videoBytes audioBytes totalBytes : UInt64) : UInt64 :=
+  computeMuxingOverheadMicroPctU64 videoBytes audioBytes totalBytes
+
+/-- HDR10 `mdcv` and `clli` static metadata box encode/decode roundtrip theorem. -/
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
-    decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
+    decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip := by
+  decide
+
+/--
+  Conformance theorem for all `@[export]` C-ABI helpers in `LeanAV.Format`.
+-/
+theorem format_ffi_export_vectors_verified :
+    classifyColrNclxExport 9 16 9 = 0x01091009 ∧
+    classifyColrNclxExport 9 18 9 = 0x02091209 ∧
+    classifyColrNclxExport 1 1 1 = 0x00010101 ∧
     classifyDisplayAspectRatioExport 1920 800 1 1 = 0x00090015 ∧
     classifyDisplayAspectRatioExport 1920 1080 1 1 = 0x00090010 ∧
     classifyDisplayAspectRatioExport 1440 960 1 1 = 0x00020003 ∧
@@ -5670,7 +5697,10 @@ theorem hdr_static_clip_roundtrip :
     selectIsoHeaderDurationExport 1 28 48000 96000 = 0 ∧
     computeBitrateKbpsExport 1000000 1000 4000 = 2000 ∧
     computeBitrateKbpsExport 0 1000 4000 = 0 ∧
-    computeBitrateKbpsExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF 1 = 0x7FFFFFFFFFFFFFFF := by
+    computeBitrateKbpsExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF 1 = 0x7FFFFFFFFFFFFFFF ∧
+    computeMuxingOverheadMicroPctExport 900 100 1025 = 2500000 ∧
+    computeMuxingOverheadMicroPctExport 900 100 1000 = 0 ∧
+    computeMuxingOverheadMicroPctExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF = 0 := by
   decide
 
 end LeanAV.Format

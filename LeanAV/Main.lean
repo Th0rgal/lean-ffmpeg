@@ -1909,6 +1909,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Domain.liftDecodedPlaneOp_preserves_colorSpace_and_explicit_convert
 #print axioms LeanAV.Format.mp4MetadataBoxInject_preserves_mdat_relative_offsets
 #print axioms LeanAV.Format.elst_rescale_mvhd_mdhd_mismatch
+#print axioms LeanAV.Format.format_ffi_export_vectors_verified
 #print axioms LeanAV.Cli.resolveScaleDims_proportional_even_and_cli_flags_verified
 #print axioms LeanAV.Cli.cli_encoder_options_retained_and_invalid_rejected
 #print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
