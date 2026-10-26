@@ -737,13 +737,18 @@ def scalePlaneDown2x2BicubicBytes (src : ByteArray) (srcW srcH st : Nat) : ByteA
   return out
 
 /--
-  Fast C-ABI / ARM64 NEON separable 4-tap bicubic 2x2 downscaler (`leanav_c_scale_plane_down_2x2_bicubic`):
+  Pure Lean 4 separable 4-tap bicubic 2x2 downscaler (`scalePlaneDown2x2BicubicCSimd`):
   Executes the exact `#eval`-exported coefficients `bicubic4TapMidpointCoeffsQ4 = #[-1, 9, 9, -1]`
-  with divisor `16` and bias `+8`, and falls back to `scalePlaneDown2x2BicubicBytes` in the kernel interpreter.
+  with divisor `16` and bias `+8` via `scalePlaneDown2x2BicubicBytes`.
 -/
-@[extern "leanav_c_scale_plane_down_2x2_bicubic"]
+@[inline]
 def scalePlaneDown2x2BicubicCSimd (src : @& ByteArray) (srcW srcH st : USize) : ByteArray :=
   scalePlaneDown2x2BicubicBytes src srcW.toNat srcH.toNat st.toNat
+
+/-- Theorem: `evalBicubic4TapMidpoint` stays strictly bounded in `[0, 255]` for all inputs `p0 p1 p2 p3 : Nat`. -/
+theorem bicubic4TapMidpoint_bounded_u8 (p0 p1 p2 p3 : Nat) :
+    evalBicubic4TapMidpoint p0 p1 p2 p3 ≤ 255 := by
+  dsimp only [evalBicubic4TapMidpoint]; split <;> omega
 
 /-- Fast 2D plane 4-tap bicubic 2x2 downscaler (`scalePlaneDown2x2BicubicSimd`). -/
 @[inline]
@@ -777,8 +782,9 @@ def tonemapPq10ToBt709Sdr8 (y10 : UInt16) : UInt8 :=
 def tonemapPq10ToBt709Sdr8Export (y10 : UInt16) : UInt8 :=
   tonemapPq10ToBt709Sdr8 y10
 
-@[extern "leanav_c_tonemap_pq10_to_bt709_u8"]
-opaque tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8
+@[inline]
+def tonemapPq10ToBt709Sdr8C (y10 : UInt16) : UInt8 :=
+  tonemapPq10ToBt709Sdr8Export y10
 
 /--
   Theorem (Wave 52): `tonemapPq10ToBt709Sdr8` maps studio black (`≤ 64`) to `16`, peak white (`≥ 940`) to `235`,

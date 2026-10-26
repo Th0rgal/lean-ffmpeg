@@ -101,103 +101,6 @@ static inline uint16_t clamp_u10_i32(int32_t v) {
 }
 
 /*
- * Certified 4-tap bicubic midpoint filter tap (`evalBicubic4TapMidpoint` in `LeanAV/Scale.lean`):
- * Uses the `#eval`-exported Q4 coefficients `bicubic4TapMidpointCoeffsQ4 = #[-1, 9, 9, -1]`,
- * `bicubic4TapMidpointDivisor = 16`, `bicubic4TapMidpointRoundBias = 8`.
- * Note: in Lean `Nat` subtraction saturates at 0 (`(p1*9 + p2*9 + 8 - p0 - p3) / 16`),
- * which equals `max(0, 9*(p1+p2) + 8 - p0 - p3) >> 4`, then clamped to `255`.
- */
-static inline uint8_t leanav_eval_bicubic_4tap_u8(uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3) {
-    int32_t num = (int32_t)p1 * 9 + (int32_t)p2 * 9 + 8 - (int32_t)p0 - (int32_t)p3;
-    if (num <= 0) return 0;
-    int32_t raw = num >> 4;
-    return (raw > 255) ? 255 : (uint8_t)raw;
-}
-
-/*
- * Fast C-ABI / ARM64 NEON separable 4-tap bicubic 2x2 downscaler (`scalePlaneDown2x2BicubicCSimd`):
- * Bit-exact with `scalePlaneDown2x2BicubicBytes` in `LeanAV/Scale.lean`.
- */
-LEAN_EXPORT lean_obj_res leanav_c_scale_plane_down_2x2_bicubic(
-    b_lean_obj_arg src_ba,
-    size_t src_w,
-    size_t src_h,
-    size_t src_stride
-) {
-    size_t dst_w = src_w >> 1;
-    size_t dst_h = src_h >> 1;
-    if (dst_w == 0) dst_w = 1;
-    if (dst_h == 0) dst_h = 1;
-    if (dst_h > SIZE_MAX / dst_w) {
-        return lean_alloc_sarray(1, 0, 0);
-    }
-    size_t dst_size = dst_w * dst_h;
-    lean_obj_res dst_ba = lean_alloc_sarray(1, dst_size, dst_size);
-    uint8_t *dst = lean_sarray_cptr(dst_ba);
-    const uint8_t *src = lean_sarray_cptr(src_ba);
-    size_t src_cap = lean_sarray_size(src_ba);
-
-    if (src_w >= 4 && src_h >= 4 && src_stride >= src_w && src_cap >= (src_h - 1) * src_stride + src_w) {
-        for (size_t dy = 0; dy < dst_h; dy++) {
-            size_t y1 = dy * 2;
-            size_t cy0 = (y1 > 0) ? (y1 - 1) : 0;
-            size_t cy1 = y1 < src_h ? y1 : src_h - 1;
-            size_t cy2 = (y1 + 1 < src_h) ? (y1 + 1) : src_h - 1;
-            size_t cy3 = (y1 + 2 < src_h) ? (y1 + 2) : src_h - 1;
-            const uint8_t *r0 = src + cy0 * src_stride;
-            const uint8_t *r1 = src + cy1 * src_stride;
-            const uint8_t *r2 = src + cy2 * src_stride;
-            const uint8_t *r3 = src + cy3 * src_stride;
-            uint8_t *out_row = dst + dy * dst_w;
-            for (size_t dx = 0; dx < dst_w; dx++) {
-                size_t x1 = dx * 2;
-                size_t cx0 = (x1 > 0) ? (x1 - 1) : 0;
-                size_t cx1 = x1 < src_w ? x1 : src_w - 1;
-                size_t cx2 = (x1 + 1 < src_w) ? (x1 + 1) : src_w - 1;
-                size_t cx3 = (x1 + 2 < src_w) ? (x1 + 2) : src_w - 1;
-                uint8_t h0 = leanav_eval_bicubic_4tap_u8(r0[cx0], r0[cx1], r0[cx2], r0[cx3]);
-                uint8_t h1 = leanav_eval_bicubic_4tap_u8(r1[cx0], r1[cx1], r1[cx2], r1[cx3]);
-                uint8_t h2 = leanav_eval_bicubic_4tap_u8(r2[cx0], r2[cx1], r2[cx2], r2[cx3]);
-                uint8_t h3 = leanav_eval_bicubic_4tap_u8(r3[cx0], r3[cx1], r3[cx2], r3[cx3]);
-                out_row[dx] = leanav_eval_bicubic_4tap_u8(h0, h1, h2, h3);
-            }
-        }
-        return dst_ba;
-    }
-
-    for (size_t dy = 0; dy < dst_h; dy++) {
-        size_t y1 = dy * 2;
-        size_t y0 = (y1 > 0) ? (y1 - 1) : 0;
-        size_t y2 = y1 + 1;
-        size_t y3 = y1 + 2;
-        size_t cy0 = (src_h == 0) ? 0 : (y0 < src_h ? y0 : src_h - 1);
-        size_t cy1 = (src_h == 0) ? 0 : (y1 < src_h ? y1 : src_h - 1);
-        size_t cy2 = (src_h == 0) ? 0 : (y2 < src_h ? y2 : src_h - 1);
-        size_t cy3 = (src_h == 0) ? 0 : (y3 < src_h ? y3 : src_h - 1);
-        for (size_t dx = 0; dx < dst_w; dx++) {
-            size_t x1 = dx * 2;
-            size_t x0 = (x1 > 0) ? (x1 - 1) : 0;
-            size_t x2 = x1 + 1;
-            size_t x3 = x1 + 2;
-            size_t cx0 = (src_w == 0) ? 0 : (x0 < src_w ? x0 : src_w - 1);
-            size_t cx1 = (src_w == 0) ? 0 : (x1 < src_w ? x1 : src_w - 1);
-            size_t cx2 = (src_w == 0) ? 0 : (x2 < src_w ? x2 : src_w - 1);
-            size_t cx3 = (src_w == 0) ? 0 : (x3 < src_w ? x3 : src_w - 1);
-
-            #define GET_PX(cy, cx) ((src_stride == 0 || (cy) <= (SIZE_MAX - (cx)) / src_stride) && ((cy) * src_stride + (cx) < src_cap) ? src[(cy) * src_stride + (cx)] : (uint8_t)0)
-            uint8_t h0 = leanav_eval_bicubic_4tap_u8(GET_PX(cy0, cx0), GET_PX(cy0, cx1), GET_PX(cy0, cx2), GET_PX(cy0, cx3));
-            uint8_t h1 = leanav_eval_bicubic_4tap_u8(GET_PX(cy1, cx0), GET_PX(cy1, cx1), GET_PX(cy1, cx2), GET_PX(cy1, cx3));
-            uint8_t h2 = leanav_eval_bicubic_4tap_u8(GET_PX(cy2, cx0), GET_PX(cy2, cx1), GET_PX(cy2, cx2), GET_PX(cy2, cx3));
-            uint8_t h3 = leanav_eval_bicubic_4tap_u8(GET_PX(cy3, cx0), GET_PX(cy3, cx1), GET_PX(cy3, cx2), GET_PX(cy3, cx3));
-            #undef GET_PX
-
-            dst[dy * dst_w + dx] = leanav_eval_bicubic_4tap_u8(h0, h1, h2, h3);
-        }
-    }
-    return dst_ba;
-}
-
-/*
  * Fast 16-bit (`yuv420p10le`) 2x2 Box Downscale (`leanav_scale_plane_2x2_u16_raw`):
  * Preserves full 10-bit HDR10 / HLG precision without 8-bit truncation (`M4`).
  */
@@ -1876,10 +1779,6 @@ static void leanav_scale_plane_bilinear_u16_raw_with_tabs(
  * (`tonemapPq10ToBt709Sdr8` in `LeanAV/Scale.lean`): zero duplicated C formula.
  */
 extern uint8_t leanav_lean_tonemap_pq10_to_bt709_u8(uint16_t y10);
-
-LEAN_EXPORT uint8_t leanav_c_tonemap_pq10_to_bt709_u8(uint16_t y10) {
-    return leanav_lean_tonemap_pq10_to_bt709_u8(y10);
-}
 
 /*
  * BT.2020 -> BT.709 Q10 Chroma Re-matrixing + Optional Luma Contrast/Brightness LUT (`filter_flags`):
