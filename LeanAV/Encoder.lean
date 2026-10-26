@@ -1167,8 +1167,8 @@ def measureLumaAcceptance16x16Pure
   let is3x3 : Bool := (srcW == dstW * 3 && srcH == dstH * 3)
   let srcCap := src.size
   let dstCap := dst.size
-  let getS (idx : Nat) : Nat := if idx < srcCap then (src.get! idx).toNat else 0
-  let getD (idx : Nat) : Nat := if idx < dstCap then (dst.get! idx).toNat else 0
+  let getS (idx : Nat) : Nat := if h : idx < srcCap then (src.get idx h).toNat else 0
+  let getD (idx : Nat) : Nat := if h : idx < dstCap then (dst.get idx h).toNat else 0
   let nBlocksY := (dstH - 16) / mbStepY + 1
   let nBlocksX := (dstW - 16) / mbStepX + 1
   for byStep in [:nBlocksY] do
@@ -1287,8 +1287,90 @@ def computeLumaStatsU8Pure (luma : @& ByteArray) (nPixels : Nat) : UInt64 × UIn
         (accS + v, accSq + v * v, accC + 1)
       else
         (accS, accSq, accC)) (0, 0, 0)
-    let packed := computeLumaMeanVarPackedU64 sum sumSq cnt
+    let packed := computeLumaMeanVarPackedExport sum sumSq cnt
     (packed &&& 0xFFFFFFFF, packed >>> 32)
+
+/-- Top-left, clipped 16x16 temporal macroblock. Missing bytes are zero, as in
+    `measureLumaAcceptance16x16Pure`. Row multiplication is outside the column fold;
+    proof-indexed reads avoid the second bounds check performed by `get!`. -/
+def computeLuma16x16SadAndSsePure (curLuma prevLuma : ByteArray) (w h : Nat) :
+    UInt64 × UInt64 :=
+  (List.range (min h 16)).foldl (fun acc r =>
+    let row := r * w
+    (List.range (min w 16)).foldl (fun (sad, sse) c =>
+      let i := row + c
+      let x := if hi : i < curLuma.size then (curLuma.get i hi).toUInt64 else 0
+      let y := if hi : i < prevLuma.size then (prevLuma.get i hi).toUInt64 else 0
+      let d := if x ≥ y then x - y else y - x
+      (sad + d, sse + d * d)) acc) (0, 0)
+
+/-- Universal reduction contract, including empty and truncated planes. Arithmetic
+    is explicitly UInt64; the block has at most 256 byte differences. -/
+theorem computeLuma16x16SadAndSsePure_eq_fold (cur prev : ByteArray) (w h : Nat) :
+    computeLuma16x16SadAndSsePure cur prev w h =
+      (List.range (min h 16)).foldl (fun acc r =>
+        (List.range (min w 16)).foldl (fun (sad, sse) c =>
+          let x := if hi : r * w + c < cur.size then (cur.get (r * w + c) hi).toUInt64 else 0
+          let y := if hi : r * w + c < prev.size then (prev.get (r * w + c) hi).toUInt64 else 0
+          let d := if x ≥ y then x - y else y - x
+          (sad + d, sse + d * d)) acc) (0, 0) := rfl
+
+/-- Inputs to the temporal luma gate. This is separate from the spatial,
+    area-averaged-source gate used by the transcode pipeline. -/
+structure Luma16x16AcceptanceInput where
+  cur : ByteArray
+  prev : ByteArray
+  width : Nat
+  height : Nat
+
+/-- Temporal acceptance requires complete nonempty planes, non-black/non-flat
+    luma, SAD at most 2048, and the exported PSNR tier at least 35.0 dB. -/
+def Luma16x16AcceptanceSafe (x : Luma16x16AcceptanceInput) : Prop :=
+  let (mean, variance) := computeLumaStatsU8Pure x.cur (x.width * x.height)
+  let (sad, sse) := computeLuma16x16SadAndSsePure x.cur x.prev x.width x.height
+  0 < x.width * x.height ∧ x.width * x.height ≤ x.cur.size ∧
+    x.width * x.height ≤ x.prev.size ∧ 17 ≤ mean ∧ mean ≤ 250 ∧
+    0 < variance ∧ sad ≤ 2048 ∧
+    350 ≤ classifyLumaPsnrX10Export sse ((min x.width 16 * min x.height 16).toUInt64)
+
+/-- Pure temporal decision and packed diagnostic word; the exported packer is
+    used directly, rather than duplicating its saturation/bit layout. -/
+def acceptTranscodedFrameWithPrevLuma (x : Luma16x16AcceptanceInput) : Bool × UInt64 :=
+  let (mean, variance) := computeLumaStatsU8Pure x.cur (x.width * x.height)
+  let (sad, sse) := computeLuma16x16SadAndSsePure x.cur x.prev x.width x.height
+  let psnr := classifyLumaPsnrX10Export sse ((min x.width 16 * min x.height 16).toUInt64)
+  let accepted := 0 < x.width * x.height && x.width * x.height ≤ x.cur.size &&
+    x.width * x.height ≤ x.prev.size && 17 ≤ mean && mean ≤ 250 &&
+    0 < variance && sad ≤ 2048 && 350 ≤ psnr
+  -- Temporal comparison does not establish distance to studio black.
+  (accepted, packAcceptanceMetricsExport sad psnr 0)
+
+theorem luma16x16Acceptance_iff (x : Luma16x16AcceptanceInput) :
+    (acceptTranscodedFrameWithPrevLuma x).1 = true ↔ Luma16x16AcceptanceSafe x := by
+  simp [acceptTranscodedFrameWithPrevLuma, Luma16x16AcceptanceSafe, Bool.and_eq_true,
+    and_assoc]
+
+/-- Universal soundness also identifies the exact exported metrics word. -/
+theorem luma16x16Acceptance_sound (x : Luma16x16AcceptanceInput)
+    (h : (acceptTranscodedFrameWithPrevLuma x).1 = true) :
+    Luma16x16AcceptanceSafe x ∧
+    (acceptTranscodedFrameWithPrevLuma x).2 =
+      packAcceptanceMetricsExport
+        (computeLuma16x16SadAndSsePure x.cur x.prev x.width x.height).1
+        (classifyLumaPsnrX10Export
+          (computeLuma16x16SadAndSsePure x.cur x.prev x.width x.height).2
+          ((min x.width 16 * min x.height 16).toUInt64)) 0 :=
+  ⟨(luma16x16Acceptance_iff x).mp h, rfl⟩
+
+def luma16x16AcceptanceGateSpec :
+    AVGateSpec Luma16x16AcceptanceInput Luma16x16AcceptanceSafe where
+  gate := fun x => (acceptTranscodedFrameWithPrevLuma x).1
+  sound := fun x => (luma16x16Acceptance_iff x).mp
+  complete := fun x => (luma16x16Acceptance_iff x).mpr
+  posWitness := ⟨⟨#[24, 26]⟩, ⟨#[24, 26]⟩, 2, 1⟩
+  negWitness := ⟨⟨#[24, 24]⟩, ⟨#[24, 24]⟩, 2, 1⟩
+  nonVacuous := by decide
+  tight := by decide
 
 /-- Fast runtime luma mean and spatial variance evaluator dispatching to compiled LLVM 18 `@lean_native_luma_stats_u8`. -/
 @[inline]
@@ -1448,6 +1530,10 @@ def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UI
   if hasExplicitSdrColrBoxPure moovBuf then
     return 0
   if let some cs := probeAvcCSpsColorspacePure moovBuf then
+    return cs
+  if let some cs := probeHvcCSpsColorspacePure moovBuf then
+    return cs
+  if let some cs := probeAv1CColorspacePure moovBuf then
     return cs
   try
     let ffprobeBin ← resolveFfprobeBinIO
@@ -1609,6 +1695,36 @@ theorem pipeChunkReassemblyGateSpec_correct (chunks : List ByteArray) (n : Nat) 
   exact ⟨pipeChunkReassemblyGateSpec.iff_safe (chunks, n),
     reassemblePipeChunksPure_verified chunks n⟩
 
+/-- Auto mode shares a CPU budget; an explicit thread count applies to each codec. -/
+def selectPipeTranscodeThreadSplit (logicalCores : Nat) (userThreads : Nat) : Nat × Nat :=
+  if userThreads == 0 then
+    (max 1 (logicalCores / 2), max 1 (logicalCores - logicalCores / 2))
+  else (userThreads, userThreads)
+
+theorem selectPipeTranscodeThreadSplit_bounded (cores user : Nat) :
+    let s := selectPipeTranscodeThreadSplit cores user
+    1 ≤ s.1 ∧ 1 ≤ s.2 ∧
+      (user = 0 → s.1 + s.2 ≤ max 2 cores) ∧
+      (user ≠ 0 → s = (user, user)) := by
+  unfold selectPipeTranscodeThreadSplit
+  split <;> simp_all <;> omega
+
+/-- Admit a pair exactly when it is positive and fits the automatic CPU budget. -/
+def threadSplitGateSpec : AVGateSpec (Nat × Nat × Nat)
+    (fun (cores, dec, enc) => 0 < dec ∧ 0 < enc ∧ dec + enc ≤ max 2 cores) where
+  gate := fun (cores, dec, enc) => decide (0 < dec ∧ 0 < enc ∧ dec + enc ≤ max 2 cores)
+  sound := by intro ⟨cores, dec, enc⟩ h; simpa using h
+  complete := by intro ⟨cores, dec, enc⟩ h; simpa using h
+  posWitness := (8, 4, 4)
+  negWitness := (8, 5, 4)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem threadSplitGateSpec_sound (cores dec enc : Nat)
+    (h : threadSplitGateSpec.gate (cores, dec, enc) = true) :
+    0 < dec ∧ 0 < enc ∧ dec + enc ≤ max 2 cores :=
+  threadSplitGateSpec.sound (cores, dec, enc) h
+
 def readExactBytesFromHandle (h : IO.FS.Handle) (n : Nat) : IO (Option ByteArray) := do
   let first ← h.read (Nat.min n 65536).toUSize
   if first.size == n then
@@ -1736,7 +1852,7 @@ def transcodeMp4GeneralVerifiedIO
       (#["-c:v", "libsvtav1", "-preset", (if cliOpts.preset != "" then cliOpts.preset else "12"),
          "-crf", (if cliOpts.crf != "" then cliOpts.crf else "28"), "-pix_fmt", effPixFmt], "", "libsvtav1")
     else
-      (#["-c:v", "libx264", "-preset", effPreset] ++ vRateCtrl ++ #["-threads", "0", "-pix_fmt", effPixFmt], ":subme=3", "libx264")
+      (#["-c:v", "libx264", "-preset", effPreset] ++ vRateCtrl ++ #["-threads", "4", "-pix_fmt", effPixFmt], ":subme=3:threads=4:lookahead_threads=1", "libx264")
 
   let aEncArgs : Array String :=
     if (filterFlags &&& 8) != 0 then
@@ -1756,24 +1872,24 @@ def transcodeMp4GeneralVerifiedIO
   let tArgs  : Array String := if durMs > 0 then #["-t", formatMsSec3 durMs] else #[]
 
   let decArgs : Array String :=
-    #["-v", "error", "-nostdin", "-threads", "0"] ++
+    #["-v", "error", "-nostdin", "-threads", "4"] ++
     ssArgs ++ tArgs ++
     #["-i", inPath, "-fps_mode", "passthrough", "-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", rawPixFmt, "-"]
 
   let encArgs : Array String :=
     let base :=
-      #["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
+      #["-y", "-v", "error", "-threads", "4", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
       rawInColorArgsForCs hdrCs ++
       #["-s", s!"{dstW}x{dstH}", "-r", fpsStr, "-i", "-"] ++
-      ssArgs ++ tArgs ++ #["-i", inPath]
+      ssArgs ++ tArgs ++ #["-threads", "4", "-i", inPath]
     if effWithAudio then
       base ++ #["-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
                 "-map_metadata:s:v", "1:s:v", "-map_metadata:s:a", "1:s:a",
-                "-map_chapters", "1", "-dn", "-sn"] ++
+                "-map_chapters", "1", "-dn", "-sn", "-threads", "4"] ++
       vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ aEncArgs ++ #[outPath]
     else
       base ++ #["-map", "0:v:0", "-map_metadata", "1", "-map_metadata:s:v", "1:s:v",
-                "-map_chapters", "1", "-dn", "-sn", "-an"] ++
+                "-map_chapters", "1", "-dn", "-sn", "-an", "-threads", "4"] ++
       vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
 
   let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
@@ -1790,7 +1906,7 @@ def transcodeMp4GeneralVerifiedIO
   let srcYSz := srcW * srcH
   let srcUvSz := (srcW / 2) * (srcH / 2)
   let bps := if is10bit then 2 else 1
-  let srcFrameSz := (srcYSz + 2 * srcUvSz) * bps
+  let frameBytes := (srcYSz + 2 * srcUvSz) * bps
   let dstYSz := dstW * dstH
 
   let decChild ← IO.Process.spawn {
@@ -1814,11 +1930,23 @@ def transcodeMp4GeneralVerifiedIO
   let mut psnrMin : UInt64 := 600
   let mut distLtBlackAll : UInt32 := 1
   let mut writeFailed : Bool := false
+  let mut nextFrameTaskOpt : Option (Task (Except IO.Error (Option ByteArray))) ←
+    if outputFrameLimit == 0 || framesDone < outputFrameLimit then
+      let t ← IO.asTask (prio := .dedicated) (readExactBytesFromHandle decChild.stdout frameBytes)
+      pure (some t)
+    else
+      pure none
 
   while !writeFailed do
     if outputFrameLimit > 0 && framesDone >= outputFrameLimit then
       break
-    let some srcBuf ← readExactBytesFromHandle decChild.stdout srcFrameSz | break
+    let some frameTask := nextFrameTaskOpt | break
+    nextFrameTaskOpt := none
+    let frameRes ← IO.wait frameTask
+    let some srcBuf ← (match frameRes with | .ok v => pure v | .error _ => pure none) | break
+    if outputFrameLimit == 0 || framesDone + 1 < outputFrameLimit then
+      let nextTask ← IO.asTask (prio := .dedicated) (readExactBytesFromHandle decChild.stdout frameBytes)
+      nextFrameTaskOpt := some nextTask
     if encChildOpt.isNone then
       let ec ← IO.Process.spawn {
         cmd := ffmpegBin
@@ -1831,14 +1959,6 @@ def transcodeMp4GeneralVerifiedIO
       encChildOpt := some ec
 
     if isIdentityU8 then
-      let (fMean, fVar) := computeLumaStatsU8Fast srcBuf dstYSz
-      meanAccum := meanAccum + fMean
-      varAccum := varAccum + fVar
-      if (framesDone &&& 7) == 0 then
-        let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcBuf srcW srcH srcBuf dstW dstH
-        if fSad > maxSadWorst then maxSadWorst := fSad
-        if fPsnr < psnrMin then psnrMin := fPsnr
-        if fDist == 0 then distLtBlackAll := 0
       if let some ec := encChildOpt then
         let wroteOk ← (do
           try
@@ -1848,65 +1968,73 @@ def transcodeMp4GeneralVerifiedIO
             pure false)
         if !wroteOk then
           writeFailed := true
-        else
-          framesDone := framesDone + 1
+      if !writeFailed then
+        let (fMean, fVar) := computeLumaStatsU8Fast srcBuf dstYSz
+        meanAccum := meanAccum + fMean
+        varAccum := varAccum + fVar
+        if (framesDone &&& 7) == 0 then
+          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcBuf srcW srcH srcBuf dstW dstH
+          if fSad > maxSadWorst then maxSadWorst := fSad
+          if fPsnr < psnrMin then psnrMin := fPsnr
+          if fDist == 0 then distLtBlackAll := 0
+        framesDone := framesDone + 1
     else
-      let (dstY, dstU, dstV) : ByteArray × ByteArray × ByteArray :=
+      let dstFrame : ByteArray :=
         if is10bit then
           let uOff := srcYSz * 2
           let vOff := (srcYSz + srcUvSz) * 2
           let yScaled := scalePlaneBilinearU16LeBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
           let uScaled := scalePlaneBilinearU16LeBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
           let vScaled := scalePlaneBilinearU16LeBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          (yScaled, uScaled, vScaled)
+          yScaled ++ uScaled ++ vScaled
+        else if (filterFlags &&& 3) == 0 then
+          scaleFrameYuv420pQ8WithTabs srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else
           let uOff := srcYSz
           let vOff := srcYSz + srcUvSz
           let yScaled := scalePlaneBilinearWithTabsBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
           let uScaled := scalePlaneBilinearWithTabsBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
           let vScaled := scalePlaneBilinearWithTabsBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          if (filterFlags &&& 3) != 0 then
-            applyPixelFiltersYuv420p yScaled uScaled vScaled filterFlags
-          else
-            (yScaled, uScaled, vScaled)
-
-      let (fMean, fVar) :=
-        if is10bit then computeLumaStatsU16LePure dstY dstYSz
-        else computeLumaStatsU8Fast dstY dstYSz
-      meanAccum := meanAccum + fMean
-      varAccum := varAccum + fVar
-
-      if (framesDone &&& 7) == 0 then
-        if !is10bit then
-          let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Pure srcBuf srcW srcH dstY dstW dstH
-          let (fSad, fPsnr, fDist) :=
-            if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
-            else (fSad0, fPsnr0, fDist0)
-          if fSad > maxSadWorst then maxSadWorst := fSad
-          if fPsnr < psnrMin then psnrMin := fPsnr
-          if fDist == 0 then distLtBlackAll := 0
-        else
-          let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
-          let dstY8 := extractU16LeMsb8Pure dstY dstYSz
-          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcY8 srcW srcH dstY8 dstW dstH
-          if fSad > maxSadWorst then maxSadWorst := fSad
-          if fPsnr < psnrMin then psnrMin := fPsnr
-          if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
+          let (yF, uF, vF) := applyPixelFiltersYuv420p yScaled uScaled vScaled filterFlags
+          yF ++ uF ++ vF
 
       if let some ec := encChildOpt then
         let wroteOk ← (do
           try
-            ec.stdin.write dstY
-            ec.stdin.write dstU
-            ec.stdin.write dstV
+            ec.stdin.write dstFrame
             pure true
           catch _ =>
             pure false)
         if !wroteOk then
           writeFailed := true
-        else
-          framesDone := framesDone + 1
 
+      if !writeFailed then
+        let (fMean, fVar) :=
+          if is10bit then computeLumaStatsU16LePure dstFrame dstYSz
+          else computeLumaStatsU8Fast dstFrame dstYSz
+        meanAccum := meanAccum + fMean
+        varAccum := varAccum + fVar
+
+        if (framesDone &&& 7) == 0 then
+          if !is10bit then
+            let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Pure srcBuf srcW srcH dstFrame dstW dstH
+            let (fSad, fPsnr, fDist) :=
+              if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
+              else (fSad0, fPsnr0, fDist0)
+            if fSad > maxSadWorst then maxSadWorst := fSad
+            if fPsnr < psnrMin then psnrMin := fPsnr
+            if fDist == 0 then distLtBlackAll := 0
+          else
+            let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
+            let dstY8 := extractU16LeMsb8Pure dstFrame dstYSz
+            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcY8 srcW srcH dstY8 dstW dstH
+            if fSad > maxSadWorst then maxSadWorst := fSad
+            if fPsnr < psnrMin then psnrMin := fPsnr
+            if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
+        framesDone := framesDone + 1
+
+  if let some pendingTask := nextFrameTaskOpt then
+    let _ ← IO.wait pendingTask
   drainHandleUntilEof decChild.stdout
   let _ ← decChild.wait
   let mut encRc : UInt32 := 1

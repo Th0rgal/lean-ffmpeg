@@ -879,6 +879,11 @@ opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteAr
 @[extern "leanav_c_exec_lnir_scale2d_ba"]
 opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH pAlpha arg1 : UInt64) : ByteArray
 
+/-- Zero-copy fused 3-plane `YUV420P` `ByteArray` 2D LNIR dispatcher
+    (`0=swscale_down2x2_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`). -/
+@[extern "leanav_c_exec_lnir_scale2d_yuv420p_ba"]
+opaque execLnirScale2dYuv420pBaC (kernelId : UInt32) (src : @& ByteArray) (srcW srcH dstW dstH : UInt64) : ByteArray
+
 /-- Zero-copy `ByteArray` 2D AV1 CDEF directional deringing filter LNIR dispatcher (`@lean_native_av1_cdef_filter_u8`). -/
 @[extern "leanav_c_exec_lnir_cdef_ba"]
 opaque execLnirAv1CdefBaC (src : @& ByteArray) (w h priStr damping : UInt64) : ByteArray
@@ -994,6 +999,31 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
       let invalid := execLnirScale2dBaC k offsetSrc st dw dh 0xffffffffffffffff 0
       actual.data == expected.data && actual.size == (dw * dh).toNat &&
         invalid.size == actual.size && invalid.data.all (· == 0)
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 then 1 else 0
+  let ok21 := ([0, 2, 3] : List UInt32).all fun k =>
+    let sw : UInt64 := 24
+    let sh : UInt64 := 12
+    let dw : UInt64 := if k == 0 then 12 else if k == 2 then 8 else 16
+    let dh : UInt64 := if k == 0 then 6 else if k == 2 then 4 else 8
+    let scw : UInt64 := sw / 2
+    let sch : UInt64 := sh / 2
+    let dcw : UInt64 := dw / 2
+    let dch : UInt64 := dh / 2
+    let srcY : UInt64 := sw * sh
+    let srcUv : UInt64 := scw * sch
+    let srcTotal : Nat := (srcY + 2 * srcUv).toNat
+    let fused := execLnirScale2dYuv420pBaC k offsetSrc sw sh dw dh
+    let yExpected := execLnirScale2dBaC k offsetSrc sw dw dh 0 0
+    let uExpected := execLnirScale2dBaC k offsetSrc scw dcw dch srcY 0
+    let vExpected := execLnirScale2dBaC k offsetSrc scw dcw dch (srcY + srcUv) 0
+    let expected := yExpected ++ uExpected ++ vExpected
+    let shortIn := offsetSrc.extract 0 (srcTotal - 1)
+    let invalidShort := execLnirScale2dYuv420pBaC k shortIn sw sh dw dh
+    let invalidKernel := execLnirScale2dYuv420pBaC 99 offsetSrc sw sh dw dh
+    let invalidBounds := execLnirScale2dYuv420pBaC k offsetSrc (dw - 2) sh dw dh
+    fused.data == expected.data && fused.size == expected.size &&
+      invalidShort.size == expected.size && invalidShort.data.all (· == 0) &&
+      invalidKernel.size == expected.size && invalidKernel.data.all (· == 0) &&
+      invalidBounds.size == expected.size && invalidBounds.data.all (· == 0)
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 then 1 else 0
 
 end LeanAV.NativeKernels

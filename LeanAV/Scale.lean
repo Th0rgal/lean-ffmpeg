@@ -955,6 +955,101 @@ def offsetPlaneGateSpec : AVGateSpec (Nat × Nat × Nat)
   nonVacuous := rfl
   tight := rfl
 
+/-- Tight admission gate for fused 3-plane contiguous `YUV420P` scaling (`yuv420pPackedLayoutGateSpec`). -/
+def yuv420pPackedLayoutGateSpec : AVGateSpec (Nat × Nat × Nat)
+    (fun (w, h, cap) =>
+      2 ≤ w ∧ 2 ≤ h ∧ w % 2 = 0 ∧ h % 2 = 0 ∧
+      w * h + 2 * ((w / 2) * (h / 2)) ≤ cap) where
+  gate := fun (w, h, cap) =>
+    decide (2 ≤ w ∧ 2 ≤ h ∧ w % 2 = 0 ∧ h % 2 = 0 ∧ w * h + 2 * ((w / 2) * (h / 2)) ≤ cap)
+  sound := by intro ⟨w, h, cap⟩ h; exact of_decide_eq_true h
+  complete := by intro ⟨w, h, cap⟩ h; exact decide_eq_true h
+  posWitness := (4, 4, 24)
+  negWitness := (4, 4, 23)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Universal theorem: `yuv420pPackedLayoutGateSpec.gate (w, h, cap) = true` holds iff
+    `w, h ≥ 2` are even and `cap` covers the contiguous 3-plane `Y + U + V` footprint. -/
+theorem yuv420pPackedLayoutGateSpec_iff (w h cap : Nat) :
+    yuv420pPackedLayoutGateSpec.gate (w, h, cap) = true ↔
+      (2 ≤ w ∧ 2 ≤ h ∧ w % 2 = 0 ∧ h % 2 = 0 ∧ w * h + 2 * ((w / 2) * (h / 2)) ≤ cap) :=
+  yuv420pPackedLayoutGateSpec.iff_safe (w, h, cap)
+
+/-- Fused 3-plane `YUV420P` 2x2 box downscaler (`scaleFrameYuv420pDown2x2Auto`):
+    Uses `execLnirScale2dYuv420pBaC 0` for single-allocation zero-copy 3-plane scaling when
+    source and destination dimensions are even (`≥ 2`) and `src` covers the full `YUV420P` frame. -/
+@[inline]
+def scaleFrameYuv420pDown2x2Auto (src : @& ByteArray) (srcW srcH : Nat) : ByteArray :=
+  let dstW := Nat.max 1 (srcW / 2)
+  let dstH := Nat.max 1 (srcH / 2)
+  let srcCw := srcW / 2
+  let srcCh := srcH / 2
+  let dstCw := dstW / 2
+  let dstCh := dstH / 2
+  let srcY := srcW * srcH
+  let srcUv := srcCw * srcCh
+  if srcW >= 4 && srcH >= 4 && dstW >= 2 && dstH >= 2 &&
+      srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0 &&
+      srcW >= dstW * 2 && srcH >= dstH * 2 && srcCw >= dstCw * 2 && srcCh >= dstCh * 2 &&
+      src.size >= srcY + 2 * srcUv then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 0 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else
+    let yOut := scalePlaneDown2x2OffCSimd src 0 srcW.toUSize srcH.toUSize srcW.toUSize
+    let uOut := scalePlaneDown2x2OffCSimd src srcY srcCw.toUSize srcCh.toUSize srcCw.toUSize
+    let vOut := scalePlaneDown2x2OffCSimd src (srcY + srcUv) srcCw.toUSize srcCh.toUSize srcCw.toUSize
+    yOut ++ uOut ++ vOut
+
+/-- Fused 3-plane `YUV420P` 3x3 box downscaler (`scaleFrameYuv420pDown3x3Auto`):
+    Uses `execLnirScale2dYuv420pBaC 2` for single-allocation zero-copy 3-plane scaling when
+    source and destination dimensions are even (`≥ 2`) and `src` covers the full `YUV420P` frame. -/
+@[inline]
+def scaleFrameYuv420pDown3x3Auto (src : @& ByteArray) (srcW srcH : Nat) : ByteArray :=
+  let dstW := Nat.max 1 (srcW / 3)
+  let dstH := Nat.max 1 (srcH / 3)
+  let srcCw := srcW / 2
+  let srcCh := srcH / 2
+  let dstCw := dstW / 2
+  let dstCh := dstH / 2
+  let srcY := srcW * srcH
+  let srcUv := srcCw * srcCh
+  if srcW >= 6 && srcH >= 6 && dstW >= 2 && dstH >= 2 &&
+      srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0 &&
+      srcW >= dstW * 3 && srcH >= dstH * 3 && srcCw >= dstCw * 3 && srcCh >= dstCh * 3 &&
+      src.size >= srcY + 2 * srcUv then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 2 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else
+    let yOut := scalePlaneDown3x3OffCSimd src 0 srcW.toUSize srcH.toUSize
+    let uOut := scalePlaneDown3x3OffCSimd src srcY srcCw.toUSize srcCh.toUSize
+    let vOut := scalePlaneDown3x3OffCSimd src (srcY + srcUv) srcCw.toUSize srcCh.toUSize
+    yOut ++ uOut ++ vOut
+
+/-- Fused 3-plane `YUV420P` 3:2 block downscaler (`scaleFrameYuv420pDown3to2Auto`):
+    Uses `execLnirScale2dYuv420pBaC 3` for single-allocation zero-copy 3-plane scaling when
+    source, destination luma, and destination chroma dimensions are even (`≥ 2`) and `src` covers the full `YUV420P` frame. -/
+@[inline]
+def scaleFrameYuv420pDown3to2Auto (src : @& ByteArray) (srcW srcH : Nat) : ByteArray :=
+  let dstW := Nat.max 1 ((srcW * 2) / 3)
+  let dstH := Nat.max 1 ((srcH * 2) / 3)
+  let srcCw := srcW / 2
+  let srcCh := srcH / 2
+  let dstCw := dstW / 2
+  let dstCh := dstH / 2
+  let srcY := srcW * srcH
+  let srcUv := srcCw * srcCh
+  if srcW >= 6 && srcH >= 6 && dstW >= 4 && dstH >= 4 &&
+      srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0 &&
+      dstCw % 2 == 0 && dstCh % 2 == 0 &&
+      srcW >= (dstW / 2) * 3 && srcH >= (dstH / 2) * 3 &&
+      srcCw >= (dstCw / 2) * 3 && srcCh >= (dstCh / 2) * 3 &&
+      src.size >= srcY + 2 * srcUv then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 3 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else
+    let yOut := scalePlaneDown3to2OffCSimd src 0 srcW.toUSize srcH.toUSize
+    let uOut := scalePlaneDown3to2OffCSimd src srcY srcCw.toUSize srcCh.toUSize
+    let vOut := scalePlaneDown3to2OffCSimd src (srcY + srcUv) srcCw.toUSize srcCh.toUSize
+    yOut ++ uOut ++ vOut
+
 /--
   Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
   operating on a slice `[srcOff, srcOff + srcW * srcH)` of `src : ByteArray`.
@@ -993,6 +1088,42 @@ def scalePlaneBilinearWithTabsBytes
         let val := (ify * top + fy * bot + 32768) >>> 16
         out := out.push (Nat.min 255 val).toUInt8
     return out
+
+/--
+  Fused 3-plane `YUV420P` frame scaler (`scaleFrameYuv420pQ8WithTabs`):
+  Dispatches `2x2` (`kernel_id = 0`), `3x3` (`kernel_id = 2`), and `3:2` (`kernel_id = 3`) scaling
+  to `execLnirScale2dYuv420pBaC` (single `ByteArray` allocation for all 3 planes) when dimensions are even
+  and `src.size >= srcW * srcH + 2 * ((srcW / 2) * (srcH / 2))`, falling back to per-plane
+  `scalePlaneBilinearWithTabsBytes` concatenation otherwise.
+-/
+def scaleFrameYuv420pQ8WithTabs
+    (src : @& ByteArray) (srcW srcH dstW dstH : Nat)
+    (yXTab yYTab uvXTab uvYTab : @& Array UInt64) : ByteArray :=
+  let srcCw := srcW / 2
+  let srcCh := srcH / 2
+  let dstCw := dstW / 2
+  let dstCh := dstH / 2
+  let srcY := srcW * srcH
+  let srcUv := srcCw * srcCh
+  let srcTotal := srcY + 2 * srcUv
+  let evenDims : Bool :=
+    srcW >= 2 && srcH >= 2 && dstW >= 2 && dstH >= 2 &&
+    srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0
+  if evenDims && srcW == dstW && srcH == dstH && src.size >= srcTotal then
+    if src.size == srcTotal then src else src.extract 0 srcTotal
+  else if evenDims && src.size >= srcTotal && srcW == dstW * 2 && srcH == dstH * 2 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 0 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal && srcW == dstW * 3 && srcH == dstH * 3 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 2 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal && dstCw >= 2 && dstCh >= 2 &&
+      dstCw % 2 == 0 && dstCh % 2 == 0 &&
+      srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 3 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else
+    let yOut := scalePlaneBilinearWithTabsBytes src 0 srcW srcH dstW dstH yXTab yYTab
+    let uOut := scalePlaneBilinearWithTabsBytes src srcY srcCw srcCh dstCw dstCh uvXTab uvYTab
+    let vOut := scalePlaneBilinearWithTabsBytes src (srcY + srcUv) srcCw srcCh dstCw dstCh uvXTab uvYTab
+    yOut ++ uOut ++ vOut
 
 /--
   Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3) 16-bit little-endian (`yuv420p10le`)

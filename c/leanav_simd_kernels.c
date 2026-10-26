@@ -328,6 +328,13 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
     return ba0;
 }
 
+static inline uint64_t leanav_scale2d_req_extent(uint32_t kernel_id, uint64_t d) {
+    return (kernel_id <= 1u) ? (d * 2u)
+         : (kernel_id == 2u) ? (d * 3u)
+         : (kernel_id == 3u) ? ((d >> 1u) * 3u + ((d & 1u) ? 2u : 0u))
+         : d;
+}
+
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     uint32_t kernel_id,
     b_lean_obj_arg src_ba,
@@ -341,8 +348,8 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     size_t total = (size_t)(dst_w * dst_h);
     lean_object *out = lean_alloc_sarray(1, total, total);
     uint8_t *dst_ptr = lean_sarray_cptr(out);
-    uint64_t sh = (kernel_id <= 1u) ? (dst_h * 2u) : (kernel_id == 2u) ? (dst_h * 3u) : (kernel_id == 3u) ? ((dst_h >> 1u) * 3u + ((dst_h & 1u) ? 2u : 0u)) : dst_h;
-    uint64_t mw = (kernel_id <= 1u) ? (dst_w * 2u) : (kernel_id == 2u) ? (dst_w * 3u) : (kernel_id == 3u) ? ((dst_w >> 1u) * 3u + ((dst_w & 1u) ? 2u : 0u)) : dst_w;
+    uint64_t sh = leanav_scale2d_req_extent(kernel_id, dst_h);
+    uint64_t mw = leanav_scale2d_req_extent(kernel_id, dst_w);
     uint64_t st = (kernel_id == 4u) ? dst_w : src_stride;
     uint64_t src_off = (kernel_id == 1u) ? 0u : p_alpha;
     uint64_t src_cap = (uint64_t)lean_sarray_size(src_ba);
@@ -358,6 +365,75 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
         case 3u: lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
         case 4u: lean_native_stencil2d_box3x3_u8(dst_ptr, src_ptr, dst_w, dst_h); break;
         default: memset(dst_ptr, 0, total); break;
+    }
+    return out;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p_ba(
+    uint32_t kernel_id,
+    b_lean_obj_arg src_ba,
+    uint64_t src_w,
+    uint64_t src_h,
+    uint64_t dst_w,
+    uint64_t dst_h
+) {
+    if (dst_w < 2u || dst_h < 2u || (dst_w & 1u) != 0u || (dst_h & 1u) != 0u ||
+        dst_w > 0x3FFFFFFFull || dst_h > 0x3FFFFFFFull) {
+        return lean_alloc_sarray(1, 0, 0);
+    }
+    uint64_t dst_cw = dst_w >> 1u;
+    uint64_t dst_ch = dst_h >> 1u;
+    uint64_t dst_y = dst_w * dst_h;
+    uint64_t dst_uv = dst_cw * dst_ch;
+    uint64_t dst_total = dst_y + 2u * dst_uv;
+    lean_obj_res out = lean_alloc_sarray(1, (size_t)dst_total, (size_t)dst_total);
+    uint8_t *dst_ptr = lean_sarray_cptr(out);
+    if ((kernel_id != 0u && kernel_id != 2u && kernel_id != 3u) ||
+        src_w < 2u || src_h < 2u || (src_w & 1u) != 0u || (src_h & 1u) != 0u ||
+        src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull) {
+        memset(dst_ptr, 0, (size_t)dst_total);
+        return out;
+    }
+    uint64_t src_cw = src_w >> 1u;
+    uint64_t src_ch = src_h >> 1u;
+    uint64_t src_y = src_w * src_h;
+    uint64_t src_uv = src_cw * src_ch;
+    uint64_t src_total = src_y + 2u * src_uv;
+    uint64_t src_cap = (uint64_t)lean_sarray_size(src_ba);
+    uint64_t y_mw = leanav_scale2d_req_extent(kernel_id, dst_w);
+    uint64_t y_sh = leanav_scale2d_req_extent(kernel_id, dst_h);
+    uint64_t c_mw = leanav_scale2d_req_extent(kernel_id, dst_cw);
+    uint64_t c_sh = leanav_scale2d_req_extent(kernel_id, dst_ch);
+    if (src_cap < src_total ||
+        src_w < y_mw || src_h < y_sh || (y_sh - 1u) * src_w + y_mw > src_y ||
+        src_cw < c_mw || src_ch < c_sh || (c_sh - 1u) * src_cw + c_mw > src_uv) {
+        memset(dst_ptr, 0, (size_t)dst_total);
+        return out;
+    }
+    const uint8_t *src_ptr = (const uint8_t *)lean_sarray_cptr(src_ba);
+    const uint8_t *src_u = src_ptr + src_y;
+    const uint8_t *src_v = src_u + src_uv;
+    uint8_t *dst_u = dst_ptr + dst_y;
+    uint8_t *dst_v = dst_u + dst_uv;
+    switch (kernel_id) {
+        case 0u:
+            lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
+            lean_native_swscale_down2x2_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
+            lean_native_swscale_down2x2_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
+            break;
+        case 2u:
+            lean_native_swscale_down3x3_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
+            lean_native_swscale_down3x3_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
+            lean_native_swscale_down3x3_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
+            break;
+        case 3u:
+            lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
+            lean_native_swscale_down3to2_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
+            lean_native_swscale_down3to2_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
+            break;
+        default:
+            memset(dst_ptr, 0, (size_t)dst_total);
+            break;
     }
     return out;
 }

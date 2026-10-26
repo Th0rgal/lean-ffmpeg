@@ -6249,6 +6249,344 @@ def avcSpsSdrGateSpec : AVGateSpec AvcSpsColorInfo AvcSpsSdrSafe where
   nonVacuous := rfl
   tight := rfl
 
+/-! ### AV1 sequence-header and HEVC SPS colorimetry (bounded, conservative probes) -/
+
+/-- Shared explicit CICP evidence. Missing descriptions are never inferred to be SDR. -/
+structure SequenceColorInfo where
+  primaries : UInt16
+  transfer : UInt16
+  matrix : UInt16
+  deriving Repr, DecidableEq, Inhabited
+
+def SequenceSdrSafe (i : SequenceColorInfo) : Prop :=
+  (i.primaries = 1 ∨ i.primaries = 5 ∨ i.primaries = 6) ∧
+  (i.transfer = 1 ∨ i.transfer = 6) ∧
+  (i.matrix = 1 ∨ i.matrix = 5 ∨ i.matrix = 6)
+
+def classifySequenceColorInfo (i : SequenceColorInfo) : Option UInt32 :=
+  if i.transfer == 16 then some 1
+  else if i.transfer == 18 then some 2
+  else if isExplicitSdrCodePoint i.primaries i.transfer i.matrix then some 0
+  else none
+
+/-- Universal classification soundness; these claims concern parsed CICP evidence. -/
+theorem classifySequenceColorInfo_sound (i : SequenceColorInfo) :
+    (classifySequenceColorInfo i = some 0 ↔ SequenceSdrSafe i) ∧
+    (classifySequenceColorInfo i = some 1 ↔ i.transfer = 16) ∧
+    (classifySequenceColorInfo i = some 2 ↔ i.transfer = 18) := by
+  unfold classifySequenceColorInfo SequenceSdrSafe isExplicitSdrCodePoint
+  split <;> (try split) <;> (try split) <;> simp_all [or_assoc]
+
+def av1CSdrGateSpec : AVGateSpec SequenceColorInfo SequenceSdrSafe where
+  gate i := classifySequenceColorInfo i == some 0
+  sound i h := (classifySequenceColorInfo_sound i).1.mp (by simpa using h)
+  complete i h := by simpa using (classifySequenceColorInfo_sound i).1.mpr h
+  posWitness := ⟨1, 1, 1⟩
+  negWitness := ⟨9, 16, 9⟩
+  nonVacuous := rfl
+  tight := rfl
+
+def hvcCSpsSdrGateSpec : AVGateSpec SequenceColorInfo SequenceSdrSafe where
+  gate i := classifySequenceColorInfo i == some 0
+  sound i h := (classifySequenceColorInfo_sound i).1.mp (by simpa using h)
+  complete i h := by simpa using (classifySequenceColorInfo_sound i).1.mpr h
+  posWitness := ⟨5, 6, 5⟩
+  negWitness := ⟨2, 2, 2⟩
+  nonVacuous := rfl
+  tight := rfl
+
+private abbrev ColorBits := StateT BitReader Option
+
+/-- Audit-facing universal equivalence for the AV1 SDR gate. -/
+theorem av1CSdrGateSpec_iff (i : SequenceColorInfo) :
+    av1CSdrGateSpec.gate i = true ↔ SequenceSdrSafe i := by
+  exact ⟨av1CSdrGateSpec.sound i, av1CSdrGateSpec.complete i⟩
+
+/-- Audit-facing universal equivalence for the HEVC SDR gate. -/
+theorem hvcCSpsSdrGateSpec_iff (i : SequenceColorInfo) :
+    hvcCSpsSdrGateSpec.gate i = true ↔ SequenceSdrSafe i := by
+  exact ⟨hvcCSpsSdrGateSpec.sound i, hvcCSpsSdrGateSpec.complete i⟩
+
+private def colorBits (n : Nat) : ColorBits Nat := fun r => do
+  let (v, r') ← r.readBitsMSB n
+  return (v.toNat, r')
+
+private def colorUE (max : Nat) : ColorBits Nat := fun r => do
+  let (v, r') ← r.readUE
+  guard (v.toNat ≤ max)
+  return (v.toNat, r')
+
+private def colorSkip (n : Nat) : ColorBits Unit := do
+  for _ in [:n] do
+    let _ ← colorBits 1
+
+private def colorRequire (b : Bool) : ColorBits Unit := fun r => do
+  guard b
+  return ((), r)
+
+private def colorTriple : ColorBits SequenceColorInfo := do
+  let p ← colorBits 8
+  let t ← colorBits 8
+  let m ← colorBits 8
+  return ⟨p.toUInt16, t.toUInt16, m.toUInt16⟩
+
+/-- AV1 §5.5.1 through color_config. Timing-model headers conservatively defer to ffprobe. -/
+private def av1SequenceColors : ColorBits SequenceColorInfo := do
+  let profile ← colorBits 3
+  colorRequire (profile ≤ 2)
+  let still ← colorBits 1
+  let reduced ← colorBits 1
+  colorRequire (reduced == 0 || still == 1)
+  if reduced == 1 then
+    colorSkip 5 -- seq_level_idx[0]
+  else
+    colorRequire ((← colorBits 1) == 0) -- timing_info_present_flag: unsupported
+    let delay ← colorBits 1 -- initial_display_delay_present_flag
+    let ops ← colorBits 5
+    for _ in [:ops + 1] do
+      colorSkip 12 -- operating_point_idc
+      let level ← colorBits 5
+      if level > 7 then colorSkip 1
+      if delay == 1 then
+        if (← colorBits 1) == 1 then colorSkip 4
+  let wb ← colorBits 4
+  let hb ← colorBits 4
+  colorSkip (wb + hb + 2) -- max_frame_width/height_minus_1
+  if reduced == 0 then
+    if (← colorBits 1) == 1 then colorSkip 7 -- frame ID lengths
+  colorSkip 3 -- superblock, filter intra, intra edge filter
+  if reduced == 0 then
+    colorSkip 4 -- interintra, masked compound, warped motion, dual filter
+    let order ← colorBits 1
+    if order == 1 then colorSkip 2
+    let choose ← colorBits 1
+    let screen ← if choose == 1 then pure 2 else colorBits 1
+    if screen > 0 then
+      if (← colorBits 1) == 0 then colorSkip 1
+    if order == 1 then colorSkip 3
+  colorSkip 3 -- superres, cdef, restoration
+  let high ← colorBits 1
+  let twelve ← if profile == 2 && high == 1 then colorBits 1 else pure 0
+  let mono ← if profile == 1 then pure 0 else colorBits 1
+  colorRequire ((← colorBits 1) == 1) -- explicit color_description_present_flag
+  let info ← colorTriple
+  if mono == 1 then
+    colorSkip 1 -- color_range; subsampling fixed, separate_uv_delta_q inferred
+  else
+    if info.primaries == 1 && info.transfer == 13 && info.matrix == 0 then
+      pure () -- RGB identity implies full range and 4:4:4
+    else
+      colorSkip 1 -- color_range
+      let (sx, sy) ← if profile == 0 then pure (1, 1)
+        else if profile == 1 then pure (0, 0)
+        else if twelve == 1 then do
+          let x ← colorBits 1
+          let y ← if x == 1 then colorBits 1 else pure 0
+          pure (x, y)
+        else pure (1, 0)
+      if sx == 1 && sy == 1 then colorSkip 2
+    colorSkip 1 -- separate_uv_delta_q
+  colorSkip 1 -- film_grain_params_present
+  colorRequire ((← colorBits 1) == 1) -- trailing_one_bit
+  let r ← get
+  for _ in [:r.bitsLeft] do
+    colorRequire ((← colorBits 1) == 0)
+  return info
+
+/-- HEVC scaling_list_data, including signed deltas (only their encoded lengths matter). -/
+private def hevcSkipScaling : ColorBits Unit := do
+  for size in [:4] do
+    for _ in [:(if size == 3 then 2 else 6)] do
+      if (← colorBits 1) == 0 then
+        let _ ← colorUE 5
+      else
+        if size > 1 then
+          let _ ← colorUE 255
+        for _ in [:(if size == 0 then 16 else 64)] do
+          let _ ← colorUE 255
+
+/-- HEVC SPS through VUI colour_description. Predicted RPS is deliberately unsupported. -/
+private def hevcSpsColors : ColorBits SequenceColorInfo := do
+  colorSkip 4 -- sps_video_parameter_set_id
+  let layers ← colorBits 3
+  colorRequire (layers ≤ 6)
+  colorSkip 1
+  colorSkip 96 -- general profile_tier_level (88 profile bits + 8 level bits)
+  let mut flags : Array (Nat × Nat) := #[]
+  for _ in [:layers] do
+    let p ← colorBits 1
+    let l ← colorBits 1
+    flags := flags.push (p, l)
+  if layers > 0 then colorSkip ((8 - layers) * 2)
+  for (p, l) in flags do
+    if p == 1 then colorSkip 88
+    if l == 1 then colorSkip 8
+  let _ ← colorUE 15 -- sps_seq_parameter_set_id
+  let chroma ← colorUE 3
+  if chroma == 3 then colorSkip 1
+  let w ← colorUE 0xFFFFFFFF
+  let h ← colorUE 0xFFFFFFFF
+  colorRequire (w > 0 && h > 0)
+  if (← colorBits 1) == 1 then
+    for _ in [:4] do
+      let _ ← colorUE 0xFFFFFFFF
+  let _ ← colorUE 8 -- bit_depth_luma_minus8
+  let _ ← colorUE 8 -- bit_depth_chroma_minus8
+  let poc ← colorUE 12
+  let all ← colorBits 1
+  for _ in [(if all == 1 then 0 else layers):layers + 1] do
+    let _ ← colorUE 16
+    let _ ← colorUE 16
+    let _ ← colorUE 0xFFFFFFFF
+  for _ in [:6] do -- coding/transform block sizes and hierarchy depths
+    let _ ← colorUE 32
+  if (← colorBits 1) == 1 then
+    if (← colorBits 1) == 1 then hevcSkipScaling
+  colorSkip 2 -- amp_enabled, sample_adaptive_offset_enabled
+  if (← colorBits 1) == 1 then
+    colorSkip 8
+    let _ ← colorUE 32
+    let _ ← colorUE 32
+    colorSkip 1
+  let sets ← colorUE 64
+  for idx in [:sets] do
+    if idx > 0 then colorRequire ((← colorBits 1) == 0)
+    let neg ← colorUE 16
+    let pos ← colorUE 16
+    colorRequire (neg + pos ≤ 16)
+    for _ in [:neg + pos] do
+      let _ ← colorUE 0xFFFFFFFF
+      colorSkip 1
+  if (← colorBits 1) == 1 then
+    let refs ← colorUE 32
+    colorSkip (refs * (poc + 5))
+  colorSkip 2 -- temporal MVP, strong intra smoothing
+  colorRequire ((← colorBits 1) == 1) -- vui_parameters_present_flag
+  if (← colorBits 1) == 1 then
+    if (← colorBits 8) == 255 then colorSkip 32
+  if (← colorBits 1) == 1 then colorSkip 1
+  colorRequire ((← colorBits 1) == 1) -- video_signal_type_present_flag
+  colorSkip 4
+  colorRequire ((← colorBits 1) == 1) -- colour_description_present_flag
+  colorTriple
+
+/-- Locate a configuration payload only when container color/HDR metadata does not conflict.
+    Extended box headers are honored rather than interpreted as configuration bytes. -/
+private def colorConfigPayload (buf : ByteArray) (entries : List UInt32) (kind : UInt32) :
+    Option ByteArray := do
+  let loc ← mp4LocateVideoBoxes buf buf.size
+  let start := loc.vrePos + 86
+  let stop := loc.vrePos + loc.vreSz
+  guard (start < stop && stop ≤ buf.size && entries.contains (baRdU32BE buf (loc.vrePos + 4)))
+  guard (mp4FindChildBox buf start stop 0x6D646376).isNone
+  guard (mp4FindChildBox buf start stop 0x636C6C69).isNone
+  if let some (p, s) := mp4FindChildBox buf start stop 0x636F6C72 then
+    let q := mp4BoxPayloadOffset buf p (p + s)
+    let sub := baRdU32BE buf q
+    guard (q + 10 ≤ p + s && (sub == 0x6E636C78 || sub == 0x6E636C63) &&
+      baRdU16BE buf (q + 4) == 2 && baRdU16BE buf (q + 6) == 2 && baRdU16BE buf (q + 8) == 2)
+  let (p, s) ← mp4FindChildBox buf start stop kind
+  guard (p + s ≤ stop)
+  return buf.extract (mp4BoxPayloadOffset buf p (p + s)) (p + s)
+
+/-- Parse the sole sequence header OBU from av1C; bounded LEB128 and exact OBU windows.
+    Extra sequence headers are ambiguous and are rejected. -/
+def parseAv1CColorInfoPure (buf : ByteArray) : Option SequenceColorInfo := do
+  let cfg ← colorConfigPayload buf [0x61763031] 0x61763143
+  guard (cfg.size ≥ 4 && cfg.get! 0 == 0x81 && (cfg.get! 3 &&& 0xE0) == 0)
+  let mut p := 4
+  let mut found : Option SequenceColorInfo := none
+  for _ in [:cfg.size] do
+    if p < cfg.size then
+      let hdr := (cfg.get! p).toNat
+      p := p + 1
+      guard (hdr / 128 == 0 && hdr % 2 == 0 && hdr / 2 % 2 == 1)
+      let kind := hdr / 8 % 16
+      if hdr / 4 % 2 == 1 then
+        guard (p < cfg.size && (cfg.get! p &&& 7) == 0)
+        -- Sequence header OBUs must belong to temporal/spatial layer zero.
+        if kind == 1 then guard (cfg.get! p == 0)
+        p := p + 1
+      let mut size := 0
+      let mut done := false
+      for j in [:8] do
+        if !done then
+          guard (p < cfg.size)
+          let b := (cfg.get! p).toNat
+          p := p + 1
+          size := size + (b % 128) * 2 ^ (7 * j)
+          done := b < 128
+      guard (done && size ≤ cfg.size - p)
+      if kind == 1 then
+        guard found.isNone
+        let rbsp := cfg.extract p (p + size)
+        let (info, _) ← av1SequenceColors (BitReader.ofSlice (ByteSlice.ofByteArray rbsp))
+        found := some info
+      else
+        guard (kind == 5 || kind == 15) -- metadata or padding only in configOBUs
+      p := p + size
+  guard (p == cfg.size)
+  found
+
+/-- Walk every hvcC NAL array. All SPS color descriptions must agree; no first-SPS guess. -/
+def parseHvcCColorInfoPure (buf : ByteArray) : Option SequenceColorInfo := do
+  let cfg ← colorConfigPayload buf [0x68766331, 0x68657631] 0x68766343
+  guard (cfg.size ≥ 23 && cfg.get! 0 == 1)
+  let mut p := 23
+  let mut found : Option SequenceColorInfo := none
+  for _ in [:(cfg.get! 22).toNat] do
+    guard (p + 3 ≤ cfg.size)
+    let hdr := cfg.get! p
+    guard ((hdr &&& 0x40) == 0)
+    let kind := hdr &&& 0x3F
+    let count := (baRdU16BE cfg (p + 1)).toNat
+    p := p + 3
+    for _ in [:count] do
+      guard (p + 2 ≤ cfg.size)
+      let len := (baRdU16BE cfg p).toNat
+      p := p + 2
+      guard (len ≥ 2 && p + len ≤ cfg.size)
+      guard ((cfg.get! p &&& 0x80) == 0 && ((cfg.get! p >>> 1) &&& 0x3F) == kind &&
+        (cfg.get! (p + 1) &&& 7) != 0)
+      if kind == 33 then
+        guard ((cfg.get! p &&& 1) == 0 && (cfg.get! (p + 1) >>> 3) == 0)
+        let rbsp := avcUnescapeRbspPure cfg (p + 2) (p + len)
+        let (info, _) ← hevcSpsColors (BitReader.ofSlice (ByteSlice.ofByteArray rbsp))
+        if let some old := found then guard (old == info)
+        found := some info
+      p := p + len
+  guard (p == cfg.size)
+  found
+
+def probeAv1CColorspacePure (buf : @& ByteArray) : Option UInt32 :=
+  (parseAv1CColorInfoPure buf).bind classifySequenceColorInfo
+
+def probeHvcCSpsColorspacePure (buf : @& ByteArray) : Option UInt32 :=
+  (parseHvcCColorInfoPure buf).bind classifySequenceColorInfo
+
+/-- Every successful probe has parsed evidence, and SDR results satisfy the declarative gate. -/
+theorem probeAv1CColorspacePure_sound (buf : ByteArray) (cs : UInt32)
+    (h : probeAv1CColorspacePure buf = some cs) :
+    ∃ i, parseAv1CColorInfoPure buf = some i ∧ classifySequenceColorInfo i = some cs ∧
+      (cs = 0 → SequenceSdrSafe i) := by
+  unfold probeAv1CColorspacePure at h
+  cases he : parseAv1CColorInfoPure buf with
+  | none => simp [he] at h
+  | some i =>
+    simp [he] at h
+    exact ⟨i, rfl, h, fun hc => (classifySequenceColorInfo_sound i).1.mp (hc ▸ h)⟩
+
+theorem probeHvcCSpsColorspacePure_sound (buf : ByteArray) (cs : UInt32)
+    (h : probeHvcCSpsColorspacePure buf = some cs) :
+    ∃ i, parseHvcCColorInfoPure buf = some i ∧ classifySequenceColorInfo i = some cs ∧
+      (cs = 0 → SequenceSdrSafe i) := by
+  unfold probeHvcCSpsColorspacePure at h
+  cases he : parseHvcCColorInfoPure buf with
+  | none => simp [he] at h
+  | some i =>
+    simp [he] at h
+    exact ⟨i, rfl, h, fun hc => (classifySequenceColorInfo_sound i).1.mp (hc ▸ h)⟩
+
 /-- Pure Lean 4 nominal video frame rate `(fpsNum, fpsDen)` prober from `mdhd` timescale and `stts` sample delta. -/
 def probeMp4FpsRationalPure (buf : @& ByteArray) : Option (UInt32 × UInt32) := do
   let loc ← mp4LocateVideoBoxes buf buf.size
