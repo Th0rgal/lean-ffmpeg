@@ -2353,6 +2353,7 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
 extern uint32_t leanav_lean_classify_colr_nclx_u32(uint16_t prim, uint16_t trc, uint16_t spc);
 extern uint32_t leanav_lean_classify_dar_u32(uint32_t width, uint32_t height, uint32_t sar_num, uint32_t sar_den);
 extern uint32_t leanav_lean_classify_avc_level_u32(uint32_t dst_w, uint32_t dst_h);
+extern uint64_t leanav_lean_compute_output_frame_limit_u64(uint32_t dur_ms, uint32_t fps_num, uint32_t fps_den);
 
 /*
  * Scans the first and last 2 MiB of `in_path` for ISO BMFF `colr` (`nclx` primaries=9, trc=16/18, matrix=9)
@@ -3215,12 +3216,8 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
     } else {
         snprintf(fps_str, sizeof(fps_str), "%u/%u", fps_num, fps_den);
     }
-    uint64_t output_frame_limit = 0;
-    if (dur_ms_u32 > 0 && output_fps_num > 0 && output_fps_den > 0) {
-        uint64_t scaled_duration = (uint64_t)dur_ms_u32 * (uint64_t)output_fps_num;
-        uint64_t frame_den = 1000ULL * (uint64_t)output_fps_den;
-        output_frame_limit = (scaled_duration + frame_den - 1ULL) / frame_den;
-    }
+    uint64_t output_frame_limit =
+        leanav_lean_compute_output_frame_limit_u64(dur_ms_u32, output_fps_num, output_fps_den);
 
     leanav_media_info_t fb_info;
     leanav_populate_media_info_mp4_boxes(in_path, &fb_info);

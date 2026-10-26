@@ -805,7 +805,11 @@ def runSelfTest : IO UInt32 := do
                      classifyAvcLevelExport 3840 2160 == 51 &&
                      classifyAvcLevelExport 1920 1080 == 40 &&
                      classifyAvcLevelExport 1280 960 == 40 &&
-                     classifyAvcLevelExport 1280 720 == 31
+                     classifyAvcLevelExport 1280 720 == 31 &&
+                     computeOutputFrameLimitExport 1000 24000 1001 == 24 &&
+                     computeOutputFrameLimitExport 2000 30 1 == 60 &&
+                     computeOutputFrameLimitExport 0 24000 1001 == 0 &&
+                     computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF == 4294968
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1

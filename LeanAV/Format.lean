@@ -5465,6 +5465,27 @@ def classifyAvcLevelU32 (dstW dstH : UInt32) : UInt32 :=
 def classifyAvcLevelExport (dstW dstH : UInt32) : UInt32 :=
   classifyAvcLevelU32 dstW dstH
 
+/--
+  Overflow-free 64-bit ceiling output frame limit `⌈(durMs * fpsNum) / (1000 * fpsDen)⌉` for a trim
+  window `durMs` (milliseconds) at rational frame rate `fpsNum / fpsDen` (frames per second):
+  - Returns `0` (no frame limit) when `durMs == 0 || fpsNum == 0 || fpsDen == 0`.
+  - Otherwise computes `(durMs.toUInt64 * fpsNum.toUInt64 - 1) / (1000 * fpsDen.toUInt64) + 1`.
+    Since `1 <= durMs.toUInt64 * fpsNum.toUInt64 <= (2^32 - 1)^2 < 2^64`, `(scaled - 1) / frameDen + 1`
+    computes exact ceiling division across the entire 32-bit `UInt32` domain without the 64-bit
+    `(scaled + frameDen - 1)` addition wrap-around on large `UInt32` inputs.
+-/
+@[inline]
+def computeOutputFrameLimitU64 (durMs fpsNum fpsDen : UInt32) : UInt64 :=
+  if durMs == 0 || fpsNum == 0 || fpsDen == 0 then 0
+  else
+    let scaled : UInt64 := durMs.toUInt64 * fpsNum.toUInt64
+    let frameDen : UInt64 := (1000 : UInt64) * fpsDen.toUInt64
+    (scaled - 1) / frameDen + 1
+
+@[export leanav_lean_compute_output_frame_limit_u64]
+def computeOutputFrameLimitExport (durMs fpsNum fpsDen : UInt32) : UInt64 :=
+  computeOutputFrameLimitU64 durMs fpsNum fpsDen
+
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
     decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
@@ -5477,7 +5498,11 @@ theorem hdr_static_clip_roundtrip :
     classifyAvcLevelExport 3840 2160 = 51 ∧
     classifyAvcLevelExport 1920 1080 = 40 ∧
     classifyAvcLevelExport 1280 960 = 40 ∧
-    classifyAvcLevelExport 1280 720 = 31 := by
+    classifyAvcLevelExport 1280 720 = 31 ∧
+    computeOutputFrameLimitExport 1000 24000 1001 = 24 ∧
+    computeOutputFrameLimitExport 2000 30 1 = 60 ∧
+    computeOutputFrameLimitExport 0 24000 1001 = 0 ∧
+    computeOutputFrameLimitExport 0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF = 4294968 := by
   decide
 
 end LeanAV.Format
