@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **LeanNative (`LNIR_WIRE_V1`)** DSP kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) with C-ABI SIMD kernels (`AVX2` / `SSE4.2` / `NEON`) in `libleanav_dsp.a`, backed by **`0 sorryAx`** across **`8,140`** declarations and **`208 / 208` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **LeanNative (`LNIR_WIRE_V1`)** DSP kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) with C-ABI SIMD kernels (`AVX2` / `SSE4.2` / `NEON`) in `libleanav_dsp.a`, backed by **`0 sorryAx`** across **`8,142`** declarations and **`208 / 208` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 ---
 
@@ -32,7 +32,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`208 / 208` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,140`** kernel-checked declarations (`Format`: 47, `Video`: 27, `Spec`: 23, `NativeKernels`: 21, `Bitstream`: 13, `PlanIR`: 13, `Scale`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 9, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`208 / 208` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,142`** kernel-checked declarations (`Format`: 47, `Video`: 27, `Spec`: 23, `NativeKernels`: 21, `Bitstream`: 13, `PlanIR`: 13, `Scale`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 9, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
@@ -47,7 +47,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,140 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,142 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
 # Audit all 15 formal modules with turbo-lean (208/208 tight, 0 vacuous, 0 trivial)

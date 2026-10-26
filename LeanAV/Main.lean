@@ -791,7 +791,13 @@ def runSelfTest : IO UInt32 := do
                      rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 == 0x000003E8FFFFFFFE &&
                      classifyColrNclxExport 9 16 9 == 0x01091009 &&
                      classifyColrNclxExport 9 18 9 == 0x02091209 &&
-                     classifyColrNclxExport 1 1 1 == 0x00010101
+                     classifyColrNclxExport 1 1 1 == 0x00010101 &&
+                     classifyDisplayAspectRatioExport 1920 800 1 1 == 0x00090015 &&
+                     classifyDisplayAspectRatioExport 1920 1080 1 1 == 0x00090010 &&
+                     classifyDisplayAspectRatioExport 1440 960 1 1 == 0x00020003 &&
+                     classifyDisplayAspectRatioExport 1440 1080 1 1 == 0x00030004 &&
+                     classifyDisplayAspectRatioExport 1080 1080 1 1 == 0x00010001 &&
+                     classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 == 0x00010001
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1

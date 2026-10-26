@@ -2345,6 +2345,9 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     return 0;
 }
 
+extern uint32_t leanav_lean_classify_colr_nclx_u32(uint16_t prim, uint16_t trc, uint16_t spc);
+extern uint32_t leanav_lean_classify_dar_u32(uint32_t width, uint32_t height, uint32_t sar_num, uint32_t sar_den);
+
 /*
  * Scans the first and last 2 MiB of `in_path` for ISO BMFF `colr` (`nclx` primaries=9, trc=16/18, matrix=9)
  * or H.264/HEVC VUI / SEI strings (`bt2020`, `smpte2084`, `arib-std-b67`), returning:
@@ -2352,8 +2355,6 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
  *   1 -> BT.2020 + SMPTE-2084 PQ (HDR10)
  *   2 -> BT.2020 + ARIB-STD-B67 HLG
  */
-extern uint32_t leanav_lean_classify_colr_nclx_u32(uint16_t prim, uint16_t trc, uint16_t spc);
-
 static int leanav_probe_input_hdr_colorspace(const char *in_path, const char *q_in) {
     FILE *fp = fopen(in_path, "rb");
     if (fp) {
@@ -2643,13 +2644,11 @@ static void leanav_print_ffmpeg_banner(
     int64_t in_br = info ? info->bitrate_kbps : 0;
     int sar_n = (info && info->sar_num > 0) ? info->sar_num : 1;
     int sar_d = (info && info->sar_den > 0) ? info->sar_den : 1;
-    double dar = (src_h > 0 && sar_d > 0) ? ((double)src_w * (double)sar_n) / ((double)src_h * (double)sar_d) : 1.0;
-    int dar_w = 16, dar_h = 9;
-    if (dar > 2.3) { dar_w = 21; dar_h = 9; }
-    else if (dar > 1.7) { dar_w = 16; dar_h = 9; }
-    else if (dar > 1.4) { dar_w = 3; dar_h = 2; }
-    else if (dar > 1.2) { dar_w = 4; dar_h = 3; }
-    else { dar_w = 1; dar_h = 1; }
+    uint32_t dar_packed = (src_w <= 0xFFFFFFu && src_h <= 0xFFFFFFu)
+        ? leanav_lean_classify_dar_u32((uint32_t)src_w, (uint32_t)src_h, (uint32_t)sar_n, (uint32_t)sar_d)
+        : 0x00010001u;
+    int dar_w = (int)(dar_packed & 0xFFFFu);
+    int dar_h = (int)(dar_packed >> 16);
 
     leanav_cprint(stderr, LEANAV_C_INFO, "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '%s':\n", in_path);
     if (info && (info->major_brand[0] || info->encoder[0])) {

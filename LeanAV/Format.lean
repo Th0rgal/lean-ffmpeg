@@ -3113,6 +3113,7 @@ def rescaleElstEntryExport (segDur mediaTime srcMvhdTs dstMvhdTs srcMdhdTs dstMd
 /--
   Rescale a v0 `elst` entry from the source movie/media timescales to the output movie/media timescales.
   `mediaTime = 0xFFFFFFFF` (empty dwell) is preserved. Empty-dwell entries keep `mediaRateInteger = 1`.
+  `Nat` timescales are truncated to 32-bit ISO/IEC 14496-12 v0 `UInt32` timescales via `.toUInt32`.
 -/
 def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdTs : Nat) : ElstEntryView :=
   let packed := rescaleElstEntryU64 e.segmentDuration e.mediaTime
@@ -5402,9 +5403,40 @@ def hdrClliClip : ClliBoxView := {
   maxContentLightLevel := 774
   maxPicAverageLightLevel := 263 }
 
+/--
+  Exact integer cross-product display aspect ratio (`DAR`) classifier for `(width, height, sarNum, sarDen)`:
+  returns `darW ||| (darH <<< 16)` in `{21:9, 16:9, 3:2, 4:3, 1:1}` without floating-point arithmetic.
+  Inputs `= 0` or `> 0xFFFFFF` (24-bit guard) fail closed to `1:1` (`0x00010001`) so `num * 10` and `den * 23`
+  are strictly `< 2^53` and never overflow `UInt64`.
+-/
+@[inline]
+def classifyDisplayAspectRatioU32 (width height sarNum sarDen : UInt32) : UInt32 :=
+  if width == 0 || height == 0 || sarNum == 0 || sarDen == 0 ||
+     width > (0xFFFFFF : UInt32) || height > (0xFFFFFF : UInt32) ||
+     sarNum > (0xFFFFFF : UInt32) || sarDen > (0xFFFFFF : UInt32) then
+    (1 : UInt32) ||| ((1 : UInt32) <<< 16)
+  else
+    let num10 : UInt64 := width.toUInt64 * sarNum.toUInt64 * (10 : UInt64)
+    let den   : UInt64 := height.toUInt64 * sarDen.toUInt64
+    if num10 > den * (23 : UInt64) then (21 : UInt32) ||| ((9 : UInt32) <<< 16)
+    else if num10 > den * (17 : UInt64) then (16 : UInt32) ||| ((9 : UInt32) <<< 16)
+    else if num10 > den * (14 : UInt64) then (3 : UInt32) ||| ((2 : UInt32) <<< 16)
+    else if num10 > den * (12 : UInt64) then (4 : UInt32) ||| ((3 : UInt32) <<< 16)
+    else (1 : UInt32) ||| ((1 : UInt32) <<< 16)
+
+@[export leanav_lean_classify_dar_u32]
+def classifyDisplayAspectRatioExport (width height sarNum sarDen : UInt32) : UInt32 :=
+  classifyDisplayAspectRatioU32 width height sarNum sarDen
+
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
-    decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip := by
+    decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
+    classifyDisplayAspectRatioExport 1920 800 1 1 = 0x00090015 ∧
+    classifyDisplayAspectRatioExport 1920 1080 1 1 = 0x00090010 ∧
+    classifyDisplayAspectRatioExport 1440 960 1 1 = 0x00020003 ∧
+    classifyDisplayAspectRatioExport 1440 1080 1 1 = 0x00030004 ∧
+    classifyDisplayAspectRatioExport 1080 1080 1 1 = 0x00010001 ∧
+    classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 = 0x00010001 := by
   decide
 
 end LeanAV.Format
