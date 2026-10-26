@@ -5651,6 +5651,24 @@ def computeMuxingOverheadMicroPctU64 (videoBytes audioBytes totalBytes : UInt64)
 def computeMuxingOverheadMicroPctExport (videoBytes audioBytes totalBytes : UInt64) : UInt64 :=
   computeMuxingOverheadMicroPctU64 videoBytes audioBytes totalBytes
 
+/--
+  ISO/IEC 14496-12 `hdlr` box `handler_type` big-endian FourCC classifier (`classifyMp4HandlerTypeU32`):
+  - `0x76696465` (`'vide'`) -> `1` (video track)
+  - `0x736F756E` (`'soun'`) -> `2` (audio track)
+  - `0x73756274` (`'subt'`), `0x7362746C` (`'sbtl'`), or `0x74657874` (`'text'`) -> `3` (subtitle track)
+  - Otherwise -> `0` (other / metadata track)
+-/
+@[inline]
+def classifyMp4HandlerTypeU32 (handlerFourCC : UInt32) : UInt32 :=
+  if handlerFourCC == 0x76696465 then 1
+  else if handlerFourCC == 0x736F756E then 2
+  else if handlerFourCC == 0x73756274 || handlerFourCC == 0x7362746C || handlerFourCC == 0x74657874 then 3
+  else 0
+
+@[export leanav_lean_classify_mp4_handler_type_u32]
+def classifyMp4HandlerTypeExport (handlerFourCC : UInt32) : UInt32 :=
+  classifyMp4HandlerTypeU32 handlerFourCC
+
 /-- HDR10 `mdcv` and `clli` static metadata box encode/decode roundtrip theorem. -/
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
@@ -5700,7 +5718,11 @@ theorem format_ffi_export_vectors_verified :
     computeBitrateKbpsExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF 1 = 0x7FFFFFFFFFFFFFFF ∧
     computeMuxingOverheadMicroPctExport 900 100 1025 = 2500000 ∧
     computeMuxingOverheadMicroPctExport 900 100 1000 = 0 ∧
-    computeMuxingOverheadMicroPctExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF = 0 := by
+    computeMuxingOverheadMicroPctExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF = 0 ∧
+    classifyMp4HandlerTypeExport 0x76696465 = 1 ∧
+    classifyMp4HandlerTypeExport 0x736F756E = 2 ∧
+    classifyMp4HandlerTypeExport 0x73756274 = 3 ∧
+    classifyMp4HandlerTypeExport 0x6D657461 = 0 := by
   decide
 
 end LeanAV.Format

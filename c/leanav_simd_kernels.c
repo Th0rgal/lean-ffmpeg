@@ -1956,12 +1956,32 @@ static int leanav_find_child_box(
     return 0;
 }
 
-static int leanav_is_video_trak(const uint8_t *buf, size_t trak_pos, size_t trak_end) {
+extern uint32_t leanav_lean_classify_mp4_handler_type_u32(uint32_t handler_fourcc);
+
+static uint32_t leanav_trak_handler_kind(const uint8_t *buf, size_t trak_pos, size_t trak_end) {
     size_t mdia_pos = 0, mdia_sz = 0;
-    if (!leanav_find_child_box(buf, trak_pos + 8, trak_end, "mdia", &mdia_pos, &mdia_sz)) return 0;
+    if (!leanav_find_child_box(buf, trak_pos + 8, trak_end, "mdia", &mdia_pos, &mdia_sz)) return 0u;
     size_t hdlr_pos = 0, hdlr_sz = 0;
-    if (!leanav_find_child_box(buf, mdia_pos + 8, mdia_pos + mdia_sz, "hdlr", &hdlr_pos, &hdlr_sz)) return 0;
-    if (hdlr_sz >= 20 && memcmp(buf + hdlr_pos + 16, "vide", 4) == 0) return 1;
+    if (!leanav_find_child_box(buf, mdia_pos + 8, mdia_pos + mdia_sz, "hdlr", &hdlr_pos, &hdlr_sz)) return 0u;
+    if (hdlr_sz < 20) return 0u;
+    return leanav_lean_classify_mp4_handler_type_u32(leanav_rd_u32be(buf + hdlr_pos + 16));
+}
+
+static int leanav_is_video_trak(const uint8_t *buf, size_t trak_pos, size_t trak_end) {
+    return leanav_trak_handler_kind(buf, trak_pos, trak_end) == 1u ? 1 : 0;
+}
+
+static int leanav_has_audio_trak_in_moov(const uint8_t *buf, size_t moov_pos, size_t moov_sz) {
+    size_t m_end = moov_pos + moov_sz;
+    size_t p = moov_pos + 8;
+    while (p + 8 <= m_end) {
+        uint32_t tsz = leanav_rd_u32be(buf + p);
+        if (tsz < 8 || p + tsz > m_end) break;
+        if (memcmp(buf + p + 4, "trak", 4) == 0 && leanav_trak_handler_kind(buf, p, p + tsz) == 2u) {
+            return 1;
+        }
+        p += tsz;
+    }
     return 0;
 }
 
@@ -2457,6 +2477,7 @@ typedef struct {
     double mdcv_min_luma, mdcv_max_luma;
     int has_clli;
     uint32_t max_cll, max_fall;
+    int has_audio;
     int audio_sample_rate;
     int audio_channels;
     int64_t audio_bitrate_kbps;
@@ -2558,6 +2579,7 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
         }
         if (located) {
             size_t bp, bs;
+            info->has_audio = leanav_has_audio_trak_in_moov(buf, moov_p, moov_s);
             if (leanav_find_child_box(buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 28) {
                 uint32_t ts = leanav_extract_box_timescale(buf + bp, bs);
                 uint64_t dur = leanav_extract_box_duration(buf + bp, bs);
@@ -3210,15 +3232,16 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
 
     leanav_media_info_t fb_info;
     leanav_populate_media_info_mp4_boxes(in_path, &fb_info);
+    int eff_with_audio = (with_audio_u32 != 0 && fb_info.has_audio != 0) ? 1 : 0;
     const char *fb_enc_name = (codec_id_u32 == 2) ? "libx265" : (codec_id_u32 == 3 ? "libsvtav1" : "libx264");
     leanav_print_ffmpeg_banner(
         in_path, out_path, src_w, src_h, dst_w, dst_h,
-        codec_id_u32, raw_pix_fmt, fps_str, with_audio_u32 != 0,
+        codec_id_u32, raw_pix_fmt, fps_str, eff_with_audio,
         (g_enc_ab[0] != '\0') ? g_enc_ab : ((filter_flags_u32 & 8u) ? "192k" : "128k"),
         &fb_info, fb_enc_name);
 
     char enc_cmd[8192];
-    if (with_audio_u32) {
+    if (eff_with_audio) {
         snprintf(enc_cmd, sizeof(enc_cmd),
             "%s -y -v error -f rawvideo -pix_fmt %s %s -s %zux%zu -r %s -i - "
             "%s%s-i %s -map 0:v:0 -map 1:a:0? -map_metadata 1 -map_metadata:s:v 1:s:v -map_metadata:s:a 1:s:a -map_chapters 1 -dn -sn "
