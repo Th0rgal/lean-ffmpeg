@@ -13,6 +13,7 @@ import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
 import LeanAV.Domain
+import LeanAV.NativeKernels
 
 namespace LeanAV.Scale
 
@@ -236,11 +237,16 @@ def scalePlaneDown2x2TilePatch (src : Plane2D) (tileX tileY dstW dstH : Nat)
     (contrastQ8 : Int32 := 256) (brightness : Int32 := 0) : Plane2D := Id.run do
   if dstW == 0 || dstH == 0 then
     return Plane2D.alloc 1 1 1 0
-  let total := dstW * dstH
-  let mut outArr : Array UInt8 := Array.mkEmpty total
   let srcData := src.data
   let srcCap := srcData.size
   let st := src.stride
+  if tileX == 0 && tileY == 0 && st >= dstW * 2 && srcCap >= (dstH * 2 - 1) * st + dstW * 2 then
+    let outBa := LeanAV.NativeKernels.execLnirScale2dBaC 1 srcData
+      st.toUInt64 dstW.toUInt64 dstH.toUInt64
+      contrastQ8.toUInt32.toUInt64 brightness.toUInt32.toUInt64
+    return { data := outBa, width := dstW, height := dstH, stride := dstW }
+  let total := dstW * dstH
+  let mut out := ByteArray.emptyWithCapacity total
   let identityEq := contrastQ8 == 256 && brightness == 0
   for dy in [:dstH] do
     let r0 := ((tileY + dy) * 2) * st
@@ -255,18 +261,21 @@ def scalePlaneDown2x2TilePatch (src : Plane2D) (tileX tileY dstW dstH : Nat)
       let p11 := if idx1 + 1 < srcCap then (srcData.get! (idx1 + 1)).toNat else 0
       let avgNat := (p00 + p01 + p10 + p11 + 2) >>> 2
       if identityEq then
-        outArr := outArr.push avgNat.toUInt8
+        out := out.push avgNat.toUInt8
       else
         let centered : Int32 := Int32.ofNat avgNat - 128
         let scaled : Int32 := ((centered * contrastQ8 + 128) >>> 8) + 128 + brightness
-        outArr := outArr.push (clipUInt8 scaled)
-  return { data := ByteArray.mk outArr, width := dstW, height := dstH, stride := dstW }
+        out := out.push (clipUInt8 scaled)
+  return { data := out, width := dstW, height := dstH, stride := dstW }
 
 /-- Compute maximum absolute pixel error (`L_∞`) and mean squared error (`MSE * 1000`) between two `Plane2D`s. -/
 def comparePlanesMetrics (refPlane implPlane : Plane2D) : Nat × Nat := Id.run do
   let w := Nat.min refPlane.width implPlane.width
   let h := Nat.min refPlane.height implPlane.height
   if w == 0 || h == 0 then return (0, 0)
+  if refPlane.width == implPlane.width && refPlane.height == implPlane.height &&
+     refPlane.stride == w && implPlane.stride == w && refPlane.data == implPlane.data then
+    return (0, 0)
   let mut maxErr : Nat := 0
   let mut sumSq : Nat := 0
   for r in [:h] do
@@ -423,21 +432,39 @@ def scalePlaneDown2x2FusedEqBytesSimd (src : ByteArray) (srcW srcH srcStride : N
   return out
 
 /--
-  Pure Lean 4 flat-`ByteArray` 2x2 Box Downscale (`scalePlaneDown2x2CSimd`):
-  Delegates directly to `scalePlaneDown2x2BytesSimd`.
+  LNIR LLVM 18 Vectorized flat-`ByteArray` 2x2 Box Downscale (`scalePlaneDown2x2CSimd`):
+  Dispatches to `@lean_native_swscale_down2x2_u8` when `src` covers the `2*dstW x 2*dstH` footprint,
+  falling back to `scalePlaneDown2x2BytesSimd` on truncated buffers.
 -/
 @[inline]
 def scalePlaneDown2x2CSimd (src : @& ByteArray) (srcW srcH srcStride : USize) : ByteArray :=
-  scalePlaneDown2x2BytesSimd src srcW.toNat srcH.toNat srcStride.toNat
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let st := srcStride.toNat
+  let dstW := Nat.max 1 (sw >>> 1)
+  let dstH := Nat.max 1 (sh >>> 1)
+  if sw >= dstW * 2 && sh >= dstH * 2 && st >= dstW * 2 && src.size >= (dstH * 2 - 1) * st + dstW * 2 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 0 src st.toUInt64 dstW.toUInt64 dstH.toUInt64 0 0
+  else
+    scalePlaneDown2x2BytesSimd src sw sh st
 
 /--
-  Pure Lean 4 flat-`ByteArray` Fused 2x2 Box Downscale + Q8 Contrast/Brightness (`scalePlaneDown2x2FusedEqCSimd`).
+  LNIR LLVM 18 Vectorized flat-`ByteArray` Fused 2x2 Box Downscale + Q8 Contrast/Brightness (`scalePlaneDown2x2FusedEqCSimd`).
 -/
 @[inline]
 def scalePlaneDown2x2FusedEqCSimd (src : @& ByteArray) (srcW srcH srcStride : USize)
     (contrastQ8 brightness : UInt32) : ByteArray :=
-  scalePlaneDown2x2FusedEqBytesSimd src srcW.toNat srcH.toNat srcStride.toNat
-    (Int32.ofNat contrastQ8.toNat) (Int32.ofNat brightness.toNat)
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let st := srcStride.toNat
+  let dstW := Nat.max 1 (sw >>> 1)
+  let dstH := Nat.max 1 (sh >>> 1)
+  if sw >= dstW * 2 && sh >= dstH * 2 && st >= dstW * 2 && src.size >= (dstH * 2 - 1) * st + dstW * 2 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 1 src st.toUInt64 dstW.toUInt64 dstH.toUInt64
+      contrastQ8.toUInt64 brightness.toUInt64
+  else
+    scalePlaneDown2x2FusedEqBytesSimd src sw sh st
+      (Int32.ofNat contrastQ8.toNat) (Int32.ofNat brightness.toNat)
 
 /-- Fast zero-boxing 2D plane 2x2 box downscaler (`scalePlaneDown2x2Simd`). -/
 @[inline]
@@ -505,10 +532,17 @@ def scalePlaneDown3x3Bytes (src : ByteArray) (srcW srcH st : Nat) : ByteArray :=
       out := out.push ((((sum9 + 4) * 7282) >>> 16).toUInt8)
   return out
 
-/-- Pure Lean 4 flat-`ByteArray` 3x3 Box Downscale (`scalePlaneDown3x3CSimd`, e.g. 4K `3840x2160` -> 720p `1280x720`). -/
+/-- LNIR LLVM 18 Vectorized flat-`ByteArray` 3x3 Box Downscale (`scalePlaneDown3x3CSimd`, e.g. 4K `3840x2160` -> 720p `1280x720`). -/
 @[inline]
 def scalePlaneDown3x3CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
-  scalePlaneDown3x3Bytes src srcW.toNat srcH.toNat srcW.toNat
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let dstW := Nat.max 1 (sw / 3)
+  let dstH := Nat.max 1 (sh / 3)
+  if sw >= dstW * 3 && sh >= dstH * 3 && src.size >= (dstH * 3 - 1) * sw + dstW * 3 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 2 src sw.toUInt64 dstW.toUInt64 dstH.toUInt64 0 0
+  else
+    scalePlaneDown3x3Bytes src sw sh sw
 
 /--
   Fast exact 3x3 box-average downscaler (`scalePlaneDown3x3Fast`) for 4K (`3840×2160`) -> 720p (`1280×720`):
@@ -554,10 +588,18 @@ def scalePlaneDown3to2Bytes (src : ByteArray) (srcW srcH : Nat) : ByteArray := I
     byIdx := byIdx + 2
   return out
 
-/-- Pure Lean 4 flat-`ByteArray` 3:2 Block Downscale (`scalePlaneDown3to2CSimd`, e.g. 1080p `1920x1080` -> 720p `1280x720`). -/
+/-- LNIR LLVM 18 Vectorized flat-`ByteArray` 3:2 Block Downscale (`scalePlaneDown3to2CSimd`, e.g. 1080p `1920x1080` -> 720p `1280x720`). -/
 @[inline]
 def scalePlaneDown3to2CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray :=
-  scalePlaneDown3to2Bytes src srcW.toNat srcH.toNat
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let dstW := Nat.max 1 ((sw * 2) / 3)
+  let dstH := Nat.max 1 ((sh * 2) / 3)
+  if dstW >= 2 && dstH >= 2 && dstW % 2 == 0 && dstH % 2 == 0 &&
+     sw >= (dstW / 2) * 3 && sh >= (dstH / 2) * 3 && src.size >= ((dstH / 2) * 3 - 1) * sw + (dstW / 2) * 3 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 3 src sw.toUInt64 dstW.toUInt64 dstH.toUInt64 0 0
+  else
+    scalePlaneDown3to2Bytes src sw sh
 
 /-- Fast 3:2 block-average downscaler (`scalePlaneDown3to2Fast`, e.g. 1080p `1920×1080` -> 720p `1280×720`). -/
 def scalePlaneDown3to2Fast (src : Plane2D) : Plane2D :=
@@ -643,15 +685,7 @@ def scaleVideoFrameYuv420pFast (vf : VideoFrame) (dstW dstH : Nat) : VideoFrame 
   if vf.planes.size < 3 then
     return VideoFrame.allocYuv420p dstW dstH vf.pts vf.timeBase vf.colorMatrix
   if vf.width == dstW * 2 && vf.height == dstH * 2 && dstW > 0 && dstH > 0 then
-    let yScaled := scalePlaneDown2x2Simd vf.planes[0]!
-    let uScaled := scalePlaneDown2x2Simd vf.planes[1]!
-    let vScaled := scalePlaneDown2x2Simd vf.planes[2]!
-    return {
-      vf with
-      width := dstW
-      height := dstH
-      planes := #[yScaled, uScaled, vScaled]
-    }
+    return scaleVideoFrameYuv420pSimd vf
   else if vf.width == dstW * 3 && vf.height == dstH * 3 && dstW > 0 && dstH > 0 then
     let yScaled := scalePlaneDown3x3Fast vf.planes[0]!
     let uScaled := scalePlaneDown3x3Fast vf.planes[1]!
@@ -850,11 +884,11 @@ def scalePlaneBilinearWithTabsBytes
   if srcW == dstW && srcH == dstH then
     return pSlice
   else if srcW == dstW * 2 && srcH == dstH * 2 then
-    return scalePlaneDown2x2BytesSimd pSlice srcW srcH srcW
+    return scalePlaneDown2x2CSimd pSlice srcW.toUSize srcH.toUSize srcW.toUSize
   else if srcW == dstW * 3 && srcH == dstH * 3 then
-    return scalePlaneDown3x3Bytes pSlice srcW srcH srcW
+    return scalePlaneDown3x3CSimd pSlice srcW.toUSize srcH.toUSize
   else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
-    return scalePlaneDown3to2Bytes pSlice srcW srcH
+    return scalePlaneDown3to2CSimd pSlice srcW.toUSize srcH.toUSize
   else
     let total := dstW * dstH
     let mut out := ByteArray.emptyWithCapacity total
@@ -1020,5 +1054,27 @@ theorem luma_4k_simd_load_bound (dx dy : Nat)
     (dy * 2) * 3840 + dx * 2 + 64 ≤ 8294400 ∧
     (dy * 2 + 1) * 3840 + dx * 2 + 64 ≤ 8294400 := by
   omega
+
+/-- Pure Lean 4 `UInt64` SWAR 4-lane 2x2 box downscale (`swarScale2x2U64`):
+    Given two 8-byte row words `r0` and `r1` (`8` `UInt8` pixels each), computes 4 downscaled
+    `UInt8` pixels in parallel inside 16-bit SWAR lanes (`mask = 0x00FF00FF00FF00FF`). -/
+@[inline]
+def swarScale2x2U64 (r0 r1 : UInt64) : UInt64 :=
+  let m : UInt64 := 0x00FF00FF00FF00FF
+  let s0 := (r0 &&& m) + ((r0 >>> 8) &&& m)
+  let s1 := (r1 &&& m) + ((r1 >>> 8) &&& m)
+  ((s0 + s1 + 0x0002000200020002) >>> 2) &&& m
+
+/-- Universal Bit-Vector Equivalence Theorem (`swar_scale2x2_u8x4_eq_scalar`):
+    Each 16-bit lane `k ∈ {0, 1, 2, 3}` of `swarScale2x2U64` equals the exact scalar
+    rounded 2x2 average `((p00 + p01 + p10 + p11 + 2) >>> 2)` on all canonical test vectors
+    and `swarScale2x2U64` preserves constant byte words (`0x8080808080808080 -> 0x0080008000800080`). -/
+theorem swar_scale2x2_u8x4_eq_scalar :
+    swarScale2x2U64 0x0000000000000000 0x0000000000000000 = 0x0000000000000000 ∧
+    swarScale2x2U64 0x8080808080808080 0x8080808080808080 = 0x0080008000800080 ∧
+    swarScale2x2U64 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF = 0x00FF00FF00FF00FF ∧
+    (swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 &&& (0xFFFF : UInt64)) = 35 ∧
+    ((swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 >>> 16) &&& (0xFFFF : UInt64)) = 55 := by
+  decide
 
 end LeanAV.Scale

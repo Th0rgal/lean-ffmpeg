@@ -268,6 +268,8 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_binary_ba(
         case 2u: (void)bframe_bipred_blend_gpu(ba0, (void *)ba1); break;
         case 3u: (void)hevc_sao_band_offset_add_gpu(ba0, (void *)ba1); break;
         case 4u: (void)aac_imdct_window_mul_gpu(ba0, (void *)ba1); break;
+        case 5u: (void)swscale_down2x2_box_simd(ba0, (void *)ba1); break;
+        case 6u: (void)swscale_down3to2_bilinear_simd(ba0, (void *)ba1); break;
         default: break;
     }
     s0->m_size = n_lanes << 3;
@@ -306,6 +308,8 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
     switch (kernel_id) {
         case 0u: (void)av1_wiener_3tap_sym_gpu(ba0, (void *)ba1, (void *)ba2_eff); break;
         case 1u: (void)av1_cdef_fma_blend_gpu(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 2u: (void)swscale_down3x3_box_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 3u: (void)av1_cdef_dir_filter_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
         default: break;
     }
     s0->m_size = n_lanes << 3;
@@ -313,4 +317,42 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
         lean_dec(ba2_eff);
     }
     return ba0;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
+    uint32_t kernel_id,
+    b_lean_obj_arg src_ba,
+    uint64_t src_stride,
+    uint64_t dst_w,
+    uint64_t dst_h,
+    uint64_t arg0,
+    uint64_t arg1
+) {
+    size_t total = (size_t)(dst_w * dst_h);
+    lean_object *out = lean_alloc_sarray(1, total, total);
+    if (total == 0) return out;
+    const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
+    uint8_t *dst_ptr = lean_sarray_cptr(out);
+    switch (kernel_id) {
+        case 0u: lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
+        case 1u: lean_native_swscale_down2x2_fused_eq_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h, arg0, arg1); break;
+        case 2u: lean_native_swscale_down3x3_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
+        case 3u: lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
+        default: memset(dst_ptr, 0, total); break;
+    }
+    return out;
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_cdef_ba(
+    b_lean_obj_arg src_ba,
+    uint64_t w,
+    uint64_t h,
+    uint64_t pri_str,
+    uint64_t damping
+) {
+    size_t total = (size_t)(w * h);
+    lean_object *out = lean_alloc_sarray(1, total, total);
+    if (total == 0) return out;
+    lean_native_av1_cdef_filter_u8(lean_sarray_cptr(out), lean_sarray_cptr(src_ba), w, h, pri_str, damping);
+    return out;
 }

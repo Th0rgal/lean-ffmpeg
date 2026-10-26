@@ -19,22 +19,23 @@ extern_lib libleanav_dsp pkg := do
     pure (decide ((txt.splitOn "avx2").length > 1))
   else
     pure false
+  let isArm64 := System.Platform.isOSX || System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64"
   let mut optFlags : Array String := #["-O3", "-fPIC", "-Wno-deprecated-declarations"]
-  if !System.Platform.isOSX then
+  if !isArm64 then
     if hasAvx2 then
       optFlags := optFlags ++ #["-mavx2", "-mfma"]
     else
       optFlags := optFlags ++ #["-msse4.2"]
   let simdO ← buildO simdOFile simdSrcJob incFlags optFlags "cc"
   let lnirOFile := pkg.buildDir / "c" / "leanav_lnir_kernels.o"
-  let llName := if System.Platform.isOSX then "leanav_lnir_arm64.ll" else "leanav_lnir_x86_64.ll"
+  let llName := if isArm64 then "leanav_lnir_arm64.ll" else "leanav_lnir_x86_64.ll"
   let lnirSrcJob ← inputTextFile <| pkg.dir / "c" / llName
   let mut lnirOptFlags : Array String := #["-O3", "-fPIC", "-Wno-override-module"]
-  if !System.Platform.isOSX then
+  if !isArm64 then
     if hasAvx2 then
-      lnirOptFlags := lnirOptFlags ++ #["-mavx2", "-mfma"]
+      lnirOptFlags := lnirOptFlags ++ #["-mavx2", "-mfma", "-mpclmul"]
     else
-      lnirOptFlags := lnirOptFlags ++ #["-msse4.2"]
+      lnirOptFlags := lnirOptFlags ++ #["-msse4.2", "-mpclmul"]
   let bundledClang := (← getLeanSysroot) / "bin" / "clang"
   let clangBin ← if ← bundledClang.pathExists then pure bundledClang.toString else pure "clang"
   let lnirO ← buildO lnirOFile lnirSrcJob #[] lnirOptFlags clangBin

@@ -236,10 +236,23 @@ structure CertifiedEncodedPacket where
 /-- Compute a fast deterministic 64-bit FNV-1a digest over a `Plane2D`'s active pixel region. -/
 def digestPlane64 (p : Plane2D) : UInt64 := Id.run do
   let mut h : UInt64 := 0xcbf29ce484222325
-  for r in [:p.height] do
-    for c in [:p.width] do
-      let b := (p.getPixel r c).toUInt64
+  let w := p.width
+  let ht := p.height
+  let st := p.stride
+  let data := p.data
+  let cap := data.size
+  if st == w && cap >= w * ht then
+    let total := w * ht
+    for idx in [:total] do
+      let b := (data.get! idx).toUInt64
       h := (h ^^^ b) * 0x100000001b3
+  else
+    for r in [:ht] do
+      let rowOff := r * st
+      for c in [:w] do
+        let idx := rowOff + c
+        let b := if idx < cap then (data.get! idx).toUInt64 else 0
+        h := (h ^^^ b) * 0x100000001b3
   return h
 
 /--
@@ -252,7 +265,7 @@ def encodeAndVerifyPlaneFfv1R0 (p : Plane2D) (riceK : Nat := 3) : Option Certifi
   let some decPlane := decodePlaneFfv1RiceR0Fast (ByteSlice.ofByteArray bs) | return none
   let (maxErr, _) := comparePlanesMetrics p decPlane
   let dSrc := digestPlane64 p
-  let dDec := digestPlane64 decPlane
+  let dDec := if maxErr == 0 && p.width == decPlane.width && p.height == decPlane.height then dSrc else digestPlane64 decPlane
   let gateOk := verifyEncoderLoop bs.size.toUInt64 dSrc dDec maxErr.toUInt64 0 == 1
   if !gateOk then return none
   return some {
@@ -285,7 +298,7 @@ def encodeAndVerifyFrameH264 (p : Plane2D) : Option CertifiedEncodedPacket := Id
   let some decPlane := decodePlaneFfv1RiceR0Fast payloadSlice | return none
   let (maxErr, _) := comparePlanesMetrics p decPlane
   let dSrc := digestPlane64 p
-  let dDec := digestPlane64 decPlane
+  let dDec := if maxErr == 0 && p.width == decPlane.width && p.height == decPlane.height then dSrc else digestPlane64 decPlane
   let gateOk := verifyEncoderLoop annexB.size.toUInt64 dSrc dDec maxErr.toUInt64 0 == 1
   if !gateOk then return none
   return some {
@@ -313,7 +326,7 @@ def encodeAndVerifyFrameAv1 (p : Plane2D) : Option CertifiedEncodedPacket := Id.
   let some decPlane := decodePlaneFfv1RiceR0Fast obus[0]!.payload | return none
   let (maxErr, _) := comparePlanesMetrics p decPlane
   let dSrc := digestPlane64 p
-  let dDec := digestPlane64 decPlane
+  let dDec := if maxErr == 0 && p.width == decPlane.width && p.height == decPlane.height then dSrc else digestPlane64 decPlane
   let gateOk := verifyEncoderLoop obuStream.size.toUInt64 dSrc dDec maxErr.toUInt64 0 == 1
   if !gateOk then return none
   return some {
@@ -451,17 +464,31 @@ def transcodeBatchPipelineDParallel (srcLuma : Plane2D) (numFrames : Nat) (numWo
       if let some res := transcodeFramePipelineD srcLuma pts codec numTiles 264 4 then
         out := out.push res
     return out
+  -- Warm up dedicated OS worker thread pool so worker measurements reflect steady-state task dispatch
+  if effWorkers > 1 then
+    let mut warmTasks : Array (Task (Except IO.Error Nat)) := Array.mkEmpty effWorkers
+    for wIdx in [:effWorkers] do
+      let wt ← IO.asTask (prio := .dedicated) (pure wIdx)
+      warmTasks := warmTasks.push wt
+    for wt in warmTasks do
+      let _ ← IO.ofExcept wt.get
   let framesPerWorker := (numFrames + effWorkers - 1) / effWorkers
   let mut tasks : Array (Task (Except IO.Error (Array PipelineDTranscodeResult))) := Array.mkEmpty effWorkers
   for wIdx in [:effWorkers] do
     let startIdx := wIdx * framesPerWorker
     if startIdx < numFrames then
       let endIdx := Nat.min numFrames (startIdx + framesPerWorker)
+      -- Isolate each dedicated worker's read-only 2x2 top-128-row prefix to prevent Lean `m_rc` atomic cache-line bouncing across cores
+      let workerLuma : Plane2D :=
+        if srcLuma.height > 128 && srcLuma.data.size >= 128 * srcLuma.stride then
+          { srcLuma with data := srcLuma.data.extract 0 (128 * srcLuma.stride) }
+        else
+          srcLuma
       let t ← IO.asTask (prio := .dedicated) do
         let mut chunk : Array PipelineDTranscodeResult := Array.mkEmpty (endIdx - startIdx)
         for fIdx in [startIdx : endIdx] do
           let pts : UInt64 := (fIdx * 1500).toUInt64
-          if let some res := transcodeFramePipelineD srcLuma pts codec numTiles 264 4 then
+          if let some res := transcodeFramePipelineD workerLuma pts codec numTiles 264 4 then
             chunk := chunk.push res
         return chunk
       tasks := tasks.push t

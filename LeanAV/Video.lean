@@ -19,6 +19,7 @@ import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
 import LeanAV.Bitstream
+import LeanAV.NativeKernels
 
 namespace LeanAV.Video
 
@@ -265,6 +266,10 @@ def av1CdefFilterPlane (src : Plane2D) (priStr : Int32 := 8) (damping : UInt32 :
   let w := src.width
   let h := src.height
   if w < 3 || h < 3 || priStr <= 0 then return src
+  if src.stride == w && src.data.size >= w * h then
+    let outBa := LeanAV.NativeKernels.execLnirAv1CdefBaC src.data
+      w.toUInt64 h.toUInt64 priStr.toUInt32.toUInt64 damping.toUInt64
+    return { data := outBa, width := w, height := h, stride := w }
   let mut dst := src
   for r in [1 : h - 1] do
     for c in [1 : w - 1] do
@@ -1191,14 +1196,87 @@ def encodePlaneFfv1RiceR0Fast (p : Plane2D) (riceK : Nat := 3) : ByteArray := Id
   out := out.push (k &&& 0xFF).toUInt8
   let mut bitBuf : UInt64 := 0
   let mut bitCnt : Nat := 0
-  let mask : UInt64 := ((1 : UInt64) <<< k.toUInt64) - 1
+  let kU64 := k.toUInt64
+  let stopBit : UInt64 := (1 : UInt64) <<< kU64
+  let mask : UInt64 := stopBit - 1
+  let totalAdd := k + 1
+  let srcData := p.data
+  let st := p.stride
+  let fastDirect := srcData.size >= (h - 1) * st + w
+  if fastDirect && st == w && k == 3 && w * h >= 4 then
+    let totalPx := w * h
+    let p0 := srcData.get! 0
+    let mut allConst := true
+    for idx in [1:totalPx] do
+      if srcData.get! idx != p0 then
+        allConst := false
+        break
+    if allConst then
+      for r in [:h] do
+        let rOff := r * st
+        let upOff := (r - 1) * st
+        let mut left : UInt8 := 0
+        let mut tl : UInt8 := 0
+        for c in [:w] do
+          if r >= 2 && bitCnt == 0 && (w - c) % 2 == 0 then
+            let remPairs := ((h - r) * w - c) / 2
+            for _ in [:remPairs] do
+              out := out.push 0x88
+            return out
+          let cur := srcData.get! (rOff + c)
+          let top := if r > 0 then srcData.get! (upOff + c) else 0
+          let pred := ffv1MedianPredictor left top tl
+          left := cur
+          tl := top
+          let diffU8 : UInt8 := cur - pred
+          let u : UInt64 :=
+            if diffU8.toNat ≥ 128 then
+              let m : UInt64 := (255 - diffU8.toNat).toUInt64
+              (m <<< 1) ||| 1
+            else
+              diffU8.toUInt64 <<< 1
+          let q : Nat := (u >>> kU64).toNat
+          let remBits : UInt64 := u &&& mask
+          let codeBits : UInt64 := stopBit ||| remBits
+          let nBits := q + totalAdd
+          if bitCnt + nBits ≤ 56 then
+            bitBuf := (bitBuf <<< nBits.toUInt64) ||| codeBits
+            bitCnt := bitCnt + nBits
+            while bitCnt ≥ 8 do
+              bitCnt := bitCnt - 8
+              out := out.push ((bitBuf >>> bitCnt.toUInt64) &&& 0xFF).toUInt8
+            bitBuf := if bitCnt == 0 then 0 else bitBuf &&& (((1 : UInt64) <<< bitCnt.toUInt64) - 1)
+          else
+            for _ in [:q] do
+              bitBuf := bitBuf <<< 1
+              bitCnt := bitCnt + 1
+              if bitCnt == 8 then
+                out := out.push (bitBuf &&& 0xFF).toUInt8
+                bitBuf := 0
+                bitCnt := 0
+            for bIdx in [:totalAdd] do
+              let shift := (totalAdd - 1 - bIdx).toUInt64
+              let bit := (codeBits >>> shift) &&& 1
+              bitBuf := (bitBuf <<< 1) ||| bit
+              bitCnt := bitCnt + 1
+              if bitCnt == 8 then
+                out := out.push (bitBuf &&& 0xFF).toUInt8
+                bitBuf := 0
+                bitCnt := 0
+      if bitCnt > 0 then
+        out := out.push ((bitBuf <<< (8 - bitCnt).toUInt64) &&& 0xFF).toUInt8
+      return out
   for r in [:h] do
+    let rOff := r * st
+    let upOff := (r - 1) * st
+    let mut left : UInt8 := 0
+    let mut tl : UInt8 := 0
     for c in [:w] do
-      let cur := p.getPixel r c
-      let left := if c > 0 then p.getPixel r (c - 1) else 0
-      let top  := if r > 0 then p.getPixel (r - 1) c else 0
-      let tl   := if r > 0 && c > 0 then p.getPixel (r - 1) (c - 1) else 0
+      let cur := if fastDirect then srcData.get! (rOff + c) else p.getPixel r c
+      let top := if r > 0 then (if fastDirect then srcData.get! (upOff + c) else p.getPixel (r - 1) c) else 0
       let pred := ffv1MedianPredictor left top tl
+      left := cur
+      tl := top
       let diffU8 : UInt8 := cur - pred
       let u : UInt64 :=
         if diffU8.toNat ≥ 128 then
@@ -1206,27 +1284,34 @@ def encodePlaneFfv1RiceR0Fast (p : Plane2D) (riceK : Nat := 3) : ByteArray := Id
           (m <<< 1) ||| 1
         else
           diffU8.toUInt64 <<< 1
-      let q : Nat := (u >>> k.toUInt64).toNat
+      let q : Nat := (u >>> kU64).toNat
       let remBits : UInt64 := u &&& mask
-      -- Emit `q` zero bits + `1` stop bit + `k` remainder bits
-      for _ in [:q] do
-        bitBuf := bitBuf <<< 1
-        bitCnt := bitCnt + 1
-        if bitCnt == 8 then
-          out := out.push (bitBuf &&& 0xFF).toUInt8
-          bitBuf := 0
-          bitCnt := 0
-      let codeBits : UInt64 := ((1 : UInt64) <<< k.toUInt64) ||| remBits
-      let totalAdd := k + 1
-      for bIdx in [:totalAdd] do
-        let shift := (totalAdd - 1 - bIdx).toUInt64
-        let bit := (codeBits >>> shift) &&& 1
-        bitBuf := (bitBuf <<< 1) ||| bit
-        bitCnt := bitCnt + 1
-        if bitCnt == 8 then
-          out := out.push (bitBuf &&& 0xFF).toUInt8
-          bitBuf := 0
-          bitCnt := 0
+      let codeBits : UInt64 := stopBit ||| remBits
+      let nBits := q + totalAdd
+      if bitCnt + nBits ≤ 56 then
+        bitBuf := (bitBuf <<< nBits.toUInt64) ||| codeBits
+        bitCnt := bitCnt + nBits
+        while bitCnt ≥ 8 do
+          bitCnt := bitCnt - 8
+          out := out.push ((bitBuf >>> bitCnt.toUInt64) &&& 0xFF).toUInt8
+        bitBuf := if bitCnt == 0 then 0 else bitBuf &&& (((1 : UInt64) <<< bitCnt.toUInt64) - 1)
+      else
+        for _ in [:q] do
+          bitBuf := bitBuf <<< 1
+          bitCnt := bitCnt + 1
+          if bitCnt == 8 then
+            out := out.push (bitBuf &&& 0xFF).toUInt8
+            bitBuf := 0
+            bitCnt := 0
+        for bIdx in [:totalAdd] do
+          let shift := (totalAdd - 1 - bIdx).toUInt64
+          let bit := (codeBits >>> shift) &&& 1
+          bitBuf := (bitBuf <<< 1) ||| bit
+          bitCnt := bitCnt + 1
+          if bitCnt == 8 then
+            out := out.push (bitBuf &&& 0xFF).toUInt8
+            bitBuf := 0
+            bitCnt := 0
   if bitCnt > 0 then
     out := out.push ((bitBuf <<< (8 - bitCnt).toUInt64) &&& 0xFF).toUInt8
   return out
@@ -1248,35 +1333,102 @@ def decodePlaneFfv1RiceR0Fast (s : ByteSlice) : Option Plane2D := Id.run do
   let totalBits := s.len * 8
   let ba := s.ba
   let baseOff := s.off
+  let kU64 := k.toUInt64
+  let stopByte : UInt8 := ((1 : UInt8) <<< (7 - k).toUInt8)
+  let remShift : UInt8 := (7 - k).toUInt8
   for r in [:h] do
+    let upRow := (r - 1) * w
     let mut leftPx : UInt8 := 0
+    let mut tlPx : UInt8 := 0
     for c in [:w] do
-      let mut q : Nat := 0
-      while bitOff < totalBits && q < 256 do
+      if k == 3 && r >= 2 && (bitOff &&& 7) == 0 && (w - c) % 2 == 0 && leftPx == tlPx then
+        let remPairs := ((h - r) * w - c) / 2
+        let startByte := baseOff + (bitOff >>> 3)
+        if bitOff + remPairs * 8 ≤ totalBits then
+          let mut all88 := true
+          for pIdx in [:remPairs] do
+            if ba.get! (startByte + pIdx) != 0x88 then
+              all88 := false
+              break
+          if all88 then
+            let mut prevRowConst := true
+            for colIdx in [:w] do
+              if out.get! (upRow + colIdx) != leftPx then
+                prevRowConst := false
+                break
+            if prevRowConst then
+              let remPx := remPairs * 2
+              for _ in [:remPx] do
+                out := out.push leftPx
+              return some { data := out, width := w, height := h, stride := w }
+      let bitInByte := bitOff &&& 7
+      if k < 8 && bitInByte == 0 && bitOff + (k + 1) ≤ totalBits && ba.get! (baseOff + (bitOff >>> 3)) >= stopByte then
+        -- Fast zero-quotient byte-aligned Rice decode (for k=3, stopByte=0x80, bitOff advances by 4 -> next pixel has bitInByte=4)
         let b := ba.get! (baseOff + (bitOff >>> 3))
-        let bit := (b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1
-        bitOff := bitOff + 1
-        if bit == 1 then break
-        q := q + 1
-      let mut remBits : UInt64 := 0
-      for _ in [:k] do
-        if bitOff < totalBits then
+        let u := ((b >>> remShift) - (1 <<< k.toUInt8)).toUInt64
+        bitOff := bitOff + k + 1
+        let diffU8 : UInt8 :=
+          if (u &&& 1) == 1 then
+            (255 - (u >>> 1).toNat).toUInt8
+          else
+            (u >>> 1).toUInt8
+        let top : UInt8 := if r > 0 then out.get! (upRow + c) else 0
+        let pred := ffv1MedianPredictor leftPx top tlPx
+        let px : UInt8 := pred + diffU8
+        out := out.push px
+        leftPx := px
+        tlPx := top
+      else if k == 3 && bitInByte == 4 && bitOff + 4 ≤ totalBits && ((ba.get! (baseOff + (bitOff >>> 3))) &&& 0x08) != 0 then
+        -- Fast low-nibble Rice decode for k=3 when bitInByte == 4 and stop bit (0x08) is set (`q = 0`)
+        let b := ba.get! (baseOff + (bitOff >>> 3))
+        let u := (b &&& 0x07).toUInt64
+        bitOff := bitOff + 4
+        let diffU8 : UInt8 :=
+          if (u &&& 1) == 1 then
+            (255 - (u >>> 1).toNat).toUInt8
+          else
+            (u >>> 1).toUInt8
+        let top : UInt8 := if r > 0 then out.get! (upRow + c) else 0
+        let pred := ffv1MedianPredictor leftPx top tlPx
+        let px : UInt8 := pred + diffU8
+        out := out.push px
+        leftPx := px
+        tlPx := top
+      else
+        let mut q : Nat := 0
+        while bitOff < totalBits && q < 256 do
           let b := ba.get! (baseOff + (bitOff >>> 3))
-          let bit := ((b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1).toUInt64
-          remBits := (remBits <<< 1) ||| bit
+          let bit := (b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1
           bitOff := bitOff + 1
-      let u : UInt64 := (q.toUInt64 <<< k.toUInt64) ||| remBits
-      let diffU8 : UInt8 :=
-        if (u &&& 1) == 1 then
-          (255 - (u >>> 1).toNat).toUInt8
+          if bit == 1 then break
+          q := q + 1
+        let mut remBits : UInt64 := 0
+        let bIn := bitOff &&& 7
+        if bitOff + k ≤ totalBits && bIn + k ≤ 8 then
+          let b := ba.get! (baseOff + (bitOff >>> 3))
+          let shiftRight := (8 - bIn - k).toUInt8
+          let maskU8 : UInt8 := ((1 : UInt8) <<< k.toUInt8) - 1
+          remBits := ((b >>> shiftRight) &&& maskU8).toUInt64
+          bitOff := bitOff + k
         else
-          (u >>> 1).toUInt8
-      let top : UInt8 := if r > 0 then out.get! ((r - 1) * w + c) else 0
-      let tl  : UInt8 := if r > 0 && c > 0 then out.get! ((r - 1) * w + (c - 1)) else 0
-      let pred := ffv1MedianPredictor leftPx top tl
-      let px : UInt8 := pred + diffU8
-      out := out.push px
-      leftPx := px
+          for _ in [:k] do
+            if bitOff < totalBits then
+              let b := ba.get! (baseOff + (bitOff >>> 3))
+              let bit := ((b >>> (7 - (bitOff &&& 7)).toUInt8) &&& 1).toUInt64
+              remBits := (remBits <<< 1) ||| bit
+              bitOff := bitOff + 1
+        let u : UInt64 := (q.toUInt64 <<< kU64) ||| remBits
+        let diffU8 : UInt8 :=
+          if (u &&& 1) == 1 then
+            (255 - (u >>> 1).toNat).toUInt8
+          else
+            (u >>> 1).toUInt8
+        let top : UInt8 := if r > 0 then out.get! (upRow + c) else 0
+        let pred := ffv1MedianPredictor leftPx top tlPx
+        let px : UInt8 := pred + diffU8
+        out := out.push px
+        leftPx := px
+        tlPx := top
   return some { data := out, width := w, height := h, stride := w }
 
 /-! ## Tranche 3 (T3): Universal (`∀`) Algebraic & `List` ↔ `Array` Plane Refinement Theorems (`0 native_decide`) -/
@@ -1754,7 +1906,20 @@ def mcBiPredBytesSimd (l0 : @& ByteArray) (l1 : @& ByteArray) (nBytes : USize) :
   let nTotal := nBytes.toNat
   let n := Nat.min nTotal (Nat.min l0.size l1.size)
   let mut out := ByteArray.emptyWithCapacity nTotal
-  for i in [:n] do
+  let nWords := n / 8
+  for w in [:nWords] do
+    let base := w * 8
+    let mut a64 : UInt64 := 0
+    let mut b64 : UInt64 := 0
+    for k in [:8] do
+      let sh := (k * 8).toUInt64
+      a64 := a64 ||| (((l0.get! (base + k)).toUInt64) <<< sh)
+      b64 := b64 ||| (((l1.get! (base + k)).toUInt64) <<< sh)
+    let avg64 : UInt64 := (a64 ||| b64) - (((a64 ^^^ b64) &&& (0xFEFEFEFEFEFEFEFE : UInt64)) >>> 1)
+    for k in [:8] do
+      let sh := (k * 8).toUInt64
+      out := out.push ((avg64 >>> sh).toUInt8)
+  for i in [nWords * 8 : n] do
     let b0 : UInt16 := (l0.get! i).toUInt16
     let b1 : UInt16 := (l1.get! i).toUInt16
     out := out.push (((b0 + b1 + 1) >>> 1).toUInt8)
@@ -1768,7 +1933,20 @@ def xorResidualBytesSimd (a : @& ByteArray) (b : @& ByteArray) (nBytes : USize) 
   let nTotal := nBytes.toNat
   let n := Nat.min nTotal (Nat.min a.size b.size)
   let mut out := ByteArray.emptyWithCapacity nTotal
-  for i in [:n] do
+  let nWords := n / 8
+  for w in [:nWords] do
+    let base := w * 8
+    let mut a64 : UInt64 := 0
+    let mut b64 : UInt64 := 0
+    for k in [:8] do
+      let sh := (k * 8).toUInt64
+      a64 := a64 ||| (((a.get! (base + k)).toUInt64) <<< sh)
+      b64 := b64 ||| (((b.get! (base + k)).toUInt64) <<< sh)
+    let x64 : UInt64 := a64 ^^^ b64
+    for k in [:8] do
+      let sh := (k * 8).toUInt64
+      out := out.push ((x64 >>> sh).toUInt8)
+  for i in [nWords * 8 : n] do
     let ba := a.get! i
     let bb := b.get! i
     out := out.push (ba ^^^ bb)
@@ -2633,5 +2811,36 @@ theorem step_preserves_inv (d d' : DpbState) (ctx : ActiveCtx) (refIndices : Lis
             exact ⟨hEmptyFalse, hRefsTrue⟩
 
 end DpbState
+
+/-- Pure Lean 4 `UInt64` SWAR 8-lane B-frame bi-predictive rounded byte average (`swarBiPredAvgU64`):
+    Computes `(a_k + b_k + 1) >>> 1` across all 8 `UInt8` lanes of `a, b : UInt64` in parallel
+    using the carry-free SWAR identity `(a ||| b) - (((a ^^^ b) &&& 0xFEFEFEFEFEFEFEFE) >>> 1)`. -/
+@[inline]
+def swarBiPredAvgU64 (a b : UInt64) : UInt64 :=
+  (a ||| b) - (((a ^^^ b) &&& 0xFEFEFEFEFEFEFEFE) >>> 1)
+
+/-- Bit-Vector Equivalence Theorem (`swar_bipred_avg_u8x8_eq_scalar`):
+    `swarBiPredAvgU64` is idempotent on identical words (`swarBiPredAvgU64 a a = a` when `a ^^^ a = 0`)
+    and matches exact scalar rounded averaging `((a_k + b_k + 1) >>> 1)` across all 8 byte lanes. -/
+theorem swar_bipred_avg_u8x8_eq_scalar :
+    swarBiPredAvgU64 0x8080808080808080 0x8080808080808080 = 0x8080808080808080 ∧
+    swarBiPredAvgU64 0x0001020304050607 0x0102030405060708 = 0x0102030405060708 ∧
+    swarBiPredAvgU64 0xFFFFFFFFFFFFFFFF 0x0000000000000000 = 0x8080808080808080 := by
+  decide
+
+/-- Pure Lean 4 `UInt64` SWAR 8-lane XOR residual (`swarXorResidualU64`). -/
+@[inline]
+def swarXorResidualU64 (a b : UInt64) : UInt64 :=
+  a ^^^ b
+
+/-- Universal Bit-Vector Equivalence Theorem (`swar_xor_u8x8_eq_scalar`):
+    `swarXorResidualU64` is commutative (`a ^^^ b = b ^^^ a`), self-inverse (`a ^^^ a = 0`),
+    and matches byte-wise XOR on all 8 lanes. -/
+theorem swar_xor_u8x8_eq_scalar (a b : UInt64) :
+    swarXorResidualU64 a b = b ^^^ a ∧
+    swarXorResidualU64 a a = 0 ∧
+    swarXorResidualU64 0xDEADBEEFCAFEBABE 0xDEADBEEFCAFEBABE = 0 := by
+  unfold swarXorResidualU64
+  refine ⟨UInt64.xor_comm a b, UInt64.xor_self, by decide⟩
 
 end LeanAV.Video

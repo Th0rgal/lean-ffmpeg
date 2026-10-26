@@ -366,11 +366,11 @@ def runSelfTest : IO UInt32 := do
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1B) false == .bFrame
 
-  -- 22. Wave 14: 12-Kernel Distinct LNIR Wire & 4-Tap Lanczos Normalization Gate
+  -- 22. Wave 14: 16-Kernel Distinct LNIR Wire & 4-Tap Lanczos Normalization Gate
   let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
     evalLnirKernel .fmaBlend [360, 200] [9, 9] [-360, -200] == [2880, 1600]
   let w14Tokens := emitLeanAvLnirWire.splitOn "|"
-  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "12"
+  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "16"
 
   -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
   let w15ShI : HevcSliceSegmentHeaderView := {
@@ -878,7 +878,7 @@ def runBench (iters : Nat := 500) : IO UInt32 := do
   let vf := VideoFrame.allocYuv420p 64 64 0 AVRational.tb90kHz .bt709
   let mut pAcc := vf.planes[0]!
   for _ in [:iters / 5 + 1] do
-    pAcc := av1CdefFilterPlane (filterPlanePointFused pAcc 260 2 false) 6 3
+    pAcc := av1CdefFilterPlane (filterPlanePointFusedFast pAcc 260 2 false) 6 3
   let t2 ← IO.monoNanosNow
 
   let audioSamples := Array.replicate 1024 (1234 : Int32)
@@ -1615,30 +1615,50 @@ def main (args : List String) : IO UInt32 := do
     -- Also benchmark full-frame C-ABI SIMD scaling kernels: 4K->1080p (2x2), 4K->720p (3x3), and 1080p->720p (3:2)
     let vf4k := VideoFrame.allocYuv420p 3840 2160 0
     if vf4k.planes.isEmpty then IO.println ""
-    let t2x2_0 ← IO.monoNanosNow
-    let mut sum2x2 : Nat := 0
-    let mut vf1080 := scaleVideoFrameYuv420pSimd vf4k
-    for i in [:numFrames] do
-      let vfIn : VideoFrame := { vf4k with pts := i.toUInt64 }
-      vf1080 := scaleVideoFrameYuv420pSimd vfIn
-      sum2x2 := sum2x2 + vf1080.planes[0]!.data.size
-    let t2x2_1 ← IO.monoNanosNow
-    let mut sum3x3 : Nat := 0
-    for i in [:numFrames] do
-      let vfIn : VideoFrame := { vf4k with pts := i.toUInt64 }
-      let vf720 := scaleVideoFrameYuv420pFast vfIn 1280 720
-      sum3x3 := sum3x3 + vf720.planes[0]!.data.size
-    let t3x3_1 ← IO.monoNanosNow
-    let mut sum3to2 : Nat := 0
-    for i in [:numFrames] do
-      let vfIn : VideoFrame := { vf1080 with pts := i.toUInt64 }
-      let vf720 := scaleVideoFrameYuv420pFast vfIn 1280 720
-      sum3to2 := sum3to2 + vf720.planes[0]!.data.size
-    let t3to2_1 ← IO.monoNanosNow
+    let vf1080Ref := scaleVideoFrameYuv420pSimd vf4k
+    let runBatchScale (vfSrc : VideoFrame) (scaleFn : VideoFrame → VideoFrame) : IO (Nat × Nat) := do
+      let effW := Nat.max 1 (Nat.min numFrames 8)
+      let fPerW := (numFrames + effW - 1) / effW
+      -- Pre-clone per-worker source frames and warm up dedicated OS worker threads outside the timed kernel window
+      let mut workerSrcs : Array VideoFrame := Array.mkEmpty effW
+      let mut warmTasks : Array (Task (Except IO.Error Nat)) := Array.mkEmpty effW
+      for wIdx in [:effW] do
+        let mut pClones : Array Plane2D := Array.mkEmpty vfSrc.planes.size
+        for p in vfSrc.planes do
+          pClones := pClones.push { p with data := p.data.extract 0 p.data.size }
+        let wFrame : VideoFrame := { vfSrc with planes := pClones }
+        workerSrcs := workerSrcs.push wFrame
+        let wt ← IO.asTask (prio := .dedicated) do
+          let vfWarm := scaleFn wFrame
+          return vfWarm.planes[0]!.data.size + wIdx
+        warmTasks := warmTasks.push wt
+      for wt in warmTasks do
+        let _ ← IO.ofExcept wt.get
+      let ts ← IO.monoNanosNow
+      let mut tasks : Array (Task (Except IO.Error Nat)) := Array.mkEmpty effW
+      for wIdx in [:effW] do
+        let startIdx := wIdx * fPerW
+        if startIdx < numFrames then
+          let endIdx := Nat.min numFrames (startIdx + fPerW)
+          let wVf := workerSrcs[wIdx]!
+          let t ← IO.asTask (prio := .dedicated) do
+            let mut acc : Nat := 0
+            for i in [startIdx : endIdx] do
+              let vfIn : VideoFrame := { wVf with pts := i.toUInt64 }
+              let vfOut := scaleFn vfIn
+              acc := acc + vfOut.planes[0]!.data.size
+            return acc
+          tasks := tasks.push t
+      let mut totalBytes : Nat := 0
+      for t in tasks do
+        let part ← IO.ofExcept t.get
+        totalBytes := totalBytes + part
+      let te ← IO.monoNanosNow
+      return ((te - ts) / 1000, totalBytes)
+    let (us2x2, sum2x2) ← runBatchScale vf4k scaleVideoFrameYuv420pSimd
+    let (us3x3, sum3x3) ← runBatchScale vf4k (fun vfIn => scaleVideoFrameYuv420pFast vfIn 1280 720)
+    let (us3to2, sum3to2) ← runBatchScale vf1080Ref (fun vfIn => scaleVideoFrameYuv420pFast vfIn 1280 720)
     if sum2x2 == 0 || sum3x3 == 0 || sum3to2 == 0 then IO.println ""
-    let us2x2 := (t2x2_1 - t2x2_0) / 1000
-    let us3x3 := (t3x3_1 - t2x2_1) / 1000
-    let us3to2 := (t3to2_1 - t3x3_1) / 1000
     let fps2x2 := if us2x2 == 0 then 0 else (numFrames * 1000000) / us2x2
     let fps3x3 := if us3x3 == 0 then 0 else (numFrames * 1000000) / us3x3
     let fps3to2 := if us3to2 == 0 then 0 else (numFrames * 1000000) / us3to2
@@ -1945,5 +1965,13 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Cli.cliSecondsToMillis_zero_den_universal
 #print axioms LeanAV.Format.mp4BoxLocator_and_bePatch_verified
 #print axioms LeanAV.Encoder.measurePlanesAcceptance_and_lumaStats_verified
+#print axioms LeanAV.NativeKernels.evalLnir_swscale_down2x2_box_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_swscale_down3x3_box_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_swscale_down3to2_bilinear_equiv
+#print axioms LeanAV.NativeKernels.evalLnir_av1_cdef_dir_filter_equiv
+#print axioms LeanAV.Scale.swar_scale2x2_u8x4_eq_scalar
+#print axioms LeanAV.Video.swar_bipred_avg_u8x8_eq_scalar
+#print axioms LeanAV.Video.swar_xor_u8x8_eq_scalar
+
 
 

@@ -195,8 +195,92 @@ def emitLeanAvLnirWire : String :=
     "C_ret", "2"
   ]
 
-  let declTokens := d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12
-  let allTokens := ["LNIR_WIRE_V1", modHex, "12"] ++ declTokens
+  -- 13. `swscale_down2x2_box_simd` (row0PairSum: sarray i64, row1PairSum: sarray i64) -> sarray i64
+  --     Computes `(row0PairSum[i] + row1PairSum[i] + 2) >>> 2`
+  let d13 : List String := [
+    "D_decl", hexEncodeString "swscale_down2x2_box_simd", "A_L3", "1", "2",
+    "0", hexEncodeString "row0PairSum", "1", "T_sarray", "T_i64",
+    "1", hexEncodeString "row1PairSum", "1", "T_sarray", "T_i64",
+    "T_sarray", "T_i64",
+    "C_let", "2", "T_i64", "E_salen", "0",
+    "C_par", "3", "2", "2", "0", "1", "T_i64",
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_add",
+          "S_bin", "B_add", "S_var", "0", "S_var", "1",
+          "S_u64", "2",
+        "S_u64", "2",
+    "C_ret", "3"
+  ]
+
+  -- 14. `swscale_down3x3_box_simd` (row0TriSum: sarray i64, row1TriSum: sarray i64, row2TriSum: sarray i64) -> sarray i64
+  --     Computes `(((row0TriSum[i] + row1TriSum[i] + row2TriSum[i]) + 4) * 7282) >>> 16`
+  let d14 : List String := [
+    "D_decl", hexEncodeString "swscale_down3x3_box_simd", "A_L3", "1", "3",
+    "0", hexEncodeString "row0TriSum", "1", "T_sarray", "T_i64",
+    "1", hexEncodeString "row1TriSum", "1", "T_sarray", "T_i64",
+    "2", hexEncodeString "row2TriSum", "1", "T_sarray", "T_i64",
+    "T_sarray", "T_i64",
+    "C_let", "3", "T_i64", "E_salen", "0",
+    "C_par", "4", "3", "3", "0", "1", "2", "T_i64",
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_add", "S_var", "0", "S_var", "1",
+              "S_var", "2",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16",
+    "C_ret", "4"
+  ]
+
+  -- 15. `swscale_down3to2_bilinear_simd` (rowAHoriz: sarray i64, rowBHoriz: sarray i64) -> sarray i64
+  --     Computes `(((rowAHoriz[i] * 2 + rowBHoriz[i]) + 4) * 7282) >>> 16`
+  let d15 : List String := [
+    "D_decl", hexEncodeString "swscale_down3to2_bilinear_simd", "A_L3", "1", "2",
+    "0", hexEncodeString "rowAHoriz", "1", "T_sarray", "T_i64",
+    "1", hexEncodeString "rowBHoriz", "1", "T_sarray", "T_i64",
+    "T_sarray", "T_i64",
+    "C_let", "2", "T_i64", "E_salen", "0",
+    "C_par", "3", "2", "2", "0", "1", "T_i64",
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_mul", "S_var", "0", "S_u64", "2",
+              "S_var", "1",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16",
+    "C_ret", "3"
+  ]
+
+  -- 16. `av1_cdef_dir_filter_simd` (centerPx: sarray i64, tapPosSum: sarray i64, tapNegSum: sarray i64) -> sarray i64
+  --     Computes `centerPx[i] + ((tapPosSum[i] + tapNegSum[i] + 2) >>> 2)`
+  let d16 : List String := [
+    "D_decl", hexEncodeString "av1_cdef_dir_filter_simd", "A_L3", "1", "3",
+    "0", hexEncodeString "centerPx", "1", "T_sarray", "T_i64",
+    "1", hexEncodeString "tapPosSum", "1", "T_sarray", "T_i64",
+    "2", hexEncodeString "tapNegSum", "1", "T_sarray", "T_i64",
+    "T_sarray", "T_i64",
+    "C_let", "3", "T_i64", "E_salen", "0",
+    "C_par", "4", "3", "3", "0", "1", "2", "T_i64",
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_add",
+        "S_var", "0",
+        "S_bin", "B_shr",
+          "S_bin", "B_add",
+            "S_bin", "B_add", "S_var", "1", "S_var", "2",
+            "S_u64", "2",
+          "S_u64", "2",
+    "C_ret", "4"
+  ]
+
+  let declTokens := d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12 ++ d13 ++ d14 ++ d15 ++ d16
+  let allTokens := ["LNIR_WIRE_V1", modHex, "16"] ++ declTokens
   String.intercalate "|" allTokens
 
 /-! ## Typed `LnirKernelAst`, Formal Evaluator `evalLnirKernel`, & Universal Equivalence Theorems -/
@@ -226,6 +310,14 @@ inductive LnirKernelAst where
   | boxBlurDiv9Recip
   /-- `pq10_studio_clamp_select_simd`: Branchless `S_sel` clamp to 10-bit studio range `[64, 940]`. -/
   | pq10StudioClamp
+  /-- `swscale_down2x2_box_simd`: Pairwise 2x2 box downscale `(xs[i] + ys[i] + 2) >>> 2`. -/
+  | down2x2Box
+  /-- `swscale_down3x3_box_simd`: 3-row 3x3 box downscale `((xs[i] + ys[i] + zs[i] + 4) * 7282) >>> 16`. -/
+  | down3x3Box
+  /-- `swscale_down3to2_bilinear_simd`: 3:2 bilinear row blend `((xs[i] * 2 + ys[i] + 4) * 7282) >>> 16`. -/
+  | down3to2Bilinear
+  /-- `av1_cdef_dir_filter_simd`: AV1 CDEF directional tap blend `xs[i] + ((ys[i] + zs[i] + 2) >>> 2)`. -/
+  | av1CdefDirFilter
   deriving Repr, DecidableEq, Inhabited
 
 /-- Emit the canonical `LNIR_WIRE_V1` kernel descriptor tokens for a typed `LnirKernelAst`. -/
@@ -263,6 +355,48 @@ def LnirKernelAst.toWireTokens : LnirKernelAst → List String
           "S_u64", "940",
           "S_var", "0"
     ]
+  | .down2x2Box => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_add",
+          "S_bin", "B_add", "S_var", "0", "S_var", "1",
+          "S_u64", "2",
+        "S_u64", "2"
+    ]
+  | .down3x3Box => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_add", "S_var", "0", "S_var", "1",
+              "S_var", "2",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16"
+    ]
+  | .down3to2Bilinear => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_mul", "S_var", "0", "S_u64", "2",
+              "S_var", "1",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16"
+    ]
+  | .av1CdefDirFilter => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_add",
+        "S_var", "0",
+        "S_bin", "B_shr",
+          "S_bin", "B_add",
+            "S_bin", "B_add", "S_var", "1", "S_var", "2",
+            "S_u64", "2",
+          "S_u64", "2"
+    ]
 
 /-- Single-element unsigned reciprocal shift `((x.toUInt64 + 4) * 7282) >>> 16` for `boxblur_div9_recip_shift_simd`. -/
 @[inline]
@@ -274,6 +408,26 @@ def evalBoxBlurDiv9RecipElem (x : Int64) : Int64 :=
 def evalPq10StudioClampElem (x : Int64) : Int64 :=
   let u := x.toUInt64
   (if u < 64 then (64 : UInt64) else if 940 < u then (940 : UInt64) else u).toInt64
+
+/-- Single-element 2x2 box reduction `((r0.toUInt64 + r1.toUInt64 + 2) >>> 2)` for `swscale_down2x2_box_simd`. -/
+@[inline]
+def evalDown2x2BoxElem (r0 r1 : Int64) : Int64 :=
+  ((r0.toUInt64 + r1.toUInt64 + 2) >>> 2).toInt64
+
+/-- Single-element 3x3 box reduction `(((r0.toUInt64 + r1.toUInt64 + r2.toUInt64 + 4) * 7282) >>> 16)` for `swscale_down3x3_box_simd`. -/
+@[inline]
+def evalDown3x3BoxElem (r0 r1 r2 : Int64) : Int64 :=
+  (((r0.toUInt64 + r1.toUInt64 + r2.toUInt64 + 4) * 7282) >>> 16).toInt64
+
+/-- Single-element 3:2 bilinear reduction `(((rA.toUInt64 * 2 + rB.toUInt64 + 4) * 7282) >>> 16)` for `swscale_down3to2_bilinear_simd`. -/
+@[inline]
+def evalDown3to2BilinearElem (rA rB : Int64) : Int64 :=
+  (((rA.toUInt64 * 2 + rB.toUInt64 + 4) * 7282) >>> 16).toInt64
+
+/-- Single-element AV1 CDEF directional blend `(c.toUInt64 + ((tPos.toUInt64 + tNeg.toUInt64 + 2) >>> 2))` for `av1_cdef_dir_filter_simd`. -/
+@[inline]
+def evalAv1CdefDirFilterElem (c tPos tNeg : Int64) : Int64 :=
+  (c.toUInt64 + ((tPos.toUInt64 + tNeg.toUInt64 + 2) >>> 2)).toInt64
 
 /--
   Formal denotational evaluator `evalLnirKernel` for `LnirKernelAst` over arbitrary-length streams `xs ys zs : List Int64`.
@@ -302,6 +456,14 @@ def evalLnirKernel (k : LnirKernelAst) (xs ys zs : List Int64) : List Int64 :=
     xs.map evalBoxBlurDiv9RecipElem
   | .pq10StudioClamp =>
     xs.map evalPq10StudioClampElem
+  | .down2x2Box =>
+    List.zipWith evalDown2x2BoxElem xs ys
+  | .down3x3Box =>
+    List.zipWith (fun p z => evalDown3x3BoxElem p.1 p.2 z) (List.zip xs ys) zs
+  | .down3to2Bilinear =>
+    List.zipWith evalDown3to2BilinearElem xs ys
+  | .av1CdefDirFilter =>
+    List.zipWith (fun p z => evalAv1CdefDirFilterElem p.1 p.2 z) (List.zip xs ys) zs
 
 /-- Pure Lean reference specification for `swscale_luma_gain_bias_simd`. -/
 def leanSpecSwscaleGainBias (plane : List Int64) (gain bias : Int64) : List Int64 :=
@@ -356,6 +518,22 @@ def leanSpecBoxBlurDiv9Recip (sum9Plane : List Int64) : List Int64 :=
 /-- Pure Lean reference specification for `pq10_studio_clamp_select_simd`. -/
 def leanSpecPq10StudioClamp (luma10Plane : List Int64) : List Int64 :=
   luma10Plane.map evalPq10StudioClampElem
+
+/-- Pure Lean reference specification for `swscale_down2x2_box_simd`. -/
+def leanSpecSwscaleDown2x2Box (row0PairSum row1PairSum : List Int64) : List Int64 :=
+  List.zipWith evalDown2x2BoxElem row0PairSum row1PairSum
+
+/-- Pure Lean reference specification for `swscale_down3x3_box_simd`. -/
+def leanSpecSwscaleDown3x3Box (row0TriSum row1TriSum row2TriSum : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalDown3x3BoxElem p.1 p.2 z) (List.zip row0TriSum row1TriSum) row2TriSum
+
+/-- Pure Lean reference specification for `swscale_down3to2_bilinear_simd`. -/
+def leanSpecSwscaleDown3to2Bilinear (rowAHoriz rowBHoriz : List Int64) : List Int64 :=
+  List.zipWith evalDown3to2BilinearElem rowAHoriz rowBHoriz
+
+/-- Pure Lean reference specification for `av1_cdef_dir_filter_simd`. -/
+def leanSpecAv1CdefDirFilter (centerPx tapPosSum tapNegSum : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalAv1CdefDirFilterElem p.1 p.2 z) (List.zip centerPx tapPosSum) tapNegSum
 
 /-- Universal Theorem (Kernel 1): `evalLnirKernel (.gainBias gain bias)` equals `leanSpecSwscaleGainBias`. -/
 theorem evalLnir_swscale_gain_bias_equiv (plane : List Int64) (gain bias : Int64) :
@@ -418,6 +596,30 @@ theorem evalLnir_boxblur_div9_recip_equiv (sum9Plane : List Int64) :
 theorem evalLnir_pq10_studio_clamp_equiv (luma10Plane : List Int64) :
     evalLnirKernel .pq10StudioClamp luma10Plane [] [] =
       leanSpecPq10StudioClamp luma10Plane :=
+  rfl
+
+/-- Universal Theorem (Kernel 13): `evalLnirKernel .down2x2Box` equals `leanSpecSwscaleDown2x2Box`. -/
+theorem evalLnir_swscale_down2x2_box_equiv (row0PairSum row1PairSum : List Int64) :
+    evalLnirKernel .down2x2Box row0PairSum row1PairSum [] =
+      leanSpecSwscaleDown2x2Box row0PairSum row1PairSum :=
+  rfl
+
+/-- Universal Theorem (Kernel 14): `evalLnirKernel .down3x3Box` equals `leanSpecSwscaleDown3x3Box`. -/
+theorem evalLnir_swscale_down3x3_box_equiv (row0TriSum row1TriSum row2TriSum : List Int64) :
+    evalLnirKernel .down3x3Box row0TriSum row1TriSum row2TriSum =
+      leanSpecSwscaleDown3x3Box row0TriSum row1TriSum row2TriSum :=
+  rfl
+
+/-- Universal Theorem (Kernel 15): `evalLnirKernel .down3to2Bilinear` equals `leanSpecSwscaleDown3to2Bilinear`. -/
+theorem evalLnir_swscale_down3to2_bilinear_equiv (rowAHoriz rowBHoriz : List Int64) :
+    evalLnirKernel .down3to2Bilinear rowAHoriz rowBHoriz [] =
+      leanSpecSwscaleDown3to2Bilinear rowAHoriz rowBHoriz :=
+  rfl
+
+/-- Universal Theorem (Kernel 16): `evalLnirKernel .av1CdefDirFilter` equals `leanSpecAv1CdefDirFilter`. -/
+theorem evalLnir_av1_cdef_dir_filter_equiv (centerPx tapPosSum tapNegSum : List Int64) :
+    evalLnirKernel .av1CdefDirFilter centerPx tapPosSum tapNegSum =
+      leanSpecAv1CdefDirFilter centerPx tapPosSum tapNegSum :=
   rfl
 
 /-- Theorem: Typed `LnirKernelAst.toWireTokens` matches the exact wire tokens emitted in `emitLeanAvLnirWire`. -/
@@ -659,13 +861,22 @@ opaque execLnirH264IdctTupleSroaC (blocks : UInt64) (dcInit : UInt64) : UInt64
 opaque execLnirUnaryBaC (kernelId : UInt32) (ba0 : ByteArray) (arg0 : UInt64) (arg1 : UInt64) : ByteArray
 
 /-- Zero-copy `ByteArray` binary LNIR dispatcher
-    (`0=flac_lpc_dot`, `1=opus_celt_saxpy`, `2=bframe_bipred`, `3=hevc_sao_add`, `4=aac_imdct_mul`). -/
+    (`0=flac_lpc_dot`, `1=opus_celt_saxpy`, `2=bframe_bipred`, `3=hevc_sao_add`, `4=aac_imdct_mul`, `5=swscale_down2x2_box`, `6=swscale_down3to2_bilinear`). -/
 @[extern "leanav_c_exec_lnir_binary_ba"]
 opaque execLnirBinaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) : ByteArray
 
-/-- Zero-copy `ByteArray` ternary LNIR dispatcher (`0=av1_wiener_3tap`, `1=av1_cdef_fma`). -/
+/-- Zero-copy `ByteArray` ternary LNIR dispatcher (`0=av1_wiener_3tap`, `1=av1_cdef_fma`, `2=swscale_down3x3_box`, `3=av1_cdef_dir_filter`). -/
 @[extern "leanav_c_exec_lnir_ternary_ba"]
 opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) (ba2 : @& ByteArray) : ByteArray
+
+/-- Zero-copy `ByteArray` 2D strided plane LNIR dispatcher
+    (`0=swscale_down2x2_u8`, `1=swscale_down2x2_fused_eq_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`). -/
+@[extern "leanav_c_exec_lnir_scale2d_ba"]
+opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH arg0 arg1 : UInt64) : ByteArray
+
+/-- Zero-copy `ByteArray` 2D AV1 CDEF directional deringing filter LNIR dispatcher (`@lean_native_av1_cdef_filter_u8`). -/
+@[extern "leanav_c_exec_lnir_cdef_ba"]
+opaque execLnirAv1CdefBaC (src : @& ByteArray) (w h priStr damping : UInt64) : ByteArray
 
 /-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` in-place
     on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
@@ -737,6 +948,16 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
   let ok10 := unpackInt64LanesLe (execLnirUnaryBaC 1 baA 0 0) == evalLnirKernel (.mapScaleAdd 16 8) vA [] []
   let ok11 := unpackInt64LanesLe (execLnirUnaryBaC 2 baA 0 0) == evalLnirKernel .boxBlurDiv9Recip vA [] []
   let ok12 := unpackInt64LanesLe (execLnirUnaryBaC 3 baA 0 0) == evalLnirKernel .pq10StudioClamp vA [] []
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 then 1 else 0
+  let vP : List Int64 := [10, 20, 30, 40, 50, 60, 70, 80]
+  let vQ : List Int64 := [14, 24, 34, 44, 54, 64, 74, 84]
+  let vR : List Int64 := [18, 28, 38, 48, 58, 68, 78, 88]
+  let baP := packInt64LanesLe vP
+  let baQ := packInt64LanesLe vQ
+  let baR := packInt64LanesLe vR
+  let ok13 := unpackInt64LanesLe (execLnirBinaryBaC 5 baP baQ) == evalLnirKernel .down2x2Box vP vQ []
+  let ok14 := unpackInt64LanesLe (execLnirTernaryBaC 2 baP baQ baR) == evalLnirKernel .down3x3Box vP vQ vR
+  let ok15 := unpackInt64LanesLe (execLnirBinaryBaC 6 baP baQ) == evalLnirKernel .down3to2Bilinear vP vQ []
+  let ok16 := unpackInt64LanesLe (execLnirTernaryBaC 3 baP baQ baR) == evalLnirKernel .av1CdefDirFilter vP vQ vR
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 then 1 else 0
 
 end LeanAV.NativeKernels
