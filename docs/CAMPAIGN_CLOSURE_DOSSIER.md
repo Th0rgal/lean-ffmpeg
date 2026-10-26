@@ -59,7 +59,8 @@ Every capability in the registry and in [`LeanAV.PlanIR.BackendTier`](../LeanAV/
   - `leanav_c_ffi_abi_version` (`0x00010005`, forwarded to `@[export leanav_lean_ffi_abi_version]` in [`LeanAV/PlanIR.lean`](../LeanAV/PlanIR.lean))
   - `leanav_c_ffi_probe_mp4_contract` (pure Lean 4 bounded MP4 box probe `ffiProbeMp4ContractPure` via `@[export leanav_lean_ffi_probe_mp4_contract]` with a borrowed `b_lean_obj_arg` C-ABI shim preserving caller reference counts)
   - `leanav_c_ffi_cancel_gate` (`__ATOMIC_SEQ_CST` fence in C followed by `@[export leanav_lean_ffi_cancel_gate]` / `specFfiCancelGate` with zero model-code gap)
-  - `leanav_c_verify_plane_ffi_contract` (64-byte stride alignment + 64-byte tail SIMD padding)
+  - `leanav_c_verify_plane_ffi_contract` (64-byte stride alignment + 64-byte tail SIMD padding, delegated directly to `@[export leanav_lean_verify_plane_ffi_contract]` in [`LeanAV/Encoder.lean`](../LeanAV/Encoder.lean))
+  - 14 additional ISO BMFF / transcode / quality-acceptance / handler-classification C-ABI exports in [`LeanAV/Format.lean`](../LeanAV/Format.lean) (`leanav_lean_rescale_elst_entry_u64`, `leanav_lean_select_iso_header_timescale_u32`, `leanav_lean_select_iso_header_duration_u64`, `leanav_lean_compute_bitrate_kbps_u64`, `leanav_lean_classify_colr_nclx_u32`, `leanav_lean_classify_dar_u32`, `leanav_lean_classify_avc_level_u32`, `leanav_lean_compute_output_frame_limit_u64`, `leanav_lean_classify_luma_psnr_x10_u64`, `leanav_lean_pack_acceptance_metrics_u64`, `leanav_lean_pack_transcode_report_u64`, `leanav_lean_compute_luma_mean_var_packed_u64`, `leanav_lean_compute_muxing_overhead_micro_pct_u64`, `leanav_lean_classify_mp4_handler_type_u32`) and 3 scaling/tonemap exports in [`LeanAV/Scale.lean`](../LeanAV/Scale.lean) (`leanav_lean_csc_chroma_bt2020_to_bt709_u16`, `leanav_lean_bilinear_tab_entry_q8`, `leanav_lean_tonemap_pq10_to_bt709_u8`)
   - `leanav_c_mc_bipred_plane` and `leanav_c_xor_residual_plane` wired as `@[extern]` in [`LeanAV/Video.lean`](../LeanAV/Video.lean)
 - **CLI Verification**: `lffmpeg verify-ffi`.
 
@@ -89,10 +90,10 @@ Executed via Orb MCP on `nippur`:
 
 All parity, security, universal theorem (`∀`), and architectural deduplication items raised by the three reviewers were remediated and covered by regression tests in [`tests/differential/test_phase3_to_7.py`](../tests/differential/test_phase3_to_7.py).
 
-### 3.2 Final `turbo-lean` (`23e426f`) + `lean-native-core` Closure Quorum
-Executed on `nippur` after integrating `turbo-lean` (`23e426f`), fixing the 3+ binder sampler in `gpu_fastcheck.rs`, fixing `scripts/check_axioms.lean` (`8,112` declarations verified), consolidating the 15 `LeanAV/*.lean` modules (`205 / 205` `non_vacuous_and_tight`), moving the C-ABI gates and MP4 header probe to direct Lean 4 `@[export]` functions, adding zero-copy `ByteArray` (`lean_sarray_object`) LNIR execution, and linking the 12 compiled `LNIR_WIRE_V1` kernels into `libleanav_dsp.a`:
-- **GPT-6 Astra** (`codex`, `gpt-6-astra`), Mission `8a3a02ee-9f9a-46d3-a987-c8dfea825322`: **`VERDICT: APPROVED`** (zero blocking issues).
-- **Claude Fable 5.1** (`claudecode`, `claude-fable-5-1`), Mission `3820c481-cc12-4e40-aa3b-719294176f73`: **`Verdict: APPROVED`** (zero blocking issues after independent verification of all build, spec audit, axiom, LNIR, and differential gates).
+### 3.2 Final `turbo-lean` (`c301cfb`) + Built-In `LeanNative` Closure Quorum
+Executed across `nippur` and `ashur` after integrating unified `turbo-lean` (`c301cfb10d25372de9fcf2b49830ecb25f55d4b7` with built-in `LeanNative`), verifying **`8,165` declarations** (`0 sorryAx`, `0` custom axioms) via `scripts/check_axioms.lean`, auditing all 15 `LeanAV/*.lean` modules (**`209 / 209` `non_vacuous_and_tight`**), migrating 21 C-ABI gates, scaling/tonemapping kernels, and ISO BMFF / transcode / quality-acceptance routines to direct Lean 4 `@[export]` functions, adding unified 32/64-bit ISO BMFF box walking + top-level `moov` seeking + tri-state audio detection in `c/leanav_simd_kernels.c`, and linking the 12 compiled `LNIR_WIRE_V1` kernels into `libleanav_dsp.a`:
+- **GPT-6 Astra** (`codex`, `gpt-6-astra`), Mission `2d44b8ec-e74d-47a0-bd65-7b2c8401fc9f`: **`VERDICT: APPROVED`** (zero blocking issues).
+- **Claude Fable 5.1** (`claudecode`, `claude-fable-5-1`), Mission `2078cb13-feb4-46f7-93c1-e2a7c0f98717`: **`VERDICT: APPROVED`** (zero blocking issues after independent verification of all build, spec audit, axiom, LNIR, and end-to-end transcode gates).
 
 ---
 
