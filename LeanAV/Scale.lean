@@ -592,6 +592,25 @@ def cscChromaBt2020ToBt709Q10Export (u v : UInt8) : UInt16 :=
   let (u', v') := cscChromaBt2020ToBt709Q10 u v
   u'.toUInt16 ||| (v'.toUInt16 <<< 8)
 
+/-- Compute one Q8 (`256`-scale) bilinear coordinate/fraction table entry for `dIdx < dstDim`
+    mapping `[0, dstDim) -> [0, srcDim)`, packed as `(s0 : UInt24) ||| ((s1 : UInt24) <<< 24) ||| ((fQ8 : UInt16) <<< 48)`. -/
+@[inline]
+def bilinearTabEntryQ8 (dIdx srcDim dstDim : UInt32) : UInt64 :=
+  if srcDim == 0 || dstDim == 0 then 0
+  else
+    let srcN : UInt64 := srcDim.toUInt64
+    let dstN : UInt64 := dstDim.toUInt64
+    let q8 : UInt64 := (dIdx.toUInt64 * srcN * 256) / dstN
+    let rawS0 : UInt64 := q8 >>> 8
+    let s0 : UInt64 := if rawS0 >= srcN then srcN - 1 else rawS0
+    let s1 : UInt64 := if s0 + 1 < srcN then s0 + 1 else s0
+    let f : UInt64 := q8 &&& (0xFF : UInt64)
+    (s0 &&& (0xFFFFFF : UInt64)) ||| ((s1 &&& (0xFFFFFF : UInt64)) <<< 24) ||| (f <<< 48)
+
+@[export leanav_lean_bilinear_tab_entry_q8]
+def bilinearTabEntryQ8Export (dIdx srcDim dstDim : UInt32) : UInt64 :=
+  bilinearTabEntryQ8 dIdx srcDim dstDim
+
 /-- Reinhard-style fixed-point HDR-to-SDR luma tonemapper (`tonemapLumaReinhardQ8`):
     Maps `[0, 255]` luma with highlight knee compression `y' = clipUInt8((y * 320 * 255) / (256 * 255 + y * 64))`. -/
 @[inline]
@@ -602,12 +621,14 @@ def tonemapLumaReinhardQ8 (y : UInt8) : UInt8 :=
   clipUInt8 (Int32.ofNat (num / den))
 
 /-- Theorem (Wave B3): Neutral achromatic chroma `(128, 128)` is a fixed point of `cscChromaBt2020ToBt709Q10`
-    and `cscChromaBt2020ToBt709Q10Export`, off-axis `(64, 192)` maps to `(61, 192)`, and `tonemapLumaReinhardQ8`
-    maps `0 -> 0` and `255 -> 255`. -/
+    and `cscChromaBt2020ToBt709Q10Export`, off-axis `(64, 192)` maps to `(61, 192)`, `bilinearTabEntryQ8Export`
+    packs exact Q8 coordinates/fractions, and `tonemapLumaReinhardQ8` maps `0 -> 0` and `255 -> 255`. -/
 theorem cscBt2020ToBt709_and_tonemap_invariants :
     cscChromaBt2020ToBt709Q10 128 128 = (128, 128) ∧
     cscChromaBt2020ToBt709Q10Export 128 128 = 0x8080 ∧
     cscChromaBt2020ToBt709Q10 64 192 = (61, 192) ∧
+    bilinearTabEntryQ8Export 0 3840 1920 = 0x000001000000 ∧
+    bilinearTabEntryQ8Export 1 3 2 = 0x0080000002000001 ∧
     tonemapLumaReinhardQ8 0 = 0 ∧
     tonemapLumaReinhardQ8 255 = 255 := by
   decide

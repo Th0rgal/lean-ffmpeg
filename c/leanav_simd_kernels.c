@@ -1625,6 +1625,8 @@ typedef struct {
     int ready;
 } leanav_bilinear_tabs_t;
 
+extern uint64_t leanav_lean_bilinear_tab_entry_q8(uint32_t d_idx, uint32_t src_dim, uint32_t dst_dim);
+
 static void leanav_build_bilinear_tabs(
     leanav_bilinear_tabs_t *tabs,
     size_t src_w,
@@ -1642,22 +1644,16 @@ static void leanav_build_bilinear_tabs(
     tabs->fy  = (uint16_t *)malloc(dst_h * sizeof(uint16_t));
     if (!tabs->sx0 || !tabs->sx1 || !tabs->fx || !tabs->sy0 || !tabs->sy1 || !tabs->fy) return;
     for (size_t dx = 0; dx < dst_w; dx++) {
-        size_t sx_q8 = (dx * src_w * 256) / dst_w;
-        size_t s0 = sx_q8 >> 8;
-        if (s0 >= src_w) s0 = src_w - 1;
-        size_t s1 = (s0 + 1 < src_w) ? (s0 + 1) : s0;
-        tabs->sx0[dx] = (uint32_t)s0;
-        tabs->sx1[dx] = (uint32_t)s1;
-        tabs->fx[dx]  = (uint16_t)(sx_q8 & 0xFF);
+        uint64_t entry = leanav_lean_bilinear_tab_entry_q8((uint32_t)dx, (uint32_t)src_w, (uint32_t)dst_w);
+        tabs->sx0[dx] = (uint32_t)(entry & 0xFFFFFFu);
+        tabs->sx1[dx] = (uint32_t)((entry >> 24) & 0xFFFFFFu);
+        tabs->fx[dx]  = (uint16_t)((entry >> 48) & 0xFFu);
     }
     for (size_t dy = 0; dy < dst_h; dy++) {
-        size_t sy_q8 = (dy * src_h * 256) / dst_h;
-        size_t s0 = sy_q8 >> 8;
-        if (s0 >= src_h) s0 = src_h - 1;
-        size_t s1 = (s0 + 1 < src_h) ? (s0 + 1) : s0;
-        tabs->sy0[dy] = (uint32_t)s0;
-        tabs->sy1[dy] = (uint32_t)s1;
-        tabs->fy[dy]  = (uint16_t)(sy_q8 & 0xFF);
+        uint64_t entry = leanav_lean_bilinear_tab_entry_q8((uint32_t)dy, (uint32_t)src_h, (uint32_t)dst_h);
+        tabs->sy0[dy] = (uint32_t)(entry & 0xFFFFFFu);
+        tabs->sy1[dy] = (uint32_t)((entry >> 24) & 0xFFFFFFu);
+        tabs->fy[dy]  = (uint16_t)((entry >> 48) & 0xFFu);
     }
     tabs->dst_w = dst_w;
     tabs->dst_h = dst_h;
