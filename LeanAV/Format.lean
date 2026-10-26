@@ -5448,6 +5448,23 @@ def classifyDisplayAspectRatioU32 (width height sarNum sarDen : UInt32) : UInt32
 def classifyDisplayAspectRatioExport (width height sarNum sarDen : UInt32) : UInt32 :=
   classifyDisplayAspectRatioU32 width height sarNum sarDen
 
+/--
+  ITU-T H.264 Table A-1 / ISO/IEC 14496-15 `AVCLevelIndication` tier classifier (`31` = 3.1, `40` = 4.0, `51` = 5.1)
+  for output frame dimensions `(dstW, dstH)` in pixels:
+  - `dstW > 1920 || dstH > 1080` -> `51` (Level 5.1, > 1080p)
+  - `dstW > 1280 || dstH > 720`  -> `40` (Level 4.0, > 720p including 1280x960)
+  - Otherwise                    -> `31` (Level 3.1, <= 720p)
+-/
+@[inline]
+def classifyAvcLevelU32 (dstW dstH : UInt32) : UInt32 :=
+  if dstW > 1920 || dstH > 1080 then 51
+  else if dstW > 1280 || dstH > 720 then 40
+  else 31
+
+@[export leanav_lean_classify_avc_level_u32]
+def classifyAvcLevelExport (dstW dstH : UInt32) : UInt32 :=
+  classifyAvcLevelU32 dstW dstH
+
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
     decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
@@ -5456,7 +5473,11 @@ theorem hdr_static_clip_roundtrip :
     classifyDisplayAspectRatioExport 1440 960 1 1 = 0x00020003 ∧
     classifyDisplayAspectRatioExport 1440 1080 1 1 = 0x00030004 ∧
     classifyDisplayAspectRatioExport 1080 1080 1 1 = 0x00010001 ∧
-    classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 = 0x00010001 := by
+    classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 = 0x00010001 ∧
+    classifyAvcLevelExport 3840 2160 = 51 ∧
+    classifyAvcLevelExport 1920 1080 = 40 ∧
+    classifyAvcLevelExport 1280 960 = 40 ∧
+    classifyAvcLevelExport 1280 720 = 31 := by
   decide
 
 end LeanAV.Format

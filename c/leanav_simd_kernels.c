@@ -2352,6 +2352,7 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
 
 extern uint32_t leanav_lean_classify_colr_nclx_u32(uint16_t prim, uint16_t trc, uint16_t spc);
 extern uint32_t leanav_lean_classify_dar_u32(uint32_t width, uint32_t height, uint32_t sar_num, uint32_t sar_den);
+extern uint32_t leanav_lean_classify_avc_level_u32(uint32_t dst_w, uint32_t dst_h);
 
 /*
  * Scans the first and last 2 MiB of `in_path` for ISO BMFF `colr` (`nclx` primaries=9, trc=16/18, matrix=9)
@@ -2724,7 +2725,10 @@ static void leanav_print_ffmpeg_banner(
         "none";
 #endif
     const char *profile = (codec_id_u32 == 2) ? "Main" : "High";
-    const char *level = (dst_w > 1920 || dst_h > 1080) ? "5.1" : (dst_w > 1280 ? "4.0" : "3.1");
+    uint32_t lvl_code = (dst_w <= 0xFFFFFFFFu && dst_h <= 0xFFFFFFFFu)
+        ? leanav_lean_classify_avc_level_u32((uint32_t)dst_w, (uint32_t)dst_h)
+        : 51u;
+    const char *level = (lvl_code >= 51u) ? "5.1" : (lvl_code >= 40u ? "4.0" : "3.1");
     leanav_cprint(stderr, LEANAV_C_LIBX264, "[%s @ 0x%lx] ", enc_name ? enc_name : "libx264",
         (unsigned long)0x100000000UL);
     fprintf(stderr, "using SAR=%d/%d\n", sar_n, sar_d);

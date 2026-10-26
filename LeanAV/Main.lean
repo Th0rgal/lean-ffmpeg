@@ -801,7 +801,11 @@ def runSelfTest : IO UInt32 := do
                      selectIsoHeaderTimescaleExport 0 24 1000 90000 == 1000 &&
                      selectIsoHeaderTimescaleExport 1 32 1000 90000 == 90000 &&
                      selectIsoHeaderTimescaleExport 1 28 1000 90000 == 0 &&
-                     selectIsoHeaderTimescaleExport 2 36 1000 90000 == 0
+                     selectIsoHeaderTimescaleExport 2 36 1000 90000 == 0 &&
+                     classifyAvcLevelExport 3840 2160 == 51 &&
+                     classifyAvcLevelExport 1920 1080 == 40 &&
+                     classifyAvcLevelExport 1280 960 == 40 &&
+                     classifyAvcLevelExport 1280 720 == 31
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1
