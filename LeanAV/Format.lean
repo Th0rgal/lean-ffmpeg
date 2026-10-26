@@ -5580,19 +5580,55 @@ def computeLumaMeanVarPackedU64 (sum sumSq cnt : UInt64) : UInt64 :=
   if cnt == 0 then 0
   else
     let mean : UInt64 := sum / cnt
-    let meanSq : UInt64 := sumSq / cnt
-    let var : UInt64 :=
-      if mean > 0xFFFFFFFF then 0
-      else
-        let sq := mean * mean
-        if meanSq > sq then meanSq - sq else 0
-    let meanClamped : UInt64 := if mean > 0xFFFFFFFF then 0xFFFFFFFF else mean
-    let varClamped : UInt64 := if var > 0xFFFFFFFF then 0xFFFFFFFF else var
-    (varClamped <<< 32) ||| meanClamped
+    if mean > 0xFFFFFFFF then 0x00000000FFFFFFFF
+    else
+      let meanSq : UInt64 := sumSq / cnt
+      let sq : UInt64 := mean * mean
+      let var : UInt64 := if meanSq > sq then meanSq - sq else 0
+      let varClamped : UInt64 := if var > 0xFFFFFFFF then 0xFFFFFFFF else var
+      (varClamped <<< 32) ||| mean
 
 @[export leanav_lean_compute_luma_mean_var_packed_u64]
 def computeLumaMeanVarPackedExport (sum sumSq cnt : UInt64) : UInt64 :=
   computeLumaMeanVarPackedU64 sum sumSq cnt
+
+/--
+  ISO/IEC 14496-12 `mvhd` / `mdhd` full-box duration selector (`selectIsoHeaderDurationU64`):
+  - Version `0` (`version == 0` and `boxSize >= 28`): 32-bit duration at byte offset `24..27` (`durAt24.toUInt64`).
+  - Version `1` (`version == 1` and `boxSize >= 40`): 64-bit duration at byte offset `32..39` (`durAt32`).
+  - Otherwise: `0` (unsupported version or truncated box).
+-/
+@[inline]
+def selectIsoHeaderDurationU64 (version : UInt8) (boxSize : UInt32) (durAt24 : UInt32) (durAt32 : UInt64) : UInt64 :=
+  if version == 0 && boxSize >= 28 then durAt24.toUInt64
+  else if version == 1 && boxSize >= 40 then durAt32
+  else 0
+
+@[export leanav_lean_select_iso_header_duration_u64]
+def selectIsoHeaderDurationExport (version : UInt8) (boxSize : UInt32) (durAt24 : UInt32) (durAt32 : UInt64) : UInt64 :=
+  selectIsoHeaderDurationU64 version boxSize durAt24 durAt32
+
+/--
+  Overflow-free integer container bitrate estimator (`round((fileBytes * 8 * timescale) / (durationTicks * 1000))`
+  in `kb/s`, clamped to `0x7FFFFFFFFFFFFFFF` for signed `int64_t` C-ABI safety):
+  - Returns `0` when `fileBytes == 0 || timescale == 0 || durationTicks == 0`.
+  - Evaluates exact nearest-integer rounding `(num + den / 2) / den` in arbitrary-precision `Nat`
+    (`num = fileBytes * timescale * 8`, `den = durationTicks * 1000`), avoiding 64-bit multiplication
+    overflow, 53-bit `double` mantissa precision loss, and floating-point division-by-zero UB.
+-/
+@[inline]
+def computeBitrateKbpsU64 (fileBytes : UInt64) (timescale : UInt32) (durationTicks : UInt64) : UInt64 :=
+  if fileBytes == 0 || timescale == 0 || durationTicks == 0 then 0
+  else
+    let num : Nat := fileBytes.toNat * timescale.toNat * 8
+    let den : Nat := durationTicks.toNat * 1000
+    let kbps : Nat := (num + den / 2) / den
+    if kbps > 0x7FFFFFFFFFFFFFFF then 0x7FFFFFFFFFFFFFFF
+    else kbps.toUInt64
+
+@[export leanav_lean_compute_bitrate_kbps_u64]
+def computeBitrateKbpsExport (fileBytes : UInt64) (timescale : UInt32) (durationTicks : UInt64) : UInt64 :=
+  computeBitrateKbpsU64 fileBytes timescale durationTicks
 
 /--
   Module-level HDR static metadata (`mdcv` / `clli`) roundtrip and `@[export]` C-ABI helper
@@ -5628,7 +5664,13 @@ theorem hdr_static_clip_roundtrip :
     computeLumaMeanVarPackedExport 0 0 0 = 0 ∧
     computeLumaMeanVarPackedExport 200 24000 2 = 0x000007D000000064 ∧
     computeLumaMeanVarPackedExport 200 12000 2 = 0x0000000000000064 ∧
-    computeLumaMeanVarPackedExport 0x100000000 0xFFFFFFFFFFFFFFFF 1 = 0x00000000FFFFFFFF := by
+    computeLumaMeanVarPackedExport 0x100000000 0xFFFFFFFFFFFFFFFF 1 = 0x00000000FFFFFFFF ∧
+    selectIsoHeaderDurationExport 0 28 48000 96000 = 48000 ∧
+    selectIsoHeaderDurationExport 1 40 48000 96000 = 96000 ∧
+    selectIsoHeaderDurationExport 1 28 48000 96000 = 0 ∧
+    computeBitrateKbpsExport 1000000 1000 4000 = 2000 ∧
+    computeBitrateKbpsExport 0 1000 4000 = 0 ∧
+    computeBitrateKbpsExport 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF 1 = 0x7FFFFFFFFFFFFFFF := by
   decide
 
 end LeanAV.Format

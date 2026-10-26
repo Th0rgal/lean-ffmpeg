@@ -2032,6 +2032,12 @@ extern uint64_t leanav_lean_rescale_elst_entry_u64(
 extern uint32_t leanav_lean_select_iso_header_timescale_u32(
     uint8_t version, uint32_t box_size, uint32_t ts_at_20, uint32_t ts_at_28
 );
+extern uint64_t leanav_lean_select_iso_header_duration_u64(
+    uint8_t version, uint32_t box_size, uint32_t dur_at_24, uint64_t dur_at_32
+);
+extern uint64_t leanav_lean_compute_bitrate_kbps_u64(
+    uint64_t file_bytes, uint32_t timescale, uint64_t duration_ticks
+);
 
 static uint32_t leanav_extract_box_timescale(const uint8_t *box, size_t bs) {
     if (bs < 24) return 0u;
@@ -2039,6 +2045,14 @@ static uint32_t leanav_extract_box_timescale(const uint8_t *box, size_t bs) {
     uint32_t ts20 = leanav_rd_u32be(box + 20);
     uint32_t ts28 = (bs >= 32) ? leanav_rd_u32be(box + 28) : 0u;
     return leanav_lean_select_iso_header_timescale_u32(box[8], sz32, ts20, ts28);
+}
+
+static uint64_t leanav_extract_box_duration(const uint8_t *box, size_t bs) {
+    if (bs < 28) return 0ULL;
+    uint32_t sz32 = (bs > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)bs;
+    uint32_t dur24 = leanav_rd_u32be(box + 24);
+    uint64_t dur32 = (bs >= 40) ? leanav_rd_u64be(box + 32) : 0ULL;
+    return leanav_lean_select_iso_header_duration_u64(box[8], sz32, dur24, dur32);
 }
 
 static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *out_path, int copy_elst) {
@@ -2545,13 +2559,11 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
         if (located) {
             size_t bp, bs;
             if (leanav_find_child_box(buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 28) {
-                uint8_t ver = buf[bp + 8];
                 uint32_t ts = leanav_extract_box_timescale(buf + bp, bs);
-                uint64_t dur = (ver == 1 && bs >= 40) ? leanav_rd_u64be(buf + bp + 32)
-                             : (ver == 0 ? (uint64_t)leanav_rd_u32be(buf + bp + 24) : 0ULL);
+                uint64_t dur = leanav_extract_box_duration(buf + bp, bs);
                 if (ts > 0 && dur > 0) {
                     info->duration_s = (double)dur / (double)ts;
-                    info->bitrate_kbps = (int64_t)(((double)fsz * 8.0) / (info->duration_s * 1000.0) + 0.5);
+                    info->bitrate_kbps = (int64_t)leanav_lean_compute_bitrate_kbps_u64((uint64_t)fsz, ts, dur);
                 }
             }
             if (leanav_find_child_box(buf, vre_p + 86, vre_p + vre_s, "pasp", &bp, &bs) && bs >= 16) {
