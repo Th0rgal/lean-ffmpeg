@@ -34,6 +34,9 @@ static void leanav_init_glibc_malloc_arena(void) {
 static const char *leanav_resolve_ffmpeg_exec_path(void) {
     const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
     if (env_bin && env_bin[0] != '\0' && access(env_bin, X_OK) == 0) return env_bin;
+    if (access("/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg", X_OK) == 0) {
+        return "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg";
+    }
     if (access("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg", X_OK) == 0) {
         return "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg";
     }
@@ -56,16 +59,14 @@ static pthread_once_t leanav_ld_env_once = PTHREAD_ONCE_INIT;
 
 static void leanav_init_ld_env(void) {
     signal(SIGPIPE, SIG_IGN);
-    if (access("/tmp/opencode/ffmpeg-runtime-full/lib", R_OK) == 0) {
+    if (access("/tmp/opencode/ffmpeg-runtime-full", R_OK) == 0) {
         const char *old_ld = getenv("LD_LIBRARY_PATH");
         char ld_buf[4096];
+        const char *rt_ld = "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu";
         if (old_ld && old_ld[0] != '\0') {
-            snprintf(ld_buf, sizeof(ld_buf),
-                "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:%s",
-                old_ld);
+            snprintf(ld_buf, sizeof(ld_buf), "%s:%s", rt_ld, old_ld);
         } else {
-            snprintf(ld_buf, sizeof(ld_buf),
-                "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu");
+            snprintf(ld_buf, sizeof(ld_buf), "%s", rt_ld);
         }
         setenv("LD_LIBRARY_PATH", ld_buf, 1);
     }
@@ -333,7 +334,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     uint64_t src_stride,
     uint64_t dst_w,
     uint64_t dst_h,
-    uint64_t arg0,
+    uint64_t p_alpha,
     uint64_t arg1
 ) {
     if (dst_w == 0 || dst_h == 0 || dst_w > 0x3FFFFFFFull || dst_h > 0x3FFFFFFFull) return lean_alloc_sarray(1, 0, 0);
@@ -343,11 +344,16 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     uint64_t sh = (kernel_id <= 1u) ? (dst_h * 2u) : (kernel_id == 2u) ? (dst_h * 3u) : (kernel_id == 3u) ? ((dst_h >> 1u) * 3u + ((dst_h & 1u) ? 2u : 0u)) : dst_h;
     uint64_t mw = (kernel_id <= 1u) ? (dst_w * 2u) : (kernel_id == 2u) ? (dst_w * 3u) : (kernel_id == 3u) ? ((dst_w >> 1u) * 3u + ((dst_w & 1u) ? 2u : 0u)) : dst_w;
     uint64_t st = (kernel_id == 4u) ? dst_w : src_stride;
-    if (st < mw || st > 0x3FFFFFFFull || (uint64_t)lean_sarray_size(src_ba) < (sh - 1u) * st + mw) { memset(dst_ptr, 0, total); return out; }
-    const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
+    uint64_t src_off = (kernel_id == 1u) ? 0u : p_alpha;
+    uint64_t src_cap = (uint64_t)lean_sarray_size(src_ba);
+    if (st < mw || st > 0x3FFFFFFFull) { memset(dst_ptr, 0, total); return out; }
+    /* Dimension and stride caps above keep this footprint below UINT64_MAX. */
+    uint64_t need = (sh - 1u) * st + mw;
+    if (!(src_off <= src_cap && need <= src_cap - src_off)) { memset(dst_ptr, 0, total); return out; }
+    const uint8_t *src_ptr = (const uint8_t *)lean_sarray_cptr(src_ba) + src_off;
     switch (kernel_id) {
         case 0u: lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
-        case 1u: lean_native_swscale_down2x2_fused_eq_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h, arg0, arg1); break;
+        case 1u: lean_native_swscale_down2x2_fused_eq_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h, p_alpha, arg1); break;
         case 2u: lean_native_swscale_down3x3_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
         case 3u: lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
         case 4u: lean_native_stencil2d_box3x3_u8(dst_ptr, src_ptr, dst_w, dst_h); break;

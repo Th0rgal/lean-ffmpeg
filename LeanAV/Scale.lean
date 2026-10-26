@@ -601,6 +601,46 @@ def scalePlaneDown3to2CSimd (src : @& ByteArray) (srcW srcH : USize) : ByteArray
   else
     scalePlaneDown3to2Bytes src sw sh
 
+/-- Offset-aware 2x2 dispatch; incomplete planes retain the scalar slice semantics. -/
+@[inline]
+def scalePlaneDown2x2OffCSimd (src : @& ByteArray) (srcOff : Nat)
+    (srcW srcH srcStride : USize) : ByteArray :=
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let st := srcStride.toNat
+  let dw := Nat.max 1 (sw / 2)
+  let dh := Nat.max 1 (sh / 2)
+  if sw >= dw * 2 && sh >= dh * 2 && st >= dw * 2 &&
+      srcOff + st * sh <= src.size && srcOff < 2^64 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 0 src st.toUInt64 dw.toUInt64 dh.toUInt64 srcOff.toUInt64 0
+  else
+    scalePlaneDown2x2CSimd (src.extract srcOff (srcOff + st * sh)) srcW srcH srcStride
+
+/-- Offset-aware 3x3 dispatch on a contiguous plane. -/
+@[inline]
+def scalePlaneDown3x3OffCSimd (src : @& ByteArray) (srcOff : Nat) (srcW srcH : USize) : ByteArray :=
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let dw := Nat.max 1 (sw / 3)
+  let dh := Nat.max 1 (sh / 3)
+  if sw >= dw * 3 && sh >= dh * 3 && srcOff + sw * sh <= src.size && srcOff < 2^64 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 2 src sw.toUInt64 dw.toUInt64 dh.toUInt64 srcOff.toUInt64 0
+  else
+    scalePlaneDown3x3CSimd (src.extract srcOff (srcOff + sw * sh)) srcW srcH
+
+/-- Offset-aware 3:2 dispatch; odd/small dimensions use the existing fallback. -/
+@[inline]
+def scalePlaneDown3to2OffCSimd (src : @& ByteArray) (srcOff : Nat) (srcW srcH : USize) : ByteArray :=
+  let sw := srcW.toNat
+  let sh := srcH.toNat
+  let dw := Nat.max 1 (sw * 2 / 3)
+  let dh := Nat.max 1 (sh * 2 / 3)
+  if dw >= 2 && dh >= 2 && dw % 2 == 0 && dh % 2 == 0 &&
+      sw >= dw / 2 * 3 && sh >= dh / 2 * 3 && srcOff + sw * sh <= src.size && srcOff < 2^64 then
+    LeanAV.NativeKernels.execLnirScale2dBaC 3 src sw.toUInt64 dw.toUInt64 dh.toUInt64 srcOff.toUInt64 0
+  else
+    scalePlaneDown3to2CSimd (src.extract srcOff (srcOff + sw * sh)) srcW srcH
+
 /-- Fast 3:2 block-average downscaler (`scalePlaneDown3to2Fast`, e.g. 1080p `1920×1080` -> 720p `1280×720`). -/
 def scalePlaneDown3to2Fast (src : Plane2D) : Plane2D :=
   let dstW := Nat.max 1 ((src.width * 2) / 3)
@@ -873,6 +913,48 @@ def buildBilinearTabQ8 (srcDim dstDim : Nat) : Array UInt64 := Id.run do
     tab := tab.push (bilinearTabEntryQ8 dIdx.toUInt32 s32 d32)
   return tab
 
+/-- Read a plane-relative byte without allocating a slice, including zero padding. -/
+@[inline]
+def planeByteOff (src : ByteArray) (off len i : Nat) : Nat :=
+  if i < len && off + i < src.size then src[off + i]!.toNat else 0
+
+/-- Universal offset/extract equivalence, including truncated planes and out-of-range taps. -/
+theorem planeByteOff_eq_extract (src : ByteArray) (off len i : Nat) :
+    planeByteOff src off len i =
+      (if i < (src.extract off (off + len)).size then
+        (src.extract off (off + len))[i]!.toNat else 0) := by
+  have hs := @ByteArray.size_extract src off (off + len)
+  by_cases h : i < (src.extract off (off + len)).size
+  · have hi : i < len := by omega
+    have hb : off + i < src.size := by omega
+    simp only [planeByteOff, hi, hb, decide_true, Bool.and_self, ite_true, h]
+    rw [getElem!_pos src (off + i) hb, getElem!_pos (src.extract off (off + len)) i h,
+      ByteArray.getElem_extract]
+  · have hn : ¬ (i < len ∧ off + i < src.size) := by omega
+    simp [planeByteOff, hn]
+    omega
+
+/-- Every pure sampling computation has the same result on offset and extracted readers. -/
+theorem planeOffset_sampling_equiv {α : Type} (sample : (Nat → Nat) → α)
+    (src : ByteArray) (off len : Nat) :
+    sample (planeByteOff src off len) =
+      sample (fun i => if i < (src.extract off (off + len)).size then
+        (src.extract off (off + len))[i]!.toNat else 0) := by
+  congr 1
+  funext i
+  exact planeByteOff_eq_extract src off len i
+
+/-- Subtraction-form FFI bounds are equivalent to a fitting offset footprint. -/
+def offsetPlaneGateSpec : AVGateSpec (Nat × Nat × Nat)
+    (fun (off, need, cap) => off + need ≤ cap) where
+  gate := fun (off, need, cap) => decide (off ≤ cap ∧ need ≤ cap - off)
+  sound := by intro ⟨off, need, cap⟩ h; simp only [decide_eq_true_eq] at h; omega
+  complete := by intro ⟨off, need, cap⟩ h; simp only [decide_eq_true_eq]; omega
+  posWitness := (7, 36, 43)
+  negWitness := (8, 36, 43)
+  nonVacuous := rfl
+  tight := rfl
+
 /--
   Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
   operating on a slice `[srcOff, srcOff + srcW * srcH)` of `src : ByteArray`.
@@ -880,27 +962,18 @@ def buildBilinearTabQ8 (srcDim dstDim : Nat) : Array UInt64 := Id.run do
 def scalePlaneBilinearWithTabsBytes
     (src : @& ByteArray) (srcOff srcW srcH dstW dstH : Nat)
     (xTab yTab : @& Array UInt64) : ByteArray := Id.run do
-  if srcOff == 0 && src.size >= srcW * srcH then
-    if srcW == dstW * 2 && srcH == dstH * 2 then
-      return scalePlaneDown2x2CSimd src srcW.toUSize srcH.toUSize srcW.toUSize
-    else if srcW == dstW * 3 && srcH == dstH * 3 then
-      return scalePlaneDown3x3CSimd src srcW.toUSize srcH.toUSize
-    else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
-      return scalePlaneDown3to2CSimd src srcW.toUSize srcH.toUSize
-  let pSlice := src.extract srcOff (srcOff + srcW * srcH)
   if srcW == dstW && srcH == dstH then
-    return pSlice
+    return src.extract srcOff (srcOff + srcW * srcH)
   else if srcW == dstW * 2 && srcH == dstH * 2 then
-    return scalePlaneDown2x2CSimd pSlice srcW.toUSize srcH.toUSize srcW.toUSize
+    return scalePlaneDown2x2OffCSimd src srcOff srcW.toUSize srcH.toUSize srcW.toUSize
   else if srcW == dstW * 3 && srcH == dstH * 3 then
-    return scalePlaneDown3x3CSimd pSlice srcW.toUSize srcH.toUSize
+    return scalePlaneDown3x3OffCSimd src srcOff srcW.toUSize srcH.toUSize
   else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
-    return scalePlaneDown3to2CSimd pSlice srcW.toUSize srcH.toUSize
+    return scalePlaneDown3to2OffCSimd src srcOff srcW.toUSize srcH.toUSize
   else
     let total := dstW * dstH
     let mut out := ByteArray.emptyWithCapacity total
-    let cap := pSlice.size
-    let getB (idx : Nat) : Nat := if idx < cap then (pSlice.get! idx).toNat else 0
+    let getB (idx : Nat) : Nat := planeByteOff src srcOff (srcW * srcH) idx
     for dy in [:dstH] do
       let ey := yTab.getD dy 0
       let sy0 := (ey &&& 0xFFFFFF).toNat

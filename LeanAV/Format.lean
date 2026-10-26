@@ -6018,6 +6018,237 @@ theorem isExplicitSdrCodePoint_accepts_sdr_and_rejects_unspecified_or_hdr :
     isExplicitSdrCodePoint 9 1 9 = false := by
   decide
 
+/-! ### Pure Lean 4 H.264 `avcC` SPS VUI Colorimetry Prober (ITU-T H.264 §7.3.2.1.1 / Annex E) -/
+
+/-- Strip H.264 emulation-prevention bytes (`00 00 03 -> 00 00`) from NAL bytes `[start, stop)` of `buf`. -/
+def avcUnescapeRbspPure (buf : @& ByteArray) (start stop : Nat) : ByteArray := Id.run do
+  let lim := Nat.min stop buf.size
+  let mut out := ByteArray.emptyWithCapacity (lim - start)
+  let mut zeros : Nat := 0
+  for i in [start:lim] do
+    let b := buf.get! i
+    if zeros ≥ 2 && b == 0x03 then
+      zeros := 0
+    else
+      out := out.push b
+      zeros := if b == 0 then zeros + 1 else 0
+  return out
+
+/-- Skip one H.264 `scaling_list(sizeOfScalingList)` (§7.3.2.1.1.1), rejecting out-of-range `delta_scale`. -/
+def avcSkipScalingList (r : BitReader) (size : Nat) : Option BitReader := do
+  let mut cur := r
+  let mut lastScale : Int := 8
+  let mut nextScale : Int := 8
+  for _ in [:size] do
+    if nextScale != 0 then
+      let (delta, r') ← cur.readSE
+      guard (-128 ≤ delta.toInt && delta.toInt ≤ 127)
+      cur := r'
+      nextScale := (lastScale + delta.toInt + 256) % 256
+    if nextScale != 0 then
+      lastScale := nextScale
+  return cur
+
+/-- Colorimetry-relevant fields of an H.264 sequence parameter set (`2` = unspecified when absent). -/
+structure AvcSpsColorInfo where
+  chromaFormatIdc          : Nat    := 1
+  bitDepthLumaMinus8       : Nat    := 0
+  bitDepthChromaMinus8     : Nat    := 0
+  vuiPresent               : Bool   := false
+  videoSignalTypePresent   : Bool   := false
+  colourDescriptionPresent : Bool   := false
+  colourPrimaries          : UInt16 := 2
+  transferCharacteristics  : UInt16 := 2
+  matrixCoefficients       : UInt16 := 2
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Parse an H.264 SPS RBSP (after the NAL header byte) up to `colour_description` with bounded `ue(v)`/`se(v)` reads. -/
+def parseAvcSpsColorInfoPure (rbsp : ByteArray) : Option AvcSpsColorInfo := do
+  let r0 := BitReader.ofSlice (ByteSlice.ofByteArray rbsp)
+  let (profile, r1) ← r0.readBitsMSB 8
+  let (_, r2) ← r1.readBitsMSB 16 -- constraint_set flags + level_idc
+  let (spsId, r3) ← r2.readUE
+  guard (spsId ≤ 31)
+  let mut r := r3
+  let mut chroma : Nat := 1
+  let mut bdl : Nat := 0
+  let mut bdc : Nat := 0
+  if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains profile.toNat then
+    let (c, r4) ← r.readUE
+    guard (c ≤ 3)
+    chroma := c.toNat
+    r := r4
+    if chroma == 3 then
+      let (_, r5) ← r.readBitsMSB 1 -- separate_colour_plane_flag
+      r := r5
+    let (l, r6) ← r.readUE
+    let (cc, r7) ← r6.readUE
+    guard (l ≤ 6 && cc ≤ 6)
+    bdl := l.toNat
+    bdc := cc.toNat
+    let (_, r8) ← r7.readBitsMSB 1 -- qpprime_y_zero_transform_bypass_flag
+    let (smp, r9) ← r8.readBitsMSB 1
+    r := r9
+    if smp == 1 then
+      for i in [:(if chroma == 3 then 12 else 8)] do
+        let (present, r10) ← r.readBitsMSB 1
+        r := r10
+        if present == 1 then
+          r ← avcSkipScalingList r (if i < 6 then 16 else 64)
+  let (log2Fn, r11) ← r.readUE
+  let (pocType, r12) ← r11.readUE
+  guard (log2Fn ≤ 12 && pocType ≤ 2)
+  r := r12
+  if pocType == 0 then
+    let (log2Poc, r13) ← r.readUE
+    guard (log2Poc ≤ 12)
+    r := r13
+  else if pocType == 1 then
+    let (_, r14) ← r.readBitsMSB 1 -- delta_pic_order_always_zero_flag
+    let (_, r15) ← r14.readSE
+    let (_, r16) ← r15.readSE
+    let (cycle, r17) ← r16.readUE
+    guard (cycle ≤ 255)
+    r := r17
+    for _ in [:cycle.toNat] do
+      let (_, r18) ← r.readSE
+      r := r18
+  let (_, r19) ← r.readUE -- max_num_ref_frames
+  let (_, r20) ← r19.readBitsMSB 1 -- gaps_in_frame_num_value_allowed_flag
+  let (_, r21) ← r20.readUE -- pic_width_in_mbs_minus1
+  let (_, r22) ← r21.readUE -- pic_height_in_map_units_minus1
+  let (frameMbsOnly, r23) ← r22.readBitsMSB 1
+  r := r23
+  if frameMbsOnly == 0 then
+    let (_, r24) ← r.readBitsMSB 1 -- mb_adaptive_frame_field_flag
+    r := r24
+  let (_, r25) ← r.readBitsMSB 1 -- direct_8x8_inference_flag
+  let (crop, r26) ← r25.readBitsMSB 1
+  r := r26
+  if crop == 1 then
+    for _ in [:4] do
+      let (_, r27) ← r.readUE
+      r := r27
+  let base : AvcSpsColorInfo := { chromaFormatIdc := chroma, bitDepthLumaMinus8 := bdl, bitDepthChromaMinus8 := bdc }
+  let (vui, r28) ← r.readBitsMSB 1
+  if vui == 0 then return base
+  let (aspect, r29) ← r28.readBitsMSB 1
+  r := r29
+  if aspect == 1 then
+    let (idc, r30) ← r.readBitsMSB 8
+    r := r30
+    if idc == 255 then
+      let (_, r31) ← r.readBitsMSB 32 -- sar_width + sar_height
+      r := r31
+  let (overscan, r32) ← r.readBitsMSB 1
+  r := r32
+  if overscan == 1 then
+    let (_, r33) ← r.readBitsMSB 1 -- overscan_appropriate_flag
+    r := r33
+  let (vst, r34) ← r.readBitsMSB 1
+  if vst == 0 then return { base with vuiPresent := true }
+  let (_, r35) ← r34.readBitsMSB 4 -- video_format + video_full_range_flag
+  let (cdp, r36) ← r35.readBitsMSB 1
+  if cdp == 0 then return { base with vuiPresent := true, videoSignalTypePresent := true }
+  let (prim, r37) ← r36.readBitsMSB 8
+  let (trc, r38) ← r37.readBitsMSB 8
+  let (mat, _) ← r38.readBitsMSB 8
+  return { base with
+    vuiPresent := true, videoSignalTypePresent := true, colourDescriptionPresent := true,
+    colourPrimaries := prim.toUInt16, transferCharacteristics := trc.toUInt16, matrixCoefficients := mat.toUInt16 }
+
+/--
+  Classify parsed SPS colorimetry (`some 0` = SDR, `some 1` = PQ, `some 2` = HLG, `none` = undecided):
+  explicit `colour_description` with PQ (`trc = 16`), HLG (`trc = 18`), or `isExplicitSdrCodePoint`;
+  otherwise absent `colour_description` on 8-bit `4:2:0`/mono streams is SDR.
+-/
+@[inline]
+def classifyAvcSpsColorInfo (i : AvcSpsColorInfo) : Option UInt32 :=
+  if i.colourDescriptionPresent then
+    if i.transferCharacteristics == 16 then some 1
+    else if i.transferCharacteristics == 18 then some 2
+    else if isExplicitSdrCodePoint i.colourPrimaries i.transferCharacteristics i.matrixCoefficients then some 0
+    else none
+  else if i.chromaFormatIdc ≤ 1 && i.bitDepthLumaMinus8 == 0 && i.bitDepthChromaMinus8 == 0 then some 0
+  else none
+
+/--
+  Probe the primary video `avc1`/`avc3` sample entry's `avcC` first SPS colorimetry in pure Lean 4
+  (`some 0/1/2` = SDR/PQ/HLG). Returns `none` (defer to `ffprobe`) when the entry carries `mdcv`,
+  `clli`, or a non-unspecified `colr` box, or when `avcC`/SPS is missing or malformed.
+-/
+def probeAvcCSpsColorspacePure (buf : @& ByteArray) : Option UInt32 := do
+  let loc ← mp4LocateVideoBoxes buf buf.size
+  let vreStart := loc.vrePos + 86
+  let vreEnd := loc.vrePos + loc.vreSz
+  guard (vreStart < vreEnd && vreEnd ≤ buf.size)
+  let entry := baRdU32BE buf (loc.vrePos + 4)
+  guard (entry == 0x61766331 || entry == 0x61766333) -- 'avc1' or 'avc3'
+  guard (mp4FindChildBox buf vreStart vreEnd 0x6D646376).isNone -- 'mdcv'
+  guard (mp4FindChildBox buf vreStart vreEnd 0x636C6C69).isNone -- 'clli'
+  match mp4FindChildBox buf vreStart vreEnd 0x636F6C72 with -- 'colr': only all-unspecified (`2/2/2`) defers to the SPS
+  | none => pure ()
+  | some (cp, cs) =>
+    let sub := baRdU32BE buf (cp + 8)
+    guard (cs ≥ 18 && cp + cs ≤ vreEnd && (sub == 0x6E636C78 || sub == 0x6E636C63) &&
+      baRdU16BE buf (cp + 12) == 2 && baRdU16BE buf (cp + 14) == 2 && baRdU16BE buf (cp + 16) == 2)
+  let (bp, bs) ← mp4FindChildBox buf vreStart vreEnd 0x61766343 -- 'avcC'
+  guard (bs ≥ 16 && bp + bs ≤ vreEnd)
+  guard (buf.get! (bp + 8) == 1 && (buf.get! (bp + 13) &&& 0x1F) ≥ 1) -- configurationVersion, numOfSPS
+  let spsLen := (baRdU16BE buf (bp + 14)).toNat
+  let nalPos := bp + 16
+  guard (spsLen ≥ 4 && nalPos + spsLen ≤ bp + bs)
+  guard ((buf.get! nalPos &&& 0x9F) == 0x07) -- forbidden_zero_bit = 0, nal_unit_type = 7 (SPS)
+  let info ← parseAvcSpsColorInfoPure (avcUnescapeRbspPure buf (nalPos + 1) (nalPos + spsLen))
+  classifyAvcSpsColorInfo info
+
+/-- `true` when the `avcC` SPS VUI proves SDR colorimetry without `colr`/`mdcv`/`clli` boxes. -/
+@[inline]
+def hasExplicitSdrAvcCSpsPure (buf : @& ByteArray) : Bool :=
+  probeAvcCSpsColorspacePure buf == some 0
+
+/--
+  Theorem: `classifyAvcSpsColorInfo` only reports HDR from an explicit `colour_description` PQ/HLG transfer,
+  and only reports SDR from explicit SDR code points or an absent description on 8-bit `4:2:0`/mono SPS.
+-/
+theorem classifyAvcSpsColorInfo_sound (i : AvcSpsColorInfo) :
+    (classifyAvcSpsColorInfo i = some 1 ↔ i.colourDescriptionPresent = true ∧ i.transferCharacteristics = 16) ∧
+    (classifyAvcSpsColorInfo i = some 2 ↔ i.colourDescriptionPresent = true ∧ i.transferCharacteristics = 18) ∧
+    (classifyAvcSpsColorInfo i = some 0 →
+      (i.colourDescriptionPresent = true ∧
+        isExplicitSdrCodePoint i.colourPrimaries i.transferCharacteristics i.matrixCoefficients = true) ∨
+      (i.colourDescriptionPresent = false ∧ i.chromaFormatIdc ≤ 1 ∧
+        i.bitDepthLumaMinus8 = 0 ∧ i.bitDepthChromaMinus8 = 0)) := by
+  unfold classifyAvcSpsColorInfo
+  refine ⟨?_, ?_, ?_⟩ <;> split <;> (try split) <;> (try split) <;> (try split) <;> simp_all
+
+/-- Declarative safety predicate: the SPS colorimetry is provably SDR, so skipping `ffprobe` is sound. -/
+def AvcSpsSdrSafe (i : AvcSpsColorInfo) : Prop :=
+  (i.colourDescriptionPresent = true ∧
+    (i.colourPrimaries = 1 ∨ i.colourPrimaries = 5 ∨ i.colourPrimaries = 6) ∧
+    (i.transferCharacteristics = 1 ∨ i.transferCharacteristics = 6) ∧
+    (i.matrixCoefficients = 1 ∨ i.matrixCoefficients = 5 ∨ i.matrixCoefficients = 6)) ∨
+  (i.colourDescriptionPresent = false ∧ i.chromaFormatIdc ≤ 1 ∧
+    i.bitDepthLumaMinus8 = 0 ∧ i.bitDepthChromaMinus8 = 0)
+
+/-- Layer II: `avcC` SPS VUI SDR `ffprobe`-skip gate (`AVGateSpec`). -/
+def avcSpsSdrGateSpec : AVGateSpec AvcSpsColorInfo AvcSpsSdrSafe where
+  gate i := classifyAvcSpsColorInfo i == some 0
+  sound i h := by
+    unfold classifyAvcSpsColorInfo isExplicitSdrCodePoint at h
+    unfold AvcSpsSdrSafe
+    revert h; split <;> (try split) <;> (try split) <;> (try split) <;> simp_all [or_assoc]
+  complete i h := by
+    unfold classifyAvcSpsColorInfo isExplicitSdrCodePoint
+    unfold AvcSpsSdrSafe at h
+    rcases h with ⟨h1, h2, h3, h4⟩ | ⟨h1, h2, h3, h4⟩
+    · rcases h3 with h3 | h3 <;> simp_all [or_assoc]
+    · simp_all
+  posWitness := {}
+  negWitness := { chromaFormatIdc := 1, bitDepthLumaMinus8 := 2 }
+  nonVacuous := rfl
+  tight := rfl
+
 /-- Pure Lean 4 nominal video frame rate `(fpsNum, fpsDen)` prober from `mdhd` timescale and `stts` sample delta. -/
 def probeMp4FpsRationalPure (buf : @& ByteArray) : Option (UInt32 × UInt32) := do
   let loc ← mp4LocateVideoBoxes buf buf.size
@@ -6128,7 +6359,18 @@ def patchMp4HdrAndElstBoxesPure (inBuf outBuf : @& ByteArray) (copyElst : Bool) 
   let mdcvBox := extractChild inVreStart inVreEnd 0x6D646376 64
   let paspBox := extractChild inVreStart inVreEnd 0x70617370 32
   let inTrakBody := mp4BoxPayloadOffset inBuf inLoc.trakPos (inLoc.trakPos + inLoc.trakSz)
-  let mut edtsBox := if copyElst then extractChild inTrakBody (inLoc.trakPos + inLoc.trakSz) 0x65647473 128 else ByteArray.empty
+  let rawEdtsBox := if copyElst then extractChild inTrakBody (inLoc.trakPos + inLoc.trakSz) 0x65647473 128 else ByteArray.empty
+  let hasNontrivialEdts : Bool := Id.run do
+    if rawEdtsBox.size < 28 then return false
+    if baRdU32BE rawEdtsBox 12 != 0x656C7374 || rawEdtsBox.get! 16 != 0 then return false
+    let cnt := (baRdU32BE rawEdtsBox 20).toNat
+    if cnt > 1 then return true
+    let mut e : Nat := 0
+    while e < cnt && 24 + (e + 1) * 12 <= rawEdtsBox.size do
+      if baRdU32BE rawEdtsBox (24 + e * 12 + 4) != 0 then return true
+      e := e + 1
+    return false
+  let mut edtsBox := if hasNontrivialEdts then rawEdtsBox else ByteArray.empty
 
   if colrBox.isEmpty && clliBox.isEmpty && mdcvBox.isEmpty && paspBox.isEmpty && edtsBox.isEmpty then
     return none

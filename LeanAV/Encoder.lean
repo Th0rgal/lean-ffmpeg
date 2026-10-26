@@ -1340,6 +1340,7 @@ def resolveToolExecPathIO (envVar : String) (candidates : List String) (fallback
 
 def resolveFfmpegBinIO : IO String :=
   resolveToolExecPathIO "LEANAV_FFMPEG_BIN" [
+    "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg",
     "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg",
     "/tmp/opencode/ffmpeg_build/ffmpeg",
     "/opt/homebrew/bin/ffmpeg",
@@ -1349,6 +1350,7 @@ def resolveFfmpegBinIO : IO String :=
 
 def resolveFfprobeBinIO : IO String :=
   resolveToolExecPathIO "LEANAV_FFPROBE_BIN" [
+    "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffprobe",
     "/tmp/opencode/ffmpeg-runtime-full/bin/ffprobe",
     "/tmp/opencode/ffmpeg_build/ffprobe",
     "/opt/homebrew/bin/ffprobe",
@@ -1357,7 +1359,7 @@ def resolveFfprobeBinIO : IO String :=
   ] "ffprobe"
 
 def ffmpegSpawnEnvIO : IO (Array (String × Option String)) := do
-  let runtimeLib := "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu"
+  let runtimeLib := "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu"
   let oldLd ← IO.getEnv "LD_LIBRARY_PATH"
   let newLd := match oldLd with
     | some s => if s != "" then s!"{runtimeLib}:{s}" else runtimeLib
@@ -1390,30 +1392,26 @@ def readMediaBytesWindow (path : String) (offset : UInt64) (maxLen : Nat) : IO B
   | .ok ba => pure ba
   | .error _ => pure ByteArray.empty
 
-/-- Locate and read the ISO BMFF `moov` window from `inPath` using `preadByteArray`. -/
+/-- Locate and read the ISO BMFF `moov` window from `inPath` using `preadByteArray`.
+    Walks top-level ISO BMFF box headers first (`O(boxes)` instead of `O(bytes)`) so
+    end-of-file `moov` boxes are returned as compact `moov`-sized slices rather than
+    scanning 4 MB windows multiple times. -/
 def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
   let probeCap := 4 * 1024 * 1024
   let headCap := 512 * 1024
   let fsz ← getFileSizeU64IO inPath
   if fsz == 0 then return ByteArray.empty
   let headSlice ← readMediaBytesWindow inPath 0 headCap
-  if (mp4LocateVideoBoxes headSlice headSlice.size).isSome then
-    return headSlice
-  if fsz.toNat > headCap then
-    let fullHead ← readMediaBytesWindow inPath 0 probeCap
-    if (mp4LocateVideoBoxes fullHead fullHead.size).isSome then
-      return fullHead
-  if fsz.toNat > probeCap then
-    let tailOff := fsz - probeCap.toUInt64
-    let tailSlice ← readMediaBytesWindow inPath tailOff probeCap
-    if (mp4LocateVideoBoxes tailSlice tailSlice.size).isSome then
-      return tailSlice
   -- Top-level box walk (`leanav_seek_locate_moov_in_file` equivalent)
   let mut off : UInt64 := 0
   for _ in [:256] do
     if off + 8 > fsz then break
     let want := if off + 16 <= fsz then 16 else 8
-    let hdrBa ← readMediaBytesWindow inPath off want
+    let hdrBa ←
+      if off.toNat + want <= headSlice.size then
+        pure (headSlice.extract off.toNat (off.toNat + want))
+      else
+        readMediaBytesWindow inPath off want
     if hdrBa.size < want then break
     let sz32 := (baRdU32BE hdrBa 0).toUInt64
     let mut hdr : UInt64 := 8
@@ -1426,9 +1424,22 @@ def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
       sz := fsz - off
     if sz < hdr || sz > fsz - off then break
     if baRdU32BE hdrBa 4 == 0x6D6F6F76 && sz.toNat <= probeCap then -- 'moov'
+      if off.toNat + sz.toNat <= headSlice.size then
+        return headSlice.extract off.toNat (off.toNat + sz.toNat)
       let moovBa ← readMediaBytesWindow inPath off sz.toNat
       if moovBa.size == sz.toNat then return moovBa else break
     off := off + sz
+  if (mp4LocateVideoBoxes headSlice headSlice.size).isSome then
+    return headSlice
+  if fsz.toNat > headCap then
+    let fullHead ← readMediaBytesWindow inPath 0 probeCap
+    if (mp4LocateVideoBoxes fullHead fullHead.size).isSome then
+      return fullHead
+  if fsz.toNat > probeCap then
+    let tailOff := fsz - probeCap.toUInt64
+    let tailSlice ← readMediaBytesWindow inPath tailOff probeCap
+    if (mp4LocateVideoBoxes tailSlice tailSlice.size).isSome then
+      return tailSlice
   return headSlice
 
 def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
@@ -1436,6 +1447,8 @@ def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UI
   if pureCs > 0 then return pureCs
   if hasExplicitSdrColrBoxPure moovBuf then
     return 0
+  if let some cs := probeAvcCSpsColorspacePure moovBuf then
+    return cs
   try
     let ffprobeBin ← resolveFfprobeBinIO
     let env ← ffmpegSpawnEnvIO
@@ -1507,7 +1520,8 @@ def patchMp4HdrAndElstBoxesIO (_inPath outPath : String) (inMoovBuf : @& ByteArr
     if outSz == 0 then return ()
     let outBuf ← IO.FS.readBinFile outPath
     if let some patched := patchMp4HdrAndElstBoxesPure inMoovBuf outBuf copyElst then
-      IO.FS.writeBinFile outPath patched
+      if patched != outBuf then
+        IO.FS.writeBinFile outPath patched
   catch _ =>
     pure ()
 
@@ -1538,17 +1552,75 @@ def colorVuiArgsForCs (hdrCs codecId : UInt32) (x264SubmeSuffix : String) : Arra
     else
       #["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"]
 
+/-- Ordered pipe payload fragments; EOF is represented by the end of the list. -/
+def joinPipeChunksPure : List ByteArray → ByteArray
+  | [] => ByteArray.empty
+  | chunk :: rest => chunk ++ joinPipeChunksPure rest
+
+theorem joinPipeChunksPure_size (chunks : List ByteArray) :
+    (joinPipeChunksPure chunks).size = (chunks.map ByteArray.size).sum := by
+  induction chunks with
+  | nil => rfl
+  | cons chunk rest ih => simp [joinPipeChunksPure, ih]
+
+/-- Read the first `n` bytes in order, failing closed on an incomplete frame.
+    Empty fragments carry no payload; unlike an actual zero-byte read they are not EOF. -/
+def reassemblePipeChunksPure (chunks : List ByteArray) (n : Nat) : Option ByteArray :=
+  let bytes := joinPipeChunksPure chunks
+  if n ≤ bytes.size then some (bytes.extract 0 n) else none
+
+/-- Every successful reassembly has exactly the requested length; insufficient
+    total payload is rejected, for arbitrary fragment sizes and frame lengths. -/
+theorem reassemblePipeChunksPure_verified (chunks : List ByteArray) (n : Nat) :
+    (∀ bytes, reassemblePipeChunksPure chunks n = some bytes → bytes.size = n) ∧
+    ((chunks.map ByteArray.size).sum < n → reassemblePipeChunksPure chunks n = none) := by
+  constructor
+  · intro bytes h
+    unfold reassemblePipeChunksPure at h
+    dsimp only at h
+    split at h
+    · cases h
+      simp [ByteArray.size_extract, Nat.min_eq_left (by assumption)]
+    · cases h
+  · intro h
+    simp [reassemblePipeChunksPure, joinPipeChunksPure_size, Nat.not_le_of_lt h]
+
+theorem reassemblePipeChunksPure_isSome (chunks : List ByteArray) (n : Nat) :
+    (reassemblePipeChunksPure chunks n).isSome = true ↔
+      n ≤ (chunks.map ByteArray.size).sum := by
+  simp [reassemblePipeChunksPure, joinPipeChunksPure_size]
+
+/-- Tight admission gate for complete pipe frames, using the actual pure reassembler. -/
+def pipeChunkReassemblyGateSpec :
+    AVGateSpec (List ByteArray × Nat) (fun x => x.2 ≤ (x.1.map ByteArray.size).sum) where
+  gate := fun x => (reassemblePipeChunksPure x.1 x.2).isSome
+  sound := fun x => (reassemblePipeChunksPure_isSome x.1 x.2).mp
+  complete := fun x => (reassemblePipeChunksPure_isSome x.1 x.2).mpr
+  posWitness := ([ByteArray.mk #[1], ByteArray.mk #[2, 3]], 3)
+  negWitness := ([ByteArray.mk #[1], ByteArray.mk #[2, 3]], 4)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem pipeChunkReassemblyGateSpec_correct (chunks : List ByteArray) (n : Nat) :
+    (pipeChunkReassemblyGateSpec.gate (chunks, n) = true ↔
+      n ≤ (chunks.map ByteArray.size).sum) ∧
+    (∀ bytes, reassemblePipeChunksPure chunks n = some bytes → bytes.size = n) ∧
+    ((chunks.map ByteArray.size).sum < n → reassemblePipeChunksPure chunks n = none) := by
+  exact ⟨pipeChunkReassemblyGateSpec.iff_safe (chunks, n),
+    reassemblePipeChunksPure_verified chunks n⟩
+
 def readExactBytesFromHandle (h : IO.FS.Handle) (n : Nat) : IO (Option ByteArray) := do
-  let first ← h.read n.toUSize
+  let first ← h.read (Nat.min n 65536).toUSize
   if first.size == n then
     return some first
   else if first.isEmpty then
     return none
   else
-    let mut acc := first
+    let mut acc := ByteArray.emptyWithCapacity n
+    acc := acc ++ first
     while acc.size < n do
-      let rem := n - acc.size
-      let chunk ← h.read rem.toUSize
+      let step := Nat.min (n - acc.size) 65536
+      let chunk ← h.read step.toUSize
       if chunk.isEmpty then
         return none
       acc := acc ++ chunk
@@ -1730,6 +1802,10 @@ def transcodeMp4GeneralVerifiedIO
     env := env
   }
 
+  -- Keep spawning lazy even without audio/metadata: `-y` may truncate an existing
+  -- output on EOF before frame 0. Removing a newly created output cannot restore
+  -- that file (or retract bytes sent to a special output). Safe eager spawning
+  -- requires deferred output publication, not just closing stdin on zero frames.
   let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) := none
   let mut framesDone : UInt64 := 0
   let mut meanAccum : UInt64 := 0

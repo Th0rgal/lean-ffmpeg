@@ -874,9 +874,10 @@ opaque execLnirBinaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArr
 opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) (ba2 : @& ByteArray) : ByteArray
 
 /-- Zero-copy `ByteArray` 2D strided plane LNIR dispatcher
-    (`0=swscale_down2x2_u8`, `1=swscale_down2x2_fused_eq_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`, `4=stencil2d_box3x3_u8`). -/
+    (`0=swscale_down2x2_u8`, `1=swscale_down2x2_fused_eq_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`, `4=stencil2d_box3x3_u8`).
+    `pAlpha` is a source byte offset, except for kernel 1 where it remains the Q8 gain. -/
 @[extern "leanav_c_exec_lnir_scale2d_ba"]
-opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH arg0 arg1 : UInt64) : ByteArray
+opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH pAlpha arg1 : UInt64) : ByteArray
 
 /-- Zero-copy `ByteArray` 2D AV1 CDEF directional deringing filter LNIR dispatcher (`@lean_native_av1_cdef_filter_u8`). -/
 @[extern "leanav_c_exec_lnir_cdef_ba"]
@@ -979,6 +980,20 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
   let ok18 := (statsOut &&& 0xFFFFFFFF) == 130 && (statsOut >>> 32) == 500
   let shortOddOut := execLnirScale2dBaC 3 { data := #[90] } 1 1 1 0 0
   let ok19 := shortOddOut.size == 1 && shortOddOut.get! 0 == 0
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 then 1 else 0
+  -- Unaligned offsets, vector-width rows and tails, all offset kernels, and bounds rejection.
+  let offsetSrc : ByteArray := ⟨(Array.range 4096).map (fun i => (i * 37 + i / 11).toUInt8)⟩
+  let ok20 := ([1, 7, 31] : List Nat).all fun off =>
+    ([0, 2, 3, 4] : List UInt32).all fun k =>
+      let dw : UInt64 := if k == 3 then 18 else 19
+      let dh : UInt64 := if k == 3 then 4 else 3
+      let st : UInt64 := if k == 4 then dw else 64
+      let rows : Nat := if k == 0 then 6 else if k == 2 then 9 else if k == 3 then 6 else 3
+      let slice := offsetSrc.extract off (off + st.toNat * rows)
+      let actual := execLnirScale2dBaC k offsetSrc st dw dh off.toUInt64 0
+      let expected := execLnirScale2dBaC k slice st dw dh 0 0
+      let invalid := execLnirScale2dBaC k offsetSrc st dw dh 0xffffffffffffffff 0
+      actual.data == expected.data && actual.size == (dw * dh).toNat &&
+        invalid.size == actual.size && invalid.data.all (· == 0)
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 then 1 else 0
 
 end LeanAV.NativeKernels
