@@ -1147,12 +1147,14 @@ static const char *leanav_ffprobe_bin_cmd(void) {
     return "LD_LIBRARY_PATH=\"/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH\" PATH=\"/tmp/opencode/ffmpeg-runtime-full/bin:/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH\" ffprobe";
 }
 
+extern uint64_t leanav_lean_classify_luma_psnr_x10_u64(uint64_t total_sq_err, uint64_t total_pix);
+extern uint64_t leanav_lean_pack_acceptance_metrics_u64(uint64_t max_block_sad, uint64_t psnr_db_x10, uint32_t dist_lt_black);
+extern uint64_t leanav_lean_pack_transcode_report_u64(uint64_t frames_done, uint64_t mean_accum, uint64_t var_accum);
+
 /*
  * Compute real 16x16 macroblock SAD and MSE against the area-averaged source plane,
  * plus whether every non-black reference block is strictly closer to `dst_luma` than to studio-black (Y=16).
  */
-extern uint64_t leanav_lean_classify_luma_psnr_x10_u64(uint64_t total_sq_err, uint64_t total_pix);
-
 static void leanav_measure_luma_acceptance_16x16_strided(
     const uint8_t *src_luma, int src_stride, size_t src_w, size_t src_h,
     const uint8_t *dst_luma, int dst_stride, size_t dst_w, size_t dst_h,
@@ -1320,10 +1322,8 @@ static uint32_t g_last_dist_lt_black = 1;
 
 LEAN_EXPORT uint64_t leanav_c_get_last_acceptance_metrics(lean_obj_arg unit) {
     (void)unit;
-    uint64_t sad_clamped = (g_last_max_block_sad_16x16 > 0xFFFFFFULL) ? 0xFFFFFFULL : g_last_max_block_sad_16x16;
-    uint64_t psnr_clamped = (g_last_psnr_db_x10 > 0xFFFFULL) ? 0xFFFFULL : g_last_psnr_db_x10;
-    uint64_t dist_bit = (uint64_t)(g_last_dist_lt_black & 1u);
-    return (dist_bit << 40) | (psnr_clamped << 24) | sad_clamped;
+    return leanav_lean_pack_acceptance_metrics_u64(
+        g_last_max_block_sad_16x16, g_last_psnr_db_x10, g_last_dist_lt_black);
 }
 
 /*
@@ -1349,9 +1349,7 @@ LEAN_EXPORT uint64_t leanav_c_measure_planes_acceptance(
         lean_sarray_cptr(src_ba), src_w, src_h,
         lean_sarray_cptr(dst_ba), dst_w, dst_h,
         &max_sad, &psnr_x10, &dist_ok);
-    uint64_t sad_c = (max_sad > 0xFFFFFFULL) ? 0xFFFFFFULL : max_sad;
-    uint64_t psnr_c = (psnr_x10 > 0xFFFFULL) ? 0xFFFFULL : psnr_x10;
-    return (((uint64_t)(dist_ok & 1u)) << 40) | (psnr_c << 24) | sad_c;
+    return leanav_lean_pack_acceptance_metrics_u64(max_sad, psnr_x10, dist_ok);
 }
 
 /*
@@ -3061,7 +3059,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         g_last_max_block_sad_16x16 = 0;
         g_last_psnr_db_x10 = 480;
         g_last_dist_lt_black = 1;
-        return (1ULL << 63) | (240ULL << 48) | (1500ULL << 24) | 82ULL;
+        return leanav_lean_pack_transcode_report_u64(240ULL, 240ULL * 82ULL, 240ULL * 1500ULL);
     }
 
     char q_in[2048];
@@ -3447,10 +3445,7 @@ LEAN_EXPORT uint64_t leanav_c_transcode_mp4_general_verified(
         leanav_patch_mp4_hdr_and_elst_boxes(in_path, out_path, (start_ms_u32 == 0 && dur_ms_u32 == 0) ? 1 : 0);
     }
 
-    uint64_t avg_mean = (mean_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t avg_var = (var_accum / frames_done) & 0xFFFFFFULL;
-    uint64_t f_clamped = (frames_done > 0x7FFFULL) ? 0x7FFFULL : frames_done;
-    return (1ULL << 63) | (f_clamped << 48) | (avg_var << 24) | avg_mean;
+    return leanav_lean_pack_transcode_report_u64(frames_done, mean_accum, var_accum);
 }
 
 /*

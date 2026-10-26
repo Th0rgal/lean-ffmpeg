@@ -5521,6 +5521,50 @@ def classifyLumaPsnrX10U64 (totalSqErr totalPix : UInt64) : UInt64 :=
 def classifyLumaPsnrX10Export (totalSqErr totalPix : UInt64) : UInt64 :=
   classifyLumaPsnrX10U64 totalSqErr totalPix
 
+/--
+  Saturating 64-bit acceptance metrics word packer for Law 11 (`verifyFFmpegAcceptance`):
+  - `bit 40`: `distLtBlack & 1`
+  - `bits 24..39`: `min psnrDbX10 0xFFFF`
+  - `bits 0..23`: `min maxBlockSad 0xFFFFFF`
+-/
+@[inline]
+def packAcceptanceMetricsU64 (maxBlockSad psnrDbX10 : UInt64) (distLtBlack : UInt32) : UInt64 :=
+  let sadClamped : UInt64 := if maxBlockSad > 0xFFFFFF then 0xFFFFFF else maxBlockSad
+  let psnrClamped : UInt64 := if psnrDbX10 > 0xFFFF then 0xFFFF else psnrDbX10
+  let distBit : UInt64 := (distLtBlack &&& 1).toUInt64
+  (distBit <<< 40) ||| (psnrClamped <<< 24) ||| sadClamped
+
+@[export leanav_lean_pack_acceptance_metrics_u64]
+def packAcceptanceMetricsExport (maxBlockSad psnrDbX10 : UInt64) (distLtBlack : UInt32) : UInt64 :=
+  packAcceptanceMetricsU64 maxBlockSad psnrDbX10 distLtBlack
+
+/--
+  Saturating 64-bit pixel transcode report word packer for `runCertifiedGeneralTranscodeMp4`:
+  - Returns `0` (`cOk = false`) when `framesDone == 0` (guarding against division by zero).
+  - Otherwise computes per-frame averages `meanAccum / framesDone` and `varAccum / framesDone`,
+    saturating each 24-bit field at `0xFFFFFF` (instead of wrapping modulo `2^24` via `& 0xFFFFFF`,
+    which would alias `0x1000000` to `0` and corrupt flat-plane detection) and saturating `framesDone`
+    at `0x7FFF`:
+    `bit 63`: `1` (`cOk = true`)
+    `bits 48..62`: `min framesDone 0x7FFF`
+    `bits 24..47`: `min (varAccum / framesDone) 0xFFFFFF`
+    `bits 0..23`: `min (meanAccum / framesDone) 0xFFFFFF`
+-/
+@[inline]
+def packTranscodeReportU64 (framesDone meanAccum varAccum : UInt64) : UInt64 :=
+  if framesDone == 0 then 0
+  else
+    let rawMean : UInt64 := meanAccum / framesDone
+    let rawVar : UInt64 := varAccum / framesDone
+    let meanClamped : UInt64 := if rawMean > 0xFFFFFF then 0xFFFFFF else rawMean
+    let varClamped : UInt64 := if rawVar > 0xFFFFFF then 0xFFFFFF else rawVar
+    let fClamped : UInt64 := if framesDone > 0x7FFF then 0x7FFF else framesDone
+    ((1 : UInt64) <<< 63) ||| (fClamped <<< 48) ||| (varClamped <<< 24) ||| meanClamped
+
+@[export leanav_lean_pack_transcode_report_u64]
+def packTranscodeReportExport (framesDone meanAccum varAccum : UInt64) : UInt64 :=
+  packTranscodeReportU64 framesDone meanAccum varAccum
+
 theorem hdr_static_clip_roundtrip :
     decodeMdcvDciP3BoxSpec (encodeMdcvDciP3BoxSpec hdrMdcvClip) = some hdrMdcvClip ∧
     decodeClliBoxSpec (encodeClliBoxSpec hdrClliClip) = some hdrClliClip ∧
@@ -5542,7 +5586,12 @@ theorem hdr_static_clip_roundtrip :
     classifyLumaPsnrX10Export 64 256 = 540 ∧
     classifyLumaPsnrX10Export 256 256 = 481 ∧
     classifyLumaPsnrX10Export 5120 256 = 351 ∧
-    classifyLumaPsnrX10Export 184467440737095517 256 = 300 := by
+    classifyLumaPsnrX10Export 184467440737095517 256 = 300 ∧
+    packAcceptanceMetricsExport 512 480 1 = 0x00000101E0000200 ∧
+    packAcceptanceMetricsExport 0x1FFFFFF 0x1FFFF 3 = 0x000001FFFFFFFFFF ∧
+    packTranscodeReportExport 0 100 200 = 0 ∧
+    packTranscodeReportExport 240 (240 * 82) (240 * 1500) = 0x80F00005DC000052 ∧
+    packTranscodeReportExport 1 0x1000000 0x1000000 = 0x8001FFFFFFFFFFFF := by
   decide
 
 end LeanAV.Format
