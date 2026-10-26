@@ -1047,7 +1047,7 @@ def runtimeVideoFilterSupported (spec : String) : Bool :=
 
 def tryFastHeaderProbeTranscode
     (validCfg : CliConfig) (inPath outPath : String) (filterOps : List VideoFilterOp)
-    (t0 : Nat) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
+    (t0 : Nat) (moov : ByteArray) (fastDemux : IsoMp4TrackDemux) (startMs durMs : UInt32) (withAudio : Bool) : IO Bool := do
   let statsBit : UInt32 := if validCfg.showStats && !validCfg.jsonOutput then 1 else 0
   let bannerBit : UInt32 := if validCfg.hideBanner || validCfg.jsonOutput then 0 else 2
   let _ ← setEncoderCliOptionsC
@@ -1061,7 +1061,7 @@ def tryFastHeaderProbeTranscode
   if validCfg.videoCodec == some .copy then
     let tDemux ← IO.monoNanosNow
     let vOnlyReencodeAudio := validCfg.audioCodec == none && !validCfg.noAudio
-    let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0 vOnlyReencodeAudio
+    let copyRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux fastDemux.width fastDemux.height startMs durMs 0 withAudio 0 vOnlyReencodeAudio (some moov)
     if copyRep.ok then
       let tEnd ← IO.monoNanosNow
       let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
@@ -1104,7 +1104,7 @@ def tryFastHeaderProbeTranscode
     let acBit  : UInt32 := if validCfg.audioChannels == some 2 && validCfg.audioCodec == some .aac then 8 else 0
     let filterFlags : UInt32 := cscBit ||| tmBit ||| acBit
     let tDemux ← IO.monoNanosNow
-    let pixRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux reqW reqH startMs durMs codecCode withAudio filterFlags
+    let pixRep ← runCertifiedGeneralTranscodeMp4 inPath outPath fastDemux reqW reqH startMs durMs codecCode withAudio filterFlags false (some moov)
     if pixRep.ok then
       let tEnd ← IO.monoNanosNow
       let inStat ← getFileByteSizeOr inPath fastDemux.mdatBytes
@@ -1188,7 +1188,9 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
             "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
             (s!"{inP}: No such file or directory")
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
-    if plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer then
+    let plainStreamCopy := streamCopyFastRouteGateSpec.gate
+      (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
+    if (plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer) || plainStreamCopy then
       let isSpecialOut :=
         outPath == "-" || outPath == "/dev/null" || outPath == "md5:" ||
         strStartsWithFast outPath "md5:" || strStartsWithFast outPath "pipe:" ||
@@ -1274,40 +1276,15 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return 1
       | none => pure []
     let t0 ← IO.monoNanosNow
-    -- Fast path: read the initial 256 KiB header window via `readMediaWindow` (`pread`) to probe `ftyp`/`moov`,
-    -- or jump directly across `mdat` via `probeMp4NextMoovWindow` without reading multi-hundred-MB `mdat` payloads into RAM.
-    let hdrSliceOpt ← do
-      match ← readMediaWindow inPath 0 (256 * 1024) with
-      | .ok s => pure (some s)
-      | .error _ => pure none
-    let fastDemuxOpt ← match hdrSliceOpt with
-      | some s =>
-        match probeIsoMp4HeaderSlice s with
-        | some d => pure (some d)
-        | none =>
-          let nextOpt ← match probeMp4NextMoovWindow s 0 with
-            | some (nextOff, nextWin) =>
-              match ← readMediaWindow inPath nextOff nextWin with
-              | .ok nextSlice => pure (probeIsoMp4HeaderSlice nextSlice)
-              | .error _ => pure none
-            | none => pure none
-          match nextOpt with
-          | some d => pure (some d)
-          | none =>
-            let fileSz ← getFileByteSizeOr inPath 0
-            if fileSz > 4 * 1024 * 1024 then
-              let tailOff : UInt64 := (fileSz - 4 * 1024 * 1024).toUInt64
-              match ← readMediaWindow inPath tailOff (4 * 1024 * 1024) with
-              | .ok tailSlice => pure (probeIsoMp4HeaderSlice tailSlice)
-              | .error _ => pure none
-            else
-              pure none
-      | none => pure none
+    -- Locate once, then share the exact bytes with the encoder's metadata probes.
+    -- The box walker skips mdat payloads and reads only a 64 KiB initial window.
+    let moov ← readMp4MoovWindowIO inPath
+    let fastDemuxOpt := probeIsoMp4HeaderSlice (LeanSys.Posix.ByteSlice.ofByteArray moov)
     let startMs : UInt32 := plan.timeline.startMs.getD 0
     let durMs : UInt32 := plan.timeline.durationMs.getD 0
     let withAudio := !validCfg.noAudio
     let handledFast ← match fastDemuxOpt with
-      | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 fastDemux startMs durMs withAudio
+      | some fastDemux => tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 moov fastDemux startMs durMs withAudio
       | none => pure false
     if handledFast then
       return 0
@@ -1320,7 +1297,7 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawBytes
       -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
       if let some demux := demuxIsoMp4Track inSlice then
-        let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 demux startMs durMs withAudio
+        let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 rawBytes demux startMs durMs withAudio
         if handledFull then
           return 0
         else

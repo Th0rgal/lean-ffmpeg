@@ -1257,8 +1257,100 @@ def measureLumaAcceptance16x16Pure
   let psnrX10 := classifyLumaPsnrX10U64 totalSqErr totalPix
   return (maxSad, psnrX10, allCloserThanBlack)
 
+/-- Inputs to the 16x16 luma acceptance SIMD fast-path admission gate (`lumaAcceptanceFastPathGateSpec`). -/
+structure LumaAcceptanceFastPathInput where
+  srcW   : Nat
+  srcH   : Nat
+  srcCap : Nat
+  dstW   : Nat
+  dstH   : Nat
+  dstCap : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Safety predicate for the compiled LLVM 18 `@lean_native_luma_acceptance_16x16_u8` fast path:
+    `16 ≤ dstW ≤ 0x3FFFFFFF`, `16 ≤ dstH ≤ 0x3FFFFFFF`, `2 ≤ srcW ≤ 0x3FFFFFFF`, `2 ≤ srcH ≤ 0x3FFFFFFF`,
+    exact `1:1` (`srcW = dstW ∧ srcH = dstH`) or `2:1` (`srcW = dstW * 2 ∧ srcH = dstH * 2`) geometry,
+    and complete plane capacities (`srcW * srcH ≤ srcCap` and `dstW * dstH ≤ dstCap`). -/
+def LumaAcceptanceFastPathSafe (x : LumaAcceptanceFastPathInput) : Prop :=
+  16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 2 ≤ x.srcW ∧ 2 ≤ x.srcH ∧
+  x.srcW ≤ 0x3FFFFFFF ∧ x.srcH ≤ 0x3FFFFFFF ∧ x.dstW ≤ 0x3FFFFFFF ∧ x.dstH ≤ 0x3FFFFFFF ∧
+  ((x.srcW = x.dstW ∧ x.srcH = x.dstH) ∨ (x.srcW = x.dstW * 2 ∧ x.srcH = x.dstH * 2)) ∧
+  x.srcW * x.srcH ≤ x.srcCap ∧ x.dstW * x.dstH ≤ x.dstCap
+
+/-- Decidable admission checker for the compiled LLVM 18 16x16 luma acceptance SIMD fast path. -/
+@[inline]
+def checkLumaAcceptanceFastPath (x : LumaAcceptanceFastPathInput) : Bool :=
+  decide (
+    16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 2 ≤ x.srcW ∧ 2 ≤ x.srcH ∧
+    x.srcW ≤ 0x3FFFFFFF ∧ x.srcH ≤ 0x3FFFFFFF ∧ x.dstW ≤ 0x3FFFFFFF ∧ x.dstH ≤ 0x3FFFFFFF ∧
+    ((x.srcW = x.dstW ∧ x.srcH = x.dstH) ∨ (x.srcW = x.dstW * 2 ∧ x.srcH = x.dstH * 2)) ∧
+    x.srcW * x.srcH ≤ x.srcCap ∧ x.dstW * x.dstH ≤ x.dstCap
+  )
+
+/-- Universal equivalence theorem: `checkLumaAcceptanceFastPath x = true ↔ LumaAcceptanceFastPathSafe x`. -/
+theorem lumaAcceptanceFastPath_iff (x : LumaAcceptanceFastPathInput) :
+    checkLumaAcceptanceFastPath x = true ↔ LumaAcceptanceFastPathSafe x := by
+  unfold checkLumaAcceptanceFastPath LumaAcceptanceFastPathSafe
+  exact decide_eq_true_iff
+
+/-- Universal soundness theorem (`lumaAcceptanceFastPath_sound`):
+    If `checkLumaAcceptanceFastPath x = true`, then `LumaAcceptanceFastPathSafe x` holds and
+    every sampled 16x16 destination macroblock fits within `dstCap` and `srcCap`. -/
+theorem lumaAcceptanceFastPath_sound (x : LumaAcceptanceFastPathInput)
+    (h : checkLumaAcceptanceFastPath x = true) :
+    LumaAcceptanceFastPathSafe x ∧ 256 ≤ x.dstCap ∧ 256 ≤ x.srcCap := by
+  have hSafe := (lumaAcceptanceFastPath_iff x).mp h
+  rcases hSafe with ⟨hDw, hDh, hSw, hSh, hSwMax, hShMax, hDwMax, hDhMax, hRatio, hSrcCap, hDstCap⟩
+  have hDst256 : 256 ≤ x.dstW * x.dstH := by
+    have : 16 * 16 ≤ x.dstW * x.dstH := Nat.mul_le_mul hDw hDh
+    omega
+  have hSrc256 : 256 ≤ x.srcW * x.srcH := by
+    rcases hRatio with ⟨hW, hH⟩ | ⟨hW, hH⟩
+    · rw [hW, hH]
+      exact hDst256
+    · rw [hW, hH]
+      have : 16 * 16 ≤ (x.dstW * 2) * (x.dstH * 2) :=
+        Nat.mul_le_mul (by omega) (by omega)
+      omega
+  exact ⟨⟨hDw, hDh, hSw, hSh, hSwMax, hShMax, hDwMax, hDhMax, hRatio, hSrcCap, hDstCap⟩,
+    Nat.le_trans hDst256 hDstCap, Nat.le_trans hSrc256 hSrcCap⟩
+
+/-- Tight `AVGateSpec` bundle (`lumaAcceptanceFastPathGateSpec`) for the 16x16 luma acceptance SIMD fast path. -/
+def lumaAcceptanceFastPathGateSpec :
+    AVGateSpec LumaAcceptanceFastPathInput LumaAcceptanceFastPathSafe where
+  gate := checkLumaAcceptanceFastPath
+  sound := fun x => (lumaAcceptanceFastPath_iff x).mp
+  complete := fun x => (lumaAcceptanceFastPath_iff x).mpr
+  posWitness := ⟨32, 32, 1024, 16, 16, 256⟩
+  negWitness := ⟨32, 32, 1024, 16, 16, 255⟩
+  nonVacuous := rfl
+  tight := rfl
+
 /--
-  Direct pure Lean 4 16x16 macroblock acceptance measurement between two `ByteArray` luma planes:
+  Fast 16x16 macroblock luma acceptance evaluator (`measureLumaAcceptance16x16Fast`):
+  Dispatches to the compiled LLVM 18 SIMD kernel `@lean_native_luma_acceptance_16x16_u8` via
+  `execLnirLumaAcceptance16x16BaC` when `lumaAcceptanceFastPathGateSpec.gate` admits the plane
+  dimensions and capacities (`1:1` or `2:1` ratios with complete buffers), falling back to
+  `measureLumaAcceptance16x16Pure` otherwise (`3:1`, general bilinear, or truncated buffers).
+-/
+@[inline]
+def measureLumaAcceptance16x16Fast
+    (src : @& ByteArray) (srcW srcH : Nat)
+    (dst : @& ByteArray) (dstW dstH : Nat) : UInt64 × UInt64 × UInt32 :=
+  if dstW < 16 || dstH < 16 || srcW < 2 || srcH < 2 then
+    (0, 450, 1)
+  else if lumaAcceptanceFastPathGateSpec.gate ⟨srcW, srcH, src.size, dstW, dstH, dst.size⟩ then
+    let packed := LeanAV.NativeKernels.execLnirLumaAcceptance16x16BaC
+      src srcW.toUInt64 srcH.toUInt64 dst dstW.toUInt64 dstH.toUInt64
+    let maxSad := packed &&& 0xFFFFFF
+    let psnrX10 := (packed >>> 24) &&& 0xFFFF
+    let distOk := ((packed >>> 40) &&& 1).toUInt32
+    (maxSad, psnrX10, distOk)
+  else
+    measureLumaAcceptance16x16Pure src srcW srcH dst dstW dstH
+
+/--
+  Direct 16x16 macroblock acceptance measurement between two `ByteArray` luma planes:
   returns `(distToRefLtBlack <<< 40) ||| (psnrDbX10 <<< 24) ||| maxBlockSad16x16`.
 -/
 def measurePlanesAcceptanceC
@@ -1270,7 +1362,7 @@ def measurePlanesAcceptanceC
   let dh := dstH.toNat
   if src.size < sw * sh || dst.size < dw * dh then 0
   else
-    let (maxSad, psnrX10, distOk) := measureLumaAcceptance16x16Pure src sw sh dst dw dh
+    let (maxSad, psnrX10, distOk) := measureLumaAcceptance16x16Fast src sw sh dst dw dh
     packAcceptanceMetricsU64 maxSad psnrX10 distOk
 
 /-- Compute luma mean and spatial variance on an 8-bit planar luma buffer `luma` (`nPixels = dstW * dstH`). -/
@@ -1480,7 +1572,7 @@ def readMediaBytesWindow (path : String) (offset : UInt64) (maxLen : Nat) : IO B
     scanning 4 MB windows multiple times. -/
 def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
   let probeCap := 4 * 1024 * 1024
-  let headCap := 512 * 1024
+  let headCap := 64 * 1024
   let fsz ← getFileSizeU64IO inPath
   if fsz == 0 then return ByteArray.empty
   let headSlice ← readMediaBytesWindow inPath 0 headCap
@@ -1773,7 +1865,8 @@ def isSpecialOutputTarget (outPath : String) : Bool :=
 -/
 def transcodeMp4GeneralVerifiedIO
     (inPath outPath : String)
-    (srcW32 srcH32 dstW32 dstH32 startMs durMs codecId withAudio filterFlags : UInt32) : IO UInt64 := do
+    (srcW32 srcH32 dstW32 dstH32 startMs durMs codecId withAudio filterFlags : UInt32)
+    (probedMoov : Option ByteArray := none) : IO UInt64 := do
   let ffmpegBin ← resolveFfmpegBinIO
   let env ← ffmpegSpawnEnvIO
   let isSpecialOut := isSpecialOutputTarget outPath
@@ -1818,7 +1911,9 @@ def transcodeMp4GeneralVerifiedIO
     return 0
 
   let cliOpts ← encoderCliOptionsRef.get
-  let inMoovBuf ← readMp4MoovWindowIO inPath
+  let inMoovBuf ← match probedMoov with
+    | some bytes => pure bytes
+    | none => readMp4MoovWindowIO inPath
   let inFileSz ← getFileSizeU64IO inPath
   let hdrCs ← if (filterFlags &&& 3) == 0 then probeInputHdrColorspaceIO inPath inMoovBuf else pure 0
   let (fpsNum, fpsDen) ← probeInputFpsRationalIO inPath inMoovBuf
@@ -1894,6 +1989,7 @@ def transcodeMp4GeneralVerifiedIO
 
   let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
   let needTabs : Bool :=
+    (is10bit || (filterFlags &&& 3) != 0) &&
     !(srcW == dstW && srcH == dstH) &&
     !(srcW == dstW * 2 && srcH == dstH * 2) &&
     !(srcW == dstW * 3 && srcH == dstH * 3) &&
@@ -1918,11 +2014,6 @@ def transcodeMp4GeneralVerifiedIO
     env := env
   }
 
-  -- Keep spawning lazy even without audio/metadata: `-y` may truncate an existing
-  -- output on EOF before frame 0. Removing a newly created output cannot restore
-  -- that file (or retract bytes sent to a special output). Safe eager spawning
-  -- requires deferred output publication, not just closing stdin on zero frames.
-  let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) := none
   let mut framesDone : UInt64 := 0
   let mut meanAccum : UInt64 := 0
   let mut varAccum : UInt64 := 0
@@ -1934,6 +2025,23 @@ def transcodeMp4GeneralVerifiedIO
     if outputFrameLimit == 0 || framesDone < outputFrameLimit then
       let t ← IO.asTask (prio := .dedicated) (readExactBytesFromHandle decChild.stdout frameBytes)
       pure (some t)
+    else
+      pure none
+
+  -- Overlap encoder dynamic-linker/codec init with decoder startup + Frame 0 decode
+  -- whenever the output path is newly created (cleaned up on zero-frame failure) or
+  -- when an un-seeked valid MP4 header has already been verified.
+  let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) ←
+    if !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0)) then
+      let ec ← IO.Process.spawn {
+        cmd := ffmpegBin
+        args := encArgs
+        stdin := .piped
+        stdout := .null
+        stderr := .null
+        env := env
+      }
+      pure (some ec)
     else
       pure none
 
@@ -1973,7 +2081,7 @@ def transcodeMp4GeneralVerifiedIO
         meanAccum := meanAccum + fMean
         varAccum := varAccum + fVar
         if (framesDone &&& 7) == 0 then
-          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcBuf srcW srcH srcBuf dstW dstH
+          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Fast srcBuf srcW srcH srcBuf dstW dstH
           if fSad > maxSadWorst then maxSadWorst := fSad
           if fPsnr < psnrMin then psnrMin := fPsnr
           if fDist == 0 then distLtBlackAll := 0
@@ -1988,7 +2096,7 @@ def transcodeMp4GeneralVerifiedIO
           let vScaled := scalePlaneBilinearU16LeBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
           yScaled ++ uScaled ++ vScaled
         else if (filterFlags &&& 3) == 0 then
-          scaleFrameYuv420pQ8WithTabs srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
+          scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else
           let uOff := srcYSz
           let vOff := srcYSz + srcUvSz
@@ -2017,7 +2125,7 @@ def transcodeMp4GeneralVerifiedIO
 
         if (framesDone &&& 7) == 0 then
           if !is10bit then
-            let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Pure srcBuf srcW srcH dstFrame dstW dstH
+            let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Fast srcBuf srcW srcH dstFrame dstW dstH
             let (fSad, fPsnr, fDist) :=
               if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
               else (fSad0, fPsnr0, fDist0)
@@ -2027,7 +2135,7 @@ def transcodeMp4GeneralVerifiedIO
           else
             let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
             let dstY8 := extractU16LeMsb8Pure dstFrame dstYSz
-            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Pure srcY8 srcW srcH dstY8 dstW dstH
+            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Fast srcY8 srcW srcH dstY8 dstW dstH
             if fSad > maxSadWorst then maxSadWorst := fSad
             if fPsnr < psnrMin then psnrMin := fPsnr
             if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
@@ -2074,6 +2182,32 @@ def transcodeMp4GeneralVerifiedC
   | .ok v => return v
   | .error _ => return 0
 
+/-- Reuse the caller's MP4 window; this entry point never probes the input again. -/
+def transcodeMp4GeneralVerifiedWithMoov
+    (inPath outPath : String) (moov : ByteArray)
+    (srcW srcH dstW dstH startMs durMs codecId withAudio filterFlags : UInt32) : BaseIO UInt64 := do
+  match ← (transcodeMp4GeneralVerifiedIO inPath outPath srcW srcH dstW dstH
+      startMs durMs codecId withAudio filterFlags (some moov)).toBaseIO with
+  | .ok v => return v
+  | .error _ => return 0
+
+/-- Only plain copy without a filter or JSON metadata needs no Lean header demux.
+    The delegated backend still validates and opens the media before remuxing. -/
+def streamCopyFastRouteGateSpec : AVGateSpec (Bool × Bool × Bool)
+    (fun (copy, filter, json) => copy = true ∧ filter = false ∧ json = false) where
+  gate := fun (copy, filter, json) => copy && !filter && !json
+  sound := by intro ⟨copy, filter, json⟩ h; simpa [Bool.and_eq_true, and_assoc] using h
+  complete := by intro ⟨copy, filter, json⟩ h; simpa [Bool.and_eq_true, and_assoc] using h
+  posWitness := (true, false, false)
+  negWitness := (true, true, false)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem streamCopyFastRouteGateSpec_sound (copy filter json : Bool)
+    (h : streamCopyFastRouteGateSpec.gate (copy, filter, json) = true) :
+    copy = true ∧ filter = false ∧ json = false :=
+  streamCopyFastRouteGateSpec.sound (copy, filter, json) h
+
 /--
   2x2 SIMD MP4 transcode wrapper delegating directly to `transcodeMp4GeneralVerifiedC` in Lean 4.
 -/
@@ -2108,14 +2242,16 @@ structure CertifiedPixelTranscodeReport where
 def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4TrackDemux)
     (dstW dstH : Nat) (startMs durMs : UInt32 := 0)
     (codecCode : UInt32 := 1) (withAudio : Bool := true) (filterFlags : UInt32 := 0)
-    (copyVideoOnlyAudioReencode : Bool := false) :
+    (copyVideoOnlyAudioReencode : Bool := false) (probedMoov : Option ByteArray := none) :
     IO CertifiedPixelTranscodeReport := do
   let audioMode : UInt32 :=
     if !withAudio then 0
     else if codecCode == 0 && copyVideoOnlyAudioReencode then 2
     else 1
-  let packed ← transcodeMp4GeneralVerifiedC
-    inPath outPath
+  let transcode := match probedMoov with
+    | some moov => transcodeMp4GeneralVerifiedWithMoov inPath outPath moov
+    | none => transcodeMp4GeneralVerifiedC inPath outPath
+  let packed : UInt64 ← transcode
     demux.width.toUInt32 demux.height.toUInt32
     dstW.toUInt32 dstH.toUInt32
     startMs durMs codecCode audioMode filterFlags

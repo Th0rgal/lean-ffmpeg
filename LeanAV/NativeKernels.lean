@@ -879,8 +879,14 @@ opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteAr
 @[extern "leanav_c_exec_lnir_scale2d_ba"]
 opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH pAlpha arg1 : UInt64) : ByteArray
 
+/-- Q8 bilinear scaling from a borrowed source slice with an explicit row stride.
+    Invalid dimensions or source footprints return an empty array. -/
+@[extern "leanav_c_exec_lnir_bilinear_q8_off_ba"]
+opaque execLnirBilinearQ8OffBaC (src : @& ByteArray)
+    (srcOff srcW srcH srcStride dstW dstH : UInt64) : ByteArray
+
 /-- Zero-copy fused 3-plane `YUV420P` `ByteArray` 2D LNIR dispatcher
-    (`0=swscale_down2x2_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`). -/
+    (`0=swscale_down2x2_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`, `5=bilinear_q8_u8`). -/
 @[extern "leanav_c_exec_lnir_scale2d_yuv420p_ba"]
 opaque execLnirScale2dYuv420pBaC (kernelId : UInt32) (src : @& ByteArray) (srcW srcH dstW dstH : UInt64) : ByteArray
 
@@ -891,6 +897,10 @@ opaque execLnirAv1CdefBaC (src : @& ByteArray) (w h priStr damping : UInt64) : B
 /-- Zero-copy `ByteArray` strided luma mean & spatial variance LNIR dispatcher (`@lean_native_luma_stats_u8`). -/
 @[extern "leanav_c_exec_lnir_luma_stats_ba"]
 opaque execLnirLumaStatsBaC (src : @& ByteArray) (nPixels step : UInt64) : UInt64
+
+/-- Zero-copy `ByteArray` 16x16 macroblock luma acceptance LNIR dispatcher (`@lean_native_luma_acceptance_16x16_u8`). -/
+@[extern "leanav_c_exec_lnir_luma_acceptance_16x16_ba"]
+opaque execLnirLumaAcceptance16x16BaC (src : @& ByteArray) (srcW srcH : UInt64) (dst : @& ByteArray) (dstW dstH : UInt64) : UInt64
 
 /-- Invoke `lean-native-core`-compiled `@lean_native_stencil2d_box3x3_u8` 2D $3\times 3$ box-blur stencil on a contiguous `w x h` plane `ByteArray`. -/
 @[inline]
@@ -1024,6 +1034,19 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
       invalidShort.size == expected.size && invalidShort.data.all (· == 0) &&
       invalidKernel.size == expected.size && invalidKernel.data.all (· == 0) &&
       invalidBounds.size == expected.size && invalidBounds.data.all (· == 0)
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 then 1 else 0
+  let accDst16 := offsetSrc.extract 7 (7 + 256)
+  let acc1x1Id := execLnirLumaAcceptance16x16BaC offsetSrc 16 16 offsetSrc 16 16
+  let acc1x1Diff := execLnirLumaAcceptance16x16BaC offsetSrc 16 16 accDst16 16 16
+  let acc2x2Scaled := execLnirScale2dBaC 0 offsetSrc 32 16 16 0 0
+  let acc2x2Exact := execLnirLumaAcceptance16x16BaC offsetSrc 32 32 acc2x2Scaled 16 16
+  let accSmall := execLnirLumaAcceptance16x16BaC offsetSrc 8 8 offsetSrc 8 8
+  let accInvalidShort := execLnirLumaAcceptance16x16BaC (offsetSrc.extract 0 100) 16 16 offsetSrc 16 16
+  let ok22 :=
+    (acc1x1Id &&& 0xFFFFFF) == 0 && ((acc1x1Id >>> 24) &&& 0xFFFF) == 480 && ((acc1x1Id >>> 40) &&& 1) == 1 &&
+    (acc1x1Diff &&& 0xFFFFFF) > 0 &&
+    (acc2x2Exact &&& 0xFFFFFF) == 0 && ((acc2x2Exact >>> 24) &&& 0xFFFF) == 480 && ((acc2x2Exact >>> 40) &&& 1) == 1 &&
+    ((accSmall >>> 24) &&& 0xFFFF) == 450 &&
+    accInvalidShort == 0
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 && ok22 then 1 else 0
 
 end LeanAV.NativeKernels

@@ -913,6 +913,37 @@ def buildBilinearTabQ8 (srcDim dstDim : Nat) : Array UInt64 := Id.run do
     tab := tab.push (bilinearTabEntryQ8 dIdx.toUInt32 s32 d32)
   return tab
 
+/-- Native Q8 admission: positive dimensions, exact coordinate representation,
+    bounded output allocation, and a complete borrowed source footprint. -/
+abbrev BilinearQ8KernelSafe (a : Nat × Nat × Nat × Nat × Nat × Nat × Nat) : Prop :=
+  let (off, sw, sh, dw, dh, cap, stride) := a
+  0 < sw ∧ sw ≤ 0xFFFFFF ∧ 0 < sh ∧ sh ≤ 0xFFFFFF ∧
+  0 < dw ∧ dw ≤ 0x3FFFFFFF ∧ 0 < dh ∧ dh ≤ 0x3FFFFFFF ∧
+  sw ≤ stride ∧ stride ≤ 0xFFFFFFFFFFFFFFFF ∧ off + (sh - 1) * stride + sw ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF
+
+/-- Tight gate for the native Q8 kernel's coordinate and memory preconditions. -/
+def bilinearQ8KernelGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat × Nat × Nat)
+    BilinearQ8KernelSafe where
+  gate := fun (off, sw, sh, dw, dh, cap, stride) =>
+    decide (0 < sw ∧ sw ≤ 0xFFFFFF ∧ 0 < sh ∧ sh ≤ 0xFFFFFF ∧
+      0 < dw ∧ dw ≤ 0x3FFFFFFF ∧ 0 < dh ∧ dh ≤ 0x3FFFFFFF ∧
+      sw ≤ stride ∧ stride ≤ 0xFFFFFFFFFFFFFFFF ∧ off + (sh - 1) * stride + sw ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF)
+  sound := by intro ⟨off, sw, sh, dw, dh, cap, stride⟩ h; exact of_decide_eq_true h
+  complete := by intro ⟨off, sw, sh, dw, dh, cap, stride⟩ h; exact decide_eq_true h
+  posWitness := (3, 5, 7, 9, 11, 38, 5)
+  negWitness := (3, 5, 7, 9, 11, 37, 5)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission implies the complete native coordinate/footprint contract. -/
+theorem bilinearQ8KernelGateSpec_sound (a : Nat × Nat × Nat × Nat × Nat × Nat × Nat)
+    (h : bilinearQ8KernelGateSpec.gate a = true) : BilinearQ8KernelSafe a :=
+  bilinearQ8KernelGateSpec.sound a h
+
+/-- Preserve arbitrary caller-supplied table semantics on the pure fallback. -/
+def bilinearQ8TabsMatch (sw sh dw dh : Nat) (xt yt : Array UInt64) : Bool :=
+  xt == buildBilinearTabQ8 sw dw && yt == buildBilinearTabQ8 sh dh
+
 /-- Read a plane-relative byte without allocating a slice, including zero padding. -/
 @[inline]
 def planeByteOff (src : ByteArray) (off len i : Nat) : Nat :=
@@ -1051,7 +1082,7 @@ def scaleFrameYuv420pDown3to2Auto (src : @& ByteArray) (srcW srcH : Nat) : ByteA
     yOut ++ uOut ++ vOut
 
 /--
-  Pure Lean 4 arbitrary Q8 bilinear / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
+  Q8 bilinear native dispatch with pure Lean fallback / fast-path (1:1, 2x2, 3x3, 3:2) 8-bit plane scaler
   operating on a slice `[srcOff, srcOff + srcW * srcH)` of `src : ByteArray`.
 -/
 def scalePlaneBilinearWithTabsBytes
@@ -1065,6 +1096,10 @@ def scalePlaneBilinearWithTabsBytes
     return scalePlaneDown3x3OffCSimd src srcOff srcW.toUSize srcH.toUSize
   else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
     return scalePlaneDown3to2OffCSimd src srcOff srcW.toUSize srcH.toUSize
+  else if bilinearQ8KernelGateSpec.gate (srcOff, srcW, srcH, dstW, dstH, src.size, srcW) &&
+      bilinearQ8TabsMatch srcW srcH dstW dstH xTab yTab then
+    return LeanAV.NativeKernels.execLnirBilinearQ8OffBaC src srcOff.toUInt64
+      srcW.toUInt64 srcH.toUInt64 srcW.toUInt64 dstW.toUInt64 dstH.toUInt64
   else
     let total := dstW * dstH
     let mut out := ByteArray.emptyWithCapacity total
@@ -1091,7 +1126,7 @@ def scalePlaneBilinearWithTabsBytes
 
 /--
   Fused 3-plane `YUV420P` frame scaler (`scaleFrameYuv420pQ8WithTabs`):
-  Dispatches `2x2` (`kernel_id = 0`), `3x3` (`kernel_id = 2`), and `3:2` (`kernel_id = 3`) scaling
+  Dispatches `2x2` (`kernel_id = 0`), `3x3` (`kernel_id = 2`), `3:2` (`kernel_id = 3`), and Q8 bilinear (`kernel_id = 5`) scaling
   to `execLnirScale2dYuv420pBaC` (single `ByteArray` allocation for all 3 planes) when dimensions are even
   and `src.size >= srcW * srcH + 2 * ((srcW / 2) * (srcH / 2))`, falling back to per-plane
   `scalePlaneBilinearWithTabsBytes` concatenation otherwise.
@@ -1119,6 +1154,48 @@ def scaleFrameYuv420pQ8WithTabs
       dstCw % 2 == 0 && dstCh % 2 == 0 &&
       srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 then
     LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 3 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal &&
+      bilinearQ8KernelGateSpec.gate (0, srcW, srcH, dstW, dstH, src.size, srcW) &&
+      bilinearQ8TabsMatch srcW srcH dstW dstH yXTab yYTab &&
+      bilinearQ8TabsMatch srcCw srcCh dstCw dstCh uvXTab uvYTab then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 5 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else
+    let yOut := scalePlaneBilinearWithTabsBytes src 0 srcW srcH dstW dstH yXTab yYTab
+    let uOut := scalePlaneBilinearWithTabsBytes src srcY srcCw srcCh dstCw dstCh uvXTab uvYTab
+    let vOut := scalePlaneBilinearWithTabsBytes src (srcY + srcUv) srcCw srcCh dstCw dstCh uvXTab uvYTab
+    yOut ++ uOut ++ vOut
+
+/--
+  Fast `YUV420P` frame scaler (`scaleFrameYuv420pQ8Auto`) when standard `buildBilinearTabQ8` tables are used:
+  Avoids per-frame `bilinearQ8TabsMatch` array equality checks on the hot path.
+-/
+@[inline]
+def scaleFrameYuv420pQ8Auto
+    (src : @& ByteArray) (srcW srcH dstW dstH : Nat)
+    (yXTab yYTab uvXTab uvYTab : @& Array UInt64) : ByteArray :=
+  let srcCw := srcW / 2
+  let srcCh := srcH / 2
+  let dstCw := dstW / 2
+  let dstCh := dstH / 2
+  let srcY := srcW * srcH
+  let srcUv := srcCw * srcCh
+  let srcTotal := srcY + 2 * srcUv
+  let evenDims : Bool :=
+    srcW >= 2 && srcH >= 2 && dstW >= 2 && dstH >= 2 &&
+    srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0
+  if evenDims && srcW == dstW && srcH == dstH && src.size >= srcTotal then
+    if src.size == srcTotal then src else src.extract 0 srcTotal
+  else if evenDims && src.size >= srcTotal && srcW == dstW * 2 && srcH == dstH * 2 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 0 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal && srcW == dstW * 3 && srcH == dstH * 3 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 2 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal && dstCw >= 2 && dstCh >= 2 &&
+      dstCw % 2 == 0 && dstCh % 2 == 0 &&
+      srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 3 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+  else if evenDims && src.size >= srcTotal &&
+      bilinearQ8KernelGateSpec.gate (0, srcW, srcH, dstW, dstH, src.size, srcW) then
+    LeanAV.NativeKernels.execLnirScale2dYuv420pBaC 5 src srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
   else
     let yOut := scalePlaneBilinearWithTabsBytes src 0 srcW srcH dstW dstH yXTab yYTab
     let uOut := scalePlaneBilinearWithTabsBytes src srcY srcCw srcCh dstCw dstCh uvXTab uvYTab

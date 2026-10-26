@@ -369,6 +369,26 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
     return out;
 }
 
+/* Borrow the source slice; allocate only the destination. Invalid footprints
+ * return an empty array. Bounds keep Q8 coordinate products within uint64_t. */
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_bilinear_q8_off_ba(
+    b_lean_obj_arg src_ba, uint64_t src_off, uint64_t src_w,
+    uint64_t src_h, uint64_t src_stride, uint64_t dst_w, uint64_t dst_h
+) {
+    uint64_t cap = (uint64_t)lean_sarray_size(src_ba);
+    if (!src_w || !src_h || src_w > 0xFFFFFFu || src_h > 0xFFFFFFu ||
+        !dst_w || !dst_h || dst_w > 0xFFFFFFFFu || dst_h > 0xFFFFFFFFu ||
+        src_stride < src_w || src_off > cap || src_w > cap - src_off ||
+        src_h - 1u > (cap - src_off - src_w) / src_stride ||
+        dst_w > (SIZE_MAX - sizeof(lean_sarray_object)) / dst_h)
+        return lean_alloc_sarray(1, 0, 0);
+    size_t total = (size_t)(dst_w * dst_h);
+    lean_object *out = lean_alloc_sarray(1, total, total);
+    lean_native_swscale_bilinear_q8_u8(lean_sarray_cptr(out),
+        lean_sarray_cptr(src_ba) + src_off, src_w, src_h, src_stride, dst_w, dst_h);
+    return out;
+}
+
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p_ba(
     uint32_t kernel_id,
     b_lean_obj_arg src_ba,
@@ -388,9 +408,10 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p_ba(
     uint64_t dst_total = dst_y + 2u * dst_uv;
     lean_obj_res out = lean_alloc_sarray(1, (size_t)dst_total, (size_t)dst_total);
     uint8_t *dst_ptr = lean_sarray_cptr(out);
-    if ((kernel_id != 0u && kernel_id != 2u && kernel_id != 3u) ||
+    if ((kernel_id != 0u && kernel_id != 2u && kernel_id != 3u && kernel_id != 5u) ||
         src_w < 2u || src_h < 2u || (src_w & 1u) != 0u || (src_h & 1u) != 0u ||
-        src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull) {
+        src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull ||
+        (kernel_id == 5u && (src_w > 0xFFFFFFu || src_h > 0xFFFFFFu))) {
         memset(dst_ptr, 0, (size_t)dst_total);
         return out;
     }
@@ -400,10 +421,10 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p_ba(
     uint64_t src_uv = src_cw * src_ch;
     uint64_t src_total = src_y + 2u * src_uv;
     uint64_t src_cap = (uint64_t)lean_sarray_size(src_ba);
-    uint64_t y_mw = leanav_scale2d_req_extent(kernel_id, dst_w);
-    uint64_t y_sh = leanav_scale2d_req_extent(kernel_id, dst_h);
-    uint64_t c_mw = leanav_scale2d_req_extent(kernel_id, dst_cw);
-    uint64_t c_sh = leanav_scale2d_req_extent(kernel_id, dst_ch);
+    uint64_t y_mw = kernel_id == 5u ? src_w : leanav_scale2d_req_extent(kernel_id, dst_w);
+    uint64_t y_sh = kernel_id == 5u ? src_h : leanav_scale2d_req_extent(kernel_id, dst_h);
+    uint64_t c_mw = kernel_id == 5u ? src_cw : leanav_scale2d_req_extent(kernel_id, dst_cw);
+    uint64_t c_sh = kernel_id == 5u ? src_ch : leanav_scale2d_req_extent(kernel_id, dst_ch);
     if (src_cap < src_total ||
         src_w < y_mw || src_h < y_sh || (y_sh - 1u) * src_w + y_mw > src_y ||
         src_cw < c_mw || src_ch < c_sh || (c_sh - 1u) * src_cw + c_mw > src_uv) {
@@ -416,6 +437,11 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p_ba(
     uint8_t *dst_u = dst_ptr + dst_y;
     uint8_t *dst_v = dst_u + dst_uv;
     switch (kernel_id) {
+        case 5u:
+            lean_native_swscale_bilinear_q8_u8(dst_ptr, src_ptr, src_w, src_h, src_w, dst_w, dst_h);
+            lean_native_swscale_bilinear_q8_u8(dst_u, src_u, src_cw, src_ch, src_cw, dst_cw, dst_ch);
+            lean_native_swscale_bilinear_q8_u8(dst_v, src_v, src_cw, src_ch, src_cw, dst_cw, dst_ch);
+            break;
         case 0u:
             lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
             lean_native_swscale_down2x2_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
@@ -462,4 +488,39 @@ LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_stats_ba(
     uint64_t eff_n = (n_pixels < (uint64_t)sz) ? n_pixels : (uint64_t)sz;
     if (eff_n == 0 || step == 0) return 0ull;
     return lean_native_luma_stats_u8(lean_sarray_cptr(src_ba), eff_n, step);
+}
+
+extern uint64_t leanav_lean_classify_luma_psnr_x10_u64(uint64_t total_sq_err, uint64_t total_pix);
+extern uint64_t leanav_lean_pack_acceptance_metrics_u64(uint64_t max_block_sad, uint64_t psnr_x10, uint32_t dist_lt_black);
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
+    b_lean_obj_arg src_ba,
+    uint64_t src_w,
+    uint64_t src_h,
+    b_lean_obj_arg dst_ba,
+    uint64_t dst_w,
+    uint64_t dst_h
+) {
+    if (dst_w < 16u || dst_h < 16u || src_w < 2u || src_h < 2u ||
+        src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull ||
+        dst_w > 0x3FFFFFFFull || dst_h > 0x3FFFFFFFull) {
+        return leanav_lean_pack_acceptance_metrics_u64(0ull, 450ull, 1u);
+    }
+    int is_1x1 = (src_w == dst_w && src_h == dst_h);
+    int is_2x2 = (src_w == dst_w * 2u && src_h == dst_h * 2u);
+    if (!is_1x1 && !is_2x2) return 0ull;
+    uint64_t src_need = src_w * src_h;
+    uint64_t dst_need = dst_w * dst_h;
+    if ((uint64_t)lean_sarray_size(src_ba) < src_need ||
+        (uint64_t)lean_sarray_size(dst_ba) < dst_need) {
+        return 0ull;
+    }
+    uint64_t metrics[4] = {0ull, 0ull, 0ull, 1ull};
+    lean_native_luma_acceptance_16x16_u8(
+        lean_sarray_cptr(src_ba), src_w, src_h,
+        lean_sarray_cptr(dst_ba), dst_w, dst_h,
+        metrics
+    );
+    uint64_t psnr_x10 = leanav_lean_classify_luma_psnr_x10_u64(metrics[1], metrics[2]);
+    return leanav_lean_pack_acceptance_metrics_u64(metrics[0], psnr_x10, (uint32_t)metrics[3]);
 }

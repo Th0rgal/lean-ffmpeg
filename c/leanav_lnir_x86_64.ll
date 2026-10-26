@@ -1001,6 +1001,238 @@ exit.zero:
   ret i64 0
 }
 
+define weak_odr dso_local void @lean_native_swscale_bilinear_q8_u8(ptr noalias noundef %dst, ptr noalias noundef readonly %src, i64 noundef %srcW, i64 noundef %srcH, i64 noundef %srcStride, i64 noundef %dstW, i64 noundef %dstH) #0 {
+entry:
+  %qx_tab = alloca [4096 x i64], align 16
+  %sw0 = icmp eq i64 %srcW, 0
+  %sh0 = icmp eq i64 %srcH, 0
+  %dw0 = icmp eq i64 %dstW, 0
+  %dh0 = icmp eq i64 %dstH, 0
+  %s0 = or i1 %sw0, %sh0
+  %d0 = or i1 %dw0, %dh0
+  %empty = or i1 %s0, %d0
+  %lastX = sub i64 %srcW, 1
+  %lastY = sub i64 %srcH, 1
+  %scaleX = shl i64 %srcW, 8
+  %scaleY = shl i64 %srcH, 8
+  %use_tab = icmp ule i64 %dstW, 4096
+  br i1 %empty, label %exit, label %check.tab
+check.tab:
+  br i1 %use_tab, label %init.xtab, label %row
+init.xtab:
+  %tx = phi i64 [ 0, %check.tab ], [ %tx_next, %init.xtab ]
+  %tnx = mul i64 %tx, %scaleX
+  %tqx = udiv i64 %tnx, %dstW
+  %tp = getelementptr inbounds [4096 x i64], ptr %qx_tab, i64 0, i64 %tx
+  store i64 %tqx, ptr %tp, align 8
+  %tx_next = add nuw i64 %tx, 1
+  %tdone = icmp eq i64 %tx_next, %dstW
+  br i1 %tdone, label %row, label %init.xtab
+row:
+  %dy = phi i64 [ 0, %check.tab ], [ 0, %init.xtab ], [ %nextY, %rowEnd ]
+  %ny = mul i64 %dy, %scaleY
+  %qy = udiv i64 %ny, %dstH
+  %rawY = lshr i64 %qy, 8
+  %yIn = icmp ult i64 %rawY, %srcH
+  %sy0 = select i1 %yIn, i64 %rawY, i64 %lastY
+  %yPlus = add i64 %sy0, 1
+  %yNextIn = icmp ult i64 %yPlus, %srcH
+  %sy1 = select i1 %yNextIn, i64 %yPlus, i64 %sy0
+  %fy64 = and i64 %qy, 255
+  %fy = trunc i64 %fy64 to i32
+  %ify = sub i32 256, %fy
+  %r0 = mul i64 %sy0, %srcStride
+  %r1 = mul i64 %sy1, %srcStride
+  %dr = mul i64 %dy, %dstW
+  br label %col
+col:
+  %dx = phi i64 [ 0, %row ], [ %nextX, %col.compute ]
+  br i1 %use_tab, label %col.from_tab, label %col.from_div
+col.from_tab:
+  %qxp = getelementptr inbounds [4096 x i64], ptr %qx_tab, i64 0, i64 %dx
+  %qx_t = load i64, ptr %qxp, align 8
+  br label %col.compute
+col.from_div:
+  %nx = mul i64 %dx, %scaleX
+  %qx_d = udiv i64 %nx, %dstW
+  br label %col.compute
+col.compute:
+  %qx = phi i64 [ %qx_t, %col.from_tab ], [ %qx_d, %col.from_div ]
+  %rawX = lshr i64 %qx, 8
+  %xIn = icmp ult i64 %rawX, %srcW
+  %sx0 = select i1 %xIn, i64 %rawX, i64 %lastX
+  %xPlus = add i64 %sx0, 1
+  %xNextIn = icmp ult i64 %xPlus, %srcW
+  %sx1 = select i1 %xNextIn, i64 %xPlus, i64 %sx0
+  %fx64 = and i64 %qx, 255
+  %fx = trunc i64 %fx64 to i32
+  %ifx = sub i32 256, %fx
+  %i00 = add i64 %r0, %sx0
+  %a00 = getelementptr i8, ptr %src, i64 %i00
+  %b00 = load i8, ptr %a00, align 1
+  %p00 = zext i8 %b00 to i32
+  %w00 = mul i32 %p00, %ifx
+  %i01 = add i64 %r0, %sx1
+  %a01 = getelementptr i8, ptr %src, i64 %i01
+  %b01 = load i8, ptr %a01, align 1
+  %p01 = zext i8 %b01 to i32
+  %w01 = mul i32 %p01, %fx
+  %i10 = add i64 %r1, %sx0
+  %a10 = getelementptr i8, ptr %src, i64 %i10
+  %b10 = load i8, ptr %a10, align 1
+  %p10 = zext i8 %b10 to i32
+  %w10 = mul i32 %p10, %ifx
+  %i11 = add i64 %r1, %sx1
+  %a11 = getelementptr i8, ptr %src, i64 %i11
+  %b11 = load i8, ptr %a11, align 1
+  %p11 = zext i8 %b11 to i32
+  %w11 = mul i32 %p11, %fx
+  %top = add i32 %w00, %w01
+  %bot = add i32 %w10, %w11
+  %wt = mul i32 %top, %ify
+  %wb = mul i32 %bot, %fy
+  %sum = add i32 %wt, %wb
+  %rounded = add i32 %sum, 32768
+  %value = lshr i32 %rounded, 16
+  %byte = trunc i32 %value to i8
+  %di = add i64 %dr, %dx
+  %dp = getelementptr i8, ptr %dst, i64 %di
+  store i8 %byte, ptr %dp, align 1
+  %nextX = add i64 %dx, 1
+  %moreX = icmp ult i64 %nextX, %dstW
+  br i1 %moreX, label %col, label %rowEnd, !llvm.loop !0
+rowEnd:
+  %nextY = add i64 %dy, 1
+  %moreY = icmp ult i64 %nextY, %dstH
+  br i1 %moreY, label %row, label %exit
+exit:
+  ret void
+}
+
+declare i32 @llvm.vector.reduce.add.v16i32(<16 x i32>)
+define weak_odr dso_local void @lean_native_luma_acceptance_16x16_u8(ptr noalias noundef readonly %src, i64 noundef %srcW, i64 noundef %srcH, ptr noalias noundef readonly %dst, i64 noundef %dstW, i64 noundef %dstH, ptr noalias noundef writeonly %outMetrics4) #0 {
+entry:
+  store i64 0, ptr %outMetrics4, align 8
+  %o1 = getelementptr i64, ptr %outMetrics4, i64 1
+  %o2 = getelementptr i64, ptr %outMetrics4, i64 2
+  %o3 = getelementptr i64, ptr %outMetrics4, i64 3
+  store i64 0, ptr %o1, align 8
+  store i64 0, ptr %o2, align 8
+  store i64 1, ptr %o3, align 8
+  %wok = icmp uge i64 %dstW, 16
+  %hok = icmp uge i64 %dstH, 16
+  %ok = and i1 %wok, %hok
+  %one = icmp eq i64 %srcW, %dstW
+  %wide = icmp uge i64 %dstW, 256
+  %tall = icmp uge i64 %dstH, 256
+  %sx = select i1 %wide, i64 64, i64 16
+  %sy = select i1 %tall, i64 64, i64 16
+  %xlim = sub i64 %dstW, 16
+  %ylim = sub i64 %dstH, 16
+  br i1 %ok, label %by, label %exit
+by:
+  %byi = phi i64 [ 0, %entry ], [ %byn, %nexty ]
+  %oldmaxy = phi i64 [ 0, %entry ], [ %newmax, %nexty ]
+  %oldsqy = phi i64 [ 0, %entry ], [ %newsq, %nexty ]
+  %oldpixy = phi i64 [ 0, %entry ], [ %newpix, %nexty ]
+  %oldoky = phi i64 [ 1, %entry ], [ %newok, %nexty ]
+  br label %bx
+bx:
+  %bxi = phi i64 [ 0, %by ], [ %bxn, %blockend ]
+  %oldmax = phi i64 [ %oldmaxy, %by ], [ %newmax, %blockend ]
+  %oldsq = phi i64 [ %oldsqy, %by ], [ %newsq, %blockend ]
+  %oldpix = phi i64 [ %oldpixy, %by ], [ %newpix, %blockend ]
+  %oldok = phi i64 [ %oldoky, %by ], [ %newok, %blockend ]
+  br label %row
+row:
+  %y = phi i64 [ 0, %bx ], [ %yn, %reduce ]
+  %sad = phi i32 [ 0, %bx ], [ %sadn, %reduce ]
+  %black = phi i32 [ 0, %bx ], [ %blackn, %reduce ]
+  %refsum = phi i32 [ 0, %bx ], [ %refn, %reduce ]
+  %sse = phi i32 [ 0, %bx ], [ %ssen, %reduce ]
+  %dy = add i64 %byi, %y
+  %dr = mul i64 %dy, %dstW
+  %di = add i64 %dr, %bxi
+  %dp = getelementptr i8, ptr %dst, i64 %di
+  %db = load <16 x i8>, ptr %dp, align 1
+  %d = zext <16 x i8> %db to <16 x i32>
+  br i1 %one, label %same, label %half
+same:
+  %sp = getelementptr i8, ptr %src, i64 %di
+  %sb = load <16 x i8>, ptr %sp, align 1
+  %r1 = zext <16 x i8> %sb to <16 x i32>
+  br label %reduce
+half:
+  %sr = mul i64 %dy, %srcW
+  %si0 = add i64 %sr, %bxi
+  %si = shl i64 %si0, 1
+  %si1 = add i64 %si, %srcW
+  %p0 = getelementptr i8, ptr %src, i64 %si
+  %p1 = getelementptr i8, ptr %src, i64 %si1
+  %a = load <32 x i8>, ptr %p0, align 1
+  %b = load <32 x i8>, ptr %p1, align 1
+  %ae8 = shufflevector <32 x i8> %a, <32 x i8> poison, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
+  %ae = zext <16 x i8> %ae8 to <16 x i32>
+  %ao8 = shufflevector <32 x i8> %a, <32 x i8> poison, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
+  %ao = zext <16 x i8> %ao8 to <16 x i32>
+  %be8 = shufflevector <32 x i8> %b, <32 x i8> poison, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
+  %be = zext <16 x i8> %be8 to <16 x i32>
+  %bo8 = shufflevector <32 x i8> %b, <32 x i8> poison, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
+  %bo = zext <16 x i8> %bo8 to <16 x i32>
+  %ab = add <16 x i32> %ae, %ao
+  %bb = add <16 x i32> %be, %bo
+  %sum = add <16 x i32> %ab, %bb
+  %rounded = add <16 x i32> %sum, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %r2 = lshr <16 x i32> %rounded, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  br label %reduce
+reduce:
+  %r = phi <16 x i32> [ %r1, %same ], [ %r2, %half ]
+  %dge = icmp uge <16 x i32> %d, %r
+  %drd = sub <16 x i32> %d, %r
+  %rdd = sub <16 x i32> %r, %d
+  %ad = select <16 x i1> %dge, <16 x i32> %drd, <16 x i32> %rdd
+  %rge = icmp uge <16 x i32> %r, <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>
+  %r16 = sub <16 x i32> %r, <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>
+  %b16 = sub <16 x i32> <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>, %r
+  %bd = select <16 x i1> %rge, <16 x i32> %r16, <16 x i32> %b16
+  %sq = mul <16 x i32> %ad, %ad
+  %rsad = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %ad)
+  %rblack = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %bd)
+  %rref = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %r)
+  %rsse = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %sq)
+  %sadn = add i32 %sad, %rsad
+  %blackn = add i32 %black, %rblack
+  %refn = add i32 %refsum, %rref
+  %ssen = add i32 %sse, %rsse
+  %yn = add i64 %y, 1
+  %rowdone = icmp eq i64 %yn, 16
+  br i1 %rowdone, label %blockend, label %row
+blockend:
+  %sad64 = zext i32 %sadn to i64
+  %sq64 = zext i32 %ssen to i64
+  %larger = icmp ugt i64 %sad64, %oldmax
+  %newmax = select i1 %larger, i64 %sad64, i64 %oldmax
+  store i64 %newmax, ptr %outMetrics4, align 8
+  %newsq = add i64 %oldsq, %sq64
+  store i64 %newsq, ptr %o1, align 8
+  %newpix = add i64 %oldpix, 256
+  store i64 %newpix, ptr %o2, align 8
+  %bright = icmp uge i32 %refn, 6144
+  %worse = icmp uge i32 %sadn, %blackn
+  %bad = and i1 %bright, %worse
+  %newok = select i1 %bad, i64 0, i64 %oldok
+  store i64 %newok, ptr %o3, align 8
+  %bxn = add i64 %bxi, %sx
+  %morex = icmp ule i64 %bxn, %xlim
+  br i1 %morex, label %bx, label %nexty
+nexty:
+  %byn = add i64 %byi, %sy
+  %morey = icmp ule i64 %byn, %ylim
+  br i1 %morey, label %by, label %exit
+exit:
+  ret void
+}
+
 ; LNIRDecl: swscale_luma_gain_bias_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.singleThreaded, isaMask=1)
 define dso_local ptr @swscale_luma_gain_bias_simd(ptr noalias noundef %arg_v0, i64 noundef %arg_v1, i64 noundef %arg_v2) #0 {
 entry:
