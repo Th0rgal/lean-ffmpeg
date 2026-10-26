@@ -5392,7 +5392,7 @@ def classifyColrNclxU32 (prim trc spc : UInt16) : UInt32 :=
   let normPrim : UInt32 := if prim == 9 then 9 else 1
   let normTrc  : UInt32 := if trc == 16 then 16 else if trc == 18 then 18 else 1
   let normSpc  : UInt32 := if spc == 9 then 9 else 1
-  let hdrMode  : UInt32 := if prim == 9 && trc == 18 then 2 else if prim == 9 then 1 else 0
+  let hdrMode  : UInt32 := if trc == 18 then 2 else if prim == 9 || trc == 16 then 1 else 0
   normPrim ||| (normTrc <<< 8) ||| (normSpc <<< 16) ||| (hdrMode <<< 24)
 
 @[export leanav_lean_classify_colr_nclx_u32]
@@ -5971,21 +5971,52 @@ def probeMp4HdrColorspacePure (buf : @& ByteArray) : UInt32 := Id.run do
       return 1
   return 0
 
-/-- Check whether `buf` contains an explicit `colr` (`nclx`/`nclc`) box declaring SDR colorimetry (`classifyColrNclxU32 prim trc 1 >>> 24 == 0`). -/
+/--
+  Recognize explicitly supported SDR `nclx`/`nclc` CICP code points:
+  - `prim ∈ {1, 5, 6}` (BT.709, BT.601 PAL, SMPTE 170M),
+  - `trc  ∈ {1, 6}` (BT.709, SMPTE 170M),
+  - `spc  ∈ {1, 5, 6}` (BT.709, BT.470BG, SMPTE 170M),
+  explicitly rejecting unspecified (`2`), reserved (`0`), BT.2020 (`9`/`10`), PQ (`16`), and HLG (`18`).
+-/
+@[inline]
+def isExplicitSdrCodePoint (prim trc spc : UInt16) : Bool :=
+  (prim == 1 || prim == 5 || prim == 6) &&
+  (trc == 1 || trc == 6) &&
+  (spc == 1 || spc == 5 || spc == 6)
+
+/--
+  Check whether `buf` contains a structurally valid ISO BMFF video sample entry (`avc1`/`hvc1`/`hev1`/`av01`)
+  whose child `colr` (`nclx`/`nclc`) box explicitly declares SDR colorimetry (`isExplicitSdrCodePoint`)
+  and has no `mdcv` or `clli` HDR boxes.
+-/
 def hasExplicitSdrColrBoxPure (buf : @& ByteArray) : Bool := Id.run do
-  let n := buf.size
-  if n < 15 then return false
-  for i in [:n - 14] do
-    let fcc := baRdU32BE buf i
-    if fcc == 0x636F6C72 then -- 'colr'
-      let sub := baRdU32BE buf (i + 4)
-      if sub == 0x6E636C78 || sub == 0x6E636C63 then -- 'nclx' or 'nclc'
-        let prim := baRdU16BE buf (i + 8)
-        let trc  := baRdU16BE buf (i + 10)
-        let hdrMode := classifyColrNclxU32 prim trc 1 >>> 24
-        if hdrMode == 0 && prim > 0 && trc > 0 then
-          return true
-  return false
+  let some loc := mp4LocateVideoBoxes buf buf.size | return false
+  let vreStart := loc.vrePos + 86
+  let vreEnd := loc.vrePos + loc.vreSz
+  if vreStart >= vreEnd || vreEnd > buf.size then return false
+  if (mp4FindChildBox buf vreStart vreEnd 0x6D646376).isSome then return false -- 'mdcv'
+  if (mp4FindChildBox buf vreStart vreEnd 0x636C6C69).isSome then return false -- 'clli'
+  let some (bp, bs) := mp4FindChildBox buf vreStart vreEnd 0x636F6C72 | return false -- 'colr'
+  if bs < 18 || bp + bs > vreEnd then return false
+  let sub := baRdU32BE buf (bp + 8)
+  if sub != 0x6E636C78 && sub != 0x6E636C63 then return false -- 'nclx' or 'nclc'
+  let prim := baRdU16BE buf (bp + 12)
+  let trc  := baRdU16BE buf (bp + 14)
+  let spc  := baRdU16BE buf (bp + 16)
+  return isExplicitSdrCodePoint prim trc spc
+
+/--
+  Theorem: `isExplicitSdrCodePoint` accepts explicit BT.709/BT.601 SDR code points (`1/1/1`, `5/6/5`)
+  and rejects unspecified (`2/2/2`), PQ (`1/16/1`), HLG (`1/18/1`), and BT.2020 (`9/1/9`) colorimetry.
+-/
+theorem isExplicitSdrCodePoint_accepts_sdr_and_rejects_unspecified_or_hdr :
+    isExplicitSdrCodePoint 1 1 1 = true ∧
+    isExplicitSdrCodePoint 5 6 5 = true ∧
+    isExplicitSdrCodePoint 2 2 2 = false ∧
+    isExplicitSdrCodePoint 1 16 1 = false ∧
+    isExplicitSdrCodePoint 1 18 1 = false ∧
+    isExplicitSdrCodePoint 9 1 9 = false := by
+  decide
 
 /-- Pure Lean 4 nominal video frame rate `(fpsNum, fpsDen)` prober from `mdhd` timescale and `stts` sample delta. -/
 def probeMp4FpsRationalPure (buf : @& ByteArray) : Option (UInt32 × UInt32) := do

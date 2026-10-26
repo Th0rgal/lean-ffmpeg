@@ -338,9 +338,13 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
 ) {
     size_t total = (size_t)(dst_w * dst_h);
     lean_object *out = lean_alloc_sarray(1, total, total);
-    if (total == 0 || (kernel_id == 4u && lean_sarray_size(src_ba) < total)) return out;
-    const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
+    if (total == 0) return out;
     uint8_t *dst_ptr = lean_sarray_cptr(out);
+    uint64_t sh = (kernel_id <= 1u) ? (dst_h * 2u) : (kernel_id == 2u) ? (dst_h * 3u) : (kernel_id == 3u) ? ((dst_h * 3u) / 2u) : dst_h;
+    uint64_t mw = (kernel_id <= 1u) ? (dst_w * 2u) : (kernel_id == 2u) ? (dst_w * 3u) : (kernel_id == 3u) ? ((dst_w * 3u) / 2u) : dst_w;
+    uint64_t st = (kernel_id == 4u) ? dst_w : src_stride;
+    if (st < mw || sh == 0 || (uint64_t)lean_sarray_size(src_ba) < (sh - 1u) * st + mw) { memset(dst_ptr, 0, total); return out; }
+    const uint8_t *src_ptr = lean_sarray_cptr(src_ba);
     switch (kernel_id) {
         case 0u: lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
         case 1u: lean_native_swscale_down2x2_fused_eq_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h, arg0, arg1); break;
@@ -361,7 +365,8 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_cdef_ba(
 ) {
     size_t total = (size_t)(w * h);
     lean_object *out = lean_alloc_sarray(1, total, total);
-    if (total == 0 || lean_sarray_size(src_ba) < total) return out;
+    if (total == 0) return out;
+    if (lean_sarray_size(src_ba) < total) { memset(lean_sarray_cptr(out), 0, total); return out; }
     lean_native_av1_cdef_filter_u8(lean_sarray_cptr(out), lean_sarray_cptr(src_ba), w, h, pri_str, damping);
     return out;
 }
