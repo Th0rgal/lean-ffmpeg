@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`366`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,344`** declarations and **`218 / 218` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`366`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,448`** declarations and **`218 / 218` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 ---
 
@@ -32,7 +32,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`218 / 218` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,344`** kernel-checked declarations (`Format`: 49, `Video`: 29, `NativeKernels`: 25, `Spec`: 23, `Scale`: 14, `Bitstream`: 13, `PlanIR`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 10, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`218 / 218` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,448`** kernel-checked declarations (`Format`: 49, `Video`: 29, `NativeKernels`: 25, `Spec`: 23, `Scale`: 14, `Bitstream`: 13, `PlanIR`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 10, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
@@ -47,7 +47,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,344 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,448 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
 # Audit all 15 formal modules with turbo-lean (218/218 tight, 0 vacuous, 0 trivial)
@@ -98,7 +98,7 @@ Measured across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 
 
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `8,344` declarations, `218/218` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), `UInt64` SWAR fast paths (`swarScale2x2RowPairU8x4`, `swarBiPredAvgU8x8`, `swarXorResidualsU8x8`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, and `IO.Process.spawn` transcode orchestration run in pure Lean 4.
+- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `8,448` declarations, `218/218` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 - [`c/`](c/):
   - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`366`-line** irreducible C-ABI bridge (reduced by **90.9%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
     1. POSIX `fork` + `execvp` delegation shim (`leanav_c_exec_delegated_ffmpeg`),
