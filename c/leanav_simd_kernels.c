@@ -346,6 +346,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_ba(
         case 1u: lean_native_swscale_down2x2_fused_eq_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h, arg0, arg1); break;
         case 2u: lean_native_swscale_down3x3_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
         case 3u: lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_stride, dst_w, dst_h); break;
+        case 4u: lean_native_stencil2d_box3x3_u8(dst_ptr, src_ptr, dst_w, dst_h); break;
         default: memset(dst_ptr, 0, total); break;
     }
     return out;
@@ -363,4 +364,15 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_cdef_ba(
     if (total == 0) return out;
     lean_native_av1_cdef_filter_u8(lean_sarray_cptr(out), lean_sarray_cptr(src_ba), w, h, pri_str, damping);
     return out;
+}
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_stats_ba(
+    b_lean_obj_arg src_ba,
+    uint64_t n_pixels,
+    uint64_t step
+) {
+    size_t sz = lean_sarray_size(src_ba);
+    uint64_t eff_n = (n_pixels < (uint64_t)sz) ? n_pixels : (uint64_t)sz;
+    if (eff_n == 0 || step == 0) return 0ull;
+    return lean_native_luma_stats_u8(lean_sarray_cptr(src_ba), eff_n, step);
 }

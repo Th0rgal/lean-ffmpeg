@@ -107,6 +107,18 @@ def filterPlaneBoxBlur3x3 (p : Plane2D) : Plane2D :=
             ((sum + 4) / 9).toUInt8))
     { data := { data := outList.toArray }, width := w, height := h, stride := w }
 
+/-- Fast LLVM-LNIR 2D $3\times 3$ Box Blur (`@lean_native_stencil2d_box3x3_u8`) on a contiguous `Plane2D`
+    with automatic fallback to `filterPlaneBoxBlur3x3` when `stride != width`. -/
+def filterPlaneBoxBlur3x3Fast (p : Plane2D) : Plane2D :=
+  let w := p.width
+  let h := p.height
+  if w < 3 || h < 3 then p
+  else if p.stride == w && p.data.size >= w * h then
+    let outBa := LeanAV.NativeKernels.execLnirBoxBlur3x3BaC p.data w.toUInt64 h.toUInt64
+    { data := outBa, width := w, height := h, stride := w }
+  else
+    filterPlaneBoxBlur3x3 p
+
 /-- Alpha-blend an overlay `Plane2D` (`fg`) onto `bg` at `(offX, offY)` with Q8 opacity `alphaQ8 ∈ [0, 256]`. -/
 def filterPlaneOverlay (bg fg : Plane2D) (offX offY : Nat) (alphaQ8 : Nat := 128) : Plane2D := Id.run do
   let mut out := bg

@@ -880,6 +880,13 @@ def buildBilinearTabQ8 (srcDim dstDim : Nat) : Array UInt64 := Id.run do
 def scalePlaneBilinearWithTabsBytes
     (src : @& ByteArray) (srcOff srcW srcH dstW dstH : Nat)
     (xTab yTab : @& Array UInt64) : ByteArray := Id.run do
+  if srcOff == 0 && src.size >= srcW * srcH then
+    if srcW == dstW * 2 && srcH == dstH * 2 then
+      return scalePlaneDown2x2CSimd src srcW.toUSize srcH.toUSize srcW.toUSize
+    else if srcW == dstW * 3 && srcH == dstH * 3 then
+      return scalePlaneDown3x3CSimd src srcW.toUSize srcH.toUSize
+    else if srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0 then
+      return scalePlaneDown3to2CSimd src srcW.toUSize srcH.toUSize
   let pSlice := src.extract srcOff (srcOff + srcW * srcH)
   if srcW == dstW && srcH == dstH then
     return pSlice

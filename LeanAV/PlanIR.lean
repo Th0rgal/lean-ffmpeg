@@ -1510,6 +1510,36 @@ def demuxIvfIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (IvfHe
   | none =>
     .fallbackDelegated "invalid_or_truncated_ivf_stream"
 
+/--
+  Phase 6 Kernel 4: Verified Matroska / WebM EBML `SimpleBlock` Demuxer (`demuxMatroskaIndependentOrFallback`).
+  Executes `demuxMatroskaSimpleBlockSpec` and verifies non-zero track number and non-empty payload,
+  or falls back explicitly if the EBML header/VINT/SimpleBlock is malformed.
+-/
+def demuxMatroskaIndependentOrFallback (bytes : List UInt8) : KernelExecutionResult MkvSimpleBlock :=
+  match demuxMatroskaSimpleBlockSpec bytes with
+  | some blk =>
+    if blk.trackNum > 0 && !blk.payload.isEmpty then
+      .independentVerified blk
+    else
+      .fallbackDelegated "matroska_empty_payload_or_zero_track"
+  | none =>
+    .fallbackDelegated "invalid_or_truncated_ebml_matroska_block"
+
+/--
+  Phase 6 Kernel 5: Verified MPEG-TS 188-Byte Packet Stream Demuxer (`demuxMpegTsIndependentOrFallback`).
+  Verifies 188-byte alignment and `0x47` sync byte before executing `demuxMpegTsPackets`,
+  or falls back explicitly.
+-/
+def demuxMpegTsIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (Array (UInt16 × ByteSlice)) :=
+  if s.len < 188 || s.len % 188 != 0 then
+    .fallbackDelegated "mpegts_length_not_multiple_of_188"
+  else
+    let pkts := demuxMpegTsPackets s
+    if pkts.size > 0 then
+      .independentVerified pkts
+    else
+      .fallbackDelegated "mpegts_missing_sync_byte_or_empty_packets"
+
 /-! ## 6. Formal Soundness, Round-Trip & Fallback Theorems (Phases 3, 4, 5 & 6) -/
 
 set_option maxRecDepth 200000
@@ -1649,17 +1679,32 @@ theorem rescalePtsIndependentOrFallback_negative_universal (n sn sd dn dd : Nat)
 
 /--
   Theorem (Phase 5 & Phase 6): `specFfiCancelGate` enforces cancellation and frame budgets,
-  and `rescalePtsIndependentOrFallback` executes the exact rational rescaler in-domain (`90000` at `1/90000 -> 1/1000` = `1000`)
-  while deterministically returning `.fallbackDelegated` on negative timestamps or zero denominators.
+  `rescalePtsIndependentOrFallback` executes the exact rational rescaler in-domain (`90000` at `1/90000 -> 1/1000` = `1000`)
+  while deterministically returning `.fallbackDelegated` on negative timestamps or zero denominators,
+  and `demuxMatroskaIndependentOrFallback` round-trips a valid Matroska/WebM `SimpleBlock` into `.independentVerified`
+  while returning `.fallbackDelegated` on empty/malformed inputs.
 -/
 theorem independentKernel_fallback_complete_and_sound :
+    let mkvBlk : MkvSimpleBlock := { trackNum := 1, relTimecodeMs := 33, isKeyframe := true, payload := [0x00, 0x00, 0x01, 0x65] }
     specFfiCancelGate 0 10 25 = true ∧
     specFfiCancelGate 1 10 25 = false ∧
     specFfiCancelGate 0 25 25 = false ∧
     rescalePtsIndependentOrFallback 90000 1 90000 1 1000 = .independentVerified 1000 ∧
     rescalePtsIndependentOrFallback (-1) 1 90000 1 1000 = .fallbackDelegated "negative_pts_requires_signed_timeline_shift" ∧
-    rescalePtsIndependentOrFallback 90000 1 0 1 1000 = .fallbackDelegated "zero_rational_component" := by
+    rescalePtsIndependentOrFallback 90000 1 0 1 1000 = .fallbackDelegated "zero_rational_component" ∧
+    demuxMatroskaIndependentOrFallback (muxMatroskaSimpleBlockSpec mkvBlk) = .independentVerified mkvBlk ∧
+    demuxMatroskaIndependentOrFallback [] = .fallbackDelegated "invalid_or_truncated_ebml_matroska_block" := by
   decide
+
+/--
+  Universal Theorem: `demuxMpegTsIndependentOrFallback` deterministically falls back on any slice shorter than 188 bytes.
+-/
+theorem demuxMpegTsIndependentOrFallback_rejects_short_universal (s : ByteSlice)
+    (hShort : s.len < 188) :
+    demuxMpegTsIndependentOrFallback s = .fallbackDelegated "mpegts_length_not_multiple_of_188" := by
+  unfold demuxMpegTsIndependentOrFallback
+  have hCond : (s.len < 188 || s.len % 188 != 0) = true := by simp [hShort]
+  simp [hCond]
 
 /--
   Universal Theorem: If `verifyExecArgvHygiene argv = true`, every token `tok ∈ argv`

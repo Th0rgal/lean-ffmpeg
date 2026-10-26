@@ -874,13 +874,22 @@ opaque execLnirBinaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArr
 opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) (ba2 : @& ByteArray) : ByteArray
 
 /-- Zero-copy `ByteArray` 2D strided plane LNIR dispatcher
-    (`0=swscale_down2x2_u8`, `1=swscale_down2x2_fused_eq_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`). -/
+    (`0=swscale_down2x2_u8`, `1=swscale_down2x2_fused_eq_u8`, `2=swscale_down3x3_u8`, `3=swscale_down3to2_u8`, `4=stencil2d_box3x3_u8`). -/
 @[extern "leanav_c_exec_lnir_scale2d_ba"]
 opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride dstW dstH arg0 arg1 : UInt64) : ByteArray
 
 /-- Zero-copy `ByteArray` 2D AV1 CDEF directional deringing filter LNIR dispatcher (`@lean_native_av1_cdef_filter_u8`). -/
 @[extern "leanav_c_exec_lnir_cdef_ba"]
 opaque execLnirAv1CdefBaC (src : @& ByteArray) (w h priStr damping : UInt64) : ByteArray
+
+/-- Zero-copy `ByteArray` strided luma mean & spatial variance LNIR dispatcher (`@lean_native_luma_stats_u8`). -/
+@[extern "leanav_c_exec_lnir_luma_stats_ba"]
+opaque execLnirLumaStatsBaC (src : @& ByteArray) (nPixels step : UInt64) : UInt64
+
+/-- Invoke `lean-native-core`-compiled `@lean_native_stencil2d_box3x3_u8` 2D $3\times 3$ box-blur stencil on a contiguous `w x h` plane `ByteArray`. -/
+@[inline]
+def execLnirBoxBlur3x3BaC (src : @& ByteArray) (w h : UInt64) : ByteArray :=
+  execLnirScale2dBaC 4 src w w h 0 0
 
 /-- Invoke `lean-native-core`-compiled `swscale_luma_gain_bias_simd` in-place
     on an 8-byte-aligned `ByteArray` (`m_rc == 1` zero-copy fast path). -/
@@ -962,6 +971,12 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
   let ok14 := unpackInt64LanesLe (execLnirTernaryBaC 2 baP baQ baR) == evalLnirKernel .down3x3Box vP vQ vR
   let ok15 := unpackInt64LanesLe (execLnirBinaryBaC 6 baP baQ) == evalLnirKernel .down3to2Bilinear vP vQ []
   let ok16 := unpackInt64LanesLe (execLnirTernaryBaC 3 baP baQ baR) == evalLnirKernel .av1CdefDirFilter vP vQ vR
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 then 1 else 0
+  let box3x3In : ByteArray := { data := #[9, 9, 9, 9, 90, 9, 9, 9, 9] }
+  let box3x3Out := execLnirBoxBlur3x3BaC box3x3In 3 3
+  let ok17 := box3x3Out.size == 9 && box3x3Out.get! 4 == 18 && box3x3Out.get! 0 == 9
+  let statsIn : ByteArray := { data := #[100, 120, 140, 160] }
+  let statsOut := execLnirLumaStatsBaC statsIn 4 1
+  let ok18 := (statsOut &&& 0xFFFFFFFF) == 130 && (statsOut >>> 32) == 500
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 then 1 else 0
 
 end LeanAV.NativeKernels

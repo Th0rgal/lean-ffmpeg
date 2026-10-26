@@ -884,6 +884,125 @@ exit:
   ret void
 }
 
+define weak_odr dso_local void @lean_native_stencil2d_box3x3_u8(ptr noalias noundef %dst, ptr noalias noundef %src, i64 noundef %w, i64 noundef %h) #0 {
+entry:
+  %total = mul nuw i64 %w, %h
+  %has_bytes = icmp ugt i64 %total, 0
+  br i1 %has_bytes, label %copy.init, label %exit
+copy.init:
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align 1 %src, i64 %total, i1 false)
+  %w_lt3 = icmp ult i64 %w, 3
+  %h_lt3 = icmp ult i64 %h, 3
+  %skip = or i1 %w_lt3, %h_lt3
+  br i1 %skip, label %exit, label %outer.ph
+outer.ph:
+  %h_limit = sub nuw i64 %h, 1
+  %w_limit = sub nuw i64 %w, 1
+  br label %outer.body
+outer.body:
+  %r = phi i64 [ 1, %outer.ph ], [ %r_next, %outer.latch ]
+  %r_prev = sub nuw i64 %r, 1
+  %r_next_row = add nuw i64 %r, 1
+  %up_off  = mul nuw i64 %r_prev, %w
+  %row_off = mul nuw i64 %r, %w
+  %dn_off  = mul nuw i64 %r_next_row, %w
+  %up_ptr  = getelementptr inbounds i8, ptr %src, i64 %up_off
+  %row_ptr = getelementptr inbounds i8, ptr %src, i64 %row_off
+  %dn_ptr  = getelementptr inbounds i8, ptr %src, i64 %dn_off
+  %dst_row = getelementptr inbounds i8, ptr %dst, i64 %row_off
+  br label %inner.body
+inner.body:
+  %c = phi i64 [ 1, %outer.body ], [ %c_next, %inner.body ]
+  %c_prev = sub nuw i64 %c, 1
+  %c_plus = add nuw i64 %c, 1
+  %p00 = getelementptr inbounds i8, ptr %up_ptr, i64 %c_prev
+  %p01 = getelementptr inbounds i8, ptr %up_ptr, i64 %c
+  %p02 = getelementptr inbounds i8, ptr %up_ptr, i64 %c_plus
+  %p10 = getelementptr inbounds i8, ptr %row_ptr, i64 %c_prev
+  %p11 = getelementptr inbounds i8, ptr %row_ptr, i64 %c
+  %p12 = getelementptr inbounds i8, ptr %row_ptr, i64 %c_plus
+  %p20 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c_prev
+  %p21 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c
+  %p22 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c_plus
+  %b00 = load i8, ptr %p00, align 1
+  %b01 = load i8, ptr %p01, align 1
+  %b02 = load i8, ptr %p02, align 1
+  %b10 = load i8, ptr %p10, align 1
+  %b11 = load i8, ptr %p11, align 1
+  %b12 = load i8, ptr %p12, align 1
+  %b20 = load i8, ptr %p20, align 1
+  %b21 = load i8, ptr %p21, align 1
+  %b22 = load i8, ptr %p22, align 1
+  %u00 = zext i8 %b00 to i32
+  %u01 = zext i8 %b01 to i32
+  %u02 = zext i8 %b02 to i32
+  %u10 = zext i8 %b10 to i32
+  %u11 = zext i8 %b11 to i32
+  %u12 = zext i8 %b12 to i32
+  %u20 = zext i8 %b20 to i32
+  %u21 = zext i8 %b21 to i32
+  %u22 = zext i8 %b22 to i32
+  %s0 = add nuw nsw i32 %u00, %u01
+  %s1 = add nuw nsw i32 %s0, %u02
+  %s2 = add nuw nsw i32 %s1, %u10
+  %s3 = add nuw nsw i32 %s2, %u11
+  %s4 = add nuw nsw i32 %s3, %u12
+  %s5 = add nuw nsw i32 %s4, %u20
+  %s6 = add nuw nsw i32 %s5, %u21
+  %sum9 = add nuw nsw i32 %s6, %u22
+  %rnd = add nuw nsw i32 %sum9, 4
+  %prod = mul nuw nsw i32 %rnd, 7282
+  %avg = lshr i32 %prod, 16
+  %out_b = trunc i32 %avg to i8
+  %dst_p = getelementptr inbounds i8, ptr %dst_row, i64 %c
+  store i8 %out_b, ptr %dst_p, align 1
+  %c_next = add nuw nsw i64 %c, 1
+  %done_c = icmp eq i64 %c_next, %w_limit
+  br i1 %done_c, label %outer.latch, label %inner.body, !llvm.loop !0
+outer.latch:
+  %r_next = add nuw nsw i64 %r, 1
+  %done_r = icmp eq i64 %r_next, %h_limit
+  br i1 %done_r, label %exit, label %outer.body
+exit:
+  ret void
+}
+
+define weak_odr dso_local i64 @lean_native_luma_stats_u8(ptr noalias noundef readonly %src, i64 noundef %nPixels, i64 noundef %step) #0 {
+entry:
+  %has_px = icmp ugt i64 %nPixels, 0
+  %step_pos = icmp ugt i64 %step, 0
+  %ok = and i1 %has_px, %step_pos
+  br i1 %ok, label %loop.body, label %exit.zero
+loop.body:
+  %idx = phi i64 [ 0, %entry ], [ %idx_next, %loop.body ]
+  %sum = phi i64 [ 0, %entry ], [ %sum_next, %loop.body ]
+  %sumSq = phi i64 [ 0, %entry ], [ %sumSq_next, %loop.body ]
+  %cnt = phi i64 [ 0, %entry ], [ %cnt_next, %loop.body ]
+  %p = getelementptr inbounds i8, ptr %src, i64 %idx
+  %b = load i8, ptr %p, align 1
+  %v = zext i8 %b to i64
+  %v2 = mul nuw i64 %v, %v
+  %sum_next = add nuw i64 %sum, %v
+  %sumSq_next = add nuw i64 %sumSq, %v2
+  %cnt_next = add nuw i64 %cnt, 1
+  %idx_next = add nuw i64 %idx, %step
+  %more = icmp ult i64 %idx_next, %nPixels
+  br i1 %more, label %loop.body, label %compute.out, !llvm.loop !0
+compute.out:
+  %mean = udiv i64 %sum_next, %cnt_next
+  %meanSq = udiv i64 %sumSq_next, %cnt_next
+  %sq = mul nuw i64 %mean, %mean
+  %gt = icmp ugt i64 %meanSq, %sq
+  %diff = sub nuw i64 %meanSq, %sq
+  %var = select i1 %gt, i64 %diff, i64 0
+  %var_hi = shl i64 %var, 32
+  %mean_lo = and i64 %mean, 4294967295
+  %packed = or i64 %var_hi, %mean_lo
+  ret i64 %packed
+exit.zero:
+  ret i64 0
+}
+
 define weak_odr dso_local i8 @leansys_select_isa(i64 %detected, i64 %req_mask, i8 %req_var, i8 %max_var) #0 {
 entry:
   %gt0 = icmp ugt i8 %req_var, 0
