@@ -2055,6 +2055,17 @@ extern uint64_t leanav_lean_rescale_elst_entry_u64(
     uint32_t src_mvhd_ts, uint32_t dst_mvhd_ts,
     uint32_t src_mdhd_ts, uint32_t dst_mdhd_ts
 );
+extern uint32_t leanav_lean_select_iso_header_timescale_u32(
+    uint8_t version, uint32_t box_size, uint32_t ts_at_20, uint32_t ts_at_28
+);
+
+static uint32_t leanav_extract_box_timescale(const uint8_t *box, size_t bs) {
+    if (bs < 24) return 0u;
+    uint32_t sz32 = (bs > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)bs;
+    uint32_t ts20 = leanav_rd_u32be(box + 20);
+    uint32_t ts28 = (bs >= 32) ? leanav_rd_u32be(box + 28) : 0u;
+    return leanav_lean_select_iso_header_timescale_u32(box[8], sz32, ts20, ts28);
+}
 
 static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *out_path, int copy_elst) {
     /* Read up to 4 MiB of header/tail from in_path to extract video stsd boxes and edts */
@@ -2102,13 +2113,11 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
         }
         if (located) {
             size_t bp, bs;
-            if (leanav_find_child_box(in_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 24) {
-                uint8_t ver = in_buf[bp + 8];
-                in_mvhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(in_buf + bp + 28) : leanav_rd_u32be(in_buf + bp + 20);
+            if (leanav_find_child_box(in_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs)) {
+                in_mvhd_ts = leanav_extract_box_timescale(in_buf + bp, bs);
             }
-            if (leanav_find_child_box(in_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs) && bs >= 24) {
-                uint8_t ver = in_buf[bp + 8];
-                in_mdhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(in_buf + bp + 28) : leanav_rd_u32be(in_buf + bp + 20);
+            if (leanav_find_child_box(in_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs)) {
+                in_mdhd_ts = leanav_extract_box_timescale(in_buf + bp, bs);
             }
             if (leanav_find_child_box(in_buf, vre_p + 86, vre_p + vre_s, "colr", &bp, &bs) && bs <= sizeof(colr_box)) {
                 memcpy(colr_box, in_buf + bp, bs); colr_len = bs;
@@ -2227,15 +2236,11 @@ static int leanav_patch_mp4_hdr_and_elst_boxes(const char *in_path, const char *
     int32_t edts_delta = 0;
     if (copy_elst && edts_len >= 28) {
         uint32_t out_mvhd_ts = 0, out_mdhd_ts = 0;
-        if (leanav_find_child_box(out_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 24) {
-            uint8_t ver = out_buf[bp + 8];
-            out_mvhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(out_buf + bp + 28) : leanav_rd_u32be(out_buf + bp + 20);
+        if (leanav_find_child_box(out_buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs)) {
+            out_mvhd_ts = leanav_extract_box_timescale(out_buf + bp, bs);
         }
-        if (leanav_find_child_box(out_buf, mdia_p + 8, mdia_p + mdia_s, "mdia", &bp, &bs) || 1) {
-            if (leanav_find_child_box(out_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs) && bs >= 24) {
-                uint8_t ver = out_buf[bp + 8];
-                out_mdhd_ts = (ver == 1 && bs >= 32) ? leanav_rd_u32be(out_buf + bp + 28) : leanav_rd_u32be(out_buf + bp + 20);
-            }
+        if (leanav_find_child_box(out_buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &bp, &bs)) {
+            out_mdhd_ts = leanav_extract_box_timescale(out_buf + bp, bs);
         }
         int in_has_nonzero_mt = 0;
         /* Rescale v0 elst entries inside `edts_box` if `edts` contains an `elst` child at offset 8 */
@@ -2565,8 +2570,9 @@ static void leanav_populate_media_info_mp4_boxes(const char *in_path, leanav_med
             size_t bp, bs;
             if (leanav_find_child_box(buf, moov_p + 8, moov_p + moov_s, "mvhd", &bp, &bs) && bs >= 28) {
                 uint8_t ver = buf[bp + 8];
-                uint32_t ts = (ver == 1 && bs >= 36) ? leanav_rd_u32be(buf + bp + 28) : leanav_rd_u32be(buf + bp + 20);
-                uint64_t dur = (ver == 1 && bs >= 36) ? leanav_rd_u64be(buf + bp + 32) : (uint64_t)leanav_rd_u32be(buf + bp + 24);
+                uint32_t ts = leanav_extract_box_timescale(buf + bp, bs);
+                uint64_t dur = (ver == 1 && bs >= 40) ? leanav_rd_u64be(buf + bp + 32)
+                             : (ver == 0 ? (uint64_t)leanav_rd_u32be(buf + bp + 24) : 0ULL);
                 if (ts > 0 && dur > 0) {
                     info->duration_s = (double)dur / (double)ts;
                     info->bitrate_kbps = (int64_t)(((double)fsz * 8.0) / (info->duration_s * 1000.0) + 0.5);
@@ -2862,10 +2868,7 @@ static void leanav_probe_input_fps_rational(
                     if (leanav_find_child_box(buf, mdia_p + 8, mdia_p + mdia_s, "mdhd", &mdhd_p, &mdhd_s) &&
                         leanav_find_child_box(buf, stbl_p + 8, stbl_p + stbl_s, "stts", &stts_p, &stts_s) &&
                         mdhd_s >= 24 && stts_s >= 24) {
-                        uint8_t ver = buf[mdhd_p + 8];
-                        uint32_t ts = (ver == 1 && mdhd_s >= 32)
-                            ? leanav_rd_u32be(buf + mdhd_p + 28)
-                            : leanav_rd_u32be(buf + mdhd_p + 20);
+                        uint32_t ts = leanav_extract_box_timescale(buf + mdhd_p, mdhd_s);
                         uint32_t entry_cnt = leanav_rd_u32be(buf + stts_p + 12);
                         uint32_t delta0 = (entry_cnt >= 1) ? leanav_rd_u32be(buf + stts_p + 20) : 0;
                         if (ts > 0 && delta0 > 0) {

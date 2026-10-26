@@ -797,7 +797,11 @@ def runSelfTest : IO UInt32 := do
                      classifyDisplayAspectRatioExport 1440 960 1 1 == 0x00020003 &&
                      classifyDisplayAspectRatioExport 1440 1080 1 1 == 0x00030004 &&
                      classifyDisplayAspectRatioExport 1080 1080 1 1 == 0x00010001 &&
-                     classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 == 0x00010001
+                     classifyDisplayAspectRatioExport 0xFFFFFFFF 1080 1 1 == 0x00010001 &&
+                     selectIsoHeaderTimescaleExport 0 24 1000 90000 == 1000 &&
+                     selectIsoHeaderTimescaleExport 1 32 1000 90000 == 90000 &&
+                     selectIsoHeaderTimescaleExport 1 28 1000 90000 == 0 &&
+                     selectIsoHeaderTimescaleExport 2 36 1000 90000 == 0
   let w52Ok := w52P010Out == leanSpecAv1CdefFma [512, 1023] [64, 64] [0, 32768] &&
                w52BoxU10Ok &&
                verifyCompiledLnirSuiteC () == 1

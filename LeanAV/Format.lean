@@ -3126,6 +3126,22 @@ def rescaleElstEntry (e : ElstEntryView) (srcMvhdTs dstMvhdTs srcMdhdTs dstMdhdT
   }
 
 /--
+  ISO/IEC 14496-12 §8.2.2 / §8.4.2 `mvhd` and `mdhd` version-aware timescale selector:
+  - `version == 0` and `boxSize >= 24`: returns `tsAt20` (32-bit timescale at byte offset 20)
+  - `version == 1` and `boxSize >= 32`: returns `tsAt28` (32-bit timescale at byte offset 28)
+  - Otherwise (truncated v1 box `24 <= boxSize < 32` or unsupported `version > 1`): fails closed (`0`).
+-/
+@[inline]
+def selectIsoHeaderTimescaleU32 (version : UInt8) (boxSize tsAt20 tsAt28 : UInt32) : UInt32 :=
+  if version == 0 && boxSize >= 24 then tsAt20
+  else if version == 1 && boxSize >= 32 then tsAt28
+  else 0
+
+@[export leanav_lean_select_iso_header_timescale_u32]
+def selectIsoHeaderTimescaleExport (version : UInt8) (boxSize tsAt20 tsAt28 : UInt32) : UInt32 :=
+  selectIsoHeaderTimescaleU32 version boxSize tsAt20 tsAt28
+
+/--
   Theorem (Wave 24b): when `mvhd.timescale != mdhd.timescale`, an `elst` copied from a source movie
   (`mvhd = 1000`, `mdhd = 24000`) onto an output movie (`mvhd = 90000`, `mdhd = 24000`) rescales the
   movie-timescale `segmentDuration`, preserves the media-timescale `mediaTime` and empty dwell,
@@ -3143,7 +3159,11 @@ theorem elst_rescale_mvhd_mdhd_mismatch :
     rescaleElstEntryExport 0xFFFFFFFF 0x7FFFFFFF 2 0xFFFFFFFF 2 0xFFFFFFFF = 0x7FFFFFFFFFFFFFFF ∧
     rescaleElstEntry { segmentDuration := 0xFFFFFFFF, mediaTime := 0x7FFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 } 2 0xFFFFFFFF 2 0xFFFFFFFF =
       { segmentDuration := 0xFFFFFFFF, mediaTime := 0x7FFFFFFF, mediaRateInteger := 1, mediaRateFraction := 0 } ∧
-    rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 = 0x000003E8FFFFFFFE := by
+    rescaleElstEntryExport 0xFFFFFFFD 1000 0xFFFFFFFE 0xFFFFFFFF 1000 1000 = 0x000003E8FFFFFFFE ∧
+    selectIsoHeaderTimescaleExport 0 24 1000 90000 = 1000 ∧
+    selectIsoHeaderTimescaleExport 1 32 1000 90000 = 90000 ∧
+    selectIsoHeaderTimescaleExport 1 28 1000 90000 = 0 ∧
+    selectIsoHeaderTimescaleExport 2 36 1000 90000 = 0 := by
   decide
 
 /--

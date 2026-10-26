@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: lake build
       - name: Install & cache turbo-lean
-        uses: Th0rgal/turbo-lean@0db632dea28231c64523819a5596791123b67f58
+        uses: Th0rgal/turbo-lean@64cd19ef1d78572dd6ac51b698a65fec398c0c1f
         with:
           project-dir: "."
           command: cache-only
