@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **LeanNative (`LNIR_WIRE_V1`)** DSP kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) with C-ABI SIMD kernels (`AVX2` / `SSE4.2` / `NEON`) in `libleanav_dsp.a`, backed by **`0 sorryAx`** across **`8,047`** declarations and **`207 / 207` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **LeanNative (`LNIR_WIRE_V1`)** DSP kernels compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) with C-ABI SIMD kernels (`AVX2` / `SSE4.2` / `NEON`) in `libleanav_dsp.a`, backed by **`0 sorryAx`** across **`8,050`** declarations and **`208 / 208` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 ---
 
@@ -32,7 +32,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`207 / 207` specifications**) pass `turbo-lean --json audit-spec` (`e2b161b`) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,047`** kernel-checked declarations (`Format`: 47, `Video`: 27, `Spec`: 23, `NativeKernels`: 21, `Bitstream`: 13, `PlanIR`: 13, `Audio`: 12, `Scale`: 12, `Core`: 11, `Encoder`: 9, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`208 / 208` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,050`** kernel-checked declarations (`Format`: 47, `Video`: 27, `Spec`: 23, `NativeKernels`: 21, `Bitstream`: 13, `PlanIR`: 13, `Scale`: 13, `Audio`: 12, `Core`: 11, `Encoder`: 9, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
@@ -47,10 +47,10 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,047 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,050 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit all 15 formal modules with turbo-lean (207/207 tight, 0 vacuous, 0 trivial)
+# Audit all 15 formal modules with turbo-lean (208/208 tight, 0 vacuous, 0 trivial)
 for f in LeanAV/*.lean; do turbo-lean --json audit-spec "$f"; done
 
 # Validate the 12 LNIR_WIRE_V1 kernels via translation validation and certificate checking
@@ -95,7 +95,7 @@ Measured on Linux x86\_64 (median of 7 runs after warmup) on a **1080p** MP4 sou
 
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `207/207` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`.
+- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `208/208` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`.
 - [`c/`](c/):
   - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): C-ABI SIMD kernels (`AVX2` / `SSE4.2` / `NEON`), zero-copy `ByteArray` (`lean_sarray_object`) runtime bridge for the 12 compiled LNIR kernels, and shell-free `execvp` delegation.
   - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 12 distinct `LNIR_WIRE_V1` DSP kernels validated (`validate-tv` + `verify-certs`) and lowered to LLVM 18 IR by `lean-native-core`, compiled and linked into `libleanav_dsp.a`.

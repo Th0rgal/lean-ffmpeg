@@ -665,15 +665,19 @@ def runSelfTest : IO UInt32 := do
       (negAccPacked &&& 0xFFFFFF) 4096 (((negAccPacked >>> 40) &&& 1).toUInt32) ((negAccPacked >>> 24) &&& 0xFFFF) 0 == 0
   let bicubicRefBytes := scalePlaneDown2x2BicubicBytes realFfmpeg8x8Plane.data 8 8 8
   let bicubicCBytes   := scalePlaneDown2x2BicubicCSimd realFfmpeg8x8Plane.data 8 8 8
-  let bicubicParityOk := bicubicRefBytes.data == bicubicCBytes.data && bicubicCBytes.size == 16
+  let bicubicParityOk :=
+    bicubicRefBytes.data == bicubicCBytes.data &&
+    bicubicCBytes.size == 16 &&
+    evalBicubic4TapMidpoint 10 120 140 250 == 130 &&
+    bicubicCBytes.toList.all (fun b => b >= 16 && b <= 235)
   let pqLutParityOk   :=
-    tonemapPq10ToBt709Sdr8C 0 == tonemapPq10ToBt709Sdr8 0 &&
-    tonemapPq10ToBt709Sdr8C 64 == tonemapPq10ToBt709Sdr8 64 &&
-    tonemapPq10ToBt709Sdr8C 256 == tonemapPq10ToBt709Sdr8 256 &&
-    tonemapPq10ToBt709Sdr8C 512 == tonemapPq10ToBt709Sdr8 512 &&
+    tonemapPq10ToBt709Sdr8C 0 == 16 &&
+    tonemapPq10ToBt709Sdr8C 64 == 16 &&
+    tonemapPq10ToBt709Sdr8C 256 == 64 &&
+    tonemapPq10ToBt709Sdr8C 512 == 128 &&
     tonemapPq10ToBt709Sdr8C 768 == tonemapPq10ToBt709Sdr8 768 &&
-    tonemapPq10ToBt709Sdr8C 940 == tonemapPq10ToBt709Sdr8 940 &&
-    tonemapPq10ToBt709Sdr8C 1023 == tonemapPq10ToBt709Sdr8 1023
+    tonemapPq10ToBt709Sdr8C 940 == 235 &&
+    tonemapPq10ToBt709Sdr8C 1023 == 235
   let w50Ok := decodeUdtaMetaIlstBoxSpec (encodeUdtaMetaIlstBoxSpec w50Udta) == some w50Udta &&
                visualFidelityGateSpec.gate visualFidelityGateSpec.posWitness &&
                !(visualFidelityGateSpec.gate visualFidelityGateSpec.negWitness) &&
@@ -1873,6 +1877,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Cli.resolveScaleDims_proportional_even_and_cli_flags_verified
 #print axioms LeanAV.Cli.cli_encoder_options_retained_and_invalid_rejected
 #print axioms LeanAV.Scale.bicubic4TapMidpoint_partition_of_unity_and_const_exact
+#print axioms LeanAV.Scale.bicubic4TapMidpoint_bounded_u8
 #print axioms LeanAV.Scale.pq10Tonemap_and_bicubic2x2_verified
 #print axioms LeanAV.Core.Plane.addr_lt
 #print axioms LeanAV.Core.Plane.simd_load_safe
