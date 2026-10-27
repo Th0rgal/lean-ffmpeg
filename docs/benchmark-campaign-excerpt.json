@@ -1,0 +1,13 @@
+{
+  "evidence_type": "historical campaign summary, not raw benchmark samples",
+  "source_document": "maxwell_overnight_campaign_log.md",
+  "source_section": "Wave 9 race group W9-B4",
+  "source_excerpt": "| **`rg-W9-B4`** | `w9/multi-hardware-dgx-spark-and-zen5-wave9` | **DGX Spark** (`edc2c0f5`) & **Zen 5 Boat VM** (`166e22a1`) | **Completed (`edc2c0f5` + `166e22a1`)**:<br>\u2022 **Zen 5 Boat VM (`AMD Ryzen 9 9950X`)**: `1080p -> 540p` **`443.78 ms` vs `486.39 ms` (`1.10x` faster than `ffmpeg 6.1.1`)**, `1080p -> 480p Q8` **`501.88 ms` vs `478.41 ms` (`0.95x`)**, `540p + tonemap + BT.709` **`500.16 ms` vs `946.64 ms` (`1.89x` faster than `ffmpeg`)**, `-c copy` **`51.69 ms` vs `38.46 ms`**, `verify-kernels` `4,809 \u00b5s`.<br>\u2022 **DGX Spark (`spark-de79` Grace ARM64 + Blackwell `sm_90`)**: `1080p -> 540p` **`309.03 ms` vs `225.77 ms`**, `1080p -> 480p Q8` **`350.85 ms` vs `209.78 ms`**, `540p + tonemap + BT.709` **`310.62 ms` vs `446.96 ms` (`1.44x` faster than `ffmpeg` on ARM64 NEON)**, `-c copy` **`79.16 ms` vs `51.11 ms`**, `ptxas -arch=sm_90` **`26` entry points, `0` errors, `0` spills**. |",
+  "verified_on": "2026-10-27",
+  "limitations": [
+    "Not rerun on the current commit",
+    "Exact commands, trial samples and output-quality comparisons unavailable in this excerpt",
+    "No MacBook Air M2 results",
+    "DGX Spark CPU timings, not CUDA timings"
+  ]
+}

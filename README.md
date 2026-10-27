@@ -13,6 +13,56 @@ sizes, truncated buffers, and the full UInt16 range.
 
 ---
 
+## Performance across x86, DGX Spark and Apple Silicon
+
+The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
+**1.44× on DGX Spark** for its scale + tonemap + BT.709 CLI workload. Other
+workloads remain slower. These are recorded campaign measurements, not a fresh
+benchmark of the current commit. See [measurement provenance](docs/BENCHMARK_EVIDENCE.md).
+
+### End-to-end CLI: FFmpeg and lffmpeg on the same host
+
+Wall time in milliseconds; lower is better. **Speedup = FFmpeg time / lffmpeg time**;
+values below 1 mean lffmpeg is slower. These reported pipeline comparisons include
+decode/encode and I/O; they do not establish identical output quality or codec settings.
+
+| Hardware | Workload | FFmpeg 6.1.1 | lffmpeg | Speedup |
+| :--- | :--- | ---: | ---: | ---: |
+| **x86 — Ryzen 9 9950X (Zen 5)** | 1080p → 540p | 486.39 ms | **443.78 ms** | **1.10×** |
+| x86 — Ryzen 9 9950X | 1080p → 480p, Q8 | 478.41 ms | 501.88 ms | 0.95× |
+| **x86 — Ryzen 9 9950X** | 540p + tonemap + BT.709 | 946.64 ms | **500.16 ms** | **1.89×** |
+| x86 — Ryzen 9 9950X | Stream copy | 38.46 ms | 51.69 ms | 0.74× |
+| **DGX Spark — ARM64 CPU** | 1080p → 540p | 225.77 ms | 309.03 ms | 0.73× |
+| DGX Spark — ARM64 CPU | 1080p → 480p, Q8 | 209.78 ms | 350.85 ms | 0.60× |
+| **DGX Spark — ARM64 CPU** | 540p + tonemap + BT.709 | 446.96 ms | **310.62 ms** | **1.44×** |
+| DGX Spark — ARM64 CPU | Stream copy | 51.11 ms | 79.16 ms | 0.65× |
+| **MacBook Air M2** | Comparative CLI benchmarks | — | — | **Not measured in the retained evidence** |
+
+DGX Spark timings above use the CPU path, not CUDA kernel execution. PTX assembly
+checks are separate from GPU runtime performance. The passing macOS CI validates
+its runner; it is **not a MacBook Air M2 benchmark**.
+
+### Native CPU kernels: throughput by architecture
+
+Historical in-memory measurements; these exclude the full FFmpeg CLI workload.
+There is no matched FFmpeg kernel baseline in the retained table, so these numbers
+must not be used to claim a speedup over an entire FFmpeg transcode.
+
+| Native workload | x86 Xeon E3-1245 V2 | x86 Ryzen 9 9950X | DGX Spark ARM64 CPU | MacBook Air M2 |
+| :--- | ---: | ---: | ---: | :--- |
+| 4K → 1080p, 2×2 plane scale | 623–693 fps | 1,611–2,128 fps | **2,005–2,469 fps** | Not measured |
+| 4K → 720p, 3×3 plane scale | 686–833 fps | 2,140–2,147 fps | **1,547–2,896 fps** | Not measured |
+| 1080p → 720p, 3:2 plane scale | 1,243–2,195 fps | **6,617–9,075 fps** | 4,651–6,722 fps | Not measured |
+| CDEF filter, 101 × 64×64 planes | 8,561 µs | **1,452 µs** | 4,232 µs | Not measured |
+| MP4 demux, 500 iterations | 229 µs | 182 µs | **89 µs** | Not measured |
+| Order-4 FLAC LPC round-trip, 500 iterations | 76 µs | **20 µs** | 33 µs | Not measured |
+
+The earlier 234×–1,382× CDEF figures compare against a scalar Lean reference,
+not FFmpeg's optimized CDEF implementation. Synthetic Pipeline D throughput is
+also excluded from the FFmpeg comparison because its workload differs.
+
+---
+
 ## Qualification Tiers (`MediaPlanIR`)
 
 Every CLI request is parsed into a typed intermediate representation (`MediaPlanIR` in [`LeanAV/PlanIR.lean`](LeanAV/PlanIR.lean)), checked against a fail-closed security policy (formally proved rejection of network protocols, `/dev/*` device nodes, and `..` path traversals), and routed to one of four execution tiers:
@@ -26,14 +76,29 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 ---
 
-## Differential & FATE Parity vs `ffmpeg 6.1.1`
+## Compatibility: what “100%” covers
 
-| Verification Suite | Scope | Verified Result | Details |
-| :--- | :--- | :---: | :--- |
-| **Suite #0 (`tests/`)** | Python unit & differential tests + C-ABI / LNIR self-tests | Wave 14 Linux CI: **30 unit tests OK; 34 differential tests, 4 skipped** | Counts are runner-dependent; skipped tests are not passes. `53/53` self-test waves; FFI and kernel checks passed. |
-| **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
-| **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` stream signatures (`0 DIFF`) |
-| **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |
+**We do not claim to pass 100% of the full FFmpeg test suite.** The historical
+FATE result is **129/129 of the reference-passing tests in a selected 187-case
+run**. This is useful compatibility evidence, but is neither all 187 cases passing
+nor coverage of the full upstream FATE suite. The broader 120-case compatibility
+suite still has one recorded mismatch. Full codecs and some CLI operations use
+FFmpeg delegation; passing compatibility tests does not imply standalone parity.
+
+| Suite / environment | Result | Scope and limitations |
+| :--- | :--- | :--- |
+| Local Python suites, 2026-10-27 | **83 passed, 0 skipped** | 30 unit + 53 differential tests; project tests, not upstream FATE |
+| Linux CI, `68936da` | **60 passed, 4 skipped** | 30 unit + 34 differential cases counted; skips excluded from passes |
+| macOS CI, `68936da` | **43 passed, 6 skipped** | 15 unit + 34 differential cases counted; some IR classes unavailable on this runner |
+| CLI self-test / FFI / kernels | **Passed on Linux and macOS** | 53 self-test waves; [CI run](https://github.com/Th0rgal/lean-ffmpeg/actions/runs/40462499784) |
+| Historical `bench.py` compatibility matrix | **119/120 matched (99.2%)** | 111 byte-exact, 5 lossy-signature matches, 3 both-fail; remaining mismatch not reclassified without evidence |
+| Historical `test_diff.py` matrix | **79/79 matched** | Exit codes and ffprobe signatures, not universal bit-exactness |
+| Historical selected FATE run | **129/129 reference-passing cases** | Selection: 187 cases; 58 outside this passing subset. Reported 186 matching non-empty outputs is a separate output comparison, not 186 passing tests |
+
+Historical compatibility totals are retained from the campaign dossier; their full
+per-case reports and external harnesses are not checked into this repository and
+were not reproduced during this documentation update. Current CI does not run the
+full upstream FATE suite. See [evidence and gaps](docs/BENCHMARK_EVIDENCE.md).
 
 ---
 
@@ -59,7 +124,7 @@ lake build
 # Verify 0 sorryAx and 0 custom axioms across all 8,887 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit all 15 formal modules in parallel with turbo-lean (264/264 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
+# Audit each formal module (compatible with single-file turbo-lean CLIs)
 for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done
 
 # Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
@@ -73,48 +138,16 @@ python3 -m unittest discover -s tests/differential -p "test_*.py"
 
 ---
 
-## Benchmarks: `lffmpeg` vs `ffmpeg` (`6.1.1`)
-
-Measured on Linux x86\_64 (median of 7 runs after warmup) on a **1080p** MP4 source (`1920x1080`, 120 frames, 4.0 s, H.264 + AAC, `7.65 MB`) and on in-memory frame buffers:
-
-### 1. End-to-End CLI (`lffmpeg` vs `ffmpeg 6.1.1-3ubuntu5`)
-
-| CLI Operation | `ffmpeg 6.1.1` | `lffmpeg` | Ratio | Execution Path |
-| :--- | ---: | ---: | ---: | :--- |
-| **MKV Remux (`-map` + `-metadata -c copy`)** | `82.8 ms` | `87.0 ms` | `1.05x` | `MediaPlanIR` validation + `execvp` delegation (`7.83 MB` bit-identical) |
-| **WAV Audio Extraction (`-vn -c:a pcm_s16le`)** | `75.6 ms` | `79.1 ms` | `1.05x` | Bit-exact output (`385,102 bytes`) |
-| **FLAC Audio Extraction (`-vn -c:a flac`)** | `82.0 ms` | `87.3 ms` | `1.06x` | Bit-exact output (`231,784 bytes`) |
-| **1080p MP4 Stream Copy (`-c copy`, 7.65 MB)** | `70.8 ms` | `75.5 ms` | `1.07x` | Zero-copy `pread` probe + `libavformat` remux without `moov` bloat |
-| **320x240 MP4 Stream Copy (`-c copy`, fixture)** | `59.1 ms` | `63.8 ms` | `1.08x` | `22.5 KB` output (matches `ffmpeg`, metadata preserved) |
-| **1080p to 540p Scale + H.264 (`-vf scale=960:540`)** | `503.5 - 512.0 ms` | **`508.6 - 517.0 ms`** | **`1.01x`** | Fused 3-plane YUV420p zero-copy LLVM-LNIR 2x2 scale (`leanav_c_exec_lnir_scale2d_yuv420p_ba`) + `4+4` thread split + `IO.asTask` pipe overlap + `@lean_native_luma_stats_u8` |
-| **Seek + Trim (`-ss 1.0 -t 2.0 -vf scale=960:540`)** | `386.0 - 396.4 ms` | **`392.3 - 394.2 ms`** | **`0.99x`** | Pure Lean 4 `O(boxes)` `moov` walk + `avcC`/`hvcC`/`av1C` pure colorimetry probe (`0` `ffprobe` spawns) + fused YUV420p 2x2 scale + pipe overlap |
-
-### 2. Verified In-Process Native Kernels (`independent_verified`) Across Architectures
-
-Measured across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 9 9950X`, AVX2/AVX-512), and **DGX Spark** (`spark-de79`, Grace ARM64 Cortex-X925/A725 NEON/SVE2 + NVIDIA Blackwell GB10 `sm_90`):
-
-| Kernel / Pipeline (`lffmpeg bench*`) | `ffmpeg 6.1.1` | `lffmpeg` (`nippur` Xeon) | `lffmpeg` (`DGX Spark` Grace ARM64) | `lffmpeg` (`Zen 5` Ryzen 9 9950X) |
-| :--- | ---: | ---: | ---: | ---: |
-| **Pipeline D Parallel Transcode (4K -> 1080p, `w4`/`w16`)** | `72 fps` | **`18,099 - 25,157 fps`** | **`4,839 - 5,009 fps`** | **`8,359 - 10,731 fps`** |
-| **4K to 1080p 2x2 LLVM-LNIR Plane Scale (8-16 frames)** | `72 fps` | **`623 - 693 fps`** | **`2,005 - 2,469 fps`** | **`1,611 - 2,128 fps`** |
-| **4K to 720p 3x3 LLVM-LNIR Plane Scale (8-16 frames)** | n/a | **`686 - 833 fps`** | **`1,547 - 2,896 fps`** | **`2,140 - 2,147 fps`** |
-| **1080p to 720p 3:2 LLVM-LNIR Plane Scale (8-16 frames)** | n/a | **`1,243 - 2,195 fps`** | **`4,651 - 6,722 fps`** | **`6,617 - 9,075 fps`** |
-| **AV1 CDEF Directional Filter (`101` x `64x64` planes)** | n/a | **`8,561 µs`** (`234x` speedup) | **`4,232 µs`** (`474x` speedup) | **`1,452 µs`** (`1,382x` speedup) |
-| **Zero-Copy MP4 Demuxer (`500` iterations)** | n/a | **`229 µs`** | **`89 µs`** | **`182 µs`** |
-| **Order-4 FLAC LPC Round-Trip (`500` iterations)** | n/a | **`76 µs`** | **`33 µs`** | **`20 µs`** |
-
----
-
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `8,605` declarations, `239/239` `non_vacuous_and_tight` specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
+- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `264/264` audited specifications): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 - [`c/`](c/):
-  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`465`-line** irreducible C-ABI bridge (reduced by **88.4%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
+  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`621`-line** irreducible C-ABI bridge (reduced by **84.6%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
     1. POSIX `fork` + `execvp` delegation shim (`leanav_c_exec_delegated_ffmpeg`),
     2. Phase 5 FFI ABI contract & `__ATOMIC_SEQ_CST` cancellation shims (`leanav_c_verify_plane_ffi_contract`, `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate`, `leanav_c_ffi_probe_mp4_contract`), and
     3. Zero-copy `ByteArray` (`lean_sarray_object` / `lean_sarray_cptr`) bridge to the 16 compiled `LNIR_WIRE_V1` LLVM IR kernels and 7 vectorized 2D strided/reduction runtime routines (`leanav_c_exec_lnir_unary_ba`, `leanav_c_exec_lnir_binary_ba`, `leanav_c_exec_lnir_ternary_ba`, `leanav_c_exec_lnir_scale2d_ba` dispatching `kernel_id` `0..4` including `@lean_native_stencil2d_box3x3_u8` at `kernel_id = 4`, fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba`, `leanav_c_exec_lnir_cdef_ba`, and `leanav_c_exec_lnir_luma_stats_ba`).
   - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 16 distinct `LNIR_WIRE_V1` DSP/stencil kernels + 7 vectorized 2D strided/reduction routines validated (`validate-tv` + `verify-certs`) and lowered to LLVM 18 IR (`x86_64` AVX2 and `arm64` NEON) and NVIDIA PTX 8.0 (`sm_90`) by `lean-native-core`, compiled and linked into `libleanav_dsp.a`.
-- [`tests/`](tests/): Python unit tests (`15` tests) and differential tests (`44` tests) against `ffmpeg`/`ffprobe`.
+- [`tests/`](tests/): Python unit and differential tests (execution counts and skips listed above) against `ffmpeg`/`ffprobe`.
 - [`docs/`](docs/): Maxwell parity plan ([`FFMPEG_PARITY_MAXWELL_PLAN.md`](docs/FFMPEG_PARITY_MAXWELL_PLAN.md)), capability registry ([`capability-registry.json`](docs/capability-registry.json)), contracts ([`docs/contracts/`](docs/contracts/)), and closure dossier ([`CAMPAIGN_CLOSURE_DOSSIER.md`](docs/CAMPAIGN_CLOSURE_DOSSIER.md)).
 
 The 10-bit identity gate is checked in both the frame scaler and the transcode
@@ -128,11 +161,9 @@ python3 -m unittest discover -s tests/differential -p "test_u16le_identity.py" -
 ```
 
 
-Validation provenance: Wave 14 CI (`b2867db`, run `40436255776`) used Lean 4.31.0
-and audited 8,993 declarations with no sorryAx/custom axioms; the local Lean 4.35.0
-report above counted 8,887. Linux ran 30 unit tests and 34 differential tests
-(4 skipped). macOS failed the identity test setup because its linker does not
-support GNU `--wrap`; the test now compiles the production C bridge with a renamed
-scaler entrypoint and a counting wrapper on both platforms. No test is skipped to
-work around that failure. Historical benchmark and suite totals below are not
-claims that every case ran on the current CI runner.
+Validation provenance: the green Linux and macOS CI at `68936da` uses Lean
+4.31.0 and audits **8,993 declarations with zero sorryAx/custom axioms**. The
+historical local Lean 4.35.0 report counts 8,887. These counts depend on the
+toolchain. The identity test now uses portable C instrumentation; neither its
+pointer-reuse checks nor its native-call positive control is skipped to make
+macOS pass.
