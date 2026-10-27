@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -69,9 +70,10 @@ class U16LeIdentityTests(unittest.TestCase):
         subprocess.run(['cc', '-O3', '-fPIC', '-I', str(Path(lean_prefix) / 'include'),
                         '-c', str(HERE / 'u16le_identity_counter.c'), '-o', str(counter)],
                        cwd=ROOT, check=True, capture_output=True, text=True, timeout=120)
+        link_args = [] if sys.platform == 'darwin' else ['-lpthread']
         result = subprocess.run(['lake', 'env', 'leanc', '-O2', '-o', str(cls.binary),
                                  str(c_file), str(counter),
-                                 *objects, '-lpthread'],
+                                 *objects, *link_args],
                                 cwd=ROOT, capture_output=True, text=True, timeout=120)
         if result.returncode or result.stderr:
             raise AssertionError(result.stdout + result.stderr)
