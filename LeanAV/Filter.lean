@@ -535,4 +535,55 @@ def lawfulStageCropScaleBlur (pf : PixelFormat) (srcW srcH cropW cropH dstW dstH
     (lawfulStageScaleBilinear pf cropW cropH dstW dstH)).comp
     (lawfulStagePointAndBlur pf dstW dstH 256 0 false)
 
+
+/-- Observable plane discipline: skip performs no memory accesses, copy is one
+    positive-length memcpy, and transform runs the enabled SIMD loop and tail. -/
+inductive Yuv420pFilterPlaneAction where
+  | skip
+  | copy (bytes : Nat)
+  | transform (bytes : Nat)
+  deriving DecidableEq, Repr
+
+/-- Exact dispatch for one plane. Empty disabled planes never call memcpy. -/
+def yuv420pFilterPlaneAction (enabled samePtr : Bool) (bytes : Nat) :
+    Yuv420pFilterPlaneAction :=
+  if enabled then .transform bytes
+  else if samePtr || bytes == 0 then .skip else .copy bytes
+
+/-- Flags are the native 64-bit word; only bits 1 (Y) and 0 (U+V) matter.
+    Lengths describe valid packed buffers, so doubling UV and the total cannot
+    overflow i64. The final two inputs are proposed Y and combined U+V actions.
+    Distinct pointers must denote disjoint buffers, as required by memcpy. -/
+def Yuv420pFilterPlaneSkipSafe
+    (a : UInt64 × Bool × Nat × Nat × Yuv420pFilterPlaneAction × Yuv420pFilterPlaneAction) :
+    Prop :=
+  let (flags, samePtr, yLen, uvLen, yAction, cAction) := a
+  yLen + 2 * uvLen < 2^64 ∧
+  yAction = yuv420pFilterPlaneAction ((flags &&& 2) != 0) samePtr yLen ∧
+  cAction = yuv420pFilterPlaneAction ((flags &&& 1) != 0) samePtr (2 * uvLen)
+
+instance (a : UInt64 × Bool × Nat × Nat × Yuv420pFilterPlaneAction × Yuv420pFilterPlaneAction) :
+    Decidable (Yuv420pFilterPlaneSkipSafe a) := by
+  unfold Yuv420pFilterPlaneSkipSafe
+  infer_instance
+
+/-- Accept exactly the enabled-transform / disabled-skip-or-copy discipline.
+    The negative witness catches dropping disabled Y on an out-of-place call. -/
+def yuv420pFilterPlaneSkipGateSpec :
+    AVGateSpec
+      (UInt64 × Bool × Nat × Nat × Yuv420pFilterPlaneAction × Yuv420pFilterPlaneAction)
+      Yuv420pFilterPlaneSkipSafe where
+  gate := fun a => decide (Yuv420pFilterPlaneSkipSafe a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := (1, false, 17, 3, .copy 17, .transform 6)
+  negWitness := (1, false, 17, 3, .skip, .transform 6)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem yuv420pFilterPlaneSkipGateSpec_iff
+    (a : UInt64 × Bool × Nat × Nat × Yuv420pFilterPlaneAction × Yuv420pFilterPlaneAction) :
+    yuv420pFilterPlaneSkipGateSpec.gate a = true ↔ Yuv420pFilterPlaneSkipSafe a :=
+  yuv420pFilterPlaneSkipGateSpec.iff_safe a
+
 end LeanAV.Filter

@@ -1695,50 +1695,56 @@ def readMediaBytesWindow (path : String) (offset : UInt64) (maxLen : Nat) : IO B
     end-of-file `moov` boxes are returned as compact `moov`-sized slices rather than
     scanning 4 MB windows multiple times. -/
 def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
-  let probeCap := 4 * 1024 * 1024
-  let headCap := 64 * 1024
-  let fsz ← getFileSizeU64IO inPath
-  if fsz == 0 then return ByteArray.empty
-  let headSlice ← readMediaBytesWindow inPath 0 headCap
-  -- Top-level box walk (`leanav_seek_locate_moov_in_file` equivalent)
-  let mut off : UInt64 := 0
-  for _ in [:256] do
-    if off + 8 > fsz then break
-    let want := if off + 16 <= fsz then 16 else 8
-    let hdrBa ←
-      if off.toNat + want <= headSlice.size then
-        pure (headSlice.extract off.toNat (off.toNat + want))
-      else
-        readMediaBytesWindow inPath off want
-    if hdrBa.size < want then break
-    let sz32 := (baRdU32BE hdrBa 0).toUInt64
-    let mut hdr : UInt64 := 8
-    let mut sz : UInt64 := sz32
-    if sz32 == 1 then
-      if want < 16 then break
-      sz := baRdU64BE hdrBa 8
-      hdr := 16
-    else if sz32 == 0 then
-      sz := fsz - off
-    if sz < hdr || sz > fsz - off then break
-    if baRdU32BE hdrBa 4 == 0x6D6F6F76 && sz.toNat <= probeCap then -- 'moov'
-      if off.toNat + sz.toNat <= headSlice.size then
-        return headSlice.extract off.toNat (off.toNat + sz.toNat)
-      let moovBa ← readMediaBytesWindow inPath off sz.toNat
-      if moovBa.size == sz.toNat then return moovBa else break
-    off := off + sz
-  if (mp4LocateVideoBoxes headSlice headSlice.size).isSome then
-    return headSlice
-  if fsz.toNat > headCap then
-    let fullHead ← readMediaBytesWindow inPath 0 probeCap
-    if (mp4LocateVideoBoxes fullHead fullHead.size).isSome then
-      return fullHead
-  if fsz.toNat > probeCap then
-    let tailOff := fsz - probeCap.toUInt64
-    let tailSlice ← readMediaBytesWindow inPath tailOff probeCap
-    if (mp4LocateVideoBoxes tailSlice tailSlice.size).isSome then
-      return tailSlice
-  return headSlice
+  try
+    match ← withFd inPath 0 (fun fd => do
+      let probeCap := 4 * 1024 * 1024
+      let headCap := 64 * 1024
+      let fsz ← getFileSizeU64IO inPath
+      if fsz == 0 then return (.ok ByteArray.empty)
+      let headSlice ← preadByteArray fd 0 headCap
+      -- Top-level box walk (`leanav_seek_locate_moov_in_file` equivalent)
+      let mut off : UInt64 := 0
+      for _ in [:256] do
+        if off + 8 > fsz then break
+        let want := if off + 16 <= fsz then 16 else 8
+        let hdrBa ←
+          if off.toNat + want <= headSlice.size then
+            pure (headSlice.extract off.toNat (off.toNat + want))
+          else
+            preadByteArray fd off want
+        if hdrBa.size < want then break
+        let sz32 := (baRdU32BE hdrBa 0).toUInt64
+        let mut hdr : UInt64 := 8
+        let mut sz : UInt64 := sz32
+        if sz32 == 1 then
+          if want < 16 then break
+          sz := baRdU64BE hdrBa 8
+          hdr := 16
+        else if sz32 == 0 then
+          sz := fsz - off
+        if sz < hdr || sz > fsz - off then break
+        if baRdU32BE hdrBa 4 == 0x6D6F6F76 && sz.toNat <= probeCap then -- 'moov'
+          if off.toNat + sz.toNat <= headSlice.size then
+            return (.ok (headSlice.extract off.toNat (off.toNat + sz.toNat)))
+          let moovBa ← preadByteArray fd off sz.toNat
+          if moovBa.size == sz.toNat then return (.ok moovBa) else break
+        off := off + sz
+      if (mp4LocateVideoBoxes headSlice headSlice.size).isSome then
+        return (.ok headSlice)
+      if fsz.toNat > headCap then
+        let fullHead ← preadByteArray fd 0 probeCap
+        if (mp4LocateVideoBoxes fullHead fullHead.size).isSome then
+          return (.ok fullHead)
+      if fsz.toNat > probeCap then
+        let tailOff := fsz - probeCap.toUInt64
+        let tailSlice ← preadByteArray fd tailOff probeCap
+        if (mp4LocateVideoBoxes tailSlice tailSlice.size).isSome then
+          return (.ok tailSlice)
+      return (.ok headSlice)) with
+    | .ok ba => pure ba
+    | .error _ => pure ByteArray.empty
+  catch _ =>
+    pure ByteArray.empty
 
 /-- Explicit SDR is a successful probe; only absent color metadata needs ffprobe. -/
 def probeMp4HdrColorspaceOptPure (moovBuf : @& ByteArray) : Option UInt32 := do

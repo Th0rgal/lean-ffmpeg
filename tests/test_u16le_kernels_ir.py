@@ -25,7 +25,7 @@ class U16LeKernelsIR(unittest.TestCase):
             text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
             names = ("lean_native_swscale_bilinear_q8_u16le", "lean_native_luma_stats_u16le", "lean_native_luma_stats_u8",
                      "lean_native_extract_u16le_msb8", "lean_native_luma_acceptance_16x16_u8",
-                     "lean_native_luma_acceptance_16x16_u16le")
+                     "lean_native_luma_acceptance_16x16_u16le", "lean_native_stencil2d_box3x3_u8")
             kernels.append("\n".join(re.search(
                 r"define weak_odr dso_local [^\n]*@" + name + r"\([^\n]*\n.*?\n}",
                 text, re.S).group() for name in names))
@@ -73,6 +73,27 @@ class U16LeKernelsIR(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def test_box3x3_interior_vectors_and_tails(self):
+        stencil = self.lib.lean_native_stencil2d_box3x3_u8
+        stencil.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 2
+        stencil.restype = None
+        rng = random.Random(13)
+        for w in list(range(28)) + [33, 65]:
+            for h in [0, 1, 2, 3, 4, 9]:
+                for values in ([255] * (w * h), [rng.randrange(256) for _ in range(w * h)]):
+                    expected = values.copy()
+                    for y in range(1, h - 1):
+                        for x in range(1, w - 1):
+                            total = sum(values[(y + dy) * w + x + dx]
+                                        for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+                            expected[y * w + x] = (total + 4) // 9
+                    src = ctypes.create_string_buffer(b"\xa5" + bytes(values) + b"\xa5")
+                    dst = ctypes.create_string_buffer(b"\x5a" * (w * h + 2))
+                    stencil(ctypes.byref(dst, 1), ctypes.byref(src, 1), w, h)
+                    self.assertEqual(dst.raw[:-1], b"\x5a" + bytes(expected) + b"\x5a",
+                                     (w, h))
+                    self.assertEqual(src.raw[:-1], b"\xa5" + bytes(values) + b"\xa5")
+
     def check_scale(self, sw, sh, dw, dh, values):
         expected = []
         for y in range(dh):
@@ -83,7 +104,7 @@ class U16LeKernelsIR(unittest.TestCase):
                     k = sw // dw
                     s = sum(values[(y * k + yy) * sw + x * k + xx]
                             for yy in range(k) for xx in range(k))
-                    v = (s + 2) >> 2 if k == 2 else ((s + 4) * 7282) >> 16
+                    v = (s + 2) >> 2 if k == 2 else (s + 4) // 9
                 else:
                     xq, yq = x * sw * 256 // dw, y * sh * 256 // dh
                     x0, y0, fx, fy = xq >> 8, yq >> 8, xq & 255, yq & 255
@@ -99,6 +120,16 @@ class U16LeKernelsIR(unittest.TestCase):
         want = b"".join(v.to_bytes(2, "little") for v in expected)
         self.assertEqual(dst.raw[:-1], b"\x5a" + want + b"\x5a", (sw, sh, dw, dh))
         self.assertEqual(src.raw[:-1], b"\xa5" + raw + b"\xa5")
+
+    def test_3x3_full_u16_maximum(self):
+        # Pure scalar, full vectors, and each possible vector tail.
+        for dw in (1, 3, 4, 5, 6, 7, 8, 9):
+            with self.subTest(dw=dw):
+                src = (ctypes.c_uint16 * (9 * dw))(*([65535] * (9 * dw)))
+                dst = (ctypes.c_uint16 * dw)()
+                self.scale(src, dst, 3 * dw, 3, dw, 1)
+                self.assertEqual(list(dst), [65535] * dw)
+                self.check_scale(3 * dw, 3, dw, 1, [65535] * (9 * dw))
 
     def test_scaling_paths_and_tails(self):
         rng = random.Random(20261027)

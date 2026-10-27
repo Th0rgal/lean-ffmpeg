@@ -898,6 +898,10 @@ copy.init:
 outer.ph:
   %h_limit = sub nuw i64 %h, 1
   %w_limit = sub nuw i64 %w, 1
+  %interior_w = sub nuw i64 %w, 2
+  %vec_count = and i64 %interior_w, -8
+  %vec_end = add nuw i64 1, %vec_count
+  %has_vec = icmp uge i64 %w, 10
   br label %outer.body
 outer.body:
   %r = phi i64 [ 1, %outer.ph ], [ %r_next, %outer.latch ]
@@ -910,19 +914,72 @@ outer.body:
   %row_ptr = getelementptr inbounds i8, ptr %src, i64 %row_off
   %dn_ptr  = getelementptr inbounds i8, ptr %src, i64 %dn_off
   %dst_row = getelementptr inbounds i8, ptr %dst, i64 %row_off
-  br label %inner.body
+  br i1 %has_vec, label %vec.body, label %scalar.check
+vec.body:
+  %c = phi i64 [ 1, %outer.body ], [ %c_next, %vec.body ]
+  %vc_prev = sub nuw i64 %c, 1
+  %vc_plus = add nuw i64 %c, 1
+  %vp00 = getelementptr inbounds i8, ptr %up_ptr, i64 %vc_prev
+  %vb00 = load <8 x i8>, ptr %vp00, align 1
+  %vu00 = zext <8 x i8> %vb00 to <8 x i16>
+  %vp01 = getelementptr inbounds i8, ptr %up_ptr, i64 %c
+  %vb01 = load <8 x i8>, ptr %vp01, align 1
+  %vu01 = zext <8 x i8> %vb01 to <8 x i16>
+  %vp02 = getelementptr inbounds i8, ptr %up_ptr, i64 %vc_plus
+  %vb02 = load <8 x i8>, ptr %vp02, align 1
+  %vu02 = zext <8 x i8> %vb02 to <8 x i16>
+  %vp10 = getelementptr inbounds i8, ptr %row_ptr, i64 %vc_prev
+  %vb10 = load <8 x i8>, ptr %vp10, align 1
+  %vu10 = zext <8 x i8> %vb10 to <8 x i16>
+  %vp11 = getelementptr inbounds i8, ptr %row_ptr, i64 %c
+  %vb11 = load <8 x i8>, ptr %vp11, align 1
+  %vu11 = zext <8 x i8> %vb11 to <8 x i16>
+  %vp12 = getelementptr inbounds i8, ptr %row_ptr, i64 %vc_plus
+  %vb12 = load <8 x i8>, ptr %vp12, align 1
+  %vu12 = zext <8 x i8> %vb12 to <8 x i16>
+  %vp20 = getelementptr inbounds i8, ptr %dn_ptr, i64 %vc_prev
+  %vb20 = load <8 x i8>, ptr %vp20, align 1
+  %vu20 = zext <8 x i8> %vb20 to <8 x i16>
+  %vp21 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c
+  %vb21 = load <8 x i8>, ptr %vp21, align 1
+  %vu21 = zext <8 x i8> %vb21 to <8 x i16>
+  %vp22 = getelementptr inbounds i8, ptr %dn_ptr, i64 %vc_plus
+  %vb22 = load <8 x i8>, ptr %vp22, align 1
+  %vu22 = zext <8 x i8> %vb22 to <8 x i16>
+  %vsum2 = add nuw nsw <8 x i16> %vu00, %vu01
+  %vsum3 = add nuw nsw <8 x i16> %vsum2, %vu02
+  %vsum4 = add nuw nsw <8 x i16> %vsum3, %vu10
+  %vsum5 = add nuw nsw <8 x i16> %vsum4, %vu11
+  %vsum6 = add nuw nsw <8 x i16> %vsum5, %vu12
+  %vsum7 = add nuw nsw <8 x i16> %vsum6, %vu20
+  %vsum8 = add nuw nsw <8 x i16> %vsum7, %vu21
+  %vsum9 = add nuw nsw <8 x i16> %vsum8, %vu22
+  %vsum32 = zext <8 x i16> %vsum9 to <8 x i32>
+  %vrnd = add nuw nsw <8 x i32> %vsum32, <i32 4, i32 4, i32 4, i32 4, i32 4, i32 4, i32 4, i32 4>
+  %vprod = mul nuw nsw <8 x i32> %vrnd, <i32 7282, i32 7282, i32 7282, i32 7282, i32 7282, i32 7282, i32 7282, i32 7282>
+  %vavg = lshr <8 x i32> %vprod, <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>
+  %vout = trunc <8 x i32> %vavg to <8 x i8>
+  %vdst = getelementptr inbounds i8, ptr %dst_row, i64 %c
+  store <8 x i8> %vout, ptr %vdst, align 1
+  %c_next = add nuw i64 %c, 8
+  %vec_done = icmp eq i64 %c_next, %vec_end
+  br i1 %vec_done, label %scalar.check, label %vec.body
+scalar.check:
+  %dx_start = phi i64 [ 1, %outer.body ], [ %vec_end, %vec.body ]
+  %has_rem = icmp ult i64 %dx_start, %w_limit
+  br i1 %has_rem, label %inner.body, label %outer.latch
 inner.body:
-  %c = phi i64 [ 1, %outer.body ], [ %c_next, %inner.body ]
-  %c_prev = sub nuw i64 %c, 1
-  %c_plus = add nuw i64 %c, 1
+  %sc = phi i64 [ %dx_start, %scalar.check ], [ %sc_next, %inner.body ]
+  %c_prev = sub nuw i64 %sc, 1
+  %c_plus = add nuw i64 %sc, 1
   %p00 = getelementptr inbounds i8, ptr %up_ptr, i64 %c_prev
-  %p01 = getelementptr inbounds i8, ptr %up_ptr, i64 %c
+  %p01 = getelementptr inbounds i8, ptr %up_ptr, i64 %sc
   %p02 = getelementptr inbounds i8, ptr %up_ptr, i64 %c_plus
   %p10 = getelementptr inbounds i8, ptr %row_ptr, i64 %c_prev
-  %p11 = getelementptr inbounds i8, ptr %row_ptr, i64 %c
+  %p11 = getelementptr inbounds i8, ptr %row_ptr, i64 %sc
   %p12 = getelementptr inbounds i8, ptr %row_ptr, i64 %c_plus
   %p20 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c_prev
-  %p21 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c
+  %p21 = getelementptr inbounds i8, ptr %dn_ptr, i64 %sc
   %p22 = getelementptr inbounds i8, ptr %dn_ptr, i64 %c_plus
   %b00 = load i8, ptr %p00, align 1
   %b01 = load i8, ptr %p01, align 1
@@ -954,10 +1011,10 @@ inner.body:
   %prod = mul nuw nsw i32 %rnd, 7282
   %avg = lshr i32 %prod, 16
   %out_b = trunc i32 %avg to i8
-  %dst_p = getelementptr inbounds i8, ptr %dst_row, i64 %c
+  %dst_p = getelementptr inbounds i8, ptr %dst_row, i64 %sc
   store i8 %out_b, ptr %dst_p, align 1
-  %c_next = add nuw nsw i64 %c, 1
-  %done_c = icmp eq i64 %c_next, %w_limit
+  %sc_next = add nuw nsw i64 %sc, 1
+  %done_c = icmp eq i64 %sc_next, %w_limit
   br i1 %done_c, label %outer.latch, label %inner.body, !llvm.loop !0
 outer.latch:
   %r_next = add nuw nsw i64 %r, 1
@@ -2820,9 +2877,71 @@ b3row:
   %r3a = mul i64 %y3, %sw
   %r3 = mul i64 %r3a, 3
   %dr3 = mul i64 %y3, %dw
-  br label %b3body
+  br label %b3veccond
+b3veccond:
+  %x3v = phi i64 [ 0, %b3row ], [ %x3vn, %b3vec ]
+  %more3v = icmp ult i64 %x3v, %vlim
+  br i1 %more3v, label %b3vec, label %b3cond
+b3vec:
+  %sx3v = mul i64 %x3v, 3
+  %base3v = add i64 %r3, %sx3v
+  %row3v0 = mul i64 %sw, 0
+  %i3v0 = add i64 %base3v, %row3v0
+  %p3v0 = getelementptr i16, ptr %src, i64 %i3v0
+  %q3v0 = getelementptr i16, ptr %p3v0, i64 8
+  %lo3v0 = load <8 x i16>, ptr %p3v0, align 1
+  %hi3v0 = load <4 x i16>, ptr %q3v0, align 1
+  %lw3v0 = zext <8 x i16> %lo3v0 to <8 x i32>
+  %hw3v0 = zext <4 x i16> %hi3v0 to <4 x i32>
+  %hp3v0 = shufflevector <4 x i32> %hw3v0, <4 x i32> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>
+  %c3v00 = shufflevector <8 x i32> %lw3v0, <8 x i32> %hp3v0, <4 x i32> <i32 0, i32 3, i32 6, i32 9>
+  %c3v01 = shufflevector <8 x i32> %lw3v0, <8 x i32> %hp3v0, <4 x i32> <i32 1, i32 4, i32 7, i32 10>
+  %c3v02 = shufflevector <8 x i32> %lw3v0, <8 x i32> %hp3v0, <4 x i32> <i32 2, i32 5, i32 8, i32 11>
+  %row3v1 = mul i64 %sw, 1
+  %i3v1 = add i64 %base3v, %row3v1
+  %p3v1 = getelementptr i16, ptr %src, i64 %i3v1
+  %q3v1 = getelementptr i16, ptr %p3v1, i64 8
+  %lo3v1 = load <8 x i16>, ptr %p3v1, align 1
+  %hi3v1 = load <4 x i16>, ptr %q3v1, align 1
+  %lw3v1 = zext <8 x i16> %lo3v1 to <8 x i32>
+  %hw3v1 = zext <4 x i16> %hi3v1 to <4 x i32>
+  %hp3v1 = shufflevector <4 x i32> %hw3v1, <4 x i32> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>
+  %c3v10 = shufflevector <8 x i32> %lw3v1, <8 x i32> %hp3v1, <4 x i32> <i32 0, i32 3, i32 6, i32 9>
+  %c3v11 = shufflevector <8 x i32> %lw3v1, <8 x i32> %hp3v1, <4 x i32> <i32 1, i32 4, i32 7, i32 10>
+  %c3v12 = shufflevector <8 x i32> %lw3v1, <8 x i32> %hp3v1, <4 x i32> <i32 2, i32 5, i32 8, i32 11>
+  %row3v2 = mul i64 %sw, 2
+  %i3v2 = add i64 %base3v, %row3v2
+  %p3v2 = getelementptr i16, ptr %src, i64 %i3v2
+  %q3v2 = getelementptr i16, ptr %p3v2, i64 8
+  %lo3v2 = load <8 x i16>, ptr %p3v2, align 1
+  %hi3v2 = load <4 x i16>, ptr %q3v2, align 1
+  %lw3v2 = zext <8 x i16> %lo3v2 to <8 x i32>
+  %hw3v2 = zext <4 x i16> %hi3v2 to <4 x i32>
+  %hp3v2 = shufflevector <4 x i32> %hw3v2, <4 x i32> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>
+  %c3v20 = shufflevector <8 x i32> %lw3v2, <8 x i32> %hp3v2, <4 x i32> <i32 0, i32 3, i32 6, i32 9>
+  %c3v21 = shufflevector <8 x i32> %lw3v2, <8 x i32> %hp3v2, <4 x i32> <i32 1, i32 4, i32 7, i32 10>
+  %c3v22 = shufflevector <8 x i32> %lw3v2, <8 x i32> %hp3v2, <4 x i32> <i32 2, i32 5, i32 8, i32 11>
+  %s3v1 = add <4 x i32> %c3v00, %c3v01
+  %s3v2 = add <4 x i32> %s3v1, %c3v02
+  %s3v3 = add <4 x i32> %s3v2, %c3v10
+  %s3v4 = add <4 x i32> %s3v3, %c3v11
+  %s3v5 = add <4 x i32> %s3v4, %c3v12
+  %s3v6 = add <4 x i32> %s3v5, %c3v20
+  %s3v7 = add <4 x i32> %s3v6, %c3v21
+  %s3v8 = add <4 x i32> %s3v7, %c3v22
+  %vr3 = add <4 x i32> %s3v8, <i32 4, i32 4, i32 4, i32 4>
+  %vo3 = udiv <4 x i32> %vr3, <i32 9, i32 9, i32 9, i32 9>
+  %vt3 = trunc <4 x i32> %vo3 to <4 x i16>
+  %di3v = add i64 %dr3, %x3v
+  %dp3v = getelementptr i16, ptr %dst, i64 %di3v
+  store <4 x i16> %vt3, ptr %dp3v, align 1
+  %x3vn = add i64 %x3v, 4
+  br label %b3veccond
+b3cond:
+  %x3 = phi i64 [ %x3v, %b3veccond ], [ %xn3, %b3body ]
+  %more3 = icmp ult i64 %x3, %dw
+  br i1 %more3, label %b3body, label %b3end
 b3body:
-  %x3 = phi i64 [ 0, %b3row ], [ %xn3, %b3body ]
   %sx3 = mul i64 %x3, 3
   %base3 = add i64 %r3, %sx3
 %row3_0 = mul i64 %sw, 0
@@ -2876,16 +2995,13 @@ b3body:
 %sum3_6 = add i32 %sum3_5, %v3_2_1
 %sum3_7 = add i32 %sum3_6, %v3_2_2
 %round3 = add i32 %sum3_7, 4
-%wide3 = zext i32 %round3 to i64
-  %prod3 = mul i64 %wide3, 7282
-  %out3 = lshr i64 %prod3, 16
-  %tr3 = trunc i64 %out3 to i16
+  %out3 = udiv i32 %round3, 9
+  %tr3 = trunc i32 %out3 to i16
 %di3 = add i64 %dr3, %x3
   %dp3 = getelementptr i16, ptr %dst, i64 %di3
   store i16 %tr3, ptr %dp3, align 1
   %xn3 = add i64 %x3, 1
-%more3 = icmp ult i64 %xn3, %dw
-  br i1 %more3, label %b3body, label %b3end
+  br label %b3cond
 b3end:
   %yn3 = add i64 %y3, 1
   %ymore3 = icmp ult i64 %yn3, %dh
@@ -3313,13 +3429,22 @@ entry:
   %cf = and i64 %flags, 1
   %tonemap = icmp ne i64 %yf, 0
   %csc = icmp ne i64 %cf, 0
+  %same_ptr = icmp eq ptr %src, %dst
   %yvlen = and i64 %y_len, -16
   %cvlen = and i64 %uv_len, -16
   %su = getelementptr i8, ptr %src, i64 %y_len
   %sv = getelementptr i8, ptr %su, i64 %uv_len
   %du = getelementptr i8, ptr %dst, i64 %y_len
   %dv = getelementptr i8, ptr %du, i64 %uv_len
-  br label %yvcheck
+  br i1 %tonemap, label %yvcheck, label %ypass
+ypass:
+  br i1 %same_ptr, label %cdispatch, label %ycopycheck
+ycopycheck:
+  %y_pos = icmp ugt i64 %y_len, 0
+  br i1 %y_pos, label %ycopy, label %cdispatch
+ycopy:
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align 1 %src, i64 %y_len, i1 false)
+  br label %cdispatch
 yvcheck:
   %yi = phi i64 [ 0, %entry ], [ %yn, %yvbody ]
   %yvmore = icmp ult i64 %yi, %yvlen
@@ -3330,14 +3455,13 @@ yvbody:
   %yb = load <16 x i8>, ptr %ysp, align 1
   %ylo = call <16 x i8> @llvm.umax.v16i8(<16 x i8> %yb, <16 x i8> <i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16>)
   %yhi = call <16 x i8> @llvm.umin.v16i8(<16 x i8> %ylo, <16 x i8> <i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235, i8 235>)
-  %yo = select i1 %tonemap, <16 x i8> %yhi, <16 x i8> %yb
-  store <16 x i8> %yo, ptr %ydp, align 1
+  store <16 x i8> %yhi, ptr %ydp, align 1
   %yn = add i64 %yi, 16
   br label %yvcheck
 yscheck:
   %ysi = phi i64 [ %yi, %yvcheck ], [ %ysn, %ysbody ]
   %ysmore = icmp ult i64 %ysi, %y_len
-  br i1 %ysmore, label %ysbody, label %cvcheck
+  br i1 %ysmore, label %ysbody, label %cdispatch
 ysbody:
   %yssp = getelementptr i8, ptr %src, i64 %ysi
   %ysdp = getelementptr i8, ptr %dst, i64 %ysi
@@ -3346,12 +3470,22 @@ ysbody:
   %yslo = select i1 %yslow, i8 16, i8 %ysb
   %yshigh = icmp ugt i8 %yslo, 235
   %yshi = select i1 %yshigh, i8 235, i8 %yslo
-  %yso = select i1 %tonemap, i8 %yshi, i8 %ysb
-  store i8 %yso, ptr %ysdp, align 1
+  store i8 %yshi, ptr %ysdp, align 1
   %ysn = add i64 %ysi, 1
   br label %yscheck
+cdispatch:
+  br i1 %csc, label %cvcheck, label %cpass
+cpass:
+  br i1 %same_ptr, label %done, label %ccopycheck
+ccopycheck:
+  %uv2_len = shl i64 %uv_len, 1
+  %uv_pos = icmp ugt i64 %uv2_len, 0
+  br i1 %uv_pos, label %ccopy, label %done
+ccopy:
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %du, ptr align 1 %su, i64 %uv2_len, i1 false)
+  br label %done
 cvcheck:
-  %cvi = phi i64 [ 0, %yscheck ], [ %cvn, %cvbody ]
+  %cvi = phi i64 [ 0, %cdispatch ], [ %cvn, %cvbody ]
   %cvmore = icmp ult i64 %cvi, %cvlen
   br i1 %cvmore, label %cvbody, label %cscheck
 cvbody:
@@ -3376,8 +3510,7 @@ cvbody:
   %cvuhigh = icmp sgt <16 x i32> %cvulo, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
   %cvuhi = select <16 x i1> %cvuhigh, <16 x i32> <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>, <16 x i32> %cvulo
   %cvubyte = trunc <16 x i32> %cvuhi to <16 x i8>
-  %cvuout = select i1 %csc, <16 x i8> %cvubyte, <16 x i8> %cvub
-  store <16 x i8> %cvuout, ptr %cvudp, align 1
+  store <16 x i8> %cvubyte, ptr %cvudp, align 1
   %cvva = mul <16 x i32> %cvu0, <i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42, i32 -42>
   %cvvbprod = mul <16 x i32> %cvv0, <i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986, i32 986>
   %cvvsum = add <16 x i32> %cvva, %cvvbprod
@@ -3389,8 +3522,7 @@ cvbody:
   %cvvhigh = icmp sgt <16 x i32> %cvvlo, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
   %cvvhi = select <16 x i1> %cvvhigh, <16 x i32> <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>, <16 x i32> %cvvlo
   %cvvbyte = trunc <16 x i32> %cvvhi to <16 x i8>
-  %cvvout = select i1 %csc, <16 x i8> %cvvbyte, <16 x i8> %cvvb
-  store <16 x i8> %cvvout, ptr %cvvdp, align 1
+  store <16 x i8> %cvvbyte, ptr %cvvdp, align 1
   %cvn = add i64 %cvi, 16
   br label %cvcheck
 cscheck:
@@ -3419,8 +3551,7 @@ csbody:
   %csuhigh = icmp sgt i32 %csulo, 255
   %csuhi = select i1 %csuhigh, i32 255, i32 %csulo
   %csubyte = trunc i32 %csuhi to i8
-  %csuout = select i1 %csc, i8 %csubyte, i8 %csub
-  store i8 %csuout, ptr %csudp, align 1
+  store i8 %csubyte, ptr %csudp, align 1
   %csva = mul i32 %csu0, -42
   %csvbprod = mul i32 %csv0, 986
   %csvsum = add i32 %csva, %csvbprod
@@ -3432,8 +3563,7 @@ csbody:
   %csvhigh = icmp sgt i32 %csvlo, 255
   %csvhi = select i1 %csvhigh, i32 255, i32 %csvlo
   %csvbyte = trunc i32 %csvhi to i8
-  %csvout = select i1 %csc, i8 %csvbyte, i8 %csvb
-  store i8 %csvout, ptr %csvdp, align 1
+  store i8 %csvbyte, ptr %csvdp, align 1
   %csn = add i64 %csi, 1
   br label %cscheck
 done:

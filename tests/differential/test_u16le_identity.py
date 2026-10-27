@@ -26,7 +26,7 @@ def scale_plane(values, sw, sh, dw, dh):
             elif (sw, sh) in ((2 * dw, 2 * dh), (3 * dw, 3 * dh)):
                 k = sw // dw
                 total = sum(values[(y*k+j)*sw+x*k+i] for j in range(k) for i in range(k))
-                v = (total + 2) >> 2 if k == 2 else ((total + 4) * 7282) >> 16
+                v = (total + 2) >> 2 if k == 2 else (total + 4) // 9
             else:
                 xq, yq = x * sw * 256 // dw, y * sh * 256 // dh
                 x0, y0, fx, fy = xq >> 8, yq >> 8, xq & 255, yq & 255

@@ -1260,7 +1260,7 @@ def scalePlaneBilinearU16LeBytes
           getU16 (r0 + sx) + getU16 (r0 + sx + 1) + getU16 (r0 + sx + 2) +
           getU16 (r1 + sx) + getU16 (r1 + sx + 1) + getU16 (r1 + sx + 2) +
           getU16 (r2 + sx) + getU16 (r2 + sx + 1) + getU16 (r2 + sx + 2)
-        let avg := ((sum9 + 4) * 7282) >>> 16
+        let avg := (sum9 + 4) / 9
         out := (out.push (avg &&& 0xFF).toUInt8).push ((avg >>> 8) &&& 0xFF).toUInt8
     return out
   else
@@ -1297,6 +1297,57 @@ def Yuv420p10leScaleSafe (a : Nat × Nat × Nat × Nat × Nat) : Prop :=
 instance (a : Nat × Nat × Nat × Nat × Nat) : Decidable (Yuv420p10leScaleSafe a) := by
   unfold Yuv420p10leScaleSafe
   infer_instance
+
+/-- A four-output 3x3 block has four available lanes and a full-U16 bounded sum.
+The bound applies independently to each of the four SIMD lanes. -/
+def U16leDownscale3x3ExactSafe (a : Nat × Nat) : Prop :=
+  a.1 ≤ 9 * 65535 ∧ 4 ≤ a.2
+
+instance (a : Nat × Nat) : Decidable (U16leDownscale3x3ExactSafe a) := by
+  unfold U16leDownscale3x3ExactSafe
+  infer_instance
+
+/-- Tight arithmetic/lane gate for the exact U16LE 3x3 vector loop. -/
+def u16leDownscale3x3VecGateSpec : AVGateSpec (Nat × Nat) U16leDownscale3x3ExactSafe where
+  gate := fun a => decide (U16leDownscale3x3ExactSafe a)
+  sound := by intro a h; exact of_decide_eq_true h
+  complete := by intro a h; exact decide_eq_true h
+  posWitness := (9 * 65535, 4)
+  negWitness := (9 * 65535 + 1, 4)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem u16leDownscale3x3VecGateSpec_iff (s remaining : Nat) :
+    u16leDownscale3x3VecGateSpec.gate (s, remaining) = true ↔
+      U16leDownscale3x3ExactSafe (s, remaining) :=
+  u16leDownscale3x3VecGateSpec.iff_safe (s, remaining)
+
+/-- Exact rounded division stays representable in UInt16. -/
+theorem u16leDownscale3x3_round_bound (s : Nat) (h : s ≤ 9 * 65535) :
+    (s + 4) / 9 ≤ 65535 := by omega
+
+/-- Nine arbitrary UInt16 samples fit the widened sum and rounded output. -/
+theorem u16leDownscale3x3_samples_bound (a b c d e f g h i : UInt16) :
+    let s := a.toNat + b.toNat + c.toNat + d.toNat + e.toNat +
+      f.toNat + g.toNat + h.toNat + i.toNat
+    s ≤ 9 * 65535 ∧ (s + 4) / 9 ≤ 65535 := by
+  have ha := a.toNat_lt
+  have hb := b.toNat_lt
+  have hc := c.toNat_lt
+  have hd := d.toNat_lt
+  have he := e.toNat_lt
+  have hf := f.toNat_lt
+  have hg := g.toNat_lt
+  have hh := h.toNat_lt
+  have hi := i.toNat_lt
+  dsimp
+  constructor <;> omega
+
+/-- The old reciprocal approximation is exact throughout the 10-bit sum range. -/
+theorem u16leDownscale3x3_tenBit_compat (s : Nat) (h : s ≤ 9 * 1023) :
+    ((s + 4) * 7282) >>> 16 = (s + 4) / 9 := by
+  rw [Nat.shiftRight_eq_div_pow]
+  omega
 
 /-- Exact admission gate for contiguous 10-bit YUV420 scaling. -/
 def yuv420p10leScaleGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat) Yuv420p10leScaleSafe where
