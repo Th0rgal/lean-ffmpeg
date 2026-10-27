@@ -67,7 +67,7 @@ def isOtherFFmpegCodecName (s : String) : Bool :=
    "r210", "v210", "v308", "v408", "v410", "y41p", "yuv4", "zlib", "snow", "asv1", "asv2",
    "roqvideo", "amv", "vc2", "vvc", "dirac", "theora", "libtheora", "utvideo", "magicyuv", "cfhd",
    "speedhq", "vnull", "wrapped_avframe", "libx264rgb", "librav1e", "prores_aw", "ffvhuff", "huffyuv",
-   "libfdk_aac", "mp2fixed", "tta", "wavpack", "wmav1", "wmav2", "truehd", "mlp",
+   "aac_fixed", "libfdk_aac", "mp2fixed", "tta", "wavpack", "wmav1", "wmav2", "truehd", "mlp",
    "real_144", "roq_dpcm", "nellymoser", "speex", "libspeex", "amr_nb", "libopencore_amrnb", "amr_wb",
    "g722", "g723_1", "g726", "g726le", "sbc", "aptx", "aptx_hd", "dfpwm", "sonic", "sonicls", "anull"].contains s
 
