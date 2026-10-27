@@ -32,6 +32,19 @@ zero forbidden axioms, and 264 tight specifications. Linux/macOS CI run
 passed. These selections do not replace the full denominator or update the
 frozen full-run counts by arithmetic.
 
+The signed `a504de1` pixel-alias wave retained all 50 selected targets:
+reference 50 passed, candidate 44 passed and six remained blocked by
+`-wavelet_type`. Linux/macOS CI run
+[40481681577](https://github.com/Th0rgal/lean-ffmpeg/actions/runs/40481681577)
+passed. The signed `05c1fdc` VVC routing wave then passed all 61 selected
+historical failures with fresh reference/candidate reports, exact argv
+attribution, and unchanged source/media/binary pins. Local validation passed
+39 unit tests, 74 differential tests, 53 self-test waves, FFI/kernels, the
+8,887-declaration axiom audit, and 264 tight specifications. Independent review
+passed 279 receipt checks. Linux/macOS CI run
+[40486081911](https://github.com/Th0rgal/lean-ffmpeg/actions/runs/40486081911)
+passed. VVC support here is delegated CLI routing, not a standalone codec.
+
 ## Delegated x86 diagnostic
 
 One predeclared attempt compared `c7bd145` against an assembly-enabled build of

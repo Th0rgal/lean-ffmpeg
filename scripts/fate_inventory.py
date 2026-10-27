@@ -8,6 +8,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -83,7 +84,8 @@ def config_flags(path):
     return flags
 
 
-def expand(root, flags, pixfmts, hypothetical=False, bigendian=False, arch='all', unstable=True, large=True, audit=None):
+def expand(root, flags, pixfmts, hypothetical=False, bigendian=False, arch='all', unstable=True, large=True, audit=None,
+           strict_config=False, evidence=None):
     """Use only tests/Makefile in an empty cwd; no root/library build rules.
 
     Goal name is deliberately not fate-list: that goal auto-includes a generated
@@ -108,22 +110,37 @@ def expand(root, flags, pixfmts, hypothetical=False, bigendian=False, arch='all'
                           for key in sorted(keys | {'ARCH_X86_64','ARCH_AARCH64','ARCH_X86'}) if key.startswith('ARCH_')]
         else:
             lines += [f'{k} := {v}' for k, v in sorted(flags.items())]
+        if strict_config:
+            if hypothetical:
+                raise ValueError('Strict cells must supply explicit flags, not an all-feature union')
+            known = sorted({k.lstrip('!') for k in flags if k.startswith(('CONFIG_', 'HAVE_', 'ARCH_', '!CONFIG_', '!HAVE_', '!ARCH_'))})
+            lines += ['INVENTORY_CONFIG_KEYS := ' + ' '.join(known),
+                      'CHKCFG = $(info CONFIG_QUERY|$(1))$(if $(filter $(1),$(INVENTORY_CONFIG_KEYS)),$($(1)),$(error Unknown inventory config: $(1)))']
         lines += [f'include {root}/tests/Makefile']
         groups = GROUPS + [f'FATE_{x}' for x in ('LIBAVCODEC-yes', 'LIBAVUTIL', 'LIBAVFORMAT-yes',
                     'LIBAVDEVICE-yes', 'LIBSWRESAMPLE-yes', 'LIBSWSCALE', 'API-yes')]
         # Expansion is printed by make itself; no shell interpolation of values.
         lines += [f'$(info INVENTORY|{g}|$(sort $({g})))' for g in groups]
-        lines += ['$(info INCLUDED|$(MAKEFILE_LIST))', '.PHONY: inventory', 'inventory:;@:']
+        lines += ['$(info INCLUDED|$(MAKEFILE_LIST))', '.PHONY: inventory', 'inventory:;']
         mk = temp/'inventory.mk'
         mk.write_text('\n'.join(lines)+'\n')
         command = ['make', '-rR', '--no-print-directory', '-f', str(mk), 'inventory']
-        proc = subprocess.run(command, cwd=temp, text=True, capture_output=True, timeout=30)
+        # GNU make imports environment variables, including variables later
+        # appended with +=. An allowlist isolates LARGE_TESTS, group variables,
+        # make options/includes, and every other source/configuration override.
+        # Keep PATH for portable GNU make lookup and fix diagnostic locale.
+        # The empty goal has no recipe, prerequisites, or root build rules.
+        env = {'PATH': os.environ.get('PATH', os.defpath), 'LC_ALL': 'C', 'LANG': 'C'}
+        proc = subprocess.run(command, cwd=temp, text=True, capture_output=True, timeout=30, env=env)
         if proc.returncode:
             raise RuntimeError(f'GNU make expansion failed: {proc.stderr}')
         if audit is not None:
             included = next(line.split('|', 1)[1].split() for line in proc.stdout.splitlines() if line.startswith('INCLUDED|'))
             audit.update({str(Path(x).relative_to(root)): hashlib.sha256(Path(x).read_bytes()).hexdigest()
                           for x in included if Path(x).is_relative_to(root)})
+        if evidence is not None:
+            evidence['queried_config_symbols'] = sorted({line.split('|', 1)[1].strip()
+                for line in proc.stdout.splitlines() if line.startswith('CONFIG_QUERY|')})
         groups_out = {}
         for line in proc.stdout.splitlines():
             if line.startswith('INVENTORY|'):

@@ -27,6 +27,28 @@ match the configured list. Independent review leaves `full_manifest_certified`
 false because executable applicability and conditional completeness are not
 fully established. Never replace this scope with a successful subset.
 
+For the pinned 6,133-row v3 census, produce a separate applicability report:
+
+```sh
+python3 scripts/fate_applicability.py --ffmpeg-root /path/to/FFmpeg \
+  --manifest inventory.json --manifest-sha256 SHA256_OF_INVENTORY_JSON \
+  --output fresh-applicability.json
+```
+
+This source-only report retains every original row and records membership in
+the configured cell, 48 architecture/endian/unstable/large flag variants, and
+11 individual feature toggles. Each cell includes its exact flags and changes.
+GNU make evaluates only source definitions in a temporary directory with a
+minimal environment; no build, media, or FATE recipe runs. Input pins, unknown
+configuration symbols, malformed expansions, and pixel-list mismatches fail
+closed. Existing output files are never overwritten.
+
+These cells are bounded observations, not configure dependency solutions or
+hardware measurements. Lexical source links do not fully attribute generated
+targets or transitive requirements. Rows absent from every cell remain in the
+report. `full_manifest_certified`, `runnable_matrix_certified`, and
+`condition_model_complete` remain false.
+
 ## Attributing execution
 
 `scripts/fate_target_exec.py` replaces only the exact pinned FFmpeg executable

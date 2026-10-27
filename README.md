@@ -31,6 +31,10 @@ execution attribution, explicit historical manifests, and paired timing controls
 The [October 27 evidence snapshot](docs/CAMPAIGN_PROGRESS_20261027.md) records
 selected correctness waves, measured delegated regressions, and the limited
 native oracle/profile observations.
+The VVC routing wave `05c1fdc` passed all 61 selected historical failures and
+Linux/macOS CI; this bounded delegated result does not update the full-run
+counts above. The applicability harness records per-target configuration
+observations while retaining the complete provisional inventory.
 
 ## Performance across x86, DGX Spark and Apple Silicon
 
