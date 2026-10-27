@@ -224,7 +224,7 @@ def supportedBsf (s : String) : Bool :=
   let base := (splitStrOnChar s '=').headD s
   ["aac_adtstoasc", "h264_mp4toannexb", "hevc_mp4toannexb",
    "av1_frame_split", "av1_frame_merge", "av1_metadata",
-   "h264_metadata", "h264_redundant_pps", "hevc_metadata", "mpeg2_metadata",
+   "h264_metadata", "h264_redundant_pps", "hevc_metadata", "vvc_metadata", "mpeg2_metadata",
    "vp9_superframe", "vp9_superframe_split", "vp9_raw_reorder", "vp9_metadata",
    "extract_extradata", "remove_extradata", "dump_extra", "dts2pts", "setts",
    "noise", "null", "chomp", "dca_core", "eac3_core", "truehd_core",
