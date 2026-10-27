@@ -1414,7 +1414,7 @@ def runVerifyKernels : IO UInt32 := do
 
   -- 4. Runtime execution of `lean-native-core`-compiled LNIR machine code (`c/leanav_lnir_x86_64.ll` / `arm64.ll`)
   --    verified bit-for-bit against formal `evalLnirKernel` and `leanSpecH264IdctTupleAccumSroa`
-  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative
+  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative && verifyU16LeNative
   let lnirSroaOk  := execLnirH264IdctTupleSroaC 16 7 == leanSpecH264IdctTupleAccumSroa 16 7
   let vX : List Int64 := [0, 16, 63, 64, 128, 512, 940, 1023]
   let vY : List Int64 := [3, -5, 10, 20, -15, 7, 4, 2]

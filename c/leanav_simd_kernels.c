@@ -525,16 +525,61 @@ LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
     return leanav_lean_pack_acceptance_metrics_u64(metrics[0], psnr_x10, (uint32_t)metrics[3]);
 }
 
-/* Borrowed packed input; reject malformed lengths before allocation or pointer arithmetic. */
+/* Owned packed input; reuse only an exclusive, exact-size array. */
 LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_apply_filters_yuv420p_ba(
-    b_lean_obj_arg src_ba, uint64_t y_len, uint64_t uv_len, uint32_t flags
+    lean_obj_arg src_ba, uint64_t y_len, uint64_t uv_len, uint32_t flags
 ) {
     size_t cap = lean_sarray_size(src_ba);
-    if (y_len > cap || uv_len > (cap - y_len) / 2u)
+    if (y_len > cap || uv_len > (cap - y_len) / 2u) {
+        lean_dec_ref(src_ba);
         return lean_alloc_sarray(1, 0, 0);
+    }
     size_t total = (size_t)(y_len + 2u * uv_len);
+    if (cap == total && lean_is_exclusive(src_ba)) {
+        lean_native_apply_filters_yuv420p_u8(
+            lean_sarray_cptr(src_ba), lean_sarray_cptr(src_ba),
+            (int64_t)y_len, (int64_t)uv_len, (int64_t)flags);
+        return src_ba;
+    }
     lean_obj_res out = lean_alloc_sarray(1, total, total);
     lean_native_apply_filters_yuv420p_u8(
         lean_sarray_cptr(src_ba), lean_sarray_cptr(out), y_len, uv_len, flags);
+    lean_dec_ref(src_ba);
+    return out;
+}
+
+/* Packed U16LE planes: validation and allocation only; DSP lives in LLVM. */
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_scale2d_yuv420p10le_ba(
+    b_lean_obj_arg src_ba, uint64_t sw, uint64_t sh, uint64_t dw, uint64_t dh) {
+    if (sw < 2 || sh < 2 || dw < 2 || dh < 2 || ((sw | sh | dw | dh) & 1) ||
+        sw > 0xFFFFFF || sh > 0xFFFFFF || dw > 0x3FFFFFFF || dh > 0x3FFFFFFF)
+        return lean_alloc_sarray(1, 0, 0);
+    uint64_t sy = sw * sh * 2, suv = (sw / 2) * (sh / 2) * 2;
+    uint64_t dy = dw * dh * 2, duv = (dw / 2) * (dh / 2) * 2;
+    uint64_t total = dy + 2 * duv;
+    if (sy + 2 * suv > lean_sarray_size(src_ba) || total > SIZE_MAX - sizeof(lean_sarray_object))
+        return lean_alloc_sarray(1, 0, 0);
+    lean_object *out = lean_alloc_sarray(1, total, total);
+    const uint8_t *src = lean_sarray_cptr(src_ba);
+    uint8_t *dst = lean_sarray_cptr(out);
+    lean_native_swscale_bilinear_q8_u16le(src, dst, sw, sh, dw, dh);
+    lean_native_swscale_bilinear_q8_u16le(src + sy, dst + dy, sw / 2, sh / 2, dw / 2, dh / 2);
+    lean_native_swscale_bilinear_q8_u16le(src + sy + suv, dst + dy + duv, sw / 2, sh / 2, dw / 2, dh / 2);
+    return out;
+}
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_stats_u16le_ba(
+    b_lean_obj_arg src_ba, uint64_t n_pixels, uint64_t step) {
+    uint64_t cap = lean_sarray_size(src_ba) / 2;
+    uint64_t n = n_pixels < cap ? n_pixels : cap;
+    return lean_native_luma_stats_u16le(lean_sarray_cptr(src_ba), n, step);
+}
+
+LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_extract_u16le_msb8_ba(
+    b_lean_obj_arg src_ba, uint64_t n_pixels) {
+    uint64_t cap = lean_sarray_size(src_ba) / 2;
+    uint64_t n = n_pixels < cap ? n_pixels : cap;
+    lean_object *out = lean_alloc_sarray(1, n, n);
+    lean_native_extract_u16le_msb8(lean_sarray_cptr(src_ba), lean_sarray_cptr(out), n);
     return out;
 }

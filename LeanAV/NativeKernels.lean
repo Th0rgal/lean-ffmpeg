@@ -885,9 +885,10 @@ opaque execLnirScale2dBaC (kernelId : UInt32) (src : @& ByteArray) (srcStride ds
 opaque execLnirBilinearQ8OffBaC (src : @& ByteArray)
     (srcOff srcW srcH srcStride dstW dstH : UInt64) : ByteArray
 
--- Borrowed packed Y/U/V input; invalid lengths return an empty array.
+-- Owned packed Y/U/V input; exclusive exact-size arrays are filtered in place.
+-- Invalid lengths consume the input and return an empty array.
 @[extern "leanav_c_exec_lnir_apply_filters_yuv420p_ba"]
-opaque execLnirApplyFiltersYuv420pBaC (src : @& ByteArray) (yLen uvLen : UInt64)
+opaque execLnirApplyFiltersYuv420pBaC (src : ByteArray) (yLen uvLen : UInt64)
     (flags : UInt32) : ByteArray
 
 /-- Zero-copy fused 3-plane `YUV420P` `ByteArray` 2D LNIR dispatcher
@@ -898,6 +899,16 @@ opaque execLnirScale2dYuv420pBaC (kernelId : UInt32) (src : @& ByteArray) (srcW 
 /-- Zero-copy `ByteArray` 2D AV1 CDEF directional deringing filter LNIR dispatcher (`@lean_native_av1_cdef_filter_u8`). -/
 @[extern "leanav_c_exec_lnir_cdef_ba"]
 opaque execLnirAv1CdefBaC (src : @& ByteArray) (w h priStr damping : UInt64) : ByteArray
+
+/-- Single-allocation packed YUV420P10LE scaling through the U16LE runtime. -/
+@[extern "leanav_c_exec_lnir_scale2d_yuv420p10le_ba"]
+opaque execLnirScale2dYuv420p10LeBaC (src : @& ByteArray) (srcW srcH dstW dstH : UInt64) : ByteArray
+
+@[extern "leanav_c_exec_lnir_luma_stats_u16le_ba"]
+opaque execLnirLumaStatsU16LeBaC (src : @& ByteArray) (nPixels step : UInt64) : UInt64
+
+@[extern "leanav_c_exec_lnir_extract_u16le_msb8_ba"]
+opaque execLnirExtractU16LeMsb8BaC (src : @& ByteArray) (nPixels : UInt64) : ByteArray
 
 /-- Zero-copy `ByteArray` strided luma mean & spatial variance LNIR dispatcher (`@lean_native_luma_stats_u8`). -/
 @[extern "leanav_c_exec_lnir_luma_stats_ba"]

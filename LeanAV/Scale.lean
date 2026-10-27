@@ -1284,6 +1284,47 @@ def scalePlaneBilinearU16LeBytes
         out := (out.push (val &&& 0xFF).toUInt8).push ((val >>> 8) &&& 0xFF).toUInt8
     return out
 
+/-- Packed U16LE scaling contract: even positive planes, representable Q8 coordinates,
+    complete source footprint and bounded destination allocation. -/
+def Yuv420p10leScaleSafe (a : Nat × Nat × Nat × Nat × Nat) : Prop :=
+  let (sw, sh, dw, dh, cap) := a
+  2 ≤ sw ∧ sw ≤ 0xFFFFFF ∧ 2 ≤ sh ∧ sh ≤ 0xFFFFFF ∧
+  2 ≤ dw ∧ dw ≤ 0x3FFFFFFF ∧ 2 ≤ dh ∧ dh ≤ 0x3FFFFFFF ∧
+  sw % 2 = 0 ∧ sh % 2 = 0 ∧ dw % 2 = 0 ∧ dh % 2 = 0 ∧
+  (sw * sh + 2 * ((sw / 2) * (sh / 2))) * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF ∧
+  (dw * dh + 2 * ((dw / 2) * (dh / 2))) * 2 ≤ 0xFFFFFFFFFFFFFFE7
+
+instance (a : Nat × Nat × Nat × Nat × Nat) : Decidable (Yuv420p10leScaleSafe a) := by
+  unfold Yuv420p10leScaleSafe
+  infer_instance
+
+/-- Exact admission gate for contiguous 10-bit YUV420 scaling. -/
+def yuv420p10leScaleGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat) Yuv420p10leScaleSafe where
+  gate := fun a => decide (Yuv420p10leScaleSafe a)
+  sound := by intro a h; exact of_decide_eq_true h
+  complete := by intro a h; exact decide_eq_true h
+  posWitness := (2, 2, 2, 2, 12)
+  negWitness := (2, 2, 2, 2, 11)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission is equivalent to the full packed U16LE scaling safety contract. -/
+theorem yuv420p10leScaleGateSpec_iff (a : Nat × Nat × Nat × Nat × Nat) :
+    yuv420p10leScaleGateSpec.gate a = true ↔ Yuv420p10leScaleSafe a :=
+  yuv420p10leScaleGateSpec.iff_safe a
+
+/-- Single allocation native scaler, with the original pure implementation as fallback. -/
+def scaleFrameYuv420p10LeAuto (src : @& ByteArray) (sw sh dw dh : Nat)
+    (xTab yTab uvXTab uvYTab : @& Array UInt64) : ByteArray :=
+  if yuv420p10leScaleGateSpec.gate (sw, sh, dw, dh, src.size) then
+    LeanAV.NativeKernels.execLnirScale2dYuv420p10LeBaC src sw.toUInt64 sh.toUInt64 dw.toUInt64 dh.toUInt64
+  else
+    let y := scalePlaneBilinearU16LeBytes src 0 sw sh dw dh xTab yTab
+    let u := scalePlaneBilinearU16LeBytes src (sw * sh * 2) (sw / 2) (sh / 2) (dw / 2) (dh / 2) uvXTab uvYTab
+    let v := scalePlaneBilinearU16LeBytes src ((sw * sh + (sw / 2) * (sh / 2)) * 2)
+      (sw / 2) (sh / 2) (dw / 2) (dh / 2) uvXTab uvYTab
+    y ++ u ++ v
+
 /--
   Pure Lean 4 pixel filter stage (`applyPixelFiltersYuv420p`) for YUV420p planes:
   - `filterFlags &&& 2 != 0`: applies ST.2084 PQ10 -> BT.709 OETF highlight tonemap (`tonemapPq10ToBt709Sdr8`) on `yBa`.
@@ -1329,7 +1370,24 @@ theorem yuv420pFilterGateSpec_iff (y uv cap : Nat) :
       y + 2 * uv ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF :=
   yuv420pFilterGateSpec.iff_safe (y, uv, cap)
 
-/-- Filter a packed frame in one native allocation; truncated inputs retain pure slice semantics. -/
+/-- Exact ownership and size condition for reusing a packed filter buffer in place. -/
+def inplaceFilterExclusivityGateSpec : AVGateSpec (Nat × Nat × Bool)
+    (fun (total, srcSize, exclusive) => total = srcSize ∧ exclusive = true) where
+  gate := fun (total, srcSize, exclusive) => decide (total = srcSize) && exclusive
+  sound := by intro ⟨total, srcSize, exclusive⟩ h; simpa using h
+  complete := by intro ⟨total, srcSize, exclusive⟩ h; simpa using h
+  posWitness := (24, 24, true)
+  negWitness := (24, 24, false)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Reuse is admitted exactly when both size and ownership permit it. -/
+theorem inplaceFilterExclusivityGateSpec_iff (total srcSize : Nat) (exclusive : Bool) :
+    inplaceFilterExclusivityGateSpec.gate (total, srcSize, exclusive) = true ↔
+      total = srcSize ∧ exclusive = true :=
+  inplaceFilterExclusivityGateSpec.iff_safe (total, srcSize, exclusive)
+
+/-- Filter a packed frame, reusing exclusive exact-size inputs; truncated inputs retain pure slice semantics. -/
 def applyPixelFiltersYuv420pFrameFast (src : ByteArray) (w h : Nat)
     (filterFlags : UInt32) : ByteArray :=
   let yLen := w * h
@@ -1359,6 +1417,27 @@ def verifyPixelFiltersNative : Bool := Id.run do
       let packed := ys ++ us ++ vs
       let actual := LeanAV.NativeKernels.execLnirApplyFiltersYuv420pBaC packed n.toUInt64 n.toUInt64 flags
       if actual.data != (ey ++ eu ++ ev).data then return false
+    -- Reuse the shared source after the native call to detect alias mutation.
+    -- Fresh scaler results passed directly to the filter exercise exclusive ownership.
+    for dims in [(2, 2), (8, 8), (18, 6)] do
+      let w := dims.1
+      let h := dims.2
+      let yl := w * h
+      let ul := (w / 2) * (h / 2)
+      let xt := buildBilinearTabQ8 8 w
+      let yt := buildBilinearTabQ8 8 h
+      let uxt := buildBilinearTabQ8 4 (w / 2)
+      let uyt := buildBilinearTabQ8 4 (h / 2)
+      let src := scaleFrameYuv420pQ8Auto y 8 8 w h xt yt uxt uyt
+      let before := src.data.toList
+      let (ey, eu, ev) := applyPixelFiltersYuv420p (src.extract 0 yl)
+        (src.extract yl (yl + ul)) (src.extract (yl + ul) (yl + 2 * ul)) flags
+      let expected := ey ++ eu ++ ev
+      let shared := applyPixelFiltersYuv420pFrameFast src w h flags
+      if src.data.toList != before || shared.data != expected.data then return false
+      let exclusive := applyPixelFiltersYuv420pFrameFast
+        (scaleFrameYuv420pQ8Auto y 8 8 w h xt yt uxt uyt) w h flags
+      if exclusive.data != expected.data then return false
     for dims in [(0, 0), (1, 1), (7, 5), (8, 8), (18, 6)] do
       for cap in [0, 1, 17, 63, 255] do
         let src := y.extract 0 cap

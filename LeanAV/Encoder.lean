@@ -1505,6 +1505,72 @@ def extractU16LeMsb8Pure (luma16 : @& ByteArray) (nPixels : Nat) : ByteArray :=
     ((u16 >>> 2) &&& 0xFF).toUInt8)
   { data := bytes.toArray }
 
+/-- Exact UInt64 and complete-pixel bounds for native U16LE luma operations. -/
+def u16LeMsb8GateSpec : AVGateSpec (Nat × Nat)
+    (fun (n, cap) => n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF) where
+  gate := fun (n, cap) => decide (n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF)
+  sound := by intro ⟨n, cap⟩ h; exact of_decide_eq_true h
+  complete := by intro ⟨n, cap⟩ h; exact decide_eq_true h
+  posWitness := (1, 2)
+  negWitness := (1, 1)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission exactly characterizes complete pixels and representable byte capacity. -/
+theorem u16LeMsb8GateSpec_iff (n cap : Nat) :
+    u16LeMsb8GateSpec.gate (n, cap) = true ↔ n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF :=
+  u16LeMsb8GateSpec.iff_safe (n, cap)
+
+/-- Native statistics retain the pure sampling threshold and UInt64 packing. -/
+def computeLumaStatsU16LeFast (src : @& ByteArray) (nPixels : Nat) : UInt64 × UInt64 :=
+  let n := Nat.min nPixels (src.size / 2)
+  if u16LeMsb8GateSpec.gate (n, src.size) then
+    let step : UInt64 := if n > 65536 then 16 else 1
+    let packed := LeanAV.NativeKernels.execLnirLumaStatsU16LeBaC src n.toUInt64 step
+    (packed &&& 0xFFFFFFFF, packed >>> 32)
+  else computeLumaStatsU16LePure src nPixels
+
+/-- Native MSB extraction with exact truncation, including short and odd buffers. -/
+def extractU16LeMsb8Fast (src : @& ByteArray) (nPixels : Nat) : ByteArray :=
+  let n := Nat.min nPixels (src.size / 2)
+  if u16LeMsb8GateSpec.gate (n, src.size) then
+    LeanAV.NativeKernels.execLnirExtractU16LeMsb8BaC src n.toUInt64
+  else extractU16LeMsb8Pure src nPixels
+
+/-- Differential runtime coverage of native U16LE paths against their pure specifications. -/
+def verifyU16LeNative : Bool := Id.run do
+  for (sw, sh, dw, dh) in [(2, 2, 2, 2), (20, 12, 10, 6), (12, 12, 6, 6),
+      (30, 18, 10, 6), (14, 10, 8, 6), (6, 4, 14, 10)] do
+    for fullRange in [false, true] do
+      let count := sw * sh + 2 * ((sw / 2) * (sh / 2))
+      let mut src := ByteArray.emptyWithCapacity (count * 2)
+      for i in [:count] do
+        let v := if fullRange then (if i % 5 == 0 then 65535 else (i * 7919 + 11) % 65536)
+          else (i * 137 + 31) % 1024
+        src := (src.push v.toUInt8).push (v / 256).toUInt8
+      let xt := buildBilinearTabQ8 sw dw
+      let yt := buildBilinearTabQ8 sh dh
+      let uxt := buildBilinearTabQ8 (sw / 2) (dw / 2)
+      let uyt := buildBilinearTabQ8 (sh / 2) (dh / 2)
+      let y := scalePlaneBilinearU16LeBytes src 0 sw sh dw dh xt yt
+      let u := scalePlaneBilinearU16LeBytes src (sw * sh * 2) (sw / 2) (sh / 2) (dw / 2) (dh / 2) uxt uyt
+      let v := scalePlaneBilinearU16LeBytes src ((sw * sh + (sw / 2) * (sh / 2)) * 2)
+        (sw / 2) (sh / 2) (dw / 2) (dh / 2) uxt uyt
+      if (scaleFrameYuv420p10LeAuto src sw sh dw dh xt yt uxt uyt).data != (y ++ u ++ v).data then
+        return false
+  for n in [0, 1, 15, 16, 17, 31, 32, 33, 65536, 65537, 65553] do
+    let mut src := ByteArray.emptyWithCapacity (n * 2 + 1)
+    for i in [:n] do
+      let v := (i * 7919 + 65535) % 65536
+      src := (src.push v.toUInt8).push (v / 256).toUInt8
+    src := src.push 255
+    for requested in [0, n / 2, n, n + 10] do
+      if (extractU16LeMsb8Fast src requested).data != (extractU16LeMsb8Pure src requested).data then
+        return false
+      if computeLumaStatsU16LeFast src requested != computeLumaStatsU16LePure src requested then
+        return false
+  return true
+
 def resolveToolExecPathIO (envVar : String) (candidates : List String) (fallback : String) : IO String := do
   if let some p ← IO.getEnv envVar then
     if p != "" && (← System.FilePath.pathExists p) then
@@ -1622,17 +1688,22 @@ def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
       return tailSlice
   return headSlice
 
-def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
+/-- Explicit SDR is a successful probe; only absent color metadata needs ffprobe. -/
+def probeMp4HdrColorspaceOptPure (moovBuf : @& ByteArray) : Option UInt32 := do
   let pureCs := probeMp4HdrColorspacePure moovBuf
   if pureCs > 0 then return pureCs
-  if hasExplicitSdrColrBoxPure moovBuf then
-    return 0
-  if let some cs := probeAvcCSpsColorspacePure moovBuf then
-    return cs
-  if let some cs := probeHvcCSpsColorspacePure moovBuf then
-    return cs
-  if let some cs := probeAv1CColorspacePure moovBuf then
-    return cs
+  if hasExplicitSdrColrBoxPure moovBuf then return 0
+  if let some cs := probeAvcCSpsColorspacePure moovBuf then return cs
+  if let some cs := probeHvcCSpsColorspacePure moovBuf then return cs
+  probeAv1CColorspacePure moovBuf
+
+def parseProbeHdrColorspacePure (output : String) : UInt32 :=
+  if (output.splitOn "arib-std-b67").length > 1 then 2
+  else if (output.splitOn "bt2020").length > 1 ||
+      (output.splitOn "smpte2084").length > 1 then 1
+  else 0
+
+def probeInputHdrColorspaceFallbackIO (inPath : String) : IO UInt32 := do
   try
     let ffprobeBin ← resolveFfprobeBinIO
     let env ← ffmpegSpawnEnvIO
@@ -1643,11 +1714,13 @@ def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UI
                 "-of", "default=noprint_wrappers=1:nokey=1", inPath]
       env := env
     }
-    if (out.stdout.splitOn "arib-std-b67").length > 1 then return 2
-    if (out.stdout.splitOn "bt2020").length > 1 || (out.stdout.splitOn "smpte2084").length > 1 then return 1
-    return 0
+    return parseProbeHdrColorspacePure out.stdout
   catch _ =>
     return 0
+
+def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
+  if let some cs := probeMp4HdrColorspaceOptPure moovBuf then return cs
+  probeInputHdrColorspaceFallbackIO inPath
 
 def parseU32SlashU32 (s : String) : Option (UInt32 × UInt32) :=
   let trimmed := (s.splitOn "\n").headD "" |>.trimAscii.toString
@@ -1679,9 +1752,7 @@ def parseU32SlashU32 (s : String) : Option (UInt32 × UInt32) :=
       | _ => none
   | _ => none
 
-def probeInputFpsRationalIO (inPath : String) (moovBuf : @& ByteArray) : IO (UInt32 × UInt32) := do
-  if let some (num, den) := probeMp4FpsRationalPure moovBuf then
-    return (num, den)
+def probeInputFpsRationalFallbackIO (inPath : String) : IO (UInt32 × UInt32) := do
   try
     let ffprobeBin ← resolveFfprobeBinIO
     let env ← ffmpegSpawnEnvIO
@@ -1695,6 +1766,65 @@ def probeInputFpsRationalIO (inPath : String) (moovBuf : @& ByteArray) : IO (UIn
     return (parseU32SlashU32 out.stdout).getD (24000, 1001)
   catch _ =>
     return (24000, 1001)
+
+def probeInputFpsRationalIO (inPath : String) (moovBuf : @& ByteArray) : IO (UInt32 × UInt32) := do
+  if let some fps := probeMp4FpsRationalPure moovBuf then return fps
+  probeInputFpsRationalFallbackIO inPath
+
+/-- One fallback process is needed exactly when either pure result is missing.
+    The HDR option already incorporates `needHdr`, with `some 0` when disabled. -/
+def combinedProbeFallbackGateSpec :
+    AVGateSpec (Option UInt32 × Option (UInt32 × UInt32))
+      (fun x => x.1 = none ∨ x.2 = none) where
+  gate := fun x => x.1.isNone || x.2.isNone
+  sound := by intro ⟨hdr, fps⟩ h; simpa using h
+  complete := by intro ⟨hdr, fps⟩ h; simpa using h
+  posWitness := (none, none)
+  negWitness := (some 0, some (24000, 1001))
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Process budget: both misses share the same single process. Setup failures may
+    use fewer processes, but never require another attempt. -/
+def combinedProbeFallbackProcessCount (hdr : Option UInt32)
+    (fps : Option (UInt32 × UInt32)) : Nat :=
+  if combinedProbeFallbackGateSpec.gate (hdr, fps) then 1 else 0
+
+theorem combinedProbeFallbackGateSpec_correct (hdr : Option UInt32)
+    (fps : Option (UInt32 × UInt32)) :
+    (combinedProbeFallbackGateSpec.gate (hdr, fps) = true ↔ hdr = none ∨ fps = none) ∧
+    (combinedProbeFallbackProcessCount hdr fps = 0 ↔ hdr.isSome ∧ fps.isSome) ∧
+    (combinedProbeFallbackProcessCount hdr fps = 1 ↔ hdr = none ∨ fps = none) := by
+  cases hdr <;> cases fps <;>
+    simp [combinedProbeFallbackProcessCount, combinedProbeFallbackGateSpec]
+
+/-- Parse keyed ffprobe output independently of field ordering. -/
+def parseProbeHdrAndFpsPure (output : String) : UInt32 × (UInt32 × UInt32) :=
+  let fpsLine := (output.splitOn "\n").find? (fun line => line.startsWith "r_frame_rate=")
+  let fps := fpsLine.bind (fun line => parseU32SlashU32 (line.drop 13 |>.toString))
+  (parseProbeHdrColorspacePure output, fps.getD (24000, 1001))
+
+def probeInputHdrAndFpsIO (inPath : String) (moovBuf : @& ByteArray)
+    (needHdr : Bool) : IO (UInt32 × (UInt32 × UInt32)) := do
+  let hdrOpt := if needHdr then probeMp4HdrColorspaceOptPure moovBuf else some 0
+  let fpsOpt := probeMp4FpsRationalPure moovBuf
+  match hdrOpt, fpsOpt with
+  | some hdr, some fps => return (hdr, fps)
+  | none, some fps => return (← probeInputHdrColorspaceFallbackIO inPath, fps)
+  | some hdr, none => return (hdr, ← probeInputFpsRationalFallbackIO inPath)
+  | none, none =>
+    try
+      let ffprobeBin ← resolveFfprobeBinIO
+      let env ← ffmpegSpawnEnvIO
+      let out ← IO.Process.output {
+        cmd := ffprobeBin
+        args := #["-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "stream=color_primaries,color_transfer,color_space,r_frame_rate",
+                  "-of", "default=noprint_wrappers=1:nokey=0", inPath]
+        env := env
+      }
+      return parseProbeHdrAndFpsPure out.stdout
+    catch _ => return (0, (24000, 1001))
 
 def patchMp4HdrAndElstBoxesIO (_inPath outPath : String) (inMoovBuf : @& ByteArray) (copyElst : Bool) : IO Unit := do
   if inMoovBuf.isEmpty then return ()
@@ -1936,8 +2066,8 @@ def transcodeMp4GeneralVerifiedIO
     | some bytes => pure bytes
     | none => readMp4MoovWindowIO inPath
   let inFileSz ← getFileSizeU64IO inPath
-  let hdrCs ← if (filterFlags &&& 3) == 0 then probeInputHdrColorspaceIO inPath inMoovBuf else pure 0
-  let (fpsNum, fpsDen) ← probeInputFpsRationalIO inPath inMoovBuf
+  let (hdrCs, (fpsNum, fpsDen)) ←
+    probeInputHdrAndFpsIO inPath inMoovBuf ((filterFlags &&& 3) == 0)
   let (outputFpsNum, outputFpsDen, fpsStr) :=
     if cliOpts.frameRate != "" then
       match parseU32SlashU32 cliOpts.frameRate with
@@ -2105,12 +2235,7 @@ def transcodeMp4GeneralVerifiedIO
     else
       let dstFrame : ByteArray :=
         if is10bit then
-          let uOff := srcYSz * 2
-          let vOff := (srcYSz + srcUvSz) * 2
-          let yScaled := scalePlaneBilinearU16LeBytes srcBuf 0 srcW srcH dstW dstH yXTab yYTab
-          let uScaled := scalePlaneBilinearU16LeBytes srcBuf uOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          let vScaled := scalePlaneBilinearU16LeBytes srcBuf vOff (srcW / 2) (srcH / 2) (dstW / 2) (dstH / 2) uvXTab uvYTab
-          yScaled ++ uScaled ++ vScaled
+          scaleFrameYuv420p10LeAuto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else if (filterFlags &&& 3) == 0 then
           scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else
@@ -2129,7 +2254,7 @@ def transcodeMp4GeneralVerifiedIO
 
       if !writeFailed then
         let (fMean, fVar) :=
-          if is10bit then computeLumaStatsU16LePure dstFrame dstYSz
+          if is10bit then computeLumaStatsU16LeFast dstFrame dstYSz
           else computeLumaStatsU8Fast dstFrame dstYSz
         meanAccum := meanAccum + fMean
         varAccum := varAccum + fVar
@@ -2144,8 +2269,8 @@ def transcodeMp4GeneralVerifiedIO
             if fPsnr < psnrMin then psnrMin := fPsnr
             if fDist == 0 then distLtBlackAll := 0
           else
-            let srcY8 := extractU16LeMsb8Pure srcBuf srcYSz
-            let dstY8 := extractU16LeMsb8Pure dstFrame dstYSz
+            let srcY8 := extractU16LeMsb8Fast srcBuf srcYSz
+            let dstY8 := extractU16LeMsb8Fast dstFrame dstYSz
             let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Fast srcY8 srcW srcH dstY8 dstW dstH
             if fSad > maxSadWorst then maxSadWorst := fSad
             if fPsnr < psnrMin then psnrMin := fPsnr

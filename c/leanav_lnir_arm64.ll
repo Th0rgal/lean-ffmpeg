@@ -978,22 +978,23 @@ loop.body:
   %sum = phi i64 [ 0, %entry ], [ %sum_next, %loop.body ]
   %sumSq = phi i64 [ 0, %entry ], [ %sumSq_next, %loop.body ]
   %cnt = phi i64 [ 0, %entry ], [ %cnt_next, %loop.body ]
-  %p = getelementptr inbounds i8, ptr %src, i64 %idx
+  %p = getelementptr i8, ptr %src, i64 %idx
   %b = load i8, ptr %p, align 1
   %v = zext i8 %b to i64
   %v2 = mul nuw i64 %v, %v
-  %sum_next = add nuw i64 %sum, %v
-  %sumSq_next = add nuw i64 %sumSq, %v2
+  %sum_next = add i64 %sum, %v
+  %sumSq_next = add i64 %sumSq, %v2
   %cnt_next = add nuw i64 %cnt, 1
-  %idx_next = add nuw i64 %idx, %step
-  %more = icmp ult i64 %idx_next, %nPixels
+  %idx_next = add i64 %idx, %step
+  %remaining = sub i64 %nPixels, %idx
+  %more = icmp ult i64 %step, %remaining
   br i1 %more, label %loop.body, label %compute.out, !llvm.loop !0
 compute.out:
   %mean = udiv i64 %sum_next, %cnt_next
   %meanSq = udiv i64 %sumSq_next, %cnt_next
   %sq = mul nuw i64 %mean, %mean
   %gt = icmp ugt i64 %meanSq, %sq
-  %diff = sub nuw i64 %meanSq, %sq
+  %diff = sub i64 %meanSq, %sq
   %var = select i1 %gt, i64 %diff, i64 0
   %var_hi = shl i64 %var, 32
   %mean_lo = and i64 %mean, 4294967295
@@ -2831,6 +2832,336 @@ attributes #3 = { nounwind uwtable "target-features"="+v9a,+neon,+fp-armv8,+full
 !8 = !{!"llvm.loop.vectorize.scalable.enable", i1 false}
 !9 = distinct !{!9, !1, !7, !10}
 !10 = !{!"llvm.loop.vectorize.scalable.enable", i1 true}
+
+; U16 LE scaling and luma runtime
+define weak_odr dso_local void @lean_native_swscale_bilinear_q8_u16le(ptr %src, ptr %dst, i64 %sw, i64 %sh, i64 %dw, i64 %dh) #0 {
+entry:
+  %sw0 = icmp eq i64 %sw, 0
+  %sh0 = icmp eq i64 %sh, 0
+  %dw0 = icmp eq i64 %dw, 0
+  %dh0 = icmp eq i64 %dh, 0
+  %s0 = or i1 %sw0, %sh0
+  %d0 = or i1 %dw0, %dh0
+  %empty = or i1 %s0, %d0
+  br i1 %empty, label %exit, label %identity
+identity:
+  %samew = icmp eq i64 %sw, %dw
+  %sameh = icmp eq i64 %sh, %dh
+  %same = and i1 %samew, %sameh
+  br i1 %same, label %copy, label %dispatch
+copy:
+  %pixels = mul i64 %sw, %sh
+  %bytes = shl i64 %pixels, 1
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align 1 %src, i64 %bytes, i1 false)
+  br label %exit
+dispatch:
+  %w2 = mul i64 %dw, 2
+  %h2 = mul i64 %dh, 2
+  %w3 = mul i64 %dw, 3
+  %h3 = mul i64 %dh, 3
+  %eqw2 = icmp eq i64 %sw, %w2
+  %eqh2 = icmp eq i64 %sh, %h2
+  %eq2 = and i1 %eqw2, %eqh2
+  %eqw3 = icmp eq i64 %sw, %w3
+  %eqh3 = icmp eq i64 %sh, %h3
+  %eq3 = and i1 %eqw3, %eqh3
+  %vlim = and i64 %dw, -4
+  br i1 %eq2, label %b2row, label %check3
+check3:
+  br i1 %eq3, label %b3row, label %qrow
+b2row:
+  %y2 = phi i64 [ 0, %dispatch ], [ %yn2, %b2end ]
+  %r2a = mul i64 %y2, %sw
+  %r2 = shl i64 %r2a, 1
+  %dr2 = mul i64 %y2, %dw
+  br label %b2veccond
+b2veccond:
+  %x2v = phi i64 [ 0, %b2row ], [ %x2vn, %b2vec ]
+  %more2v = icmp ult i64 %x2v, %vlim
+  br i1 %more2v, label %b2vec, label %b2cond
+b2vec:
+  %sx2v = shl i64 %x2v, 1
+  %i2v = add i64 %r2, %sx2v
+  %j2v = add i64 %i2v, %sw
+  %p2v = getelementptr i16, ptr %src, i64 %i2v
+  %q2v = getelementptr i16, ptr %src, i64 %j2v
+  %a2v = load <8 x i16>, ptr %p2v, align 1
+  %b2v = load <8 x i16>, ptr %q2v, align 1
+%a0s = shufflevector <8 x i16> %a2v, <8 x i16> poison, <4 x i32> <i32 0, i32 2, i32 4, i32 6>
+%a0 = zext <4 x i16> %a0s to <4 x i32>
+%a1s = shufflevector <8 x i16> %a2v, <8 x i16> poison, <4 x i32> <i32 1, i32 3, i32 5, i32 7>
+%a1 = zext <4 x i16> %a1s to <4 x i32>
+%b0s = shufflevector <8 x i16> %b2v, <8 x i16> poison, <4 x i32> <i32 0, i32 2, i32 4, i32 6>
+%b0 = zext <4 x i16> %b0s to <4 x i32>
+%b1s = shufflevector <8 x i16> %b2v, <8 x i16> poison, <4 x i32> <i32 1, i32 3, i32 5, i32 7>
+%b1 = zext <4 x i16> %b1s to <4 x i32>
+%va = add <4 x i32> %a0, %a1
+  %vb = add <4 x i32> %b0, %b1
+  %vs = add <4 x i32> %va, %vb
+  %vr = add <4 x i32> %vs, <i32 2, i32 2, i32 2, i32 2>
+  %vo = lshr <4 x i32> %vr, <i32 2, i32 2, i32 2, i32 2>
+  %vt = trunc <4 x i32> %vo to <4 x i16>
+  %di2v = add i64 %dr2, %x2v
+  %dp2v = getelementptr i16, ptr %dst, i64 %di2v
+  store <4 x i16> %vt, ptr %dp2v, align 1
+  %x2vn = add i64 %x2v, 4
+  br label %b2veccond
+b2cond:
+  %x2 = phi i64 [ %x2v, %b2veccond ], [ %xn2, %b2body ]
+  %more2 = icmp ult i64 %x2, %dw
+  br i1 %more2, label %b2body, label %b2end
+b2body:
+  %sx2 = shl i64 %x2, 1
+  %base2 = add i64 %r2, %sx2
+%row2_0 = mul i64 %sw, 0
+%base2_0 = add i64 %base2, %row2_0
+%i2_0_0 = add i64 %base2_0, 0
+  %p2_0_0 = getelementptr i16, ptr %src, i64 %i2_0_0
+  %b2_0_0 = load i16, ptr %p2_0_0, align 1
+  %v2_0_0 = zext i16 %b2_0_0 to i32
+%i2_0_1 = add i64 %base2_0, 1
+  %p2_0_1 = getelementptr i16, ptr %src, i64 %i2_0_1
+  %b2_0_1 = load i16, ptr %p2_0_1, align 1
+  %v2_0_1 = zext i16 %b2_0_1 to i32
+%row2_1 = mul i64 %sw, 1
+%base2_1 = add i64 %base2, %row2_1
+%i2_1_0 = add i64 %base2_1, 0
+  %p2_1_0 = getelementptr i16, ptr %src, i64 %i2_1_0
+  %b2_1_0 = load i16, ptr %p2_1_0, align 1
+  %v2_1_0 = zext i16 %b2_1_0 to i32
+%i2_1_1 = add i64 %base2_1, 1
+  %p2_1_1 = getelementptr i16, ptr %src, i64 %i2_1_1
+  %b2_1_1 = load i16, ptr %p2_1_1, align 1
+  %v2_1_1 = zext i16 %b2_1_1 to i32
+%sum2_0 = add i32 %v2_0_0, %v2_0_1
+%sum2_1 = add i32 %sum2_0, %v2_1_0
+%sum2_2 = add i32 %sum2_1, %v2_1_1
+%round2 = add i32 %sum2_2, 2
+%out2 = lshr i32 %round2, 2
+  %tr2 = trunc i32 %out2 to i16
+%di2 = add i64 %dr2, %x2
+  %dp2 = getelementptr i16, ptr %dst, i64 %di2
+  store i16 %tr2, ptr %dp2, align 1
+  %xn2 = add i64 %x2, 1
+br label %b2cond
+b2end:
+  %yn2 = add i64 %y2, 1
+  %ymore2 = icmp ult i64 %yn2, %dh
+  br i1 %ymore2, label %b2row, label %exit
+b3row:
+  %y3 = phi i64 [ 0, %check3 ], [ %yn3, %b3end ]
+  %r3a = mul i64 %y3, %sw
+  %r3 = mul i64 %r3a, 3
+  %dr3 = mul i64 %y3, %dw
+  br label %b3body
+b3body:
+  %x3 = phi i64 [ 0, %b3row ], [ %xn3, %b3body ]
+  %sx3 = mul i64 %x3, 3
+  %base3 = add i64 %r3, %sx3
+%row3_0 = mul i64 %sw, 0
+%base3_0 = add i64 %base3, %row3_0
+%i3_0_0 = add i64 %base3_0, 0
+  %p3_0_0 = getelementptr i16, ptr %src, i64 %i3_0_0
+  %b3_0_0 = load i16, ptr %p3_0_0, align 1
+  %v3_0_0 = zext i16 %b3_0_0 to i32
+%i3_0_1 = add i64 %base3_0, 1
+  %p3_0_1 = getelementptr i16, ptr %src, i64 %i3_0_1
+  %b3_0_1 = load i16, ptr %p3_0_1, align 1
+  %v3_0_1 = zext i16 %b3_0_1 to i32
+%i3_0_2 = add i64 %base3_0, 2
+  %p3_0_2 = getelementptr i16, ptr %src, i64 %i3_0_2
+  %b3_0_2 = load i16, ptr %p3_0_2, align 1
+  %v3_0_2 = zext i16 %b3_0_2 to i32
+%row3_1 = mul i64 %sw, 1
+%base3_1 = add i64 %base3, %row3_1
+%i3_1_0 = add i64 %base3_1, 0
+  %p3_1_0 = getelementptr i16, ptr %src, i64 %i3_1_0
+  %b3_1_0 = load i16, ptr %p3_1_0, align 1
+  %v3_1_0 = zext i16 %b3_1_0 to i32
+%i3_1_1 = add i64 %base3_1, 1
+  %p3_1_1 = getelementptr i16, ptr %src, i64 %i3_1_1
+  %b3_1_1 = load i16, ptr %p3_1_1, align 1
+  %v3_1_1 = zext i16 %b3_1_1 to i32
+%i3_1_2 = add i64 %base3_1, 2
+  %p3_1_2 = getelementptr i16, ptr %src, i64 %i3_1_2
+  %b3_1_2 = load i16, ptr %p3_1_2, align 1
+  %v3_1_2 = zext i16 %b3_1_2 to i32
+%row3_2 = mul i64 %sw, 2
+%base3_2 = add i64 %base3, %row3_2
+%i3_2_0 = add i64 %base3_2, 0
+  %p3_2_0 = getelementptr i16, ptr %src, i64 %i3_2_0
+  %b3_2_0 = load i16, ptr %p3_2_0, align 1
+  %v3_2_0 = zext i16 %b3_2_0 to i32
+%i3_2_1 = add i64 %base3_2, 1
+  %p3_2_1 = getelementptr i16, ptr %src, i64 %i3_2_1
+  %b3_2_1 = load i16, ptr %p3_2_1, align 1
+  %v3_2_1 = zext i16 %b3_2_1 to i32
+%i3_2_2 = add i64 %base3_2, 2
+  %p3_2_2 = getelementptr i16, ptr %src, i64 %i3_2_2
+  %b3_2_2 = load i16, ptr %p3_2_2, align 1
+  %v3_2_2 = zext i16 %b3_2_2 to i32
+%sum3_0 = add i32 %v3_0_0, %v3_0_1
+%sum3_1 = add i32 %sum3_0, %v3_0_2
+%sum3_2 = add i32 %sum3_1, %v3_1_0
+%sum3_3 = add i32 %sum3_2, %v3_1_1
+%sum3_4 = add i32 %sum3_3, %v3_1_2
+%sum3_5 = add i32 %sum3_4, %v3_2_0
+%sum3_6 = add i32 %sum3_5, %v3_2_1
+%sum3_7 = add i32 %sum3_6, %v3_2_2
+%round3 = add i32 %sum3_7, 4
+%wide3 = zext i32 %round3 to i64
+  %prod3 = mul i64 %wide3, 7282
+  %out3 = lshr i64 %prod3, 16
+  %tr3 = trunc i64 %out3 to i16
+%di3 = add i64 %dr3, %x3
+  %dp3 = getelementptr i16, ptr %dst, i64 %di3
+  store i16 %tr3, ptr %dp3, align 1
+  %xn3 = add i64 %x3, 1
+%more3 = icmp ult i64 %xn3, %dw
+  br i1 %more3, label %b3body, label %b3end
+b3end:
+  %yn3 = add i64 %y3, 1
+  %ymore3 = icmp ult i64 %yn3, %dh
+  br i1 %ymore3, label %b3row, label %exit
+qrow:
+  %qy = phi i64 [ 0, %check3 ], [ %qyn, %qend ]
+  %ynum0 = mul i64 %qy, %sh
+  %ynum = shl i64 %ynum0, 8
+  %yq8 = udiv i64 %ynum, %dh
+  %sy0 = lshr i64 %yq8, 8
+  %syplus = add i64 %sy0, 1
+  %yinside = icmp ult i64 %syplus, %sh
+  %sy1 = select i1 %yinside, i64 %syplus, i64 %sy0
+  %fy = and i64 %yq8, 255
+  %ify = sub i64 256, %fy
+  %qr0 = mul i64 %sy0, %sw
+  %qr1 = mul i64 %sy1, %sw
+  %qdr = mul i64 %qy, %dw
+  br label %qbody
+qbody:
+  %qx = phi i64 [ 0, %qrow ], [ %qxn, %qbody ]
+  %xnum0 = mul i64 %qx, %sw
+  %xnum = shl i64 %xnum0, 8
+  %xq8 = udiv i64 %xnum, %dw
+  %sx0 = lshr i64 %xq8, 8
+  %sxplus = add i64 %sx0, 1
+  %xinside = icmp ult i64 %sxplus, %sw
+  %sx1 = select i1 %xinside, i64 %sxplus, i64 %sx0
+  %fx = and i64 %xq8, 255
+  %ifx = sub i64 256, %fx
+%qi00 = add i64 %qr0, %sx0
+  %qp00 = getelementptr i16, ptr %src, i64 %qi00
+  %qb00 = load i16, ptr %qp00, align 1
+  %qv00 = zext i16 %qb00 to i64
+  %qw00 = mul i64 %qv00, %ifx
+%qi01 = add i64 %qr0, %sx1
+  %qp01 = getelementptr i16, ptr %src, i64 %qi01
+  %qb01 = load i16, ptr %qp01, align 1
+  %qv01 = zext i16 %qb01 to i64
+  %qw01 = mul i64 %qv01, %fx
+%qi10 = add i64 %qr1, %sx0
+  %qp10 = getelementptr i16, ptr %src, i64 %qi10
+  %qb10 = load i16, ptr %qp10, align 1
+  %qv10 = zext i16 %qb10 to i64
+  %qw10 = mul i64 %qv10, %ifx
+%qi11 = add i64 %qr1, %sx1
+  %qp11 = getelementptr i16, ptr %src, i64 %qi11
+  %qb11 = load i16, ptr %qp11, align 1
+  %qv11 = zext i16 %qb11 to i64
+  %qw11 = mul i64 %qv11, %fx
+%top = add i64 %qw00, %qw01
+  %bot = add i64 %qw10, %qw11
+  %wt = mul i64 %top, %ify
+  %wb = mul i64 %bot, %fy
+  %qs = add i64 %wt, %wb
+  %qr = add i64 %qs, 32768
+  %qavg = lshr i64 %qr, 16
+  %over = icmp ugt i64 %qavg, 1023
+  %clamp = select i1 %over, i64 1023, i64 %qavg
+  %qt = trunc i64 %clamp to i16
+  %qdi = add i64 %qdr, %qx
+  %qdp = getelementptr i16, ptr %dst, i64 %qdi
+  store i16 %qt, ptr %qdp, align 1
+  %qxn = add i64 %qx, 1
+  %qxmore = icmp ult i64 %qxn, %dw
+  br i1 %qxmore, label %qbody, label %qend
+qend:
+  %qyn = add i64 %qy, 1
+  %qymore = icmp ult i64 %qyn, %dh
+  br i1 %qymore, label %qrow, label %exit
+exit:
+  ret void
+}
+define weak_odr dso_local i64 @lean_native_luma_stats_u16le(ptr noalias noundef readonly %src, i64 noundef %nPixels, i64 noundef %step) #0 {
+entry:
+  %has_px = icmp ugt i64 %nPixels, 0
+  %step_pos = icmp ugt i64 %step, 0
+  %ok = and i1 %has_px, %step_pos
+  br i1 %ok, label %loop.body, label %exit.zero
+loop.body:
+  %idx = phi i64 [ 0, %entry ], [ %idx_next, %loop.body ]
+  %sum = phi i64 [ 0, %entry ], [ %sum_next, %loop.body ]
+  %sumSq = phi i64 [ 0, %entry ], [ %sumSq_next, %loop.body ]
+  %cnt = phi i64 [ 0, %entry ], [ %cnt_next, %loop.body ]
+  %p = getelementptr i16, ptr %src, i64 %idx
+  %b = load i16, ptr %p, align 1
+  %raw = zext i16 %b to i64
+  %v = lshr i64 %raw, 2
+  %v2 = mul nuw i64 %v, %v
+  %sum_next = add i64 %sum, %v
+  %sumSq_next = add i64 %sumSq, %v2
+  %cnt_next = add nuw i64 %cnt, 1
+  %idx_next = add i64 %idx, %step
+  %remaining = sub i64 %nPixels, %idx
+  %more = icmp ult i64 %step, %remaining
+  br i1 %more, label %loop.body, label %compute.out, !llvm.loop !0
+compute.out:
+  %mean = udiv i64 %sum_next, %cnt_next
+  %meanSq = udiv i64 %sumSq_next, %cnt_next
+  %sq = mul nuw i64 %mean, %mean
+  %gt = icmp ugt i64 %meanSq, %sq
+  %diff = sub i64 %meanSq, %sq
+  %var = select i1 %gt, i64 %diff, i64 0
+  %var_hi = shl i64 %var, 32
+  %mean_lo = and i64 %mean, 4294967295
+  %packed = or i64 %var_hi, %mean_lo
+  ret i64 %packed
+exit.zero:
+  ret i64 0
+}
+define weak_odr dso_local void @lean_native_extract_u16le_msb8(ptr %src, ptr %dst, i64 %n) #0 {
+entry:
+  %lim = and i64 %n, -16
+  br label %vcond
+vcond:
+  %vi = phi i64 [ 0, %entry ], [ %vin, %vbody ]
+  %vm = icmp ult i64 %vi, %lim
+  br i1 %vm, label %vbody, label %cond
+vbody:
+  %vp = getelementptr i16, ptr %src, i64 %vi
+  %vd = getelementptr i8, ptr %dst, i64 %vi
+  %vb = load <16 x i16>, ptr %vp, align 1
+%vs = lshr <16 x i16> %vb, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+%vt = trunc <16 x i16> %vs to <16 x i8>
+  store <16 x i8> %vt, ptr %vd, align 1
+  %vin = add i64 %vi, 16
+  br label %vcond
+cond:
+  %i = phi i64 [ %vi, %vcond ], [ %in, %body ]
+  %more = icmp ult i64 %i, %n
+  br i1 %more, label %body, label %exit
+body:
+  %p = getelementptr i16, ptr %src, i64 %i
+  %d = getelementptr i8, ptr %dst, i64 %i
+  %b = load i16, ptr %p, align 1
+  %s = lshr i16 %b, 2
+  %t = trunc i16 %s to i8
+  store i8 %t, ptr %d, align 1
+  %in = add i64 %i, 1
+  br label %cond
+exit:
+  ret void
+}
 
 ; Packed Y/U/V filter: source and destination may alias exactly.
 declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)
