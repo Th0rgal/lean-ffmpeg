@@ -2,7 +2,7 @@
 
 Only the external decoder/encoder processes are replaced, so their raw input and
 output can be compared without codec loss. The production Lean frame loop, async
-reads/writes, LLVM kernels and C ABI remain active. Linker interposition counts
+reads/writes, LLVM kernels and C ABI remain active. Test-only C interposition counts
 native scaling calls and has a resize positive control.
 """
 import json
@@ -55,14 +55,23 @@ class U16LeIdentityTests(unittest.TestCase):
         subprocess.run(['lake', 'env', 'lean', '-c', str(c_file),
                         str(HERE / 'u16le_identity.lean')], cwd=ROOT, check=True,
                        capture_output=True, text=True, timeout=120)
-        # Reuse the exact production dependency objects, replacing only Main.
+        # Reuse production dependency objects; the counter compiles the unchanged
+        # C bridge with one renamed entrypoint, avoiding GNU-only linker --wrap.
         args = shlex.split((ROOT / '.lake/build/bin/lffmpeg.rsp').read_text())
         objects = [s for s in args if s.endswith(('.o.export', '.a')) and
                    not s.endswith('/LeanAV/Main.c.o.export')]
+        # Match lakefile.lean's system C compiler for the POSIX bridge: Lean's
+        # bundled leanc sysroot need not contain the platform C headers.
+        lean_prefix = subprocess.run(['lake', 'env', 'lean', '--print-prefix'],
+                                     cwd=ROOT, check=True, capture_output=True,
+                                     text=True, timeout=30).stdout.strip()
+        counter = cls.directory / 'counter.o'
+        subprocess.run(['cc', '-O3', '-fPIC', '-I', str(Path(lean_prefix) / 'include'),
+                        '-c', str(HERE / 'u16le_identity_counter.c'), '-o', str(counter)],
+                       cwd=ROOT, check=True, capture_output=True, text=True, timeout=120)
         result = subprocess.run(['lake', 'env', 'leanc', '-O2', '-o', str(cls.binary),
-                                 str(c_file), str(HERE / 'u16le_identity_counter.c'),
-                                 *objects, '-lpthread',
-                                 '-Wl,--wrap=leanav_c_exec_lnir_scale2d_yuv420p10le_ba'],
+                                 str(c_file), str(counter),
+                                 *objects, '-lpthread'],
                                 cwd=ROOT, capture_output=True, text=True, timeout=120)
         if result.returncode or result.stderr:
             raise AssertionError(result.stdout + result.stderr)

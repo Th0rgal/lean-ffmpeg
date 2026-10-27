@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`624`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,887`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`621`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,887`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 10-bit and 8-bit luma acceptance read U16LE and U8 pixels directly from complete planes
 across all scaling ratios (`1:1`, `2:1`, `3:1`, and general Q8 bilinear), avoiding
@@ -30,7 +30,7 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 | Verification Suite | Scope | Verified Result | Details |
 | :--- | :--- | :---: | :--- |
-| **Suite #0 (`tests/`)** | **83 Python unit & differential tests** + C-ABI / LNIR self-tests | **`83 / 83` (`100%`)** | `30/30` unit tests (`tests/`) + `53/53` differential tests (`tests/differential/`) + `53/53` `self-test` waves + `16/16` compiled LNIR kernels verified via FFI |
+| **Suite #0 (`tests/`)** | Python unit & differential tests + C-ABI / LNIR self-tests | Wave 14 Linux CI: **30 unit tests OK; 34 differential tests, 4 skipped** | Counts are runner-dependent; skipped tests are not passes. `53/53` self-test waves; FFI and kernel checks passed. |
 | **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` stream signatures (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |
@@ -48,7 +48,7 @@ All **15** `LeanAV/*.lean` modules (**`264 / 264` specifications**) pass `turbo-
 ## Build & Verification
 
 ```bash
-# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 624-line C-ABI bridge (0 sorryAx)
+# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 621-line C-ABI bridge (0 sorryAx)
 lake build
 
 # Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
@@ -60,13 +60,13 @@ lake build
 lake env lean scripts/check_axioms.lean
 
 # Audit all 15 formal modules in parallel with turbo-lean (264/264 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
-turbo-lean --json audit-spec LeanAV/*.lean
+for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done
 
 # Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
 lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
 lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
-# Run the Python unit and differential test suites (83 tests: 30 unit + 53 differential)
+# Run the Python suites; report executed tests and skips separately
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```
@@ -126,3 +126,13 @@ resize fallbacks, truncated input, and encoder failure:
 ```bash
 python3 -m unittest discover -s tests/differential -p "test_u16le_identity.py" -v
 ```
+
+
+Validation provenance: Wave 14 CI (`b2867db`, run `40436255776`) used Lean 4.31.0
+and audited 8,993 declarations with no sorryAx/custom axioms; the local Lean 4.35.0
+report above counted 8,887. Linux ran 30 unit tests and 34 differential tests
+(4 skipped). macOS failed the identity test setup because its linker does not
+support GNU `--wrap`; the test now compiles the production C bridge with a renamed
+scaler entrypoint and a counting wrapper on both platforms. No test is skipped to
+work around that failure. Historical benchmark and suite totals below are not
+claims that every case ran on the current CI runner.

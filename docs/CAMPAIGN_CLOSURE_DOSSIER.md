@@ -25,8 +25,9 @@ validation under Lean v4.35.0 passed all 53 self-test waves, `verify-ffi`,
 The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 56,
 `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15,
 `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). The bridge
-has 625 lines and links 14 runtime routines. Python validation passed 30 unit/IR tests and
-53 differential tests (83/83 total). Both generated target kernels (`c/leanav_lnir_x86_64.ll`
+has 621 lines and links 14 runtime routines. The earlier local report claimed 30 unit/IR and 53 differential tests. The retained
+Wave 14 Linux CI log instead records 30 unit tests and 34 differential tests, with
+4 differential skips; these are not an 83/83 reproduction. Both generated target kernels (`c/leanav_lnir_x86_64.ll`
 and `c/leanav_lnir_arm64.ll`) compile with zero warnings under `clang-18 -O3 -Werror`.
 
 The earlier campaign results below describe their original revisions.
@@ -137,3 +138,13 @@ Executed across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 
 | **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | `78 / 120` (`65.0%`) | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | `41 / 79` (`51.9%`) | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` signatures (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | `0 / 187` FATE pass (`187/187` CLI rejections) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |
+
+
+Validation provenance: Wave 14 CI (`b2867db`, run `40436255776`) used Lean 4.31.0
+and audited 8,993 declarations with no sorryAx/custom axioms; the local Lean 4.35.0
+report above counted 8,887. Linux ran 30 unit tests and 34 differential tests
+(4 skipped). macOS failed the identity test setup because its linker does not
+support GNU `--wrap`; the test now compiles the production C bridge with a renamed
+scaler entrypoint and a counting wrapper on both platforms. No test is skipped to
+work around that failure. Historical benchmark and suite totals below are not
+claims that every case ran on the current CI runner.
