@@ -372,6 +372,7 @@ def supportedPixFmt (s : String) : Bool :=
    "yuv420p14le", "yuv420p14be", "yuv422p14le", "yuv422p14be", "yuv444p14le", "yuv444p14be",
    "yuv420p16le", "yuv420p16be", "yuv422p16le", "yuv422p16be", "yuv444p16le", "yuv444p16be",
    "nv21", "nv16", "nv24", "nv42", "p010be", "p016le", "p016be",
+   "p410le", "p410be", "p412le", "p412be",
    "gray", "gray8", "ya8", "gray9le", "gray9be", "gray10le", "gray10be",
    "gray12le", "gray12be", "gray14le", "gray14be", "gray16le", "gray16be", "ya16le", "ya16be",
    "monow", "monob", "pal8",
