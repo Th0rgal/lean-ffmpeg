@@ -24,7 +24,7 @@ class FateAdapterTests(unittest.TestCase):
             for target, expected in (("reference", "candidate"), ("helper", "helper")):
                 p = subprocess.run([sys.executable, str(SCRIPT), str(root / target), "a b", "-flag"],
                                    env=env, capture_output=True, text=True, check=True)
-                self.assertEqual(json.loads(p.stdout), [expected, ["a b", "-flag"], str(root / "reference")])
+                self.assertEqual(json.loads(p.stdout), [expected, ["a b", "-flag"], str((root / "reference").resolve())])
             trace = [json.loads(s) for s in (root / "trace").read_text().splitlines()]
             self.assertEqual([r["candidate_exercised"] for r in trace], [True, False])
             self.assertTrue(all(r["test"] == "fate-control" for r in trace))

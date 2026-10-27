@@ -44,6 +44,7 @@ def executable_pin(name: str) -> dict[str, Any]:
 
 
 def validate_manifest(manifest: Any, root: Path, warmups: int, trials: int) -> list[dict[str, Any]]:
+    root = root.resolve()
     if not isinstance(manifest, dict) or manifest.get("complete") is not True:
         raise ValueError("manifest must set complete=true; partial denominators are rejected")
     if warmups < 2 or trials < 5:
