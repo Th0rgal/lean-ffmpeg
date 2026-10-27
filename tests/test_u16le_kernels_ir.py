@@ -24,8 +24,9 @@ class U16LeKernelsIR(unittest.TestCase):
         for arch in ("x86_64", "arm64"):
             text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
             names = ("lean_native_swscale_bilinear_q8_u16le", "lean_native_luma_stats_u16le", "lean_native_luma_stats_u8",
+                     "lean_native_swscale_down2x2_u8", "lean_native_swscale_down2x2_fused_eq_u8",
                      "lean_native_extract_u16le_msb8", "lean_native_luma_acceptance_16x16_u8",
-                     "lean_native_luma_acceptance_16x16_u16le", "lean_native_stencil2d_box3x3_u8")
+                     "lean_native_luma_acceptance_16x16_u16le", "lean_native_stencil2d_box3x3_u8", "lean_native_av1_cdef_filter_u8")
             kernels.append("\n".join(re.search(
                 r"define weak_odr dso_local [^\n]*@" + name + r"\([^\n]*\n.*?\n}",
                 text, re.S).group() for name in names))
@@ -38,7 +39,7 @@ class U16LeKernelsIR(unittest.TestCase):
                       "declare i32 @llvm.vector.reduce.add.v16i32(<16 x i32>)\n" +
                       "declare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)\n" +
                       "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
-                      kernels[0].replace(" #0 {", " {").replace(", !llvm.loop !0", ""))
+                      re.sub(r", !llvm.loop ![0-9]+", "", kernels[0].replace(" #0 {", " {")))
         so = directory / "u16.so"
         subprocess.run([clang, "-Werror", "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
                        check=True, capture_output=True)
@@ -94,6 +95,39 @@ class U16LeKernelsIR(unittest.TestCase):
                                      (w, h))
                     self.assertEqual(src.raw[:-1], b"\xa5" + bytes(values) + b"\xa5")
 
+    def test_av1_cdef_interior_vectors_and_tails(self):
+        cdef = self.lib.lean_native_av1_cdef_filter_u8
+        cdef.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 4
+        cdef.restype = None
+        rng = random.Random(1403)
+        for w in (0, 1, 2, 3, 9, 10, 11, 17, 18, 19, 64):
+            for h in (0, 1, 2, 3, 7):
+                patterns = ([0] * (w * h), [255] * (w * h),
+                            [255 * (i % 2) for i in range(w * h)],
+                            [rng.randrange(256) for _ in range(w * h)])
+                for values in patterns:
+                    for strength in (0, 1, 2, 5, 31, 32):
+                        for damping in (0, 1, 2, 5, 31, 32, 33, 63, 64):
+                            expected = values.copy()
+                            shift = (damping if damping else 1) & 31
+                            for y in range(1, h - 1):
+                                for x in range(1, w - 1):
+                                    i = y * w + x
+                                    px = values[i]
+                                    total = 0
+                                    for j in (i - 1, i + 1, i - w, i + w):
+                                        diff = values[j] - px
+                                        mag = max(0, min(abs(diff), strength - (abs(diff) >> shift)))
+                                        total += -mag if diff < 0 else mag
+                                    expected[i] = max(0, min(255, px + ((total + 2) >> 2)))
+                            src = ctypes.create_string_buffer(b"S" + bytes(values) + b"S")
+                            dst = ctypes.create_string_buffer(b"D" * (w * h + 2))
+                            cdef(ctypes.byref(dst, 1), ctypes.byref(src, 1),
+                                 w, h, strength, damping)
+                            self.assertEqual(dst.raw[:-1], b"D" + bytes(expected) + b"D",
+                                             (w, h, strength, damping))
+                            self.assertEqual(src.raw[:-1], b"S" + bytes(values) + b"S")
+
     def check_scale(self, sw, sh, dw, dh, values):
         expected = []
         for y in range(dh):
@@ -120,6 +154,51 @@ class U16LeKernelsIR(unittest.TestCase):
         want = b"".join(v.to_bytes(2, "little") for v in expected)
         self.assertEqual(dst.raw[:-1], b"\x5a" + want + b"\x5a", (sw, sh, dw, dh))
         self.assertEqual(src.raw[:-1], b"\xa5" + raw + b"\xa5")
+
+    def test_fused_eq_vectors_tails_and_wrapping_int32(self):
+        fn = self.lib.lean_native_swscale_down2x2_fused_eq_u8
+        fn.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 3 + [ctypes.c_int64] * 2
+        fn.restype = None
+        rng = random.Random(1402)
+        wrap = lambda v: ctypes.c_int32(v).value
+        params = [(256, 0), (256, -23), (256, 29), (381, 17), (121, -37),
+                  (-256, 19), (-371, -61), (0, 0),
+                  (2**31-1, 2**31-1), (-2**31, -2**31),
+                  (2**31-1, -2**31), (-2**31, 2**31-1)]
+        for w in (0, 1, 15, 16, 17, 31, 32, 33):
+            for h in (0, 1, 3):
+                stride = 2 * w + 7
+                for values in ([rng.randrange(256) for _ in range(stride * 2 * h)],
+                               [255] * (stride * 2 * h), [0] * (stride * 2 * h)):
+                    for contrast, brightness in params:
+                        expected = []
+                        for y in range(h):
+                            for x in range(w):
+                                avg = (sum(values[(2*y+yy)*stride+2*x+xx]
+                                           for yy in range(2) for xx in range(2)) + 2) >> 2
+                                scaled = wrap(wrap((wrap(wrap((avg-128)*contrast)+128) >> 8)+128)
+                                              + brightness)
+                                expected.append(max(0, min(255, scaled)))
+                        src = ctypes.create_string_buffer(b"S" + bytes(values) + b"S")
+                        dst = ctypes.create_string_buffer(b"D" * (w*h+2))
+                        fn(ctypes.byref(dst, 1), ctypes.byref(src, 1),
+                           stride, w, h, contrast, brightness)
+                        self.assertEqual(dst.raw[:-1], b"D" + bytes(expected) + b"D",
+                                         (w, h, contrast, brightness))
+                        self.assertEqual(src.raw[:-1], b"S" + bytes(values) + b"S")
+
+    def test_3to2_q8_exact_and_full_u16_clamp(self):
+        rng = random.Random(1403)
+        for sw, sh, dw, dh in ((30, 18, 20, 12), (6, 6, 4, 4),
+                              (1920, 1080, 1280, 720), (3, 3, 2, 2),
+                              (9, 9, 6, 6), (15, 9, 10, 6)):
+            for cap in (1023, 65535):
+                self.check_scale(sw, sh, dw, dh,
+                                 [rng.randrange(cap + 1) for _ in range(sw * sh)])
+            self.check_scale(sw, sh, dw, dh, [65535] * (sw * sh))
+        # Distinguish origin alignment, all four parity cases, and round-once behavior.
+        for value in (0, 1, 1023, 1024, 32768, 65535):
+            self.check_scale(6, 6, 4, 4, [0, value, 1, value, 0, value] * 6)
 
     def test_3x3_full_u16_maximum(self):
         # Pure scalar, full vectors, and each possible vector tail.
@@ -236,9 +315,19 @@ class U16LeKernelsIR(unittest.TestCase):
                     for x in range(bx, bx + 16):
                         if (sw, sh) == (dw, dh):
                             r = src8[y * sw + x]
+                        elif (sw, sh) in ((dw * 2, dh * 2), (dw * 3, dh * 3)):
+                            k = sw // dw
+                            total = sum(src8[(k*y+yy)*sw+k*x+xx]
+                                        for yy in range(k) for xx in range(k))
+                            r = (total + 2) >> 2 if k == 2 else ((total + 4) * 7282) >> 16
                         else:
-                            r = (sum(src8[(2*y+yy)*sw+2*x+xx]
-                                     for yy in range(2) for xx in range(2)) + 2) >> 2
+                            xq, yq = x * sw * 256 // dw, y * sh * 256 // dh
+                            x0, y0 = min(xq >> 8, sw - 1), min(yq >> 8, sh - 1)
+                            x1, y1 = min(x0 + 1, sw - 1), min(y0 + 1, sh - 1)
+                            fx, fy = xq & 255, yq & 255
+                            top = (256-fx)*src8[y0*sw+x0] + fx*src8[y0*sw+x1]
+                            bot = (256-fx)*src8[y1*sw+x0] + fx*src8[y1*sw+x1]
+                            r = ((256-fy)*top + fy*bot + 32768) >> 16
                         ad = abs(dst8[y * dw + x] - r)
                         sad += ad
                         sse += ad * ad
@@ -275,3 +364,19 @@ class U16LeKernelsIR(unittest.TestCase):
         for s in (0, 63, 64, 95, 96, 1023, 1024, 65535):
             for d in (0, 64, s, 65535):
                 self.check_acceptance(32, 32, 16, 16, [s]*1024, [d]*256)
+
+
+    def test_acceptance_all_ratios_and_impulse(self):
+        rng = random.Random(1401)
+        geometries = [(48, 48, 16, 16), (48, 48, 32, 32), (23, 19, 16, 16),
+                      (16, 32, 16, 16), (32, 23, 16, 16), (48, 23, 16, 16),
+                      (16, 16, 33, 35), (51, 57, 17, 19), (37, 41, 257, 259)]
+        for sw, sh, dw, dh in geometries:
+            for cap in (1023, 65535):
+                src = [rng.randrange(cap + 1) for _ in range(sw * sh)]
+                dst = [rng.randrange(cap + 1) for _ in range(dw * dh)]
+                self.check_acceptance(sw, sh, dw, dh, src, dst)
+        # The center is 255, while the decoded nine-tap average is 28.
+        src = [65535 if y % 3 == 1 and x % 3 == 1 else 0
+               for y in range(48) for x in range(48)]
+        self.check_acceptance(48, 48, 16, 16, src, [28 << 2] * 256)

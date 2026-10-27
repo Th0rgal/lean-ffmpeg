@@ -1,9 +1,10 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
-## W11-W13 direct U16LE acceptance, 10-bit identity zero-copy, dual-step luma stats, surgical trailing-moov, SIMD 3x3 U16LE exact /9, disabled-plane filter skip, and 8-lane box3x3 stencil validation
+## W11-W14 direct all-ratio U8/U16LE acceptance, 10-bit identity zero-copy, dual-step luma stats, surgical trailing-moov, SIMD 3x3 & 3:2 U16LE, 16-lane down2x2_fused_eq, disabled-plane filter skip, and 8-lane box3x3 & AV1 CDEF validation
 
-The direct U16LE path preserves the existing block grid and 2:1 reference averaging,
-using a shared u8/u16le LLVM emitter. Wave 12 adds zero-copy 10-bit 1:1 identity
+The direct U16LE and U8 acceptance paths support `1:1`, `2:1`, `3:1`, and general Q8
+bilinear geometries (`lumaAcceptanceAllRatiosGateSpec`), using a shared u8/u16le LLVM
+emitter and `extractU16LeMsb8Fast` fallback. Wave 12 adds zero-copy 10-bit 1:1 identity
 frame reuse (`yuv420p10leIdentityZeroCopyGateSpec`), vectorized `step == 1` and
 `step == 16` luma statistics (`lumaStatsStepSelectionGateSpec`), and surgical
 trailing-`moov` `pwrite` patching (`surgicalMoovTailPatchGateSpec`). Wave 13 adds
@@ -12,14 +13,20 @@ across the full `0..65535` `UInt16` range (`u16leDownscale3x3VecGateSpec`),
 disabled-plane zero-copy skip (`%src == %dst`) and `memcpy` (`%src != %dst`) in
 `@lean_native_apply_filters_yuv420p_u8` (`yuv420pFilterPlaneSkipGateSpec`), single-FD
 `readMp4MoovWindowIO`, and an 8-lane `<8 x i16>/<8 x i32>` SIMD interior loop in
-`@lean_native_stencil2d_box3x3_u8` (`box3x3StencilInteriorVecGateSpec`). Local
+`@lean_native_stencil2d_box3x3_u8` (`box3x3StencilInteriorVecGateSpec`). Wave 14 adds
+all-ratio (`1:1`, `2:1`, `3:1`, and general Q8 bilinear) 16x16 luma acceptance in
+`@lean_native_luma_acceptance_16x16_u8` and `@lean_native_luma_acceptance_16x16_u16le`,
+16-lane `<16 x i8>` SIMD non-identity EQ in `@lean_native_swscale_down2x2_fused_eq_u8` +
+paired `3:2` Q8 fastpath in `@lean_native_swscale_bilinear_q8_u16le` (`down2x2FusedEqVecGateSpec`),
+and an 8-lane `<8 x i32>` SIMD interior loop with `shift & 31` normalization in
+`@lean_native_av1_cdef_filter_u8` (`av1CdefInteriorVecGateSpec`). Local
 validation under Lean v4.35.0 passed all 53 self-test waves, `verify-ffi`,
-`verify-kernels`, and the axiom audit: **8,868 declarations, zero sorryAx/custom axioms**.
-The current spec audit is **261/261 non_vacuous_and_tight, zero shadowed** (`Format`: 56,
-`Video`: 30, `Encoder`: 29, `Scale`: 27, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15,
+`verify-kernels`, and the axiom audit: **8,887 declarations, zero sorryAx/custom axioms**.
+The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 56,
+`Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15,
 `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). The bridge
-has 624 lines and links 14 runtime routines. Python validation passed 26 unit/IR tests and
-53 differential tests (79/79 total). Both generated target kernels (`c/leanav_lnir_x86_64.ll`
+has 625 lines and links 14 runtime routines. Python validation passed 30 unit/IR tests and
+53 differential tests (83/83 total). Both generated target kernels (`c/leanav_lnir_x86_64.ll`
 and `c/leanav_lnir_arm64.ll`) compile with zero warnings under `clang-18 -O3 -Werror`.
 
 The earlier campaign results below describe their original revisions.

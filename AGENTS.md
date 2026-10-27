@@ -4,8 +4,8 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`), pairing:
 1. **15 Formal Lean 4 Modules (`LeanAV/*.lean`)**:
-   - **`8,868` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
-   - **`261 / 261` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (56), `Video` (30), `Encoder` (29), `Scale` (27), `NativeKernels` (25), `Spec` (23), `PlanIR` (15), `Bitstream` (13), `Audio` (12), `Core` (11), `Domain` (8), `Cli` (6), `Filter` (6).
+   - **`8,887` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+   - **`264 / 264` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (56), `Video` (31), `Encoder` (30), `Scale` (28), `NativeKernels` (25), `Spec` (23), `PlanIR` (15), `Bitstream` (13), `Audio` (12), `Core` (11), `Domain` (8), `Cli` (6), `Filter` (6).
    - All plane scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear, 16-bit LE), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance (`@lean_native_luma_acceptance_16x16_u8`, `@lean_native_luma_acceptance_16x16_u16le`), ISO BMFF 32/64-bit box navigation, surgical trailing-`moov` `pwrite` patching (`locateMp4TrailingMoovWindowIO` + `writeMp4WindowIO`), `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
    - Decision gates, ISO BMFF header/handler/colorimetry classifiers, edit-list (`elst`) timestamp rescaling, bitrate and muxing-overhead estimators, luma mean/variance and PSNR acceptance packers, plane FFI contract checks, and PQ10/BT.2020 color-space helpers live in pure Lean 4 (`LeanAV/Format.lean`, `LeanAV/Scale.lean`, `LeanAV/PlanIR.lean`, `LeanAV/Encoder.lean`) and are exported to C without shadow re-implementations.
@@ -38,13 +38,13 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 8,868 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 8,887 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# 4. Audit all 15 formal modules in parallel with turbo-lean (261/261 non_vacuous_and_tight)
+# 4. Audit all 15 formal modules in parallel with turbo-lean (264/264 non_vacuous_and_tight)
 turbo-lean --json audit-spec LeanAV/*.lean
 
-# 5. Run the 79 Python unit and differential tests (26 unit + 53 differential)
+# 5. Run the 83 Python unit and differential tests (30 unit + 53 differential)
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```

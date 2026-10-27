@@ -503,15 +503,12 @@ static uint64_t leanav_luma_acceptance_16x16_ba(
     uint64_t pixel_bytes,
     void (*kernel)(const uint8_t *, uint64_t, uint64_t, const uint8_t *, uint64_t, uint64_t, uint64_t *)
 ) {
-    if (dst_w < 16u || dst_h < 16u || src_w < 2u || src_h < 2u ||
-        src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull ||
-        dst_w > 0x3FFFFFFFull || dst_h > 0x3FFFFFFFull) {
+    if (dst_w < 16u || dst_h < 16u || src_w < 16u || src_h < 16u ||
+        src_w > 0xFFFFFFull || src_h > 0xFFFFFFull ||
+        dst_w > 0xFFFFFFull || dst_h > 0xFFFFFFull) {
         return leanav_lean_pack_acceptance_metrics_u64(0ull, 450ull, 1u);
     }
-    int is_1x1 = (src_w == dst_w && src_h == dst_h);
-    int is_2x2 = (src_w == dst_w * 2u && src_h == dst_h * 2u);
-    if (!is_1x1 && !is_2x2) return 0ull;
-    /* Dimensions are bounded above by 2^30-1, so even two bytes/pixel fit UInt64. */
+    /* Dimensions are bounded by 2^24-1; Q8 products and byte capacities fit UInt64. */
     uint64_t src_need = src_w * src_h * pixel_bytes;
     uint64_t dst_need = dst_w * dst_h * pixel_bytes;
     if ((uint64_t)lean_sarray_size(src_ba) < src_need ||

@@ -50,6 +50,27 @@ theorem box3x3StencilInteriorVecGateSpec_iff (a : Nat × Nat) :
     box3x3StencilInteriorVecGateSpec.gate a = true ↔ Box3x3StencilInteriorVecSafe a :=
   box3x3StencilInteriorVecGateSpec.iff_safe a
 
+/-- Admission for a complete eight-column interior CDEF stencil, with no unsigned underflow. -/
+def Av1CdefInteriorVecSafe (a : Nat × Nat) : Prop :=
+  a.1 ≥ 10 ∧ a.2 ≥ 3 ∧ 1 + ((a.1 - 2) / 8) * 8 ≤ a.1 - 1
+
+instance (a : Nat × Nat) : Decidable (Av1CdefInteriorVecSafe a) :=
+  inferInstanceAs (Decidable (a.1 ≥ 10 ∧ a.2 ≥ 3 ∧ 1 + ((a.1 - 2) / 8) * 8 ≤ a.1 - 1))
+
+/-- Exact gate for the non-underflowing eight-lane interior loop. -/
+def av1CdefInteriorVecGateSpec : AVGateSpec (Nat × Nat) Av1CdefInteriorVecSafe where
+  gate := fun a => decide (Av1CdefInteriorVecSafe a)
+  sound := by intro a h; exact of_decide_eq_true h
+  complete := by intro a h; exact decide_eq_true h
+  posWitness := (10, 3)
+  negWitness := (9, 3)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem av1CdefInteriorVecGateSpec_iff (a : Nat × Nat) :
+    av1CdefInteriorVecGateSpec.gate a = true ↔ Av1CdefInteriorVecSafe a :=
+  av1CdefInteriorVecGateSpec.iff_safe a
+
 /-! ## 1. AV1 Open Bitstream Unit (`OBU`) Demuxer & Sequence Header Parser -/
 
 /-- AV1 OBU types (`Specification Section 6.2.2`). -/

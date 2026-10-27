@@ -1269,53 +1269,33 @@ structure LumaAcceptanceFastPathInput where
   dstCap : Nat
   deriving Repr, DecidableEq, Inhabited
 
-/-- Safety predicate for the compiled LLVM 18 `@lean_native_luma_acceptance_16x16_u8` fast path:
-    `16 ≤ dstW ≤ 0x3FFFFFFF`, `16 ≤ dstH ≤ 0x3FFFFFFF`, `2 ≤ srcW ≤ 0x3FFFFFFF`, `2 ≤ srcH ≤ 0x3FFFFFFF`,
-    exact `1:1` (`srcW = dstW ∧ srcH = dstH`) or `2:1` (`srcW = dstW * 2 ∧ srcH = dstH * 2`) geometry,
-    and complete plane capacities (`srcW * srcH ≤ srcCap` and `dstW * dstH ≤ dstCap`). -/
+/-- Complete planes with dimensions bounded so Q8 coordinate products fit UInt64. -/
 def LumaAcceptanceFastPathSafe (x : LumaAcceptanceFastPathInput) : Prop :=
-  16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 2 ≤ x.srcW ∧ 2 ≤ x.srcH ∧
-  x.srcW ≤ 0x3FFFFFFF ∧ x.srcH ≤ 0x3FFFFFFF ∧ x.dstW ≤ 0x3FFFFFFF ∧ x.dstH ≤ 0x3FFFFFFF ∧
-  ((x.srcW = x.dstW ∧ x.srcH = x.dstH) ∨ (x.srcW = x.dstW * 2 ∧ x.srcH = x.dstH * 2)) ∧
+  16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 16 ≤ x.srcW ∧ 16 ≤ x.srcH ∧
+  x.srcW ≤ 0xFFFFFF ∧ x.srcH ≤ 0xFFFFFF ∧ x.dstW ≤ 0xFFFFFF ∧ x.dstH ≤ 0xFFFFFF ∧
   x.srcW * x.srcH ≤ x.srcCap ∧ x.dstW * x.dstH ≤ x.dstCap
 
-/-- Decidable admission checker for the compiled LLVM 18 16x16 luma acceptance SIMD fast path. -/
+/-- Decidable admission for all native luma acceptance geometries. -/
 @[inline]
 def checkLumaAcceptanceFastPath (x : LumaAcceptanceFastPathInput) : Bool :=
-  decide (
-    16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 2 ≤ x.srcW ∧ 2 ≤ x.srcH ∧
-    x.srcW ≤ 0x3FFFFFFF ∧ x.srcH ≤ 0x3FFFFFFF ∧ x.dstW ≤ 0x3FFFFFFF ∧ x.dstH ≤ 0x3FFFFFFF ∧
-    ((x.srcW = x.dstW ∧ x.srcH = x.dstH) ∨ (x.srcW = x.dstW * 2 ∧ x.srcH = x.dstH * 2)) ∧
-    x.srcW * x.srcH ≤ x.srcCap ∧ x.dstW * x.dstH ≤ x.dstCap
-  )
+  decide (16 ≤ x.dstW ∧ 16 ≤ x.dstH ∧ 16 ≤ x.srcW ∧ 16 ≤ x.srcH ∧
+    x.srcW ≤ 0xFFFFFF ∧ x.srcH ≤ 0xFFFFFF ∧ x.dstW ≤ 0xFFFFFF ∧ x.dstH ≤ 0xFFFFFF ∧
+    x.srcW * x.srcH ≤ x.srcCap ∧ x.dstW * x.dstH ≤ x.dstCap)
 
-/-- Universal equivalence theorem: `checkLumaAcceptanceFastPath x = true ↔ LumaAcceptanceFastPathSafe x`. -/
+/-- Admission exactly characterizes arithmetic and capacity safety. -/
 theorem lumaAcceptanceFastPath_iff (x : LumaAcceptanceFastPathInput) :
     checkLumaAcceptanceFastPath x = true ↔ LumaAcceptanceFastPathSafe x := by
   unfold checkLumaAcceptanceFastPath LumaAcceptanceFastPathSafe
   exact decide_eq_true_iff
 
-/-- Universal soundness theorem (`lumaAcceptanceFastPath_sound`):
-    If `checkLumaAcceptanceFastPath x = true`, then `LumaAcceptanceFastPathSafe x` holds and
-    every sampled 16x16 destination macroblock fits within `dstCap` and `srcCap`. -/
+/-- Admitted planes contain at least one complete macroblock. -/
 theorem lumaAcceptanceFastPath_sound (x : LumaAcceptanceFastPathInput)
     (h : checkLumaAcceptanceFastPath x = true) :
     LumaAcceptanceFastPathSafe x ∧ 256 ≤ x.dstCap ∧ 256 ≤ x.srcCap := by
-  have hSafe := (lumaAcceptanceFastPath_iff x).mp h
-  rcases hSafe with ⟨hDw, hDh, hSw, hSh, hSwMax, hShMax, hDwMax, hDhMax, hRatio, hSrcCap, hDstCap⟩
-  have hDst256 : 256 ≤ x.dstW * x.dstH := by
-    have : 16 * 16 ≤ x.dstW * x.dstH := Nat.mul_le_mul hDw hDh
-    omega
-  have hSrc256 : 256 ≤ x.srcW * x.srcH := by
-    rcases hRatio with ⟨hW, hH⟩ | ⟨hW, hH⟩
-    · rw [hW, hH]
-      exact hDst256
-    · rw [hW, hH]
-      have : 16 * 16 ≤ (x.dstW * 2) * (x.dstH * 2) :=
-        Nat.mul_le_mul (by omega) (by omega)
-      omega
-  exact ⟨⟨hDw, hDh, hSw, hSh, hSwMax, hShMax, hDwMax, hDhMax, hRatio, hSrcCap, hDstCap⟩,
-    Nat.le_trans hDst256 hDstCap, Nat.le_trans hSrc256 hSrcCap⟩
+  have hs := (lumaAcceptanceFastPath_iff x).mp h
+  rcases hs with ⟨hdw, hdh, hsw, hsh, _, _, _, _, hsc, hdc⟩
+  exact ⟨(lumaAcceptanceFastPath_iff x).mp h,
+    Nat.le_trans (Nat.mul_le_mul hdw hdh) hdc, Nat.le_trans (Nat.mul_le_mul hsw hsh) hsc⟩
 
 /-- Tight `AVGateSpec` bundle (`lumaAcceptanceFastPathGateSpec`) for the 16x16 luma acceptance SIMD fast path. -/
 def lumaAcceptanceFastPathGateSpec :
@@ -1327,6 +1307,23 @@ def lumaAcceptanceFastPathGateSpec :
   negWitness := ⟨32, 32, 1024, 16, 16, 255⟩
   nonVacuous := rfl
   tight := rfl
+
+/-- All ratios share the bounded coordinate and complete-plane contract.
+    The positive witness exercises general Q8; the negative witness lacks one source pixel. -/
+def lumaAcceptanceAllRatiosGateSpec :
+    AVGateSpec LumaAcceptanceFastPathInput LumaAcceptanceFastPathSafe where
+  gate := checkLumaAcceptanceFastPath
+  sound := fun x => (lumaAcceptanceFastPath_iff x).mp
+  complete := fun x => (lumaAcceptanceFastPath_iff x).mpr
+  posWitness := ⟨23, 19, 437, 16, 16, 256⟩
+  negWitness := ⟨23, 19, 436, 16, 16, 256⟩
+  nonVacuous := rfl
+  tight := rfl
+
+/-- The all-ratios gate is non_vacuous_and_tight and admits exactly safe planes. -/
+theorem lumaAcceptanceAllRatiosGateSpec_iff (x : LumaAcceptanceFastPathInput) :
+    lumaAcceptanceAllRatiosGateSpec.gate x = true ↔ LumaAcceptanceFastPathSafe x :=
+  lumaAcceptanceAllRatiosGateSpec.iff_safe x
 
 /-- Extract 8-bit MSB (`u16 >>> 2`) luma plane from a 10-bit LE (`yuv420p10le`) plane buffer for 16x16 macroblock SAD/PSNR measurement. -/
 def extractU16LeMsb8Pure (luma16 : @& ByteArray) (nPixels : Nat) : ByteArray :=
@@ -1341,8 +1338,8 @@ def extractU16LeMsb8Pure (luma16 : @& ByteArray) (nPixels : Nat) : ByteArray :=
   Fast 16x16 macroblock luma acceptance evaluator (`measureLumaAcceptance16x16Fast`):
   Dispatches to the compiled LLVM 18 SIMD kernel `@lean_native_luma_acceptance_16x16_u8` via
   `execLnirLumaAcceptance16x16BaC` when `lumaAcceptanceFastPathGateSpec.gate` admits the plane
-  dimensions and capacities (`1:1` or `2:1` ratios with complete buffers), falling back to
-  `measureLumaAcceptance16x16Pure` otherwise (`3:1`, general bilinear, or truncated buffers).
+  dimensions and complete plane capacities for all ratios, falling back to
+  `measureLumaAcceptance16x16Pure` for short buffers or dimensions outside the arithmetic bounds.
 -/
 @[inline]
 def measureLumaAcceptance16x16Fast
@@ -1381,6 +1378,29 @@ theorem lumaAcceptance16x16U16LeGateSpec_iff (x : LumaAcceptanceFastPathInput) :
       { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 } :=
   lumaAcceptance16x16U16LeGateSpec.iff_safe x
 
+/-- Exact UInt64 and complete-pixel bounds for native U16LE luma operations. -/
+def u16LeMsb8GateSpec : AVGateSpec (Nat × Nat)
+    (fun (n, cap) => n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF) where
+  gate := fun (n, cap) => decide (n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF)
+  sound := by intro ⟨n, cap⟩ h; exact of_decide_eq_true h
+  complete := by intro ⟨n, cap⟩ h; exact decide_eq_true h
+  posWitness := (1, 2)
+  negWitness := (1, 1)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission exactly characterizes complete pixels and representable byte capacity. -/
+theorem u16LeMsb8GateSpec_iff (n cap : Nat) :
+    u16LeMsb8GateSpec.gate (n, cap) = true ↔ n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF :=
+  u16LeMsb8GateSpec.iff_safe (n, cap)
+
+/-- Native MSB extraction with exact truncation, including short and odd buffers. -/
+def extractU16LeMsb8Fast (src : @& ByteArray) (nPixels : Nat) : ByteArray :=
+  let n := Nat.min nPixels (src.size / 2)
+  if u16LeMsb8GateSpec.gate (n, src.size) then
+    LeanAV.NativeKernels.execLnirExtractU16LeMsb8BaC src n.toUInt64
+  else extractU16LeMsb8Pure src nPixels
+
 /-- Measure directly from U16LE buffers, decoding only sampled pixels. Unsupported geometry
     and short buffers retain the exact pure extraction and acceptance semantics. -/
 @[inline]
@@ -1392,8 +1412,8 @@ def measureLumaAcceptance16x16U16LeFast
       src srcW.toUInt64 srcH.toUInt64 dst dstW.toUInt64 dstH.toUInt64
     (packed &&& 0xFFFFFF, (packed >>> 24) &&& 0xFFFF, ((packed >>> 40) &&& 1).toUInt32)
   else
-    measureLumaAcceptance16x16Pure (extractU16LeMsb8Pure src (srcW * srcH)) srcW srcH
-      (extractU16LeMsb8Pure dst (dstW * dstH)) dstW dstH
+    measureLumaAcceptance16x16Pure (extractU16LeMsb8Fast src (srcW * srcH)) srcW srcH
+      (extractU16LeMsb8Fast dst (dstW * dstH)) dstW dstH
 
 /--
   Direct 16x16 macroblock acceptance measurement between two `ByteArray` luma planes:
@@ -1557,22 +1577,6 @@ def computeLumaStatsU16LePure (luma16 : @& ByteArray) (nPixels : Nat) : UInt64 �
   let packed := computeLumaMeanVarPackedU64 sum sumSq cnt
   return (packed &&& 0xFFFFFFFF, packed >>> 32)
 
-/-- Exact UInt64 and complete-pixel bounds for native U16LE luma operations. -/
-def u16LeMsb8GateSpec : AVGateSpec (Nat × Nat)
-    (fun (n, cap) => n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF) where
-  gate := fun (n, cap) => decide (n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF)
-  sound := by intro ⟨n, cap⟩ h; exact of_decide_eq_true h
-  complete := by intro ⟨n, cap⟩ h; exact decide_eq_true h
-  posWitness := (1, 2)
-  negWitness := (1, 1)
-  nonVacuous := rfl
-  tight := rfl
-
-/-- Admission exactly characterizes complete pixels and representable byte capacity. -/
-theorem u16LeMsb8GateSpec_iff (n cap : Nat) :
-    u16LeMsb8GateSpec.gate (n, cap) = true ↔ n * 2 ≤ cap ∧ cap ≤ 0xFFFFFFFFFFFFFFFF :=
-  u16LeMsb8GateSpec.iff_safe (n, cap)
-
 /-- Native statistics retain the pure sampling threshold and UInt64 packing. -/
 def computeLumaStatsU16LeFast (src : @& ByteArray) (nPixels : Nat) : UInt64 × UInt64 :=
   let n := Nat.min nPixels (src.size / 2)
@@ -1581,13 +1585,6 @@ def computeLumaStatsU16LeFast (src : @& ByteArray) (nPixels : Nat) : UInt64 × U
     let packed := LeanAV.NativeKernels.execLnirLumaStatsU16LeBaC src n.toUInt64 step
     (packed &&& 0xFFFFFFFF, packed >>> 32)
   else computeLumaStatsU16LePure src nPixels
-
-/-- Native MSB extraction with exact truncation, including short and odd buffers. -/
-def extractU16LeMsb8Fast (src : @& ByteArray) (nPixels : Nat) : ByteArray :=
-  let n := Nat.min nPixels (src.size / 2)
-  if u16LeMsb8GateSpec.gate (n, src.size) then
-    LeanAV.NativeKernels.execLnirExtractU16LeMsb8BaC src n.toUInt64
-  else extractU16LeMsb8Pure src nPixels
 
 /-- Differential runtime coverage of native U16LE paths against their pure specifications. -/
 def verifyU16LeNative : Bool := Id.run do
@@ -1621,6 +1618,29 @@ def verifyU16LeNative : Bool := Id.run do
         return false
       if computeLumaStatsU16LeFast src requested != computeLumaStatsU16LePure src requested then
         return false
+  for (sw, sh, dw, dh) in [(16, 16, 16, 16), (32, 32, 16, 16),
+      (48, 48, 16, 16), (48, 48, 32, 32), (23, 19, 16, 16),
+      (16, 32, 16, 16), (32, 23, 16, 16), (48, 23, 16, 16),
+      (16, 16, 33, 35), (7, 9, 16, 16)] do
+    for impulse in [false, true] do
+      let mut src := ByteArray.empty
+      let mut dst := ByteArray.empty
+      for i in [:sw * sh] do
+        let v := if impulse then (if i / sw % 3 == 1 && i % sw % 3 == 1 then 65535 else 0)
+          else (i * 7919 + 11) % 65536
+        src := (src.push v.toUInt8).push (v / 256).toUInt8
+      for i in [:dw * dh] do
+        let v := (i * 137 + 31) % 65536
+        dst := (dst.push v.toUInt8).push (v / 256).toUInt8
+      for short in [false, true] do
+        let shortSrc := if short then src.extract 0 (src.size - 3) else src
+        let shortDst := if short then dst.extract 0 (dst.size - 1) else dst
+        let s8 := extractU16LeMsb8Pure shortSrc (sw * sh)
+        let d8 := extractU16LeMsb8Pure shortDst (dw * dh)
+        let expected := measureLumaAcceptance16x16Pure s8 sw sh d8 dw dh
+        if measureLumaAcceptance16x16Fast s8 sw sh d8 dw dh != expected ||
+            measureLumaAcceptance16x16U16LeFast shortSrc sw sh shortDst dw dh != expected then
+          return false
   return true
 
 def resolveToolExecPathIO (envVar : String) (candidates : List String) (fallback : String) : IO String := do

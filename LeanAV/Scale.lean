@@ -1298,6 +1298,30 @@ instance (a : Nat × Nat × Nat × Nat × Nat) : Decidable (Yuv420p10leScaleSafe
   unfold Yuv420p10leScaleSafe
   infer_instance
 
+/-- A fused EQ vector consumes sixteen outputs and two bytes per source column.
+The byte sum is bounded before widening; EQ itself uses wrapping Int32 arithmetic. -/
+def Down2x2FusedEqVecSafe (a : Nat × Nat) : Prop :=
+  a.1 ≤ 4 * 255 ∧ 16 ≤ a.2
+
+instance (a : Nat × Nat) : Decidable (Down2x2FusedEqVecSafe a) := by
+  unfold Down2x2FusedEqVecSafe
+  infer_instance
+
+/-- Tight sum/lane admission gate for the sixteen-output fused EQ loop. -/
+def down2x2FusedEqVecGateSpec : AVGateSpec (Nat × Nat) Down2x2FusedEqVecSafe where
+  gate := fun a => decide (Down2x2FusedEqVecSafe a)
+  sound := by intro a h; exact of_decide_eq_true h
+  complete := by intro a h; exact decide_eq_true h
+  posWitness := (4 * 255, 16)
+  negWitness := (4 * 255, 15)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem down2x2FusedEqVecGateSpec_iff (s remaining : Nat) :
+    down2x2FusedEqVecGateSpec.gate (s, remaining) = true ↔
+      Down2x2FusedEqVecSafe (s, remaining) :=
+  down2x2FusedEqVecGateSpec.iff_safe (s, remaining)
+
 /-- A four-output 3x3 block has four available lanes and a full-U16 bounded sum.
 The bound applies independently to each of the four SIMD lanes. -/
 def U16leDownscale3x3ExactSafe (a : Nat × Nat) : Prop :=

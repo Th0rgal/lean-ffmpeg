@@ -1468,8 +1468,9 @@ private def verifyLumaAcceptanceU16Le : Bool := Id.run do
   let src := plane 1024 65535
   let dst := plane 256 64
   if !lumaAcceptance16x16U16LeGateSpec.gate ⟨32, 32, 2048, 16, 16, 512⟩ then return false
+  if !lumaAcceptance16x16U16LeGateSpec.gate ⟨48, 48, 4608, 16, 16, 512⟩ then return false
   for x in [⟨32, 32, 2047, 16, 16, 512⟩, ⟨32, 32, 2048, 16, 16, 511⟩,
-      ⟨48, 48, 4608, 16, 16, 512⟩, ⟨0x40000000, 16, 0x800000000, 0x40000000, 16, 0x800000000⟩] do
+      ⟨0x1000000, 16, 0x20000000, 16, 16, 512⟩, ⟨0x40000000, 16, 0x800000000, 0x40000000, 16, 0x800000000⟩] do
     if lumaAcceptance16x16U16LeGateSpec.gate x then return false
   if execLnirLumaAcceptance16x16U16LeBaC (src.extract 0 2047) 32 32 dst 16 16 != 0 then return false
   if execLnirLumaAcceptance16x16U16LeBaC src 32 32 (dst.extract 0 511) 16 16 != 0 then return false
