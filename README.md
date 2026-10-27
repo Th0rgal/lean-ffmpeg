@@ -19,12 +19,18 @@ The October 27 campaign pins FFmpeg commit
 `bf0e831606938f530326c9679591109407fa8d0d`. Its configured manifest contains
 5,721 targets. A broader source inventory retains 6,133 entries, including 68
 explicit pixel-format overapproximations; it is **not certified complete**.
-The baseline still contains candidate failures and unavailable cases. Passing
+The full configured run of `62ba8fd` recorded 4,241 fresh candidate-invoked
+passes, 832 failures, 609 rows without candidate execution, and 39 prerequisite
+blocks. All 5,721 configured names remain in the denominator; 412 provisional
+entries were not enabled. Passing
 delegated CLI tests does not establish standalone codec, library/API, checkasm,
 or ffprobe parity. No new cross-hardware speedup has been certified.
 
 See [reproducible campaign harnesses](docs/FATE_CAMPAIGN_HARNESSES.md) for inventory,
 execution attribution, explicit historical manifests, and paired timing controls.
+The [October 27 evidence snapshot](docs/CAMPAIGN_PROGRESS_20261027.md) records
+selected correctness waves, measured delegated regressions, and the limited
+native oracle/profile observations.
 
 ## Performance across x86, DGX Spark and Apple Silicon
 
