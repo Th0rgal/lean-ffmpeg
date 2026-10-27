@@ -1,5 +1,11 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-27 MPEG delegated-option validation under Lean v4.35.0 audited
+**8,897 declarations with zero sorryAx/custom axioms** and **264/264 tight
+specifications**. Build, 53 self-test waves, FFI/kernel checks, 64 unit tests and
+74 differential tests passed. This local quality result does not certify FATE
+coverage or performance; historical counts below retain their original scope.
+
 ## W11-W14 direct all-ratio U8/U16LE acceptance, 10-bit identity zero-copy, dual-step luma stats, surgical trailing-moov, SIMD 3x3 & 3:2 U16LE, 16-lane down2x2_fused_eq, disabled-plane filter skip, and 8-lane box3x3 & AV1 CDEF validation
 
 The direct U16LE and U8 acceptance paths support `1:1`, `2:1`, `3:1`, and general Q8

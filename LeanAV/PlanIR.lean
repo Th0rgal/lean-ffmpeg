@@ -375,6 +375,8 @@ structure MediaPlanIR where
   resources : ResourcePolicyIR
   errors    : List CliError
   backend   : BackendPolicyIR
+  /-- Validated MPEG option/value pairs, retaining repetition and encounter order. -/
+  mpegOptions : List (String × String) := []
   deriving Repr, DecidableEq, Inhabited
 
 /-- Emit exact fractional digits for `rem / den` with leading-zero preservation (`50 / 10000` -> `"005"`). -/
@@ -602,6 +604,23 @@ def stripInternalLffmpegArgs : List String → List String
     else
       tok :: stripInternalLffmpegArgs rest
 
+/-- Exact MPEG encoder option spellings supported by the delegated path. -/
+def isMpegDelegatedValueFlag (tok : String) : Bool :=
+  ["-mpv_flags", "-intra_vlc", "-data_partitioning"].contains tok
+
+/-- Restricted MPEG flag grammar: `0` or `[+-]?ATOM([+-]ATOM)*`.
+    Splitting after at most one leading sign preserves empty segments, so
+    doubled/trailing signs fail the exact atom allowlist. -/
+def isValidMpvFlags (value : String) : Bool :=
+  if value == "0" then true
+  else
+    let body := match value.toList with
+      | '+' :: rest | '-' :: rest => rest
+      | chars => chars
+    let normalized := String.ofList (body.map fun c => if c == '-' then '+' else c)
+    (splitStrOnChar normalized '+').all fun atom =>
+      ["skip_rd", "strict_gop", "qp_rd", "cbp_rd", "naq", "mv0"].contains atom
+
 /-- Extended 1-argument FFmpeg & FATE flags routed to `delegated_faithful`. -/
 def isExtendedDelegatedValueFlag (tok : String) : Bool :=
   if tok == "-y" || tok == "-n" || tok == "-vn" || tok == "-an" || tok == "-sn" ||
@@ -610,6 +629,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
     false
   else if !strStartsWithFast tok "-" then
     false
+  else if isMpegDelegatedValueFlag tok then true
   else if strStartsWithFast tok "-metadata:" ||
           strStartsWithFast tok "-disposition" ||
           strStartsWithFast tok "-map_metadata:" ||
@@ -666,6 +686,9 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
     FFmpeg's value grammar and are validated by the delegated backend. -/
 def isValidExtendedFlagValue (tok value : String) : Bool :=
   if value == "" then false
+  else if tok == "-mpv_flags" then isValidMpvFlags value
+  else if tok == "-intra_vlc" || tok == "-data_partitioning" then
+    value == "0" || value == "1"
   else if tok == "-hash" then
     ["md5", "murmur3", "ripemd128", "ripemd160", "ripemd256", "ripemd320",
      "sha160", "sha224", "sha256", "sha512/224", "sha512/256", "sha384", "sha512",
@@ -711,6 +734,7 @@ structure ExtendedPlanFlags where
   hasLavfiInput          : Bool := false
   hasExtraDelegatedFlags : Bool := false
   extraErrors            : List CliError := []
+  mpegOptions            : List (String × String) := []
   deriving Repr, DecidableEq, Inhabited
 
 def parseSignedMapIndex : String → Option Int
@@ -842,7 +866,10 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
   else if tok == "-ss" then
     { acc with hasExtraDelegatedFlags := acc.hasExtraDelegatedFlags || acc.seenInput, baseArgs := acc.baseArgs ++ ["-ss", value] }
   else if isValidExtendedFlagValue tok value then
-    { acc with hasExtraDelegatedFlags := true }
+    { acc with
+      hasExtraDelegatedFlags := true
+      mpegOptions := if isMpegDelegatedValueFlag tok then
+        acc.mpegOptions ++ [(tok, value)] else acc.mpegOptions }
   else
     { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag (tok ++ " " ++ value)] }
 
@@ -912,7 +939,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   ExtendedPlanFlags.casesOn ext fun _extBaseArgs _extPassthroughArgs extMaps extMetadataEntries
       extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extBsfs
       extDumpPlan _extSeenInput extHasLavfiFmt extHasLavfiInput extHasExtraDelegatedFlags
-      extExtraErrors =>
+      extExtraErrors extMpegOptions =>
   let startMsOpt := cfgStartSec.bind cliSecondsToMillis
   let durMsOpt := cfgDurationSec.bind cliSecondsToMillis
   let startOverflow := cfgStartSec.isSome && startMsOpt.isNone
@@ -1023,6 +1050,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     inferredFmt != "mp4" ||
     !isSingleMp4Input ||
     extHasExtraDelegatedFlags ||
+    !extMpegOptions.isEmpty ||
     extNoSubtitle ||
     !extMaps.isEmpty ||
     !extMetadataEntries.isEmpty ||
@@ -1098,6 +1126,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       logLevel := cfgLogLevel
       dumpPlan := extDumpPlan
     }
+    mpegOptions := extMpegOptions
     errors := allErrors
     backend := {
       tier := tier
@@ -1131,7 +1160,7 @@ def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
 -/
 def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :=
   MediaPlanIR.casesOn plan fun planInputs planOutputs planStreams _planPrograms planMaps
-      planGraphs planTimeline planMetadata planResources _planErrors _planBackend =>
+      planGraphs planTimeline planMetadata planResources _planErrors _planBackend planMpegOptions =>
   ResourcePolicyIR.casesOn planResources fun resThreads resJsonOutput resHideBanner
       resShowStats resLogLevel resDumpPlan =>
   TimelineIR.casesOn planTimeline fun timeStartSec timeDurationSec _timeStartMs _timeDurMs _timeFps =>
@@ -1209,6 +1238,7 @@ def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :
       (match oAudioBitrate with | some ab => ["-b:a", ab] | none => []) ++
       (if forDelegation then (match resThreads with | some t => ["-threads", s!"{t}"] | none => []) else []) ++
       (match oMovflags with | some mf => ["-movflags", mf] | none => []) ++
+      planMpegOptions.flatMap (fun (flag, value) => [flag, value]) ++
       (if forDelegation && oFormat == "null" then
         ["-f", "null", "-"]
        else
@@ -1272,7 +1302,9 @@ def serializePlanIRJson (plan : MediaPlanIR) : String :=
   let p5b := s!"\"map_chapters\":{plan.metadata.mapChaptersSource},\"preserve_color\":{plan.metadata.preserveColor}},"
   let p6a := s!"\"resources\":\{\"log_level\":\"{escapeJsonStr plan.resources.logLevel}\",\"json_output\":{plan.resources.jsonOutput},"
   let p6b := s!"\"hide_banner\":{plan.resources.hideBanner},\"show_stats\":{plan.resources.showStats}},"
-  let p7 := s!"\"error_count\":{plan.errors.length}}"
+  let mpegJson := String.intercalate "," (plan.mpegOptions.map fun (flag, value) =>
+    s!"\{\"flag\":\"{escapeJsonStr flag}\",\"value\":\"{escapeJsonStr value}\"}")
+  let p7 := s!"\"mpeg_options\":[{mpegJson}],\"error_count\":{plan.errors.length}}"
   p0 ++ p1a ++ p1b ++ p2 ++ p3 ++ p4 ++ p5a ++ p5b ++ p6a ++ p6b ++ p7
 
 /-- Shell-free `execvp` argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
