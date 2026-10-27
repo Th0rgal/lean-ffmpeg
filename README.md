@@ -19,22 +19,23 @@ The October 27 campaign pins FFmpeg commit
 `bf0e831606938f530326c9679591109407fa8d0d`. Its configured manifest contains
 5,721 targets. A broader source inventory retains 6,133 entries, including 68
 explicit pixel-format overapproximations; it is **not certified complete**.
-The full configured run of `62ba8fd` recorded 4,241 fresh candidate-invoked
-passes, 832 failures, 609 rows without candidate execution, and 39 prerequisite
-blocks. All 5,721 configured names remain in the denominator; 412 provisional
-entries were not enabled. Passing
-delegated CLI tests does not establish standalone codec, library/API, checkasm,
-or ffprobe parity. No new cross-hardware speedup has been certified.
+The latest isolated configured run of `8806be9` recorded 4,407 fresh
+candidate-invoked CLI passes, 646 candidate failures, 72 prerequisite blocks,
+215 candidate-unexercised rows, 380 helper/text rows without candidate credit,
+and one source-only row. All 5,721 configured names remain in the denominator;
+412 entries were not enabled, including the 68 overapproximations. An independent
+audit accepted receipt consistency, not full parity or an oracle certificate.
+Passing delegated CLI tests does not establish standalone codec, library/API,
+checkasm, or ffprobe parity. No new cross-hardware speedup has been certified.
 
 See [reproducible campaign harnesses](docs/FATE_CAMPAIGN_HARNESSES.md) for inventory,
-execution attribution, explicit historical manifests, and paired timing controls.
+execution attribution, historical manifests, and paired timing controls.
 The [October 27 evidence snapshot](docs/CAMPAIGN_PROGRESS_20261027.md) records
-selected correctness waves, measured delegated regressions, and the limited
-native oracle/profile observations.
-The VVC routing wave `05c1fdc` passed all 61 selected historical failures and
-Linux/macOS CI; this bounded delegated result does not update the full-run
-counts above. The applicability harness records per-target configuration
-observations while retaining the complete provisional inventory.
+correctness waves, measured delegated regressions, and the limited native oracle
+and profiling results. AAC routing commit `8806be9` passed 15 of its 17 retained
+targets; the two known option co-blockers remain failures. Linux/macOS CI passed.
+A separate actual GPL configuration enabled 57 additional inventory members;
+that configuration-list observation is not runtime coverage.
 
 ## Performance across x86, DGX Spark and Apple Silicon
 
