@@ -13,6 +13,19 @@ sizes, truncated buffers, and the full UInt16 range.
 
 ---
 
+## Full upstream FATE campaign
+
+The October 27 campaign pins FFmpeg commit
+`bf0e831606938f530326c9679591109407fa8d0d`. Its configured manifest contains
+5,721 targets. A broader source inventory retains 6,133 entries, including 68
+explicit pixel-format overapproximations; it is **not certified complete**.
+The baseline still contains candidate failures and unavailable cases. Passing
+delegated CLI tests does not establish standalone codec, library/API, checkasm,
+or ffprobe parity. No new cross-hardware speedup has been certified.
+
+See [reproducible campaign harnesses](docs/FATE_CAMPAIGN_HARNESSES.md) for inventory,
+execution attribution, explicit historical manifests, and paired timing controls.
+
 ## Performance across x86, DGX Spark and Apple Silicon
 
 The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
