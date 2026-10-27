@@ -1328,6 +1328,15 @@ def lumaAcceptanceFastPathGateSpec :
   nonVacuous := rfl
   tight := rfl
 
+/-- Extract 8-bit MSB (`u16 >>> 2`) luma plane from a 10-bit LE (`yuv420p10le`) plane buffer for 16x16 macroblock SAD/PSNR measurement. -/
+def extractU16LeMsb8Pure (luma16 : @& ByteArray) (nPixels : Nat) : ByteArray :=
+  let n := Nat.min nPixels (luma16.size / 2)
+  let bytes := (List.range n).map (fun i =>
+    let bOff := i * 2
+    let u16 : UInt16 := (luma16.get! bOff).toUInt16 ||| ((luma16.get! (bOff + 1)).toUInt16 <<< 8)
+    ((u16 >>> 2) &&& 0xFF).toUInt8)
+  { data := bytes.toArray }
+
 /--
   Fast 16x16 macroblock luma acceptance evaluator (`measureLumaAcceptance16x16Fast`):
   Dispatches to the compiled LLVM 18 SIMD kernel `@lean_native_luma_acceptance_16x16_u8` via
@@ -1350,6 +1359,41 @@ def measureLumaAcceptance16x16Fast
     (maxSad, psnrX10, distOk)
   else
     measureLumaAcceptance16x16Pure src srcW srcH dst dstW dstH
+
+/-- Complete U16LE planes with the same geometry and arithmetic bounds as the u8 kernel. -/
+def lumaAcceptance16x16U16LeGateSpec : AVGateSpec LumaAcceptanceFastPathInput
+    (fun x => LumaAcceptanceFastPathSafe
+      { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 }) where
+  gate := fun x => checkLumaAcceptanceFastPath
+    { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 }
+  sound := fun x => (lumaAcceptanceFastPath_iff
+    { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 }).mp
+  complete := fun x => (lumaAcceptanceFastPath_iff
+    { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 }).mpr
+  posWitness := ⟨32, 32, 2048, 16, 16, 512⟩
+  negWitness := ⟨32, 32, 2048, 16, 16, 511⟩
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Admission exactly characterizes full two-byte pixels and supported native geometry. -/
+theorem lumaAcceptance16x16U16LeGateSpec_iff (x : LumaAcceptanceFastPathInput) :
+    lumaAcceptance16x16U16LeGateSpec.gate x = true ↔ LumaAcceptanceFastPathSafe
+      { x with srcCap := x.srcCap / 2, dstCap := x.dstCap / 2 } :=
+  lumaAcceptance16x16U16LeGateSpec.iff_safe x
+
+/-- Measure directly from U16LE buffers, decoding only sampled pixels. Unsupported geometry
+    and short buffers retain the exact pure extraction and acceptance semantics. -/
+@[inline]
+def measureLumaAcceptance16x16U16LeFast
+    (src : @& ByteArray) (srcW srcH : Nat)
+    (dst : @& ByteArray) (dstW dstH : Nat) : UInt64 × UInt64 × UInt32 :=
+  if lumaAcceptance16x16U16LeGateSpec.gate ⟨srcW, srcH, src.size, dstW, dstH, dst.size⟩ then
+    let packed := LeanAV.NativeKernels.execLnirLumaAcceptance16x16U16LeBaC
+      src srcW.toUInt64 srcH.toUInt64 dst dstW.toUInt64 dstH.toUInt64
+    (packed &&& 0xFFFFFF, (packed >>> 24) &&& 0xFFFF, ((packed >>> 40) &&& 1).toUInt32)
+  else
+    measureLumaAcceptance16x16Pure (extractU16LeMsb8Pure src (srcW * srcH)) srcW srcH
+      (extractU16LeMsb8Pure dst (dstW * dstH)) dstW dstH
 
 /--
   Direct 16x16 macroblock acceptance measurement between two `ByteArray` luma planes:
@@ -1495,15 +1539,6 @@ def computeLumaStatsU16LePure (luma16 : @& ByteArray) (nPixels : Nat) : UInt64 �
     i := i + step
   let packed := computeLumaMeanVarPackedU64 sum sumSq cnt
   return (packed &&& 0xFFFFFFFF, packed >>> 32)
-
-/-- Extract 8-bit MSB (`u16 >>> 2`) luma plane from a 10-bit LE (`yuv420p10le`) plane buffer for 16x16 macroblock SAD/PSNR measurement. -/
-def extractU16LeMsb8Pure (luma16 : @& ByteArray) (nPixels : Nat) : ByteArray :=
-  let n := Nat.min nPixels (luma16.size / 2)
-  let bytes := (List.range n).map (fun i =>
-    let bOff := i * 2
-    let u16 : UInt16 := (luma16.get! bOff).toUInt16 ||| ((luma16.get! (bOff + 1)).toUInt16 <<< 8)
-    ((u16 >>> 2) &&& 0xFF).toUInt8)
-  { data := bytes.toArray }
 
 /-- Exact UInt64 and complete-pixel bounds for native U16LE luma operations. -/
 def u16LeMsb8GateSpec : AVGateSpec (Nat × Nat)
@@ -2004,6 +2039,24 @@ def isSpecialOutputTarget (outPath : String) : Bool :=
   outPath == "" || outPath == "-" || outPath == "/dev/null" ||
   outPath.startsWith "pipe:" || outPath.startsWith "md5:"
 
+/-- Admit a nonempty asynchronous encoder write only after the previous write succeeded. -/
+def pipelinedEncodeWriteGateSpec : AVGateSpec (Bool × Bool × Nat)
+    (fun (hasEncChild, prevWriteOk, frameBytes) =>
+      hasEncChild = true ∧ prevWriteOk = true ∧ 0 < frameBytes) where
+  gate := fun (hasEncChild, prevWriteOk, frameBytes) =>
+    decide (hasEncChild = true ∧ prevWriteOk = true ∧ 0 < frameBytes)
+  sound := by intro ⟨hasEncChild, prevWriteOk, frameBytes⟩ h; simpa using h
+  complete := by intro ⟨hasEncChild, prevWriteOk, frameBytes⟩ h; simpa using h
+  posWitness := (true, true, 1)
+  negWitness := (true, false, 1)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem pipelinedEncodeWriteGateSpec_iff (hasEncChild prevWriteOk : Bool) (frameBytes : Nat) :
+    pipelinedEncodeWriteGateSpec.gate (hasEncChild, prevWriteOk, frameBytes) = true ↔
+      hasEncChild = true ∧ prevWriteOk = true ∧ 0 < frameBytes :=
+  pipelinedEncodeWriteGateSpec.iff_safe (hasEncChild, prevWriteOk, frameBytes)
+
 /--
   Pure Lean 4 Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`transcodeMp4GeneralVerifiedIO`):
   Supports:
@@ -2140,8 +2193,15 @@ def transcodeMp4GeneralVerifiedIO
       vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
 
   let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
+  let srcYSz := srcW * srcH
+  let srcUvSz := (srcW / 2) * (srcH / 2)
+  let bps := if is10bit then 2 else 1
+  let frameBytes := (srcYSz + 2 * srcUvSz) * bps
+  let dstYSz := dstW * dstH
+
   let needTabs : Bool :=
-    (is10bit || srcW > 32768 || srcH > 32768) &&
+    ((is10bit && !LeanAV.Scale.yuv420p10leScaleGateSpec.gate (srcW, srcH, dstW, dstH, frameBytes)) ||
+      srcW > 32768 || srcH > 32768) &&
     !(srcW == dstW && srcH == dstH) &&
     !(srcW == dstW * 2 && srcH == dstH * 2) &&
     !(srcW == dstW * 3 && srcH == dstH * 3) &&
@@ -2150,12 +2210,6 @@ def transcodeMp4GeneralVerifiedIO
   let yYTab  := if needTabs then buildBilinearTabQ8 srcH dstH else #[]
   let uvXTab := if needTabs then buildBilinearTabQ8 (srcW / 2) (dstW / 2) else #[]
   let uvYTab := if needTabs then buildBilinearTabQ8 (srcH / 2) (dstH / 2) else #[]
-
-  let srcYSz := srcW * srcH
-  let srcUvSz := (srcW / 2) * (srcH / 2)
-  let bps := if is10bit then 2 else 1
-  let frameBytes := (srcYSz + 2 * srcUvSz) * bps
-  let dstYSz := dstW * dstH
 
   let decChild ← IO.Process.spawn {
     cmd := ffmpegBin
@@ -2173,6 +2227,7 @@ def transcodeMp4GeneralVerifiedIO
   let mut psnrMin : UInt64 := 600
   let mut distLtBlackAll : UInt32 := 1
   let mut writeFailed : Bool := false
+  let mut prevWriteTaskOpt : Option (Task (Except IO.Error Bool)) := none
   let mut nextFrameTaskOpt : Option (Task (Except IO.Error (Option ByteArray))) := none
   if outputFrameLimit == 0 || framesDone < outputFrameLimit then
     let t ← IO.asTask (readExactBytesFromHandle decChild.stdout frameBytes)
@@ -2213,15 +2268,22 @@ def transcodeMp4GeneralVerifiedIO
       encChildOpt := some ec
 
     if isIdentityU8 then
-      if let some ec := encChildOpt then
-        let wroteOk ← (do
-          try
-            ec.stdin.write srcBuf
-            pure true
-          catch _ =>
-            pure false)
-        if !wroteOk then
+      let dstFrame := srcBuf
+      if let some prevTask := prevWriteTaskOpt then
+        prevWriteTaskOpt := none
+        let wRes ← IO.wait prevTask
+        if !(match wRes with | .ok b => b | .error _ => false) then
           writeFailed := true
+      if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
+        if let some ec := encChildOpt then
+          let frameToSend := dstFrame
+          let wTask ← IO.asTask (do
+            try
+              ec.stdin.write frameToSend
+              pure true
+            catch _ =>
+              pure false)
+          prevWriteTaskOpt := some wTask
       if !writeFailed then
         let (fMean, fVar) := computeLumaStatsU8Fast srcBuf dstYSz
         meanAccum := meanAccum + fMean
@@ -2242,15 +2304,21 @@ def transcodeMp4GeneralVerifiedIO
           let scaled := scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
           applyPixelFiltersYuv420pFrameFast scaled dstW dstH filterFlags
 
-      if let some ec := encChildOpt then
-        let wroteOk ← (do
-          try
-            ec.stdin.write dstFrame
-            pure true
-          catch _ =>
-            pure false)
-        if !wroteOk then
+      if let some prevTask := prevWriteTaskOpt then
+        prevWriteTaskOpt := none
+        let wRes ← IO.wait prevTask
+        if !(match wRes with | .ok b => b | .error _ => false) then
           writeFailed := true
+      if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
+        if let some ec := encChildOpt then
+          let frameToSend := dstFrame
+          let wTask ← IO.asTask (do
+            try
+              ec.stdin.write frameToSend
+              pure true
+            catch _ =>
+              pure false)
+          prevWriteTaskOpt := some wTask
 
       if !writeFailed then
         let (fMean, fVar) :=
@@ -2269,14 +2337,16 @@ def transcodeMp4GeneralVerifiedIO
             if fPsnr < psnrMin then psnrMin := fPsnr
             if fDist == 0 then distLtBlackAll := 0
           else
-            let srcY8 := extractU16LeMsb8Fast srcBuf srcYSz
-            let dstY8 := extractU16LeMsb8Fast dstFrame dstYSz
-            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Fast srcY8 srcW srcH dstY8 dstW dstH
+            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16U16LeFast srcBuf srcW srcH dstFrame dstW dstH
             if fSad > maxSadWorst then maxSadWorst := fSad
             if fPsnr < psnrMin then psnrMin := fPsnr
             if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
         framesDone := framesDone + 1
 
+  if let some pendingWrite := prevWriteTaskOpt then
+    let wRes ← IO.wait pendingWrite
+    if !(match wRes with | .ok b => b | .error _ => false) then
+      writeFailed := true
   if let some pendingTask := nextFrameTaskOpt then
     let _ ← IO.wait pendingTask
   drainHandleUntilEof decChild.stdout

@@ -1371,6 +1371,50 @@ def runVerifyFfi (mp4PathOpt : Option String) : IO UInt32 := do
   IO.println s!"\{\"ok\":{allOk},\"phase\":5,\"abi_version\":\"0x00010005\",\"abi_ok\":{abiOk},\"cancel_gate_ok\":{cancelOk},\"corrupt_rejected\":{corruptRejected},\"mp4_probe_ok\":{mp4ProbeRes.ok},\"mp4_width\":{mp4ProbeRes.width},\"mp4_height\":{mp4ProbeRes.height},\"plane_ffi_contract_ok\":{planeContractOk}}"
   return if allOk then 0 else 1
 
+/-- Direct U16LE acceptance agrees with pure extraction, including fallback geometries. -/
+private def verifyLumaAcceptanceU16Le : Bool := Id.run do
+  let plane (n seed : Nat) : ByteArray := Id.run do
+    let mut out := ByteArray.emptyWithCapacity (2 * n)
+    for i in [:n] do
+      let v := (i * 7919 + seed) % 65536
+      out := (out.push v.toUInt8).push (v / 256).toUInt8
+    return out
+  let agrees (src : ByteArray) (sw sh : Nat) (dst : ByteArray) (dw dh : Nat) :=
+    measureLumaAcceptance16x16U16LeFast src sw sh dst dw dh ==
+      measureLumaAcceptance16x16Pure (extractU16LeMsb8Pure src (sw * sh)) sw sh
+        (extractU16LeMsb8Pure dst (dw * dh)) dw dh
+  for (sw, sh, dw, dh) in [(0, 0, 0, 0), (1, 1, 16, 16), (2, 3, 17, 19),
+      (15, 15, 15, 15), (16, 16, 16, 16), (17, 19, 17, 19), (33, 35, 33, 35),
+      (34, 38, 17, 19), (64, 96, 32, 48), (48, 48, 16, 16), (27, 41, 35, 19),
+      (255, 257, 255, 257), (256, 256, 256, 256), (258, 260, 129, 130),
+      (514, 518, 257, 259)] do
+    let src := plane (sw * sh) 65535
+    let dst := plane (dw * dh) 1024
+    if !agrees src sw sh dst dw dh then return false
+    if !agrees src sw sh src sw sh then return false
+    for cut in [1, 3, src.size + 1] do
+      if !agrees (src.extract 0 (src.size - cut)) sw sh dst dw dh then return false
+    if !agrees src sw sh (dst.extract 0 (dst.size - 1)) dw dh then return false
+    if !agrees (src.push 255) sw sh (dst.push 255) dw dh then return false
+  -- Every UInt16 appears in a sampled 16x16 block, including all discarded high bits.
+  for chunk in [:256] do
+    let src := plane 256 (chunk * 256 * 7919)
+    let dst := plane 256 (65535 - chunk * 256)
+    if !agrees src 16 16 dst 16 16 then return false
+  let src := plane 1024 65535
+  let dst := plane 256 64
+  if !lumaAcceptance16x16U16LeGateSpec.gate ⟨32, 32, 2048, 16, 16, 512⟩ then return false
+  for x in [⟨32, 32, 2047, 16, 16, 512⟩, ⟨32, 32, 2048, 16, 16, 511⟩,
+      ⟨48, 48, 4608, 16, 16, 512⟩, ⟨0x40000000, 16, 0x800000000, 0x40000000, 16, 0x800000000⟩] do
+    if lumaAcceptance16x16U16LeGateSpec.gate x then return false
+  if execLnirLumaAcceptance16x16U16LeBaC (src.extract 0 2047) 32 32 dst 16 16 != 0 then return false
+  if execLnirLumaAcceptance16x16U16LeBaC src 32 32 (dst.extract 0 511) 16 16 != 0 then return false
+  if execLnirLumaAcceptance16x16U16LeBaC src 48 48 dst 16 16 != 0 then return false
+  for huge in [0x40000000, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF] do
+    if execLnirLumaAcceptance16x16U16LeBaC src huge huge dst huge huge !=
+        packAcceptanceMetricsU64 0 450 1 then return false
+  return true
+
 /-- Phase 6 (Wave H) Independent Verified Kernels Verification & Micro-Benchmark (`lffmpeg verify-kernels`). -/
 def runVerifyKernels : IO UInt32 := do
   let t0 ← IO.monoNanosNow
@@ -1414,7 +1458,8 @@ def runVerifyKernels : IO UInt32 := do
 
   -- 4. Runtime execution of `lean-native-core`-compiled LNIR machine code (`c/leanav_lnir_x86_64.ll` / `arm64.ll`)
   --    verified bit-for-bit against formal `evalLnirKernel` and `leanSpecH264IdctTupleAccumSroa`
-  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative && verifyU16LeNative
+  let u16AcceptanceOk := verifyLumaAcceptanceU16Le
+  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative && verifyU16LeNative && u16AcceptanceOk
   let lnirSroaOk  := execLnirH264IdctTupleSroaC 16 7 == leanSpecH264IdctTupleAccumSroa 16 7
   let vX : List Int64 := [0, 16, 63, 64, 128, 512, 940, 1023]
   let vY : List Int64 := [3, -5, 10, 20, -15, 7, 4, 2]
@@ -1441,7 +1486,7 @@ def runVerifyKernels : IO UInt32 := do
 
   let t1 ← IO.monoNanosNow
   let allOk := rescaleOk && scaleOk && ivfOk && lnirCompiledOk
-  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"bench_us\":{(t1 - t0) / 1000}}"
+  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"u16le_acceptance_ok\":{u16AcceptanceOk},\"bench_us\":{(t1 - t0) / 1000}}"
   return if allOk then 0 else 1
 
 def main (args : List String) : IO UInt32 := do

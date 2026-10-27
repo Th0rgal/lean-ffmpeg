@@ -3,6 +3,8 @@ source_filename = "LeanAV.DSP.Kernels.lean"
 target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
 target triple = "aarch64-unknown-linux-gnu"
 
+declare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)
+
 ; --- LeanNative Runtime Intrinsics & C ABI Entrypoints ---
 declare i1 @llvm.expect.i1(i1, i1) #2
 declare <16 x i8> @llvm.aarch64.neon.pmull64(i64, i64) #2
@@ -988,7 +990,7 @@ loop.body:
   %idx_next = add i64 %idx, %step
   %remaining = sub i64 %nPixels, %idx
   %more = icmp ult i64 %step, %remaining
-  br i1 %more, label %loop.body, label %compute.out, !llvm.loop !0
+  br i1 %more, label %loop.body, label %compute.out
 compute.out:
   %mean = udiv i64 %sum_next, %cnt_next
   %meanSq = udiv i64 %sumSq_next, %cnt_next
@@ -1255,7 +1257,7 @@ col.compute:
   store i8 %byte, ptr %dp, align 1
   %nextX = add i64 %dx, 1
   %moreX = icmp ult i64 %nextX, %dstW
-  br i1 %moreX, label %col, label %rowEnd, !llvm.loop !0
+  br i1 %moreX, label %col, label %rowEnd
 rowEnd:
   %nextY = add i64 %dy, 1
   %moreY = icmp ult i64 %nextY, %dstH
@@ -1334,6 +1336,140 @@ half:
   %be = zext <16 x i8> %be8 to <16 x i32>
   %bo8 = shufflevector <32 x i8> %b, <32 x i8> poison, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
   %bo = zext <16 x i8> %bo8 to <16 x i32>
+  %ab = add <16 x i32> %ae, %ao
+  %bb = add <16 x i32> %be, %bo
+  %sum = add <16 x i32> %ab, %bb
+  %rounded = add <16 x i32> %sum, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %r2 = lshr <16 x i32> %rounded, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  br label %reduce
+reduce:
+  %r = phi <16 x i32> [ %r1, %same ], [ %r2, %half ]
+  %dge = icmp uge <16 x i32> %d, %r
+  %drd = sub <16 x i32> %d, %r
+  %rdd = sub <16 x i32> %r, %d
+  %ad = select <16 x i1> %dge, <16 x i32> %drd, <16 x i32> %rdd
+  %rge = icmp uge <16 x i32> %r, <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>
+  %r16 = sub <16 x i32> %r, <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>
+  %b16 = sub <16 x i32> <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>, %r
+  %bd = select <16 x i1> %rge, <16 x i32> %r16, <16 x i32> %b16
+  %sq = mul <16 x i32> %ad, %ad
+  %rsad = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %ad)
+  %rblack = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %bd)
+  %rref = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %r)
+  %rsse = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %sq)
+  %sadn = add i32 %sad, %rsad
+  %blackn = add i32 %black, %rblack
+  %refn = add i32 %refsum, %rref
+  %ssen = add i32 %sse, %rsse
+  %yn = add i64 %y, 1
+  %rowdone = icmp eq i64 %yn, 16
+  br i1 %rowdone, label %blockend, label %row
+blockend:
+  %sad64 = zext i32 %sadn to i64
+  %sq64 = zext i32 %ssen to i64
+  %larger = icmp ugt i64 %sad64, %oldmax
+  %newmax = select i1 %larger, i64 %sad64, i64 %oldmax
+  store i64 %newmax, ptr %outMetrics4, align 8
+  %newsq = add i64 %oldsq, %sq64
+  store i64 %newsq, ptr %o1, align 8
+  %newpix = add i64 %oldpix, 256
+  store i64 %newpix, ptr %o2, align 8
+  %bright = icmp uge i32 %refn, 6144
+  %worse = icmp uge i32 %sadn, %blackn
+  %bad = and i1 %bright, %worse
+  %newok = select i1 %bad, i64 0, i64 %oldok
+  store i64 %newok, ptr %o3, align 8
+  %bxn = add i64 %bxi, %sx
+  %morex = icmp ule i64 %bxn, %xlim
+  br i1 %morex, label %bx, label %nexty
+nexty:
+  %byn = add i64 %byi, %sy
+  %morey = icmp ule i64 %byn, %ylim
+  br i1 %morey, label %by, label %exit
+exit:
+  ret void
+}
+define weak_odr dso_local void @lean_native_luma_acceptance_16x16_u16le(ptr noalias noundef readonly %src, i64 noundef %srcW, i64 noundef %srcH, ptr noalias noundef readonly %dst, i64 noundef %dstW, i64 noundef %dstH, ptr noalias noundef writeonly %outMetrics4) #0 {
+entry:
+  store i64 0, ptr %outMetrics4, align 8
+  %o1 = getelementptr i64, ptr %outMetrics4, i64 1
+  %o2 = getelementptr i64, ptr %outMetrics4, i64 2
+  %o3 = getelementptr i64, ptr %outMetrics4, i64 3
+  store i64 0, ptr %o1, align 8
+  store i64 0, ptr %o2, align 8
+  store i64 1, ptr %o3, align 8
+  %wok = icmp uge i64 %dstW, 16
+  %hok = icmp uge i64 %dstH, 16
+  %ok = and i1 %wok, %hok
+  %one = icmp eq i64 %srcW, %dstW
+  %wide = icmp uge i64 %dstW, 256
+  %tall = icmp uge i64 %dstH, 256
+  %sx = select i1 %wide, i64 64, i64 16
+  %sy = select i1 %tall, i64 64, i64 16
+  %xlim = sub i64 %dstW, 16
+  %ylim = sub i64 %dstH, 16
+  br i1 %ok, label %by, label %exit
+by:
+  %byi = phi i64 [ 0, %entry ], [ %byn, %nexty ]
+  %oldmaxy = phi i64 [ 0, %entry ], [ %newmax, %nexty ]
+  %oldsqy = phi i64 [ 0, %entry ], [ %newsq, %nexty ]
+  %oldpixy = phi i64 [ 0, %entry ], [ %newpix, %nexty ]
+  %oldoky = phi i64 [ 1, %entry ], [ %newok, %nexty ]
+  br label %bx
+bx:
+  %bxi = phi i64 [ 0, %by ], [ %bxn, %blockend ]
+  %oldmax = phi i64 [ %oldmaxy, %by ], [ %newmax, %blockend ]
+  %oldsq = phi i64 [ %oldsqy, %by ], [ %newsq, %blockend ]
+  %oldpix = phi i64 [ %oldpixy, %by ], [ %newpix, %blockend ]
+  %oldok = phi i64 [ %oldoky, %by ], [ %newok, %blockend ]
+  br label %row
+row:
+  %y = phi i64 [ 0, %bx ], [ %yn, %reduce ]
+  %sad = phi i32 [ 0, %bx ], [ %sadn, %reduce ]
+  %black = phi i32 [ 0, %bx ], [ %blackn, %reduce ]
+  %refsum = phi i32 [ 0, %bx ], [ %refn, %reduce ]
+  %sse = phi i32 [ 0, %bx ], [ %ssen, %reduce ]
+  %dy = add i64 %byi, %y
+  %dr = mul i64 %dy, %dstW
+  %di = add i64 %dr, %bxi
+  %dp = getelementptr i16, ptr %dst, i64 %di
+  %db = load <16 x i16>, ptr %dp, align 1
+  %draw = zext <16 x i16> %db to <16 x i32>
+  %dshift = lshr <16 x i32> %draw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %d = and <16 x i32> %dshift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
+  br i1 %one, label %same, label %half
+same:
+  %sp = getelementptr i16, ptr %src, i64 %di
+  %sb = load <16 x i16>, ptr %sp, align 1
+  %r1raw = zext <16 x i16> %sb to <16 x i32>
+  %r1shift = lshr <16 x i32> %r1raw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %r1 = and <16 x i32> %r1shift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
+  br label %reduce
+half:
+  %sr = mul i64 %dy, %srcW
+  %si0 = add i64 %sr, %bxi
+  %si = shl i64 %si0, 1
+  %si1 = add i64 %si, %srcW
+  %p0 = getelementptr i16, ptr %src, i64 %si
+  %p1 = getelementptr i16, ptr %src, i64 %si1
+  %a = load <32 x i16>, ptr %p0, align 1
+  %b = load <32 x i16>, ptr %p1, align 1
+  %ae8 = shufflevector <32 x i16> %a, <32 x i16> poison, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
+  %aeraw = zext <16 x i16> %ae8 to <16 x i32>
+  %aeshift = lshr <16 x i32> %aeraw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %ae = and <16 x i32> %aeshift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
+  %ao8 = shufflevector <32 x i16> %a, <32 x i16> poison, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
+  %aoraw = zext <16 x i16> %ao8 to <16 x i32>
+  %aoshift = lshr <16 x i32> %aoraw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %ao = and <16 x i32> %aoshift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
+  %be8 = shufflevector <32 x i16> %b, <32 x i16> poison, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
+  %beraw = zext <16 x i16> %be8 to <16 x i32>
+  %beshift = lshr <16 x i32> %beraw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %be = and <16 x i32> %beshift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
+  %bo8 = shufflevector <32 x i16> %b, <32 x i16> poison, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
+  %boraw = zext <16 x i16> %bo8 to <16 x i32>
+  %boshift = lshr <16 x i32> %boraw, <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2>
+  %bo = and <16 x i32> %boshift, <i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255, i32 255>
   %ab = add <16 x i32> %ae, %ao
   %bb = add <16 x i32> %be, %bo
   %sum = add <16 x i32> %ab, %bb
@@ -2868,7 +3004,7 @@ dispatch:
   %vlim = and i64 %dw, -4
   br i1 %eq2, label %b2row, label %check3
 check3:
-  br i1 %eq3, label %b3row, label %qrow
+  br i1 %eq3, label %b3row, label %qsetup
 b2row:
   %y2 = phi i64 [ 0, %dispatch ], [ %yn2, %b2end ]
   %r2a = mul i64 %y2, %sw
@@ -3023,72 +3159,262 @@ b3end:
   %yn3 = add i64 %y3, 1
   %ymore3 = icmp ult i64 %yn3, %dh
   br i1 %ymore3, label %b3row, label %exit
-qrow:
-  %qy = phi i64 [ 0, %check3 ], [ %qyn, %qend ]
-  %ynum0 = mul i64 %qy, %sh
-  %ynum = shl i64 %ynum0, 8
-  %yq8 = udiv i64 %ynum, %dh
-  %sy0 = lshr i64 %yq8, 8
-  %syplus = add i64 %sy0, 1
-  %yinside = icmp ult i64 %syplus, %sh
-  %sy1 = select i1 %yinside, i64 %syplus, i64 %sy0
-  %fy = and i64 %yq8, 255
-  %ify = sub i64 256, %fy
-  %qr0 = mul i64 %sy0, %sw
-  %qr1 = mul i64 %sy1, %sw
-  %qdr = mul i64 %qy, %dw
-  br label %qbody
-qbody:
-  %qx = phi i64 [ 0, %qrow ], [ %qxn, %qbody ]
-  %xnum0 = mul i64 %qx, %sw
-  %xnum = shl i64 %xnum0, 8
-  %xq8 = udiv i64 %xnum, %dw
-  %sx0 = lshr i64 %xq8, 8
-  %sxplus = add i64 %sx0, 1
-  %xinside = icmp ult i64 %sxplus, %sw
-  %sx1 = select i1 %xinside, i64 %sxplus, i64 %sx0
-  %fx = and i64 %xq8, 255
-  %ifx = sub i64 256, %fx
-%qi00 = add i64 %qr0, %sx0
-  %qp00 = getelementptr i16, ptr %src, i64 %qi00
-  %qb00 = load i16, ptr %qp00, align 1
-  %qv00 = zext i16 %qb00 to i64
-  %qw00 = mul i64 %qv00, %ifx
-%qi01 = add i64 %qr0, %sx1
-  %qp01 = getelementptr i16, ptr %src, i64 %qi01
-  %qb01 = load i16, ptr %qp01, align 1
-  %qv01 = zext i16 %qb01 to i64
-  %qw01 = mul i64 %qv01, %fx
-%qi10 = add i64 %qr1, %sx0
-  %qp10 = getelementptr i16, ptr %src, i64 %qi10
-  %qb10 = load i16, ptr %qp10, align 1
-  %qv10 = zext i16 %qb10 to i64
-  %qw10 = mul i64 %qv10, %ifx
-%qi11 = add i64 %qr1, %sx1
-  %qp11 = getelementptr i16, ptr %src, i64 %qi11
-  %qb11 = load i16, ptr %qp11, align 1
-  %qv11 = zext i16 %qb11 to i64
-  %qw11 = mul i64 %qv11, %fx
-%top = add i64 %qw00, %qw01
-  %bot = add i64 %qw10, %qw11
-  %wt = mul i64 %top, %ify
-  %wb = mul i64 %bot, %fy
-  %qs = add i64 %wt, %wb
-  %qr = add i64 %qs, 32768
-  %qavg = lshr i64 %qr, 16
-  %over = icmp ugt i64 %qavg, 1023
-  %clamp = select i1 %over, i64 1023, i64 %qavg
-  %qt = trunc i64 %clamp to i16
-  %qdi = add i64 %qdr, %qx
-  %qdp = getelementptr i16, ptr %dst, i64 %qdi
-  store i16 %qt, ptr %qdp, align 1
-  %qxn = add i64 %qx, 1
-  %qxmore = icmp ult i64 %qxn, %dw
-  br i1 %qxmore, label %qbody, label %qend
-qend:
-  %qyn = add i64 %qy, 1
-  %qymore = icmp ult i64 %qyn, %dh
-  br i1 %qymore, label %qrow, label %exit
+qsetup:
+  %srcW = add i64 %sw, 0
+  %srcH = add i64 %sh, 0
+  %srcStride = add i64 %sw, 0
+  %dstW = add i64 %dw, 0
+  %dstH = add i64 %dh, 0
+  %sx0_tab = alloca [4096 x i64], align 16
+  %sx1_tab = alloca [4096 x i64], align 16
+  %fx_tab = alloca [4096 x i32], align 16
+  %lastX = sub i64 %srcW, 1
+  %lastY = sub i64 %srcH, 1
+  %scaleX = shl i64 %srcW, 8
+  %scaleY = shl i64 %srcH, 8
+  %use_tab = icmp ule i64 %dstW, 4096
+  br label %check.tab
+check.tab:
+  br i1 %use_tab, label %init.xtab, label %row
+init.xtab:
+  %tx = phi i64 [ 0, %check.tab ], [ %tx_next, %init.xtab ]
+  %tnx = mul i64 %tx, %scaleX
+  %tqx = udiv i64 %tnx, %dstW
+  %trawX = lshr i64 %tqx, 8
+  %txIn = icmp ult i64 %trawX, %srcW
+  %tsx0 = select i1 %txIn, i64 %trawX, i64 %lastX
+  %txPlus = add i64 %tsx0, 1
+  %txNextIn = icmp ult i64 %txPlus, %srcW
+  %tsx1 = select i1 %txNextIn, i64 %txPlus, i64 %tsx0
+  %tfx64 = and i64 %tqx, 255
+  %tfx = trunc i64 %tfx64 to i32
+  %tsx0p = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %tx
+  store i64 %tsx0, ptr %tsx0p, align 8
+  %tsx1p = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %tx
+  store i64 %tsx1, ptr %tsx1p, align 8
+  %tfxp = getelementptr inbounds [4096 x i32], ptr %fx_tab, i64 0, i64 %tx
+  store i32 %tfx, ptr %tfxp, align 4
+  %tx_next = add nuw i64 %tx, 1
+  %tdone = icmp eq i64 %tx_next, %dstW
+  br i1 %tdone, label %row, label %init.xtab
+row:
+  %dy = phi i64 [ 0, %check.tab ], [ 0, %init.xtab ], [ %nextY, %rowEnd ]
+  %ny = mul i64 %dy, %scaleY
+  %qy = udiv i64 %ny, %dstH
+  %rawY = lshr i64 %qy, 8
+  %yIn = icmp ult i64 %rawY, %srcH
+  %sy0 = select i1 %yIn, i64 %rawY, i64 %lastY
+  %yPlus = add i64 %sy0, 1
+  %yNextIn = icmp ult i64 %yPlus, %srcH
+  %sy1 = select i1 %yNextIn, i64 %yPlus, i64 %sy0
+  %fy64 = and i64 %qy, 255
+  %fy = trunc i64 %fy64 to i32
+  %ify = sub i32 256, %fy
+  %r0 = mul i64 %sy0, %srcStride
+  %r1 = mul i64 %sy1, %srcStride
+  %dr = mul i64 %dy, %dstW
+  %fy_seed = insertelement <4 x i32> poison, i32 %fy, i64 0
+  %fy4 = shufflevector <4 x i32> %fy_seed, <4 x i32> poison, <4 x i32> zeroinitializer
+  %ify_seed = insertelement <4 x i32> poison, i32 %ify, i64 0
+  %ify4 = shufflevector <4 x i32> %ify_seed, <4 x i32> poison, <4 x i32> zeroinitializer
+  br i1 %use_tab, label %vec.check, label %col
+vec.check:
+  %dx4 = phi i64 [ 0, %row ], [ %next4, %vec.body ]
+  %next4 = add nuw i64 %dx4, 4
+  %fits4 = icmp ule i64 %next4, %dstW
+  br i1 %fits4, label %vec.body, label %tail.check
+vec.body:
+  %fxp4 = getelementptr inbounds [4096 x i32], ptr %fx_tab, i64 0, i64 %dx4
+  %fx4 = load <4 x i32>, ptr %fxp4, align 16
+  %ifx4 = sub <4 x i32> <i32 256, i32 256, i32 256, i32 256>, %fx4
+  %vx0 = add i64 %dx4, 0
+  %vsx0p0 = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %vx0
+  %vsx0_0 = load i64, ptr %vsx0p0, align 8
+  %vsx1p0 = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %vx0
+  %vsx1_0 = load i64, ptr %vsx1p0, align 8
+  %vi00_0 = add i64 %r0, %vsx0_0
+  %va00_0 = getelementptr i16, ptr %src, i64 %vi00_0
+  %vb00_0 = load i16, ptr %va00_0, align 1
+  %vp00_0 = zext i16 %vb00_0 to i32
+  %v00_0 = insertelement <4 x i32> poison, i32 %vp00_0, i64 0
+  %vi01_0 = add i64 %r0, %vsx1_0
+  %va01_0 = getelementptr i16, ptr %src, i64 %vi01_0
+  %vb01_0 = load i16, ptr %va01_0, align 1
+  %vp01_0 = zext i16 %vb01_0 to i32
+  %v01_0 = insertelement <4 x i32> poison, i32 %vp01_0, i64 0
+  %vi10_0 = add i64 %r1, %vsx0_0
+  %va10_0 = getelementptr i16, ptr %src, i64 %vi10_0
+  %vb10_0 = load i16, ptr %va10_0, align 1
+  %vp10_0 = zext i16 %vb10_0 to i32
+  %v10_0 = insertelement <4 x i32> poison, i32 %vp10_0, i64 0
+  %vi11_0 = add i64 %r1, %vsx1_0
+  %va11_0 = getelementptr i16, ptr %src, i64 %vi11_0
+  %vb11_0 = load i16, ptr %va11_0, align 1
+  %vp11_0 = zext i16 %vb11_0 to i32
+  %v11_0 = insertelement <4 x i32> poison, i32 %vp11_0, i64 0
+  %vx1 = add i64 %dx4, 1
+  %vsx0p1 = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %vx1
+  %vsx0_1 = load i64, ptr %vsx0p1, align 8
+  %vsx1p1 = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %vx1
+  %vsx1_1 = load i64, ptr %vsx1p1, align 8
+  %vi00_1 = add i64 %r0, %vsx0_1
+  %va00_1 = getelementptr i16, ptr %src, i64 %vi00_1
+  %vb00_1 = load i16, ptr %va00_1, align 1
+  %vp00_1 = zext i16 %vb00_1 to i32
+  %v00_1 = insertelement <4 x i32> %v00_0, i32 %vp00_1, i64 1
+  %vi01_1 = add i64 %r0, %vsx1_1
+  %va01_1 = getelementptr i16, ptr %src, i64 %vi01_1
+  %vb01_1 = load i16, ptr %va01_1, align 1
+  %vp01_1 = zext i16 %vb01_1 to i32
+  %v01_1 = insertelement <4 x i32> %v01_0, i32 %vp01_1, i64 1
+  %vi10_1 = add i64 %r1, %vsx0_1
+  %va10_1 = getelementptr i16, ptr %src, i64 %vi10_1
+  %vb10_1 = load i16, ptr %va10_1, align 1
+  %vp10_1 = zext i16 %vb10_1 to i32
+  %v10_1 = insertelement <4 x i32> %v10_0, i32 %vp10_1, i64 1
+  %vi11_1 = add i64 %r1, %vsx1_1
+  %va11_1 = getelementptr i16, ptr %src, i64 %vi11_1
+  %vb11_1 = load i16, ptr %va11_1, align 1
+  %vp11_1 = zext i16 %vb11_1 to i32
+  %v11_1 = insertelement <4 x i32> %v11_0, i32 %vp11_1, i64 1
+  %vx2 = add i64 %dx4, 2
+  %vsx0p2 = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %vx2
+  %vsx0_2 = load i64, ptr %vsx0p2, align 8
+  %vsx1p2 = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %vx2
+  %vsx1_2 = load i64, ptr %vsx1p2, align 8
+  %vi00_2 = add i64 %r0, %vsx0_2
+  %va00_2 = getelementptr i16, ptr %src, i64 %vi00_2
+  %vb00_2 = load i16, ptr %va00_2, align 1
+  %vp00_2 = zext i16 %vb00_2 to i32
+  %v00_2 = insertelement <4 x i32> %v00_1, i32 %vp00_2, i64 2
+  %vi01_2 = add i64 %r0, %vsx1_2
+  %va01_2 = getelementptr i16, ptr %src, i64 %vi01_2
+  %vb01_2 = load i16, ptr %va01_2, align 1
+  %vp01_2 = zext i16 %vb01_2 to i32
+  %v01_2 = insertelement <4 x i32> %v01_1, i32 %vp01_2, i64 2
+  %vi10_2 = add i64 %r1, %vsx0_2
+  %va10_2 = getelementptr i16, ptr %src, i64 %vi10_2
+  %vb10_2 = load i16, ptr %va10_2, align 1
+  %vp10_2 = zext i16 %vb10_2 to i32
+  %v10_2 = insertelement <4 x i32> %v10_1, i32 %vp10_2, i64 2
+  %vi11_2 = add i64 %r1, %vsx1_2
+  %va11_2 = getelementptr i16, ptr %src, i64 %vi11_2
+  %vb11_2 = load i16, ptr %va11_2, align 1
+  %vp11_2 = zext i16 %vb11_2 to i32
+  %v11_2 = insertelement <4 x i32> %v11_1, i32 %vp11_2, i64 2
+  %vx3 = add i64 %dx4, 3
+  %vsx0p3 = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %vx3
+  %vsx0_3 = load i64, ptr %vsx0p3, align 8
+  %vsx1p3 = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %vx3
+  %vsx1_3 = load i64, ptr %vsx1p3, align 8
+  %vi00_3 = add i64 %r0, %vsx0_3
+  %va00_3 = getelementptr i16, ptr %src, i64 %vi00_3
+  %vb00_3 = load i16, ptr %va00_3, align 1
+  %vp00_3 = zext i16 %vb00_3 to i32
+  %v00_3 = insertelement <4 x i32> %v00_2, i32 %vp00_3, i64 3
+  %vi01_3 = add i64 %r0, %vsx1_3
+  %va01_3 = getelementptr i16, ptr %src, i64 %vi01_3
+  %vb01_3 = load i16, ptr %va01_3, align 1
+  %vp01_3 = zext i16 %vb01_3 to i32
+  %v01_3 = insertelement <4 x i32> %v01_2, i32 %vp01_3, i64 3
+  %vi10_3 = add i64 %r1, %vsx0_3
+  %va10_3 = getelementptr i16, ptr %src, i64 %vi10_3
+  %vb10_3 = load i16, ptr %va10_3, align 1
+  %vp10_3 = zext i16 %vb10_3 to i32
+  %v10_3 = insertelement <4 x i32> %v10_2, i32 %vp10_3, i64 3
+  %vi11_3 = add i64 %r1, %vsx1_3
+  %va11_3 = getelementptr i16, ptr %src, i64 %vi11_3
+  %vb11_3 = load i16, ptr %va11_3, align 1
+  %vp11_3 = zext i16 %vb11_3 to i32
+  %v11_3 = insertelement <4 x i32> %v11_2, i32 %vp11_3, i64 3
+  %w004 = mul <4 x i32> %ifx4, %v00_3
+  %w014 = mul <4 x i32> %fx4, %v01_3
+  %w104 = mul <4 x i32> %ifx4, %v10_3
+  %w114 = mul <4 x i32> %fx4, %v11_3
+  %top4 = add <4 x i32> %w004, %w014
+  %bot4 = add <4 x i32> %w104, %w114
+  %wt4 = mul <4 x i32> %ify4, %top4
+  %wb4 = mul <4 x i32> %fy4, %bot4
+  %sum4 = add <4 x i32> %wt4, %wb4
+  %rounded4 = add <4 x i32> %sum4, <i32 32768, i32 32768, i32 32768, i32 32768>
+  %res4 = lshr <4 x i32> %rounded4, <i32 16, i32 16, i32 16, i32 16>
+  %clamped4 = call <4 x i32> @llvm.umin.v4i32(<4 x i32> %res4, <4 x i32> <i32 1023, i32 1023, i32 1023, i32 1023>)
+  %bytes4 = trunc <4 x i32> %clamped4 to <4 x i16>
+  %di4 = add i64 %dr, %dx4
+  %dp4 = getelementptr i16, ptr %dst, i64 %di4
+  store <4 x i16> %bytes4, ptr %dp4, align 1
+  br label %vec.check
+tail.check:
+  %has_tail = icmp ult i64 %dx4, %dstW
+  br i1 %has_tail, label %col, label %rowEnd
+col:
+  %dx = phi i64 [ 0, %row ], [ %dx4, %tail.check ], [ %nextX, %col.compute ]
+  br i1 %use_tab, label %col.from_tab, label %col.from_div
+col.from_tab:
+  %sx0p = getelementptr inbounds [4096 x i64], ptr %sx0_tab, i64 0, i64 %dx
+  %sx0_t = load i64, ptr %sx0p, align 8
+  %sx1p = getelementptr inbounds [4096 x i64], ptr %sx1_tab, i64 0, i64 %dx
+  %sx1_t = load i64, ptr %sx1p, align 8
+  %fxp = getelementptr inbounds [4096 x i32], ptr %fx_tab, i64 0, i64 %dx
+  %fx_t = load i32, ptr %fxp, align 4
+  br label %col.compute
+col.from_div:
+  %nx = mul i64 %dx, %scaleX
+  %qx_d = udiv i64 %nx, %dstW
+  %drawX = lshr i64 %qx_d, 8
+  %dxIn = icmp ult i64 %drawX, %srcW
+  %dsx0 = select i1 %dxIn, i64 %drawX, i64 %lastX
+  %dxPlus = add i64 %dsx0, 1
+  %dxNextIn = icmp ult i64 %dxPlus, %srcW
+  %dsx1 = select i1 %dxNextIn, i64 %dxPlus, i64 %dsx0
+  %dfx64 = and i64 %qx_d, 255
+  %dfx = trunc i64 %dfx64 to i32
+  br label %col.compute
+col.compute:
+  %sx0 = phi i64 [ %sx0_t, %col.from_tab ], [ %dsx0, %col.from_div ]
+  %sx1 = phi i64 [ %sx1_t, %col.from_tab ], [ %dsx1, %col.from_div ]
+  %fx = phi i32 [ %fx_t, %col.from_tab ], [ %dfx, %col.from_div ]
+  %ifx = sub i32 256, %fx
+  %i00 = add i64 %r0, %sx0
+  %a00 = getelementptr i16, ptr %src, i64 %i00
+  %b00 = load i16, ptr %a00, align 1
+  %p00 = zext i16 %b00 to i32
+  %w00 = mul i32 %p00, %ifx
+  %i01 = add i64 %r0, %sx1
+  %a01 = getelementptr i16, ptr %src, i64 %i01
+  %b01 = load i16, ptr %a01, align 1
+  %p01 = zext i16 %b01 to i32
+  %w01 = mul i32 %p01, %fx
+  %i10 = add i64 %r1, %sx0
+  %a10 = getelementptr i16, ptr %src, i64 %i10
+  %b10 = load i16, ptr %a10, align 1
+  %p10 = zext i16 %b10 to i32
+  %w10 = mul i32 %p10, %ifx
+  %i11 = add i64 %r1, %sx1
+  %a11 = getelementptr i16, ptr %src, i64 %i11
+  %b11 = load i16, ptr %a11, align 1
+  %p11 = zext i16 %b11 to i32
+  %w11 = mul i32 %p11, %fx
+  %top = add i32 %w00, %w01
+  %bot = add i32 %w10, %w11
+  %wt = mul i32 %top, %ify
+  %wb = mul i32 %bot, %fy
+  %sum = add i32 %wt, %wb
+  %rounded = add i32 %sum, 32768
+  %value = lshr i32 %rounded, 16
+  %over = icmp ugt i32 %value, 1023
+  %clamped = select i1 %over, i32 1023, i32 %value
+  %byte = trunc i32 %clamped to i16
+  %di = add i64 %dr, %dx
+  %dp = getelementptr i16, ptr %dst, i64 %di
+  store i16 %byte, ptr %dp, align 1
+  %nextX = add i64 %dx, 1
+  %moreX = icmp ult i64 %nextX, %dstW
+  br i1 %moreX, label %col, label %rowEnd
+rowEnd:
+  %nextY = add i64 %dy, 1
+  %moreY = icmp ult i64 %nextY, %dstH
+  br i1 %moreY, label %row, label %exit
 exit:
   ret void
 }
@@ -3114,7 +3440,7 @@ loop.body:
   %idx_next = add i64 %idx, %step
   %remaining = sub i64 %nPixels, %idx
   %more = icmp ult i64 %step, %remaining
-  br i1 %more, label %loop.body, label %compute.out, !llvm.loop !0
+  br i1 %more, label %loop.body, label %compute.out
 compute.out:
   %mean = udiv i64 %sum_next, %cnt_next
   %meanSq = udiv i64 %sumSq_next, %cnt_next

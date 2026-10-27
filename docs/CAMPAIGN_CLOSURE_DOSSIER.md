@@ -1,5 +1,20 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+## W11 direct U16LE acceptance validation
+
+The direct U16LE path preserves the existing block grid and 2:1 reference averaging,
+using a shared u8/u16le LLVM emitter. Other geometries and short buffers use the pure
+fallback. Local validation under Lean v4.35.0 passed both worktree builds, all 53
+self-test waves, verify-ffi, verify-kernels (including exhaustive UInt16 acceptance
+coverage), and the axiom audit: **8,734 declarations, zero sorryAx/custom axioms**.
+The current spec audit is **252/252 non_vacuous_and_tight, zero shadowed**, with 27
+Encoder specifications. The bridge has 604 lines and links 14 runtime routines.
+Python validation passed 22 unit/IR tests and 47 differential tests (69/69 total). Both generated target kernels match
+the rebuilt emitter, and the ARM64 IR cross-compiles successfully.
+
+The earlier campaign results below describe their original revisions.
+
+
 This dossier collects the deliverables, contracts, formal proofs, differential test suites, and qualification/rollback policies required by [`docs/FFMPEG_PARITY_MAXWELL_PLAN.md`](FFMPEG_PARITY_MAXWELL_PLAN.md) (Sections 10 and 11).
 
 ---
@@ -91,7 +106,7 @@ Executed via Orb MCP on `nippur`:
 All parity, security, universal theorem (`∀`), and architectural deduplication items raised by the three reviewers were remediated and covered by regression tests in [`tests/differential/test_phase3_to_7.py`](../tests/differential/test_phase3_to_7.py).
 
 ### 3.2 Final `turbo-lean` (`689d906`) + Built-In `LeanNative` & Multi-Hardware Closure Quorum
-Executed across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 9 9950X`, Mission `465214a1-db78-4351-b9e6-7680c3ac3bd6`), and **DGX Spark** (`spark-de79`, Grace ARM64 + Blackwell GB10 `sm_90`, Missions `977f8684-fbb2-451e-95df-4243b1f7a73a` and `13515315-3d63-414d-98c0-a8da6e6dd270`) after integrating unified `turbo-lean` (`689d906` with built-in `LeanNative` LLVM 18 + PTX 8.0 `sm_90` codegen, parallel multi-file `audit_spec_files`, and Blake3 content-addressed per-file spec-audit cache achieving `2.23 ms` warm audit across all 15 modules), verifying **`8,716` declarations** (`8,716` under `v4.35.0`, `8,821` under `v4.31.0`, `0 sorryAx`, `0` custom axioms) via `scripts/check_axioms.lean`, auditing all 15 `LeanAV/*.lean` modules (**`250 / 250` `non_vacuous_and_tight`**), migrating all non-irreducible C routines to pure Lean 4 + `LNIR_WIRE_V1`, keeping `c/leanav_simd_kernels.c` at **`585` lines** of irreducible C glue (including fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba` and 16-bit LE `leanav_c_exec_lnir_scale2d_yuv420p10le_ba`, 4x-vectorized `@lean_native_swscale_bilinear_q8_u8` and `@lean_native_swscale_bilinear_q8_u16le`, `@lean_native_apply_filters_yuv420p_u8` with `lean_is_exclusive` in-place reuse, `@lean_native_luma_stats_u16le`, `@lean_native_extract_u16le_msb8`, and `@lean_native_luma_acceptance_16x16_u8`), and linking the 16 compiled `LNIR_WIRE_V1` kernels and 13 vectorized 2D strided/reduction/filter/16-bit runtime routines into `libleanav_dsp.a`:
+Executed across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 9 9950X`, Mission `465214a1-db78-4351-b9e6-7680c3ac3bd6`), and **DGX Spark** (`spark-de79`, Grace ARM64 + Blackwell GB10 `sm_90`, Missions `977f8684-fbb2-451e-95df-4243b1f7a73a` and `13515315-3d63-414d-98c0-a8da6e6dd270`) after integrating unified `turbo-lean` (`689d906` with built-in `LeanNative` LLVM 18 + PTX 8.0 `sm_90` codegen, parallel multi-file `audit_spec_files`, and Blake3 content-addressed per-file spec-audit cache achieving `2.23 ms` warm audit across all 15 modules), verifying **`8,734` declarations** (`8,734` under `v4.35.0`, `8,821` under `v4.31.0`, `0 sorryAx`, `0` custom axioms) via `scripts/check_axioms.lean`, auditing all 15 `LeanAV/*.lean` modules (**`252 / 252` `non_vacuous_and_tight`**), migrating all non-irreducible C routines to pure Lean 4 + `LNIR_WIRE_V1`, keeping `c/leanav_simd_kernels.c` at **`585` lines** of irreducible C glue (including fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba` and 16-bit LE `leanav_c_exec_lnir_scale2d_yuv420p10le_ba`, 4x-vectorized `@lean_native_swscale_bilinear_q8_u8` and `@lean_native_swscale_bilinear_q8_u16le`, `@lean_native_apply_filters_yuv420p_u8` with `lean_is_exclusive` in-place reuse, `@lean_native_luma_stats_u16le`, `@lean_native_extract_u16le_msb8`, and `@lean_native_luma_acceptance_16x16_u8`), and linking the 16 compiled `LNIR_WIRE_V1` kernels and 13 vectorized 2D strided/reduction/filter/16-bit runtime routines into `libleanav_dsp.a`:
 - **GPT-6 Astra** (`codex`, `gpt-6-astra`), Missions `2d44b8ec-e74d-47a0-bd65-7b2c8401fc9f` and `68a2250e-a517-4179-a28a-827975d1a3b2` (`VERDICT: APPROVED`), plus Wave 4 audit Mission `09eac971-7ae9-414f-a48c-37f8aa773d1f` (initial `REJECTED` audit identifying PTX GF(2) `.clmul64` lowering, universal SWAR byte-lane quantification, and `v4.31.0` `.olean` alignment, all remediated in `eea4446`, `7304087`, and `2eebfb6`).
 - **Claude Fable 5.1** (`claudecode`, `claude-fable-5-1`), Missions `2078cb13-feb4-46f7-93c1-e2a7c0f98717`, `13f1481c-e838-445c-8042-710a25fbb30c`, and `7adc1208-b806-44e4-8300-7221019f90f3` (initial audit `REJECTED` on doc sync `7304087`, final `VERDICT: APPROVED` on `2eebfb6` after independent verification of all build, spec audit, axiom, LNIR, PTX GF(2) emulation, and end-to-end transcode gates).
 

@@ -4,13 +4,13 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`), pairing:
 1. **15 Formal Lean 4 Modules (`LeanAV/*.lean`)**:
-   - **`8,716` declarations** (`8,716` under `v4.35.0`, `8,821` under `v4.31.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
-   - **`250 / 250` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (56), `Video` (29), `NativeKernels` (25), `Encoder` (25), `Spec` (23), `Scale` (22), `PlanIR` (15), `Bitstream` (13), `Audio` (12), `Core` (11), `Domain` (8), `Cli` (6), `Filter` (5).
+   - **`8,734` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+   - **`252 / 252` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (56), `Video` (29), `NativeKernels` (25), `Encoder` (27), `Spec` (23), `Scale` (22), `PlanIR` (15), `Bitstream` (13), `Audio` (12), `Core` (11), `Domain` (8), `Cli` (6), `Filter` (5).
    - All plane scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear, 16-bit LE), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance (`@lean_native_luma_acceptance_16x16_u8`), ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
    - Decision gates, ISO BMFF header/handler/colorimetry classifiers, edit-list (`elst`) timestamp rescaling, bitrate and muxing-overhead estimators, luma mean/variance and PSNR acceptance packers, plane FFI contract checks, and PQ10/BT.2020 color-space helpers live in pure Lean 4 (`LeanAV/Format.lean`, `LeanAV/Scale.lean`, `LeanAV/PlanIR.lean`, `LeanAV/Encoder.lean`) and are exported to C without shadow re-implementations.
-3. **16 Compiled `LNIR_WIRE_V1` Kernels & `585`-Line Irreducible C-ABI Bridge (`c/libleanav_dsp.a`)**:
-   - `c/leanav_lnir_kernels.lnir` is validated via `lean-native-core validate-tv` (`64` samples) and `lean-native-core verify-certs`, lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`), and linked with `c/leanav_simd_kernels.c` (`585` lines containing only the POSIX `fork`+`execvp` shim, Phase 5 FFI ABI / `__ATOMIC_SEQ_CST` shims, and zero-copy `lean_sarray_object` bridge for the 16 compiled LNIR kernels and 13 vectorized 2D strided/reduction/filter/16-bit runtime routines, including fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba` and 16-bit LE `leanav_c_exec_lnir_scale2d_yuv420p10le_ba`, 4x-vectorized `@lean_native_swscale_bilinear_q8_u8` and `@lean_native_swscale_bilinear_q8_u16le`, `@lean_native_apply_filters_yuv420p_u8` with `lean_is_exclusive` in-place reuse, `@lean_native_luma_stats_u16le`, `@lean_native_extract_u16le_msb8`, and `@lean_native_luma_acceptance_16x16_u8`).
+3. **16 Compiled `LNIR_WIRE_V1` Kernels & `604`-Line Irreducible C-ABI Bridge (`c/libleanav_dsp.a`)**:
+   - `c/leanav_lnir_kernels.lnir` is validated via `lean-native-core validate-tv` (`64` samples) and `lean-native-core verify-certs`, lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`), and linked with `c/leanav_simd_kernels.c` (`604` lines containing only the POSIX `fork`+`execvp` shim, Phase 5 FFI ABI / `__ATOMIC_SEQ_CST` shims, and zero-copy `lean_sarray_object` bridge for the 16 compiled LNIR kernels and 14 vectorized 2D strided/reduction/filter/16-bit runtime routines, including fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba` and 16-bit LE `leanav_c_exec_lnir_scale2d_yuv420p10le_ba`, 4x-vectorized `@lean_native_swscale_bilinear_q8_u8` and `@lean_native_swscale_bilinear_q8_u16le`, `@lean_native_apply_filters_yuv420p_u8` with `lean_is_exclusive` in-place reuse, `@lean_native_luma_stats_u16le`, `@lean_native_extract_u16le_msb8`, and the shared u8/u16le `@lean_native_luma_acceptance_16x16_*` kernels).
 
 ---
 
@@ -30,7 +30,7 @@
 ## 3. Standard Verification Checklist
 
 ```bash
-# 1. Build LeanAV, the 16 LLVM-compiled LNIR kernels, and the 585-line C-ABI bridge
+# 1. Build LeanAV, the 16 LLVM-compiled LNIR kernels, and the 604-line C-ABI bridge
 lake build
 
 # 2. Run all 53 self-test waves, FFI ABI checks, and compiled LNIR kernel checks
@@ -38,13 +38,13 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 8,716 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 8,734 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# 4. Audit all 15 formal modules in parallel with turbo-lean (250/250 non_vacuous_and_tight)
+# 4. Audit all 15 formal modules in parallel with turbo-lean (252/252 non_vacuous_and_tight)
 turbo-lean --json audit-spec LeanAV/*.lean
 
-# 5. Run the 66 Python unit and differential tests (19 unit + 47 differential)
+# 5. Run the 66 Python unit and differential tests (22 unit + 47 differential)
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```

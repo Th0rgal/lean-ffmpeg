@@ -493,13 +493,15 @@ LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_stats_ba(
 extern uint64_t leanav_lean_classify_luma_psnr_x10_u64(uint64_t total_sq_err, uint64_t total_pix);
 extern uint64_t leanav_lean_pack_acceptance_metrics_u64(uint64_t max_block_sad, uint64_t psnr_x10, uint32_t dist_lt_black);
 
-LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
+static uint64_t leanav_luma_acceptance_16x16_ba(
     b_lean_obj_arg src_ba,
     uint64_t src_w,
     uint64_t src_h,
     b_lean_obj_arg dst_ba,
     uint64_t dst_w,
-    uint64_t dst_h
+    uint64_t dst_h,
+    uint64_t pixel_bytes,
+    void (*kernel)(const uint8_t *, uint64_t, uint64_t, const uint8_t *, uint64_t, uint64_t, uint64_t *)
 ) {
     if (dst_w < 16u || dst_h < 16u || src_w < 2u || src_h < 2u ||
         src_w > 0x3FFFFFFFull || src_h > 0x3FFFFFFFull ||
@@ -509,20 +511,37 @@ LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
     int is_1x1 = (src_w == dst_w && src_h == dst_h);
     int is_2x2 = (src_w == dst_w * 2u && src_h == dst_h * 2u);
     if (!is_1x1 && !is_2x2) return 0ull;
-    uint64_t src_need = src_w * src_h;
-    uint64_t dst_need = dst_w * dst_h;
+    /* Dimensions are bounded above by 2^30-1, so even two bytes/pixel fit UInt64. */
+    uint64_t src_need = src_w * src_h * pixel_bytes;
+    uint64_t dst_need = dst_w * dst_h * pixel_bytes;
     if ((uint64_t)lean_sarray_size(src_ba) < src_need ||
         (uint64_t)lean_sarray_size(dst_ba) < dst_need) {
         return 0ull;
     }
     uint64_t metrics[4] = {0ull, 0ull, 0ull, 1ull};
-    lean_native_luma_acceptance_16x16_u8(
+    kernel(
         lean_sarray_cptr(src_ba), src_w, src_h,
         lean_sarray_cptr(dst_ba), dst_w, dst_h,
         metrics
     );
     uint64_t psnr_x10 = leanav_lean_classify_luma_psnr_x10_u64(metrics[1], metrics[2]);
     return leanav_lean_pack_acceptance_metrics_u64(metrics[0], psnr_x10, (uint32_t)metrics[3]);
+}
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_ba(
+    b_lean_obj_arg src_ba, uint64_t src_w, uint64_t src_h,
+    b_lean_obj_arg dst_ba, uint64_t dst_w, uint64_t dst_h
+) {
+    return leanav_luma_acceptance_16x16_ba(src_ba, src_w, src_h, dst_ba, dst_w, dst_h,
+        1u, lean_native_luma_acceptance_16x16_u8);
+}
+
+LEAN_EXPORT uint64_t leanav_c_exec_lnir_luma_acceptance_16x16_u16le_ba(
+    b_lean_obj_arg src_ba, uint64_t src_w, uint64_t src_h,
+    b_lean_obj_arg dst_ba, uint64_t dst_w, uint64_t dst_h
+) {
+    return leanav_luma_acceptance_16x16_ba(src_ba, src_w, src_h, dst_ba, dst_w, dst_h,
+        2u, lean_native_luma_acceptance_16x16_u16le);
 }
 
 /* Owned packed input; reuse only an exclusive, exact-size array. */

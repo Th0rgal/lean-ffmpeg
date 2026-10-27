@@ -1,6 +1,14 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **13 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`585`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,716`** declarations (`8,716` under `v4.35.0`, `8,821` under `v4.31.0`) and **`250 / 250` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`604`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,734`** declarations (verified under `v4.35.0`) and **`252 / 252` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+
+10-bit luma acceptance reads U16LE pixels directly from complete 1:1 and 2:1 planes,
+avoiding the two temporary 8-bit planes. The u8 and u16le kernels share the same block
+grid and reductions; each U16LE pixel is decoded as `(value >> 2) & 255` before reference
+averaging. Other geometries and short buffers retain the pure extraction fallback.
+`verify-kernels` checks parity against pure extraction plus acceptance, including odd
+sizes, truncated buffers, and the full UInt16 range.
+
 
 ---
 
@@ -32,14 +40,14 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`250 / 250` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,716`** kernel-checked declarations (`Format`: 56, `Video`: 29, `NativeKernels`: 25, `Encoder`: 25, `Spec`: 23, `Scale`: 22, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 5).
+All **15** `LeanAV/*.lean` modules (**`252 / 252` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,734`** kernel-checked declarations (`Format`: 56, `Video`: 29, `NativeKernels`: 25, `Encoder`: 27, `Spec`: 23, `Scale`: 22, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 5).
 
 ---
 
 ## Build & Verification
 
 ```bash
-# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 13 2D/stats/filter/16-bit routines, and the 585-line C-ABI bridge (0 sorryAx)
+# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 604-line C-ABI bridge (0 sorryAx)
 lake build
 
 # Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
@@ -47,17 +55,17 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,716 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,734 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit all 15 formal modules in parallel with turbo-lean (250/250 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
+# Audit all 15 formal modules in parallel with turbo-lean (252/252 tight, 0 vacuous, 0 trivial; 2.23 ms warm Blake3 cache)
 turbo-lean --json audit-spec LeanAV/*.lean
 
 # Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
 lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
 lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
-# Run the Python unit and differential test suites (66 tests: 19 unit + 47 differential)
+# Run the Python unit and differential test suites (66 tests: 22 unit + 47 differential)
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```

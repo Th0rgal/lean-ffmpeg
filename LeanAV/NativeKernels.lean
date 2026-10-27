@@ -918,6 +918,10 @@ opaque execLnirLumaStatsBaC (src : @& ByteArray) (nPixels step : UInt64) : UInt6
 @[extern "leanav_c_exec_lnir_luma_acceptance_16x16_ba"]
 opaque execLnirLumaAcceptance16x16BaC (src : @& ByteArray) (srcW srcH : UInt64) (dst : @& ByteArray) (dstW dstH : UInt64) : UInt64
 
+/-- Zero-copy U16LE luma acceptance dispatcher. -/
+@[extern "leanav_c_exec_lnir_luma_acceptance_16x16_u16le_ba"]
+opaque execLnirLumaAcceptance16x16U16LeBaC (src : @& ByteArray) (srcW srcH : UInt64) (dst : @& ByteArray) (dstW dstH : UInt64) : UInt64
+
 /-- Invoke `lean-native-core`-compiled `@lean_native_stencil2d_box3x3_u8` 2D $3\times 3$ box-blur stencil on a contiguous `w x h` plane `ByteArray`. -/
 @[inline]
 def execLnirBoxBlur3x3BaC (src : @& ByteArray) (w h : UInt64) : ByteArray :=
