@@ -346,7 +346,7 @@ def supportedFormat (s : String) : Bool :=
    "image2pipe", "apng", "gif", "webp",
    "srt", "subrip", "webvtt", "vtt", "ass", "ssa", "jacosub", "microdvd", "mpl2", "pjs",
    "realtext", "sami", "scc", "stl", "subviewer", "ttml", "vplayer", "lrc",
-   "ffmetadata", "hash", "framehash",
+   "ffmetadata", "hash", "framehash", "streamhash",
    "tee", "fifo", "segment", "stream_segment", "hls", "dash"].contains s
 
 /-- Supported `-preset` encoder tokens. -/
