@@ -649,7 +649,8 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-chroma_sample_location", "-color_range", "-colorspace", "-color_primaries", "-color_trc",
      "-aspect", "-sar", "-dar", "-timecode", "-bits_per_raw_sample", "-compression_level",
      "-frame_size", "-cutoff", "-application", "-vbr", "-mapping_family",
-     "-channel_layout", "-ch_layout", "-sample_fmt", "-guess_layout_max",
+     "-channel_layout", "-ch_layout", "-channel_order", "-sample_fmt", "-guess_layout_max",
+     "-hash",
      "-fps_mode", "-vsync", "-async",
      "-brand", "-empty_hdlr_name", "-use_editlist", "-frag_duration", "-frag_size",
      "-min_frag_duration", "-write_tmcd", "-write_bext", "-write_id3v1", "-write_id3v2",
@@ -662,6 +663,12 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
 /-- Validate the value argument of an extended 1-argument FFmpeg/FATE flag. -/
 def isValidExtendedFlagValue (tok value : String) : Bool :=
   if value == "" then false
+  else if tok == "-hash" then
+    ["md5", "murmur3", "ripemd128", "ripemd160", "ripemd256", "ripemd320",
+     "sha160", "sha224", "sha256", "sha512/224", "sha512/256", "sha384", "sha512",
+     "crc32", "adler32"].contains (strToLowerAscii value)
+  else if tok == "-channel_order" then
+    ["default", "coded", "0", "1"].contains value
   else if strStartsWithFast tok "-metadata:" then
     (parseMetadataSpec value).isSome
   else if strStartsWithFast tok "-bsf:" then

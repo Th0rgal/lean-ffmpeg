@@ -1,5 +1,6 @@
 """CLI parity for the streamhash muxer, using decoded video checksums."""
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -25,13 +26,42 @@ class StreamHashTests(unittest.TestCase):
                            capture_output=True, env=env)
             args = ["-nostdin", "-hide_banner", "-loglevel", "error", "-i", source,
                     "-c:v", "rawvideo", "-f", "streamhash", "-"]
-            expected = subprocess.run([reference, *args], check=True, env=env,
-                                      capture_output=True, timeout=30)
-            actual = subprocess.run([str(BINARY), *args], env=env,
-                                    capture_output=True, timeout=30)
-            self.assertEqual(actual.returncode, 0, actual.stderr.decode(errors="replace"))
-            self.assertTrue(expected.stdout.strip())
-            self.assertEqual(actual.stdout, expected.stdout)
+            for algorithm in (None, "md5", "sHa256", "SHA512/224"):
+                with self.subTest(algorithm=algorithm):
+                    command = args[:-1] + (["-hash", algorithm] if algorithm else []) + ["-"]
+                    expected = subprocess.run([reference, *command], check=True, env=env,
+                                              capture_output=True, timeout=30)
+                    actual = subprocess.run([str(BINARY), *command], env=env,
+                                            capture_output=True, timeout=30)
+                    self.assertEqual(actual.returncode, 0, actual.stderr.decode(errors="replace"))
+                    self.assertTrue(expected.stdout.strip())
+                    self.assertEqual(actual.stdout, expected.stdout)
+
+    def test_channel_order_uses_validated_delegated_route(self):
+        for order in ("default", "coded", "0", "1"):
+            with self.subTest(order=order):
+                result = subprocess.run([str(BINARY), "plan", "-channel_order", order,
+                                         "-i", "input.dts", "-f", "streamhash", "-"],
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                plan = json.loads(result.stdout)
+                self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
+                self.assertEqual(plan["error_count"], 0)
+
+    def test_invalid_or_missing_hash_and_channel_order_fail_closed(self):
+        for flag, value in (("-hash", "not-a-hash"), ("-channel_order", "2"),
+                            ("-hash", ""), ("-channel_order", "")):
+            with self.subTest(flag=flag, value=value):
+                result = subprocess.run([str(BINARY), "plan", "-i", "input.dts",
+                                         "-f", "streamhash", "-", flag, value],
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+        for flag in ("-hash", "-channel_order"):
+            with self.subTest(missing=flag):
+                result = subprocess.run([str(BINARY), "plan", "-i", "input.dts",
+                                         "-f", "streamhash", "-", flag],
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_streamhash_does_not_bypass_unsafe_input_policy(self):
         result = subprocess.run([str(BINARY), "plan", "-i", "https://invalid.example/input",
