@@ -1313,10 +1313,30 @@ theorem yuv420p10leScaleGateSpec_iff (a : Nat × Nat × Nat × Nat × Nat) :
     yuv420p10leScaleGateSpec.gate a = true ↔ Yuv420p10leScaleSafe a :=
   yuv420p10leScaleGateSpec.iff_safe a
 
-/-- Single allocation native scaler, with the original pure implementation as fallback. -/
+/-- Exact admission gate for byte-preserving 1:1 packed U16LE scaling. -/
+def yuv420p10leIdentityZeroCopyGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat)
+    (fun (sw, sh, dw, dh, cap) => Yuv420p10leScaleSafe (sw, sh, dw, dh, cap) ∧ sw = dw ∧ sh = dh) where
+  gate := fun (sw, sh, dw, dh, cap) => decide (Yuv420p10leScaleSafe (sw, sh, dw, dh, cap) ∧ sw = dw ∧ sh = dh)
+  sound := by intro a h; exact of_decide_eq_true h
+  complete := by intro a h; exact decide_eq_true h
+  posWitness := (2, 2, 2, 2, 12)
+  negWitness := (2, 2, 4, 2, 12)
+  nonVacuous := rfl
+  tight := rfl
+
+/-- Identity admission is equivalent to safety and equality of both dimensions. -/
+theorem yuv420p10leIdentityZeroCopyGateSpec_iff (a : Nat × Nat × Nat × Nat × Nat) :
+    yuv420p10leIdentityZeroCopyGateSpec.gate a = true ↔
+      Yuv420p10leScaleSafe a ∧ a.1 = a.2.2.1 ∧ a.2.1 = a.2.2.2.1 :=
+  yuv420p10leIdentityZeroCopyGateSpec.iff_safe a
+
+/-- Reuse exact-size identity frames; otherwise trim, scale natively, or use the pure fallback. -/
 def scaleFrameYuv420p10LeAuto (src : @& ByteArray) (sw sh dw dh : Nat)
     (xTab yTab uvXTab uvYTab : @& Array UInt64) : ByteArray :=
-  if yuv420p10leScaleGateSpec.gate (sw, sh, dw, dh, src.size) then
+  if yuv420p10leIdentityZeroCopyGateSpec.gate (sw, sh, dw, dh, src.size) then
+    let dstTotal := (sw * sh + 2 * ((sw / 2) * (sh / 2))) * 2
+    if src.size == dstTotal then src else src.extract 0 dstTotal
+  else if yuv420p10leScaleGateSpec.gate (sw, sh, dw, dh, src.size) then
     LeanAV.NativeKernels.execLnirScale2dYuv420p10LeBaC src sw.toUInt64 sh.toUInt64 dw.toUInt64 dh.toUInt64
   else
     let y := scalePlaneBilinearU16LeBytes src 0 sw sh dw dh xTab yTab

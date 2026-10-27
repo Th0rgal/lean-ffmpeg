@@ -1510,13 +1510,30 @@ def luma16x16AcceptanceGateSpec :
   nonVacuous := by decide
   tight := by decide
 
+/-- Exact admission to stride-16 statistics for each pixel representation. -/
+def lumaStatsStepSelectionGateSpec : AVGateSpec (Bool × Nat)
+    (fun (isU16, n) => 0 < n ∧ ((isU16 = false ∧ 4096 ≤ n) ∨ (isU16 = true ∧ 65536 < n))) where
+  gate := fun (isU16, n) => decide
+    (0 < n ∧ ((isU16 = false ∧ 4096 ≤ n) ∨ (isU16 = true ∧ 65536 < n)))
+  sound := by intro ⟨isU16, n⟩ h; exact of_decide_eq_true h
+  complete := by intro ⟨isU16, n⟩ h; exact decide_eq_true h
+  posWitness := (false, 4096)
+  negWitness := (true, 65536)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem lumaStatsStepSelectionGateSpec_iff (isU16 : Bool) (n : Nat) :
+    lumaStatsStepSelectionGateSpec.gate (isU16, n) = true ↔
+      0 < n ∧ ((isU16 = false ∧ 4096 ≤ n) ∨ (isU16 = true ∧ 65536 < n)) :=
+  lumaStatsStepSelectionGateSpec.iff_safe (isU16, n)
+
 /-- Fast runtime luma mean and spatial variance evaluator dispatching to compiled LLVM 18 `@lean_native_luma_stats_u8`. -/
 @[inline]
 def computeLumaStatsU8Fast (luma : @& ByteArray) (nPixels : Nat) : UInt64 × UInt64 :=
   let n := Nat.min nPixels luma.size
   if n == 0 then (0, 0)
   else
-    let step := if n >= 4096 then 16 else 1
+    let step := if lumaStatsStepSelectionGateSpec.gate (false, n) then 16 else 1
     let packed := LeanAV.NativeKernels.execLnirLumaStatsBaC luma n.toUInt64 step.toUInt64
     (packed &&& 0xFFFFFFFF, packed >>> 32)
 
@@ -1560,7 +1577,7 @@ theorem u16LeMsb8GateSpec_iff (n cap : Nat) :
 def computeLumaStatsU16LeFast (src : @& ByteArray) (nPixels : Nat) : UInt64 × UInt64 :=
   let n := Nat.min nPixels (src.size / 2)
   if u16LeMsb8GateSpec.gate (n, src.size) then
-    let step : UInt64 := if n > 65536 then 16 else 1
+    let step : UInt64 := if lumaStatsStepSelectionGateSpec.gate (true, n) then 16 else 1
     let packed := LeanAV.NativeKernels.execLnirLumaStatsU16LeBaC src n.toUInt64 step
     (packed &&& 0xFFFFFFFF, packed >>> 32)
   else computeLumaStatsU16LePure src nPixels
@@ -1861,12 +1878,83 @@ def probeInputHdrAndFpsIO (inPath : String) (moovBuf : @& ByteArray)
       return parseProbeHdrAndFpsPure out.stdout
     catch _ => return (0, (24000, 1001))
 
+/-- Natural offsets avoid overflow in the trailing-box admission check. -/
+structure SurgicalMoovTailInput where
+  mdatOff : Nat
+  mdatSz : Nat
+  moovOff : Nat
+  moovSz : Nat
+  fileSz : Nat
+  deriving DecidableEq
+
+/-- A bounded trailing movie box, entirely after the media data box. -/
+def SurgicalMoovTailSafe (x : SurgicalMoovTailInput) : Prop :=
+  8 ≤ x.mdatSz ∧ x.mdatOff + x.mdatSz ≤ x.moovOff ∧
+  8 ≤ x.moovSz ∧ x.moovSz ≤ 4 * 1024 * 1024 ∧ x.moovOff + x.moovSz = x.fileSz
+
+instance (x : SurgicalMoovTailInput) : Decidable (SurgicalMoovTailSafe x) :=
+  inferInstanceAs (Decidable (_ ∧ _ ∧ _ ∧ _ ∧ _))
+
+/-- Admit exactly the bounded trailing `moov` layouts. -/
+def surgicalMoovTailPatchGateSpec : AVGateSpec SurgicalMoovTailInput SurgicalMoovTailSafe where
+  gate := fun x => decide (SurgicalMoovTailSafe x)
+  sound := by intro x h; exact of_decide_eq_true h
+  complete := by intro x h; exact decide_eq_true h
+  posWitness := ⟨0, 8, 8, 8, 16⟩
+  negWitness := ⟨0, 8, 8, 8, 17⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem surgicalMoovTailPatchGateSpec_iff (x : SurgicalMoovTailInput) :
+    surgicalMoovTailPatchGateSpec.gate x = true ↔ SurgicalMoovTailSafe x := by
+  simp [surgicalMoovTailPatchGateSpec]
+
+/-- Walk headers without reading box payloads; only an admitted movie tail is loaded. -/
+def locateMp4TrailingMoovWindowIO (path : String) (fileSz : UInt64) :
+    IO (Option (Nat × ByteArray)) := do
+  let lim := fileSz.toNat
+  let mut off := 0
+  let mut mdat : Option (Nat × Nat) := none
+  while off + 8 ≤ lim do
+    let hdr ← readMediaBytesWindow path off.toUInt64 16
+    if hdr.size < 8 then return none
+    let sz32 := (baRdU32BE hdr 0).toNat
+    let extended := sz32 == 1
+    if extended && hdr.size < 16 then return none
+    let sz := if extended then (baRdU64BE hdr 8).toNat
+      else if sz32 == 0 then lim - off else sz32
+    if sz < (if extended then 16 else 8) || sz > lim - off then return none
+    let tag := baRdU32BE hdr 4
+    if tag == 0x6D646174 then mdat := some (off, sz)
+    if tag == 0x6D6F6F76 then
+      if let some (mdatOff, mdatSz) := mdat then
+        if surgicalMoovTailPatchGateSpec.gate ⟨mdatOff, mdatSz, off, sz, lim⟩ then
+          let slice ← readMediaBytesWindow path off.toUInt64 sz
+          if slice.size == sz then return some (off, slice)
+      return none
+    off := off + sz
+  return none
+
+/-- POSIX positional write: the runtime Handle API has no seek operation. -/
+@[extern "leanav_c_write_window"]
+opaque writeMp4WindowIO (path : @& String) (offset : UInt64)
+    (bytes : @& ByteArray) : IO Unit
+
 def patchMp4HdrAndElstBoxesIO (_inPath outPath : String) (inMoovBuf : @& ByteArray) (copyElst : Bool) : IO Unit := do
   if inMoovBuf.isEmpty then return ()
   if (patchMp4HdrAndElstBoxesPure inMoovBuf inMoovBuf copyElst).isNone then return ()
   try
     let outSz ← getFileSizeU64IO outPath
     if outSz == 0 then return ()
+    if let some (moovOff, moovSlice) ← locateMp4TrailingMoovWindowIO outPath outSz then
+      match patchMp4HdrAndElstBoxesPure inMoovBuf moovSlice copyElst with
+      | none => return ()
+      | some patchedSlice =>
+        if patchedSlice == moovSlice then return ()
+        if patchedSlice.size == moovSlice.size then
+          writeMp4WindowIO outPath moovOff.toUInt64 patchedSlice
+          return ()
+        -- Size changes use the full patcher, including truncation on shrinking tails.
     let outBuf ← IO.FS.readBinFile outPath
     if let some patched := patchMp4HdrAndElstBoxesPure inMoovBuf outBuf copyElst then
       if patched != outBuf then
@@ -2267,81 +2355,58 @@ def transcodeMp4GeneralVerifiedIO
       }
       encChildOpt := some ec
 
-    if isIdentityU8 then
-      let dstFrame := srcBuf
-      if let some prevTask := prevWriteTaskOpt then
-        prevWriteTaskOpt := none
-        let wRes ← IO.wait prevTask
-        if !(match wRes with | .ok b => b | .error _ => false) then
-          writeFailed := true
-      if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
-        if let some ec := encChildOpt then
-          let frameToSend := dstFrame
-          let wTask ← IO.asTask (do
-            try
-              ec.stdin.write frameToSend
-              pure true
-            catch _ =>
-              pure false)
-          prevWriteTaskOpt := some wTask
-      if !writeFailed then
-        let (fMean, fVar) := computeLumaStatsU8Fast srcBuf dstYSz
-        meanAccum := meanAccum + fMean
-        varAccum := varAccum + fVar
-        if (framesDone &&& 7) == 0 then
-          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16Fast srcBuf srcW srcH srcBuf dstW dstH
+    let dstFrame : ByteArray :=
+      if isIdentityU8 then srcBuf
+      else if is10bit && yuv420p10leIdentityZeroCopyGateSpec.gate
+          (srcW, srcH, dstW, dstH, srcBuf.size) then
+        let dstTotal := (srcW * srcH + 2 * ((srcW / 2) * (srcH / 2))) * 2
+        if srcBuf.size == dstTotal then srcBuf else srcBuf.extract 0 dstTotal
+      else if is10bit then
+        scaleFrameYuv420p10LeAuto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
+      else if (filterFlags &&& 3) == 0 then
+        scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
+      else
+        let scaled := scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
+        applyPixelFiltersYuv420pFrameFast scaled dstW dstH filterFlags
+
+    if let some prevTask := prevWriteTaskOpt then
+      prevWriteTaskOpt := none
+      let wRes ← IO.wait prevTask
+      if !(match wRes with | .ok b => b | .error _ => false) then
+        writeFailed := true
+    if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
+      if let some ec := encChildOpt then
+        let frameToSend := dstFrame
+        let wTask ← IO.asTask (do
+          try
+            ec.stdin.write frameToSend
+            pure true
+          catch _ =>
+            pure false)
+        prevWriteTaskOpt := some wTask
+
+    if !writeFailed then
+      let (fMean, fVar) :=
+        if is10bit then computeLumaStatsU16LeFast dstFrame dstYSz
+        else computeLumaStatsU8Fast dstFrame dstYSz
+      meanAccum := meanAccum + fMean
+      varAccum := varAccum + fVar
+
+      if (framesDone &&& 7) == 0 then
+        if !is10bit then
+          let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Fast srcBuf srcW srcH dstFrame dstW dstH
+          let (fSad, fPsnr, fDist) :=
+            if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
+            else (fSad0, fPsnr0, fDist0)
           if fSad > maxSadWorst then maxSadWorst := fSad
           if fPsnr < psnrMin then psnrMin := fPsnr
           if fDist == 0 then distLtBlackAll := 0
-        framesDone := framesDone + 1
-    else
-      let dstFrame : ByteArray :=
-        if is10bit then
-          scaleFrameYuv420p10LeAuto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
-        else if (filterFlags &&& 3) == 0 then
-          scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
         else
-          let scaled := scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
-          applyPixelFiltersYuv420pFrameFast scaled dstW dstH filterFlags
-
-      if let some prevTask := prevWriteTaskOpt then
-        prevWriteTaskOpt := none
-        let wRes ← IO.wait prevTask
-        if !(match wRes with | .ok b => b | .error _ => false) then
-          writeFailed := true
-      if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
-        if let some ec := encChildOpt then
-          let frameToSend := dstFrame
-          let wTask ← IO.asTask (do
-            try
-              ec.stdin.write frameToSend
-              pure true
-            catch _ =>
-              pure false)
-          prevWriteTaskOpt := some wTask
-
-      if !writeFailed then
-        let (fMean, fVar) :=
-          if is10bit then computeLumaStatsU16LeFast dstFrame dstYSz
-          else computeLumaStatsU8Fast dstFrame dstYSz
-        meanAccum := meanAccum + fMean
-        varAccum := varAccum + fVar
-
-        if (framesDone &&& 7) == 0 then
-          if !is10bit then
-            let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Fast srcBuf srcW srcH dstFrame dstW dstH
-            let (fSad, fPsnr, fDist) :=
-              if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
-              else (fSad0, fPsnr0, fDist0)
-            if fSad > maxSadWorst then maxSadWorst := fSad
-            if fPsnr < psnrMin then psnrMin := fPsnr
-            if fDist == 0 then distLtBlackAll := 0
-          else
-            let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16U16LeFast srcBuf srcW srcH dstFrame dstW dstH
-            if fSad > maxSadWorst then maxSadWorst := fSad
-            if fPsnr < psnrMin then psnrMin := fPsnr
-            if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
-        framesDone := framesDone + 1
+          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16U16LeFast srcBuf srcW srcH dstFrame dstW dstH
+          if fSad > maxSadWorst then maxSadWorst := fSad
+          if fPsnr < psnrMin then psnrMin := fPsnr
+          if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
+      framesDone := framesDone + 1
 
   if let some pendingWrite := prevWriteTaskOpt then
     let wRes ← IO.wait pendingWrite

@@ -1,16 +1,20 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
-## W11 direct U16LE acceptance validation
+## W11-W12 direct U16LE acceptance, 10-bit identity zero-copy, dual-step luma stats, and surgical trailing-moov validation
 
 The direct U16LE path preserves the existing block grid and 2:1 reference averaging,
-using a shared u8/u16le LLVM emitter. Other geometries and short buffers use the pure
-fallback. Local validation under Lean v4.35.0 passed both worktree builds, all 53
-self-test waves, verify-ffi, verify-kernels (including exhaustive UInt16 acceptance
-coverage), and the axiom audit: **8,734 declarations, zero sorryAx/custom axioms**.
-The current spec audit is **252/252 non_vacuous_and_tight, zero shadowed**, with 27
-Encoder specifications. The bridge has 604 lines and links 14 runtime routines.
-Python validation passed 22 unit/IR tests and 47 differential tests (69/69 total). Both generated target kernels match
-the rebuilt emitter, and the ARM64 IR cross-compiles successfully.
+using a shared u8/u16le LLVM emitter. Wave 12 adds zero-copy 10-bit 1:1 identity
+frame reuse (`yuv420p10leIdentityZeroCopyGateSpec`), vectorized `step == 1` and
+`step == 16` luma statistics (`lumaStatsStepSelectionGateSpec`), and surgical
+trailing-`moov` `pwrite` patching (`surgicalMoovTailPatchGateSpec`) that avoids
+reading or rewriting `mdat` on trailing-`moov` MP4 files. Local validation under
+Lean v4.35.0 passed all 53 self-test waves (plus 6 surgical-`moov` byte-equivalence
+fixtures), `verify-ffi`, `verify-kernels`, and the axiom audit: **8,792 declarations,
+zero sorryAx/custom axioms**. The current spec audit is **255/255 non_vacuous_and_tight,
+zero shadowed** (`Encoder`: 29, `Scale`: 24). The bridge has 624 lines and links 14
+runtime routines. Python validation passed 23 unit/IR tests and 53 differential tests
+(76/76 total). Both generated target kernels (`c/leanav_lnir_x86_64.ll` and
+`c/leanav_lnir_arm64.ll`) compile with zero warnings under `clang-18 -O3 -Werror`.
 
 The earlier campaign results below describe their original revisions.
 
@@ -116,7 +120,7 @@ Executed across `nippur` (Intel Xeon E3-1245 V2), **Zen 5 Boat VM** (`AMD Ryzen 
 
 | Verification Suite | Scope | Before (`v0.2.0-quorum`) | Current Verified State | Verifiable Details |
 | :--- | :--- | :---: | :---: | :--- |
-| **Suite #0 (`tests/`)** | **66 Python unit & differential tests** + C-ABI / LNIR self-tests | `58 / 59` (`98.3%`) | **`66 / 66` (`100%`)** | `19/19` unit + `47/47` differential + `53/53` `self-test` waves + `16/16` compiled LNIR kernels |
+| **Suite #0 (`tests/`)** | **76 Python unit & differential tests** + C-ABI / LNIR self-tests | `58 / 59` (`98.3%`) | **`76 / 76` (`100%`)** | `23/23` unit + `53/53` differential + `53/53` `self-test` waves + `16/16` compiled LNIR kernels |
 | **Suite #1 (`bench.py`)** | **120 cases**: containers, `-map`, metadata, chapters, dispositions, BSFs, subtitles, multi-input & timeline | `78 / 120` (`65.0%`) | **`119 / 120` (`99.2%`)** | `111` bit-exact `MATCH` + `5 MATCH(lossy)` + `3 MATCH(both-fail)` |
 | **Suite #2 (`test_diff.py`)** | **79 cases**: video/audio codecs, `-vf` / `-af`, `pix_fmt`, rate control (`-crf`, `-b:v`, `-qp`) & time trimming | `41 / 79` (`51.9%`) | **`79 / 79` (`100%`)** | `79/79` identical exit codes, `79/79` identical `ffprobe` signatures (`0 DIFF`) |
 | **Suite #3 (`fate-run.sh`)** | **187 official FFmpeg FATE tests** (`fate-lavf-*` + `fate-ffmpeg-*`) | `0 / 187` FATE pass (`187/187` CLI rejections) | **`129 / 129` FATE pass (`100%`)**<br>**`186 / 186` identical outputs** | `100%` of the `129` FATE tests passed by `ffmpeg 6.1.1` pass under `lffmpeg`, `0/187` CLI rejections, `186/186` bit-identical non-empty outputs |

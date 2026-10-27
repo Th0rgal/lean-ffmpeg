@@ -602,3 +602,23 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_extract_u16le_msb8_ba(
     lean_native_extract_u16le_msb8(lean_sarray_cptr(src_ba), lean_sarray_cptr(out), n);
     return out;
 }
+
+/* Irreducible positional file I/O; all box logic remains in Lean. */
+LEAN_EXPORT lean_obj_res leanav_c_write_window(b_lean_obj_arg path, uint64_t offset,
+                                               b_lean_obj_arg bytes, lean_obj_arg world) {
+    (void)world;
+    int fd = open(lean_string_cstr(path), O_RDWR);
+    if (fd < 0) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(strerror(errno))));
+    size_t done = 0, len = lean_sarray_size(bytes);
+    int err = 0;
+    while (done < len) {
+        ssize_t n = pwrite(fd, lean_sarray_cptr(bytes) + done, len - done, (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { err = n < 0 ? errno : EIO; break; }
+        done += (size_t)n;
+    }
+    if (!err && fsync(fd) < 0) err = errno;
+    if (close(fd) < 0 && !err) err = errno;
+    if (err) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(strerror(err))));
+    return lean_io_result_mk_ok(lean_box(0));
+}

@@ -22,8 +22,72 @@ open LeanSys.Store
 
 set_option maxRecDepth 4096
 
+/-- Synthetic MP4 fixtures exercise the actual file patcher against its pure oracle. -/
+def runSurgicalMoovTailTests : IO Unit := do
+  let zeros (n : Nat) := ByteArray.mk (Array.replicate n 0)
+  let box (tag : UInt32) (body : ByteArray) :=
+    baWrU32BE (baWrU32BE (zeros 8 ++ body) 0 (body.size + 8).toUInt32) 4 tag
+  let edts (count mt : Nat) := Id.run do
+    let mut body := baWrU32BE (zeros (8 + 12 * count)) 4 count.toUInt32
+    for i in [:count] do
+      body := baWrU32BE body (8 + 12 * i) 1000
+      body := baWrU32BE body (12 + 12 * i) mt.toUInt32
+      body := baWrU32BE body (16 + 12 * i) 0x10000
+    return box 0x65647473 (box 0x656C7374 body)
+  let movie (metadata edits : ByteArray) := Id.run do
+    let vre := box 0x61766331 (zeros 78 ++ metadata)
+    let stsd := box 0x73747364 (baWrU32BE (zeros 8) 4 1 ++ vre)
+    let stco := box 0x7374636F (baWrU32BE (baWrU32BE (zeros 12) 4 1) 8 32)
+    let co64 := box 0x636F3634 (baWrU64BE (baWrU32BE (zeros 16) 4 1) 8 32)
+    let minf := box 0x6D696E66 (box 0x7374626C (stsd ++ stco ++ co64))
+    let hdlr := box 0x68646C72 (baWrU32BE (zeros 12) 8 0x76696465)
+    let mdia := box 0x6D646961 (hdlr ++ minf)
+    return box 0x6D6F6F76 (box 0x7472616B (edits ++ mdia))
+  let hdr := box 0x636F6C72 (zeros 11) ++ box 0x6D646376 (zeros 24)
+  let base := movie ByteArray.empty (edts 1 0)
+  let source := movie hdr (edts 1 7)
+  let mediaPrefix := box 0x66747970 (zeros 8) ++ box 0x6D646174 (zeros (2 * 1024 * 1024))
+  let cases := #[
+    ("no-op", source, source, false, 0),
+    ("equal-size elst", movie ByteArray.empty (edts 1 7), base, false, 1),
+    ("growing colr/mdcv", source, base, false, 2),
+    ("shrinking edts", movie ByteArray.empty (edts 1 7), movie ByteArray.empty (edts 2 0), false, 3),
+    ("front moov", source, base, true, 2),
+    ("none", source, box 0x6D6F6F76 ByteArray.empty, false, 0)]
+  let path := "/tmp/leanav-surgical-moov-test.mp4"
+  try
+    for (name, input, tail, front, change) in cases do
+      let full := if front then tail ++ mediaPrefix else mediaPrefix ++ tail
+      let expected := (patchMp4HdrAndElstBoxesPure input full true).getD full
+      let valid := match change with
+        | 0 => expected == full
+        | 1 => expected.size == full.size && expected != full
+        | 2 => expected.size > full.size
+        | _ => expected.size < full.size
+      unless valid do throw (IO.userError s!"invalid surgical fixture: {name}")
+      IO.FS.writeBinFile path full
+      let located ← locateMp4TrailingMoovWindowIO path full.size.toUInt64
+      unless located.isSome == !front do throw (IO.userError s!"tail location: {name}")
+      if let some (off, slice) := located then
+        let patched := (patchMp4HdrAndElstBoxesPure input slice true).getD slice
+        unless full.extract 0 off ++ patched == expected do
+          throw (IO.userError s!"slice/full mismatch: {name}")
+      patchMp4HdrAndElstBoxesIO "" path input true
+      unless (← IO.FS.readBinFile path) == expected do
+        throw (IO.userError s!"surgical/full mismatch: {name}")
+    -- Extended-size mdat headers must skip their payload, too.
+    let extMdat := baWrU64BE (baWrU32BE (baWrU32BE (zeros 32) 0 1) 4 0x6D646174) 8 32
+    let full := extMdat ++ source
+    IO.FS.writeBinFile path full
+    unless (← locateMp4TrailingMoovWindowIO path full.size.toUInt64).isSome do
+      throw (IO.userError "extended mdat not located")
+    IO.eprintln "[surgical-moov] six byte-equivalence cases and extended header passed"
+  finally
+    IO.FS.removeFile path
+
 /-- Comprehensive end-to-end verification of all 8 FFmpeg subsystem layers in `LeanAV`. -/
 def runSelfTest : IO UInt32 := do
+  runSurgicalMoovTailTests
   -- 1. Law 1: Exact rational rescale (`libavutil` replacement)
   let r1 := rescaleQ 90000 1 90
   let tbOk := r1 == 1000 && AVRational.rescalePts 90000 AVRational.tb90kHz AVRational.tbMicros == 1000000

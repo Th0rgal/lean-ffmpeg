@@ -23,7 +23,7 @@ class U16LeKernelsIR(unittest.TestCase):
         kernels = []
         for arch in ("x86_64", "arm64"):
             text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
-            names = ("lean_native_swscale_bilinear_q8_u16le", "lean_native_luma_stats_u16le",
+            names = ("lean_native_swscale_bilinear_q8_u16le", "lean_native_luma_stats_u16le", "lean_native_luma_stats_u8",
                      "lean_native_extract_u16le_msb8", "lean_native_luma_acceptance_16x16_u8",
                      "lean_native_luma_acceptance_16x16_u16le")
             kernels.append("\n".join(re.search(
@@ -32,14 +32,19 @@ class U16LeKernelsIR(unittest.TestCase):
         if kernels[0] != kernels[1]:
             raise AssertionError("architecture U16LE implementations differ")
         ir = directory / "u16.ll"
-        ir.write_text("declare i32 @llvm.vector.reduce.add.v16i32(<16 x i32>)\n" +
+        host = subprocess.check_output([clang, "-dumpmachine"], text=True).strip()
+        ir.write_text(f'target triple = "{host}"\n' +
+                      "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n" +
+                      "declare i32 @llvm.vector.reduce.add.v16i32(<16 x i32>)\n" +
                       "declare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)\n" +
                       "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
                       kernels[0].replace(" #0 {", " {").replace(", !llvm.loop !0", ""))
         so = directory / "u16.so"
-        subprocess.run([clang, "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
+        subprocess.run([clang, "-Werror", "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
                        check=True, capture_output=True)
-        subprocess.run([clang, "-target", "aarch64-linux-gnu", "-O3", "-c", str(ir),
+        arm_ir = directory / "u16-arm.ll"
+        arm_ir.write_text(ir.read_text().replace(host, "aarch64-unknown-linux-gnu"))
+        subprocess.run([clang, "-Werror", "-target", "aarch64-unknown-linux-gnu", "-O3", "-c", str(arm_ir),
                         "-o", str(directory / "u16-arm.o")], check=True, capture_output=True)
         cls.clang = clang
         cls.directory = directory
@@ -53,6 +58,9 @@ class U16LeKernelsIR(unittest.TestCase):
         cls.stats = cls.lib.lean_native_luma_stats_u16le
         cls.stats.argtypes = [ctypes.c_void_p] + [ctypes.c_uint64] * 2
         cls.stats.restype = ctypes.c_uint64
+        cls.stats8 = cls.lib.lean_native_luma_stats_u8
+        cls.stats8.argtypes = cls.stats.argtypes
+        cls.stats8.restype = ctypes.c_uint64
 
         cls.accept = cls.lib.lean_native_luma_acceptance_16x16_u16le
         cls.accept8 = cls.lib.lean_native_luma_acceptance_16x16_u8
@@ -127,11 +135,39 @@ class U16LeKernelsIR(unittest.TestCase):
         self.check_scale(18, 6, 11, 5, [0, 65535] * 54)
 
     def test_whole_module_has_zero_clang_warnings(self):
-        result = subprocess.run(
-            [self.clang, "-O3", "-c", str(ROOT / "c/leanav_lnir_x86_64.ll"),
-             "-o", str(self.directory / "whole.o")], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr, "")
+        for arch, target in (("x86_64", "x86_64-pc-linux-gnu"),
+                             ("arm64", "aarch64-unknown-linux-gnu")):
+            result = subprocess.run(
+                [self.clang, "-Werror", "-target", target, "-O3", "-c",
+                 str(ROOT / f"c/leanav_lnir_{arch}.ll"),
+                 "-o", str(self.directory / f"whole-{arch}.o")],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+
+    def test_both_stats_vector_paths_and_tails(self):
+        rng = random.Random(1202)
+        sizes = list(range(130)) + [4095, 4096, 4097, 65535, 65536, 65537]
+        for bits, fn in ((8, self.stats8), (16, self.stats)):
+            cap = (1 << bits) - 1
+            for n in sizes:
+                patterns = ([cap] * n, [0, cap] * (n // 2) + [cap] * (n % 2),
+                            [rng.randrange(cap + 1) for _ in range(n)])
+                for values in patterns:
+                    raw = b"".join(v.to_bytes(bits // 8, "little") for v in values)
+                    src = ctypes.create_string_buffer(b"S" + raw + b"S")
+                    for step in (0, 1, 2, 3, 15, 16, 17, 63, 64, n + 1, 2**64 - 1):
+                        sampled = values[::step] if step else []
+                        if bits == 16:
+                            sampled = [v >> 2 for v in sampled]
+                        count = len(sampled)
+                        mean = sum(sampled) // count if count else 0
+                        var = max(0, sum(v*v for v in sampled) // count - mean*mean) if count else 0
+                        self.assertEqual(fn(ctypes.byref(src, 1), n, step),
+                                         (var << 32) | mean, (bits, n, step))
+                    self.assertEqual(src.raw[:-1], b"S" + raw + b"S")
+            self.assertEqual(fn(None, 0, 1), 0)
+            self.assertEqual(fn(None, 10, 0), 0)
 
     def test_all_u16_values_and_stats_steps(self):
         values = list(range(65536))
