@@ -92,8 +92,15 @@ Independent receipt auditing accepted that scoped result. All 6,133 inventory
 rows remain accounted for; this selection does not update the full-suite totals
 or establish native MPEG codec parity.
 
+The SPDIF wave adds explicit `-f spdif` routing through the delegated backend.
+An independent audit accepted 11 candidate CLI passes and three retained
+co-blocker failures from 14 isolated FATE targets; all 14 reference targets
+passed. The 6,133-row inventory and global totals remain unchanged. See the
+[per-target result and provenance](docs/SPDIF_ROUTING_20261027.md).
+
 | Suite / environment | Result | Scope and limitations |
 | :--- | :--- | :--- |
+| Local SPDIF-wave Python suites, 2026-10-27 | **148 passed, 0 skipped** | 74 unit + 74 differential tests; corrected runtime environment, earlier failed attempts retained |
 | Local MPEG-wave Python suites, 2026-10-27 | **138 passed, 0 skipped** | 64 unit + 74 differential tests; project tests, not upstream FATE |
 | Linux CI, `68936da` | **60 passed, 4 skipped** | 30 unit + 34 differential cases counted; skips excluded from passes |
 | macOS CI, `68936da` | **43 passed, 6 skipped** | 15 unit + 34 differential cases counted; some IR classes unavailable on this runner |
