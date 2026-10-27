@@ -337,7 +337,7 @@ def supportedFormat (s : String) : Bool :=
    "avi", "asf", "wmv", "wma", "flv", "swf", "rm", "nut", "gxf", "mxf", "mxf_d10", "mxf_opatom",
    "wtv", "dv", "roq", "smjpeg", "wc3movie", "film_cpk", "segafilm",
    "w64", "rf64", "aiff", "aif", "au", "caf", "voc", "sox", "ircam", "avr", "ast", "oma",
-   "ac3", "eac3", "dts", "truehd", "mlp", "adts", "aac", "latm", "mp2", "mp3",
+   "ac3", "eac3", "dts", "dtshd", "truehd", "mlp", "adts", "aac", "latm", "mp2", "mp3",
    "oga", "ogv", "opus", "spx", "tta", "wv", "ape", "amr", "g722", "g723_1", "g726", "g726le",
    "sbc", "dfpwm", "rso", "mmf", "aea", "ilbc", "adx", "flm",
    "s16be", "s24le", "s24be", "s32le", "s32be", "s8", "u8",

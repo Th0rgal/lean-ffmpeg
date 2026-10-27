@@ -643,13 +643,13 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-mbcmp", "-precmp", "-ildctcmp", "-dia_size", "-last_pred", "-preme",
      "-pred", "-huffman", "-context", "-strict", "-mpeg_quant", "-alternate_scan",
      "-aiv", "-umv", "-ps", "-aic", "-obmc", "-loop", "-part",
-     "-flags", "-fflags", "-sws_flags", "-swr_flags", "-idct", "-dct",
+     "-flags", "-flags2", "-fflags", "-sws_flags", "-swr_flags", "-idct", "-dct",
      "-cpuflags", "-hwaccel", "-thread_type", "-filter_threads", "-filter_complex_threads",
      "-top", "-field_order", "-intra_matrix", "-inter_matrix",
      "-chroma_sample_location", "-color_range", "-colorspace", "-color_primaries", "-color_trc",
      "-aspect", "-sar", "-dar", "-timecode", "-bits_per_raw_sample", "-compression_level",
      "-frame_size", "-cutoff", "-application", "-vbr", "-mapping_family",
-     "-channel_layout", "-ch_layout", "-channel_order", "-sample_fmt", "-guess_layout_max",
+     "-channel_layout", "-ch_layout", "-channel_order", "-downmix", "-sample_fmt", "-guess_layout_max",
      "-hash",
      "-fps_mode", "-vsync", "-async",
      "-brand", "-empty_hdlr_name", "-use_editlist", "-frag_duration", "-frag_size",
@@ -660,7 +660,9 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-start_number", "-pattern_type", "-ts_from_file", "-attach", "-dump_attachment",
      "-aac_coder", "-lpc_type", "-lpc_passes", "-exact_rice_parameters", "-multi_dim_quant"].contains tok
 
-/-- Validate the value argument of an extended 1-argument FFmpeg/FATE flag. -/
+/-- Validate local constraints on an extended 1-argument FFmpeg/FATE flag.
+    Codec-specific `-flags2` expressions and `-downmix` channel layouts retain
+    FFmpeg's value grammar and are validated by the delegated backend. -/
 def isValidExtendedFlagValue (tok value : String) : Bool :=
   if value == "" then false
   else if tok == "-hash" then
