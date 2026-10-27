@@ -643,6 +643,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-mbcmp", "-precmp", "-ildctcmp", "-dia_size", "-last_pred", "-preme",
      "-pred", "-huffman", "-context", "-strict", "-mpeg_quant", "-alternate_scan",
      "-aiv", "-umv", "-ps", "-aic", "-obmc", "-loop", "-part",
+     "-wavelet_type",
      "-flags", "-flags2", "-fflags", "-sws_flags", "-swr_flags", "-idct", "-dct",
      "-cpuflags", "-hwaccel", "-thread_type", "-filter_threads", "-filter_complex_threads",
      "-top", "-field_order", "-intra_matrix", "-inter_matrix",
@@ -671,6 +672,8 @@ def isValidExtendedFlagValue (tok value : String) : Bool :=
      "crc32", "adler32"].contains (strToLowerAscii value)
   else if tok == "-channel_order" then
     ["default", "coded", "0", "1"].contains value
+  else if tok == "-wavelet_type" then
+    ["9_7", "5_3", "haar", "haar_noshift"].contains value
   else if strStartsWithFast tok "-metadata:" then
     (parseMetadataSpec value).isSome
   else if strStartsWithFast tok "-bsf:" then
