@@ -343,7 +343,7 @@ def supportedFormat (s : String) : Bool :=
    "s16be", "s24le", "s24be", "s32le", "s32be", "s8", "u8",
    "u16le", "u16be", "u24le", "u24be", "u32le", "u32be", "f32le", "f32be", "f64le", "f64be", "alaw", "mulaw", "vidc",
    "h264", "hevc", "vvc", "av1", "mjpeg", "dnxhd", "h261", "h263", "yuv4mpegpipe", "y4m",
-   "image2pipe", "apng", "gif", "webp",
+   "image2pipe", "apng", "gif", "webp", "fits",
    "srt", "subrip", "webvtt", "vtt", "ass", "ssa", "jacosub", "microdvd", "mpl2", "pjs",
    "realtext", "sami", "scc", "stl", "subviewer", "ttml", "vplayer", "lrc",
    "ffmetadata", "hash", "framehash", "streamhash",
