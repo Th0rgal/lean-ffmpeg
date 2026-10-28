@@ -703,7 +703,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
   else
     ["-c:d", "-dcodec", "-codec:d", "-c:t", "-c:0", "-c:1",
      "-frames:a", "-aframes", "-frames:d", "-dframes", "-frames:s",
-     "-to", "-sseof", "-itsoffset", "-seek_timestamp", "-avoid_negative_ts",
+     "-to", "-sseof", "-itsoffset", "-output_ts_offset", "-seek_timestamp", "-avoid_negative_ts",
      "-qp", "-q", "-qscale", "-qmin", "-qmax", "-qdiff", "-qblur", "-qcomp",
      "-maxrate", "-minrate", "-bufsize", "-rc_init_occupancy", "-pass", "-passlogfile",
      "-tune", "-profile", "-profile:v", "-profile:a", "-level", "-level:v",
@@ -765,7 +765,7 @@ def isValidExtendedFlagValue (tok value : String) : Bool :=
     isValidBitrateSpec value
   else if tok == "-to" then
     (parseCliSeconds value).isSome
-  else if tok == "-sseof" || tok == "-itsoffset" then
+  else if tok == "-sseof" || tok == "-itsoffset" || tok == "-output_ts_offset" then
     let stripped := if strStartsWithFast value "-" then String.ofList (value.toList.drop 1) else value
     (parseCliSeconds stripped).isSome
   else

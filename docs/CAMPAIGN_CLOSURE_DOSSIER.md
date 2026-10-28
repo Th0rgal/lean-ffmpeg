@@ -209,3 +209,13 @@ Full FATE provenance/configuration coverage and integrated performance remain
 open. The accepted bounded x86 result of 2.861% slower paired median latency
 belongs to frozen `ae6ed0b`, not this integrated executable. This qualification
 does not claim complete FFmpeg parity, independent delegated codecs, or a speedup.
+
+## Signed output timestamp offset qualification (28 October 2026)
+
+See [the scoped timestamp-offset report](OUTPUT_TS_OFFSET_20261028.md). The exact
+`-output_ts_offset` option now accepts the existing signed-duration grammar and
+preserves delegated argv. Current project qualification passed 136/136 unit,
+81/81 differential and 7/7 focused tests with zero skips; proof counts remain
+8,899 declarations and 264 tight specs. The initial incorrect test assertion is
+retained in the audit. No fresh selected FATE media result or performance claim
+follows from this correction.
