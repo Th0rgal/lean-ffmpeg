@@ -1,5 +1,6 @@
 """Exercise the checked-in LLVM filter independently, including unaligned/in-place buffers."""
 import ctypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -7,7 +8,6 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MARKER = "; Packed Y/U/V filter:"
 
 
 class PixelFiltersIR(unittest.TestCase):
@@ -18,12 +18,22 @@ class PixelFiltersIR(unittest.TestCase):
             raise unittest.SkipTest("clang-18 unavailable")
         cls.tmp = tempfile.TemporaryDirectory(dir=ROOT / ".lake")
         directory = Path(cls.tmp.name)
-        kernels = [(ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text().split(MARKER)[1]
-                   for arch in ("x86_64", "arm64")]
+        kernels = []
+        for arch in ("x86_64", "arm64"):
+            text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
+            matches = re.findall(
+                r"^define[^\n]*@lean_native_apply_filters_yuv420p_u8\([^\n]*\n.*?^}",
+                text, re.M | re.S)
+            if len(matches) != 1:
+                raise AssertionError("exactly one packed filter definition required")
+            kernels.append(matches[0])
         if kernels[0] != kernels[1]:
             raise AssertionError("architecture filter implementations differ")
         ir = directory / "filters.ll"
-        ir.write_text("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n" + MARKER + kernels[0].replace(" #0 {", " {"))
+        ir.write_text("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n"
+                      "declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)\n"
+                      "declare <16 x i8> @llvm.umin.v16i8(<16 x i8>, <16 x i8>)\n"
+                      + kernels[0].replace(" #0 {", " {"))
         so = directory / "filters.so"
         subprocess.run([clang, "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
                        check=True, capture_output=True)
