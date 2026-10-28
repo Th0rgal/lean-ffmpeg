@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.31.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`621`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,897`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`623`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,897`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 10-bit and 8-bit luma acceptance read U16LE and U8 pixels directly from complete planes
 across all scaling ratios (`1:1`, `2:1`, `3:1`, and general Q8 bilinear), avoiding
@@ -14,6 +14,10 @@ sizes, truncated buffers, and the full UInt16 range.
 ---
 
 ## Performance across x86, DGX Spark and Apple Silicon
+
+Current integration and conformance limits are documented in the
+[28 October qualification report](docs/INTEGRATED_CONFORMANCE_20261028.md).
+Full upstream FATE parity remains unproven.
 
 The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
 **1.44× on DGX Spark** for its scale + tonemap + BT.709 CLI workload. Other
@@ -127,7 +131,7 @@ All **15** `LeanAV/*.lean` modules (**`264 / 264` specifications**) pass `turbo-
 ## Build & Verification
 
 ```bash
-# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 621-line C-ABI bridge (0 sorryAx)
+# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 623-line C-ABI bridge (0 sorryAx)
 lake build
 
 # Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
@@ -156,7 +160,7 @@ python3 -m unittest discover -s tests/differential -p "test_*.py"
 
 - [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `264/264` audited specifications): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 - [`c/`](c/):
-  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`621`-line** irreducible C-ABI bridge (reduced by **84.6%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
+  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`623`-line** irreducible C-ABI bridge (reduced by **84.6%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
     1. POSIX `fork` + `execvp` delegation shim (`leanav_c_exec_delegated_ffmpeg`),
     2. Phase 5 FFI ABI contract & `__ATOMIC_SEQ_CST` cancellation shims (`leanav_c_verify_plane_ffi_contract`, `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate`, `leanav_c_ffi_probe_mp4_contract`), and
     3. Zero-copy `ByteArray` (`lean_sarray_object` / `lean_sarray_cptr`) bridge to the 16 compiled `LNIR_WIRE_V1` LLVM IR kernels and 7 vectorized 2D strided/reduction runtime routines (`leanav_c_exec_lnir_unary_ba`, `leanav_c_exec_lnir_binary_ba`, `leanav_c_exec_lnir_ternary_ba`, `leanav_c_exec_lnir_scale2d_ba` dispatching `kernel_id` `0..4` including `@lean_native_stencil2d_box3x3_u8` at `kernel_id = 4`, fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba`, `leanav_c_exec_lnir_cdef_ba`, and `leanav_c_exec_lnir_luma_stats_ba`).

@@ -154,3 +154,10 @@ support GNU `--wrap`; the test now compiles the production C bridge with a renam
 scaler entrypoint and a counting wrapper on both platforms. No test is skipped to
 work around that failure. Historical benchmark and suite totals below are not
 claims that every case ran on the current CI runner.
+
+## 28 October integrated candidate
+
+See [the scoped qualification report](INTEGRATED_CONFORMANCE_20261028.md).
+Current source uses Lean 4.35.0, retains 8,897 declarations and 264 tight specs, and
+has 623 lines of C-ABI glue. Full FATE parity and current-candidate performance
+remain unproven; historical results above do not certify this candidate.

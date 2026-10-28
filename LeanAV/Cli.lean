@@ -386,7 +386,17 @@ def supportedPixFmt (s : String) : Bool :=
    "gbrp", "gbrp9le", "gbrp9be", "gbrp10le", "gbrp10be", "gbrp12le", "gbrp12be",
    "gbrp14le", "gbrp14be", "gbrp16le", "gbrp16be",
    "gbrap", "gbrap10le", "gbrap10be", "gbrap12le", "gbrap12be", "gbrap16le", "gbrap16be",
-   "xyz12le", "xyz12be", "ayuv64le", "ayuv64be"].contains s
+   "xyz12le", "xyz12be", "ayuv64le", "ayuv64be",
+   "ayuv", "gbrap14be", "gbrap14le", "gbrapf32be", "gbrapf32le", "gbrp10msbbe", "gbrp10msble",
+   "gbrp12msbbe", "gbrp12msble", "gbrpf32be", "gbrpf32le", "grayf32be", "grayf32le", "nv20be",
+   "nv20le", "p012be", "p012le", "p210be", "p210le", "p212be", "p212le", "p216be", "p216le",
+   "uyva", "v30xle", "vuya", "vuyx", "vyu444", "x2bgr10le", "x2rgb10le", "xv30le", "xv36be",
+   "xv36le", "xv48be", "xv48le", "y210le", "y212le", "y216le", "yuv440p10be", "yuv440p10le",
+   "yuv440p12be", "yuv440p12le", "yuv444p10msbbe", "yuv444p10msble", "yuv444p12msbbe",
+   "yuv444p12msble", "yuva420p10be", "yuva420p10le", "yuva420p16be", "yuva420p16le",
+   "yuva420p9be", "yuva420p9le", "yuva422p10be", "yuva422p10le", "yuva422p12be", "yuva422p12le",
+   "yuva422p16be", "yuva422p16le", "yuva422p9be", "yuva422p9le", "yuva444p10be", "yuva444p10le",
+   "yuva444p12be", "yuva444p12le", "yuva444p16be", "yuva444p16le", "yuva444p9be", "yuva444p9le"].contains s
 
 /-- Supported `-loglevel` / `-v` tokens. -/
 def supportedLogLevel (s : String) : Bool :=

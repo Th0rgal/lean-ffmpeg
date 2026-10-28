@@ -630,7 +630,8 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
   else if !strStartsWithFast tok "-" then
     false
   else if isMpegDelegatedValueFlag tok then true
-  else if strStartsWithFast tok "-metadata:" ||
+  else if strStartsWithFast tok "-export_side_data:" ||
+          strStartsWithFast tok "-metadata:" ||
           strStartsWithFast tok "-disposition" ||
           strStartsWithFast tok "-map_metadata:" ||
           strStartsWithFast tok "-bsf:" ||
@@ -664,7 +665,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-pred", "-huffman", "-context", "-strict", "-mpeg_quant", "-alternate_scan",
      "-aiv", "-umv", "-ps", "-aic", "-obmc", "-loop", "-part",
      "-wavelet_type",
-     "-flags", "-flags2", "-fflags", "-sws_flags", "-swr_flags", "-idct", "-dct",
+     "-flags", "-flags2", "-fflags", "-export_side_data", "-sws_flags", "-swr_flags", "-idct", "-dct",
      "-cpuflags", "-hwaccel", "-thread_type", "-filter_threads", "-filter_complex_threads",
      "-top", "-field_order", "-intra_matrix", "-inter_matrix",
      "-chroma_sample_location", "-color_range", "-colorspace", "-color_primaries", "-color_trc",
