@@ -677,7 +677,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-min_frag_duration", "-write_tmcd", "-write_bext", "-write_id3v1", "-write_id3v2",
      "-id3v2_version", "-write_xing", "-write_apetag", "-write_peak", "-mpegts_copyts", "-mpegts_flags",
      "-mpegts_transport_stream_id", "-loopstart", "-loopend", "-sample_rate", "-strip_number_adaptivity",
-     "-muxrate", "-gifflags", "-final_delay", "-update", "-update_filemtime",
+     "-serial_offset", "-muxrate", "-gifflags", "-final_delay", "-update", "-update_filemtime",
      "-start_number", "-pattern_type", "-ts_from_file", "-attach", "-dump_attachment",
      "-aac_coder", "-lpc_type", "-lpc_passes", "-exact_rice_parameters", "-multi_dim_quant"].contains tok
 
