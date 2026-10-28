@@ -98,7 +98,9 @@ static uint32_t leanav_exec_ffmpeg_argv(
                 if (!out_path || (strcmp(out_path, "-") != 0 && strcmp(out_path, "md5:") != 0 && strncmp(out_path, "pipe:", 5) != 0)) {
                     dup2(devnull, STDOUT_FILENO);
                 }
-                dup2(devnull, STDERR_FILENO);
+                /* mode 1 suppresses both streams; mode 2 suppresses only
+                   normal stdout so -nostats still exposes codec diagnostics. */
+                if (suppress_output == 1u) dup2(devnull, STDERR_FILENO);
             }
             if (devnull > STDERR_FILENO) close(devnull);
         }
