@@ -1280,7 +1280,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         (outPath == "/dev/null" && ext.hasLavfiInput)
       let suppress : UInt32 :=
         if stdoutPipeLike && !validCfg.jsonOutput then 0
-        else if validCfg.jsonOutput || cliQuiet validCfg.logLevel || !validCfg.showStats then 1
+        else if validCfg.jsonOutput || cliQuiet validCfg.logLevel then 1
+        else if !validCfg.showStats then 2
         else 0
       let rc ←
         if verifyExecArgvHygiene argv.toList then
