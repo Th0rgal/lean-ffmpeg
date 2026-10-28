@@ -161,3 +161,10 @@ See [the scoped qualification report](INTEGRATED_CONFORMANCE_20261028.md).
 Current source uses Lean 4.35.0, retains 8,897 declarations and 264 tight specs, and
 has 623 lines of C-ABI glue. Full FATE parity and current-candidate performance
 remain unproven; historical results above do not certify this candidate.
+
+## 28 October BSF parser correction
+
+See [the scoped BSF parsing report](BSF_ROUTING_20261028.md). The current audit
+remains 8,897 declarations with no forbidden axioms and 264/264 tight specs.
+The 8,909-case token-oracle comparison and routing tests are bounded parser
+evidence; they do not close the remaining FATE/media or performance gates.
