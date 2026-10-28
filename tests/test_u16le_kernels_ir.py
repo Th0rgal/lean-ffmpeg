@@ -245,11 +245,18 @@ class U16LeKernelsIR(unittest.TestCase):
         self.check_scale(18, 6, 11, 5, [0, 65535] * 54)
 
     def test_whole_module_has_zero_clang_warnings(self):
-        for arch, target in (("x86_64", "x86_64-pc-linux-gnu"),
-                             ("arm64", "aarch64-unknown-linux-gnu")):
+        for arch, allowed_targets in (
+                ("x86_64", ("x86_64-pc-linux-gnu", "x86_64-unknown-linux-gnu")),
+                ("arm64", ("aarch64-unknown-linux-gnu",))):
+            ir_path = ROOT / f"c/leanav_lnir_{arch}.ll"
+            targets = re.findall(r'^target triple = "([^"]+)"$',
+                                 ir_path.read_text(), re.M)
+            self.assertEqual(len(targets), 1, "exactly one target triple required")
+            target = targets[0]
+            self.assertIn(target, allowed_targets)
             result = subprocess.run(
                 [self.clang, "-Werror", "-target", target, "-O3", "-c",
-                 str(ROOT / f"c/leanav_lnir_{arch}.ll"),
+                 str(ir_path),
                  "-o", str(self.directory / f"whole-{arch}.o")],
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
