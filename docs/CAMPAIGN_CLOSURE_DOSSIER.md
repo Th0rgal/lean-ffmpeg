@@ -161,3 +161,11 @@ See [the scoped qualification report](INTEGRATED_CONFORMANCE_20261028.md).
 Current source uses Lean 4.35.0, retains 8,897 declarations and 264 tight specs, and
 has 623 lines of C-ABI glue. Full FATE parity and current-candidate performance
 remain unproven; historical results above do not certify this candidate.
+
+
+## PFM routing correction (28 October 2026)
+
+See [PFM validation](PFM_ROUTING_20261028.md): four scoped image recipe comparisons,
+52 byte-identical image pairs and matching upstream MD5/size/decode CRC.
+Proof counts remain 8,897 declarations and 264 tight specifications.
+This branch adds no global FATE or performance certification.

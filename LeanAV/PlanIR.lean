@@ -538,7 +538,7 @@ def inferContainerFormat (explicitFmt : Option String) (outPath : String) : Stri
           else if ext == "ffmeta" || ext == "ffmetadata" then "ffmetadata"
           else if ext == "fits" then "fits"
           else if ["png", "bmp", "pam", "pbm", "pgm", "pgmyuv", "ppm", "tga",
-                   "tif", "tiff", "dpx", "sgi", "sun", "pcx", "qoi", "xbm", "xwd", "wbmp"].contains ext then "image2"
+                   "tif", "tiff", "dpx", "sgi", "sun", "pcx", "qoi", "xbm", "xwd", "wbmp", "pfm"].contains ext then "image2"
           else "unknown"
 
 /-- Check whether a `-map` token is a valid negative map (`-0:a`), filtergraph label (`[v]`), or attachment map (`0:t`). -/

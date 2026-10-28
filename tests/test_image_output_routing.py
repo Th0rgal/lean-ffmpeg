@@ -127,6 +127,25 @@ class ImageOutputRoutingTests(unittest.TestCase):
                             str(self.root / "output frames" / "%02d.wbmp")])
         self.assert_delegated(args, "image2")
 
+    def test_pfm_routes_float_pixel_formats_to_image2(self):
+        for suffix in ("pfm", "PFM", "PfM"):
+            for pixfmt in ("gbrpf32be", "gbrpf32le", "grayf32be", "grayf32le"):
+                with self.subTest(suffix=suffix, pixfmt=pixfmt):
+                    self.assert_delegated(["-i", str(self.source), "-pix_fmt", pixfmt,
+                                           str(self.root / ("output." + suffix))], "image2")
+
+    def test_pfm_explicit_format_precedence_and_backend_error(self):
+        self.assert_delegated(["-i", str(self.source), "-f", "nut",
+                               str(self.root / "output.pfm")], "nut")
+        self.assert_delegated(["-i", str(self.source),
+                               str(self.root / "output.pfm")], "image2", 73)
+        self.assert_rejected(["-i", str(self.source), "-f", "pfm",
+                              str(self.root / "output.pfm")])
+        self.assert_rejected(["-i", str(self.source), str(self.root / "output.pfmx")],
+                             "unrecognized_output_container_format")
+        self.assert_rejected(["-i", str(self.source), "frames/../output.pfm"],
+                             "unsafe_protocol_or_path_traversal")
+
     def test_backend_error_status_is_preserved(self):
         cases = [(["-i", str(self.source), str(self.root / "out.fits")], "fits"),
                  (["-i", str(self.source), str(self.root / "%02d.wbmp")], "image2"),

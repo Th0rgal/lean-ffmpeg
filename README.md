@@ -17,7 +17,7 @@ sizes, truncated buffers, and the full UInt16 range.
 
 Current integration and conformance limits are documented in the
 [28 October qualification report](docs/INTEGRATED_CONFORMANCE_20261028.md).
-Full upstream FATE parity remains unproven.
+Full upstream FATE parity remains unproven. The [PFM routing correction](docs/PFM_ROUTING_20261028.md) passes the four affected image recipe comparisons; this is scoped conformance evidence.
 
 The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
 **1.44× on DGX Spark** for its scale + tonemap + BT.709 CLI workload. Other
