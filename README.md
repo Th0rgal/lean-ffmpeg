@@ -98,6 +98,11 @@ through FFmpeg delegation. Seven focused comparisons produced identical outputs;
 this is a scoped correctness result, not a full-suite or performance claim. See
 [FITS/WBMP validation](docs/FITS_WBMP_ROUTING_20261028.md).
 
+Bitstream-filter routing now preserves escaped/quoted commas and recognizes five
+additional upstream filter names. The parser matches the frozen upstream token
+oracle on 8,909 deterministic cases; this is not FATE/media or performance credit.
+See [BSF parsing validation](docs/BSF_ROUTING_20261028.md).
+
 **We do not claim to pass 100% of the full FFmpeg test suite.** The historical
 FATE result is **129/129 of the reference-passing tests in a selected 187-case
 run**. This is useful compatibility evidence, but is neither all 187 cases passing

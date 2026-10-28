@@ -221,7 +221,9 @@ def SubtitleCodecSpec.toString : SubtitleCodecSpec → String
 
 /-- Supported bitstream filters (`-bsf:v` / `-bsf:a` / `-bsf:s`). -/
 def supportedBsf (s : String) : Bool :=
-  let base := (splitStrOnChar s '=').headD s
+  -- av_strtok(stage, "=") skips leading equals before the name.
+  let nameChars := s.toList.dropWhile (fun c => c == '=')
+  let base := String.ofList (nameChars.takeWhile (fun c => c != '='))
   ["aac_adtstoasc", "h264_mp4toannexb", "hevc_mp4toannexb",
    "av1_frame_split", "av1_frame_merge", "av1_metadata",
    "h264_metadata", "h264_redundant_pps", "hevc_metadata", "vvc_metadata", "mpeg2_metadata",
@@ -230,10 +232,51 @@ def supportedBsf (s : String) : Bool :=
    "noise", "null", "chomp", "dca_core", "eac3_core", "truehd_core",
    "filter_units", "hapqa_extract", "imx_dump_header", "mjpeg2jpeg", "mjpega_dump_header",
    "mov2textsub", "text2movsub", "mp3_header_decompress", "mpeg4_unpack_bframes",
-   "opus_metadata", "pcm_rechunk", "pgs_frame_merge", "prores_metadata", "trace_headers"].contains base
+   "opus_metadata", "pcm_rechunk", "pgs_frame_merge", "prores_metadata", "trace_headers",
+   "trim", "jpegapp", "apv_metadata", "dv_error_marker", "remove_extra"].contains base
+
+private def isBsfWhitespace (c : Char) : Bool :=
+  c == ' ' || c == '\n' || c == '\t' || c == '\r'
+
+/-- Tokenize the outer BSF list like FFmpeg's `av_get_token` with comma terminators.
+    `trailing` counts removable whitespace at the end of the reversed token.
+    An escape or closing quote protects everything emitted so far, resetting it.
+    The original CLI string is retained separately for backend delegation. -/
+private def splitBsfChainAux : List Char → Bool → Bool → List Char → Nat → List String → List String
+  | [], _, _, rev, trailing, stages =>
+      (String.ofList ((rev.drop trailing).reverse) :: stages).reverse
+  | c :: cs, leading, quoted, rev, trailing, stages =>
+      if quoted then
+        if c == '\'' then
+          splitBsfChainAux cs false false rev 0 stages
+        else
+          splitBsfChainAux cs false true (c :: rev)
+            (if isBsfWhitespace c then trailing + 1 else 0) stages
+      else if leading && isBsfWhitespace c then
+        splitBsfChainAux cs true false rev trailing stages
+      else if c == '\\' then
+        match cs with
+        | [] => (String.ofList ((c :: rev).reverse) :: stages).reverse
+        | next :: rest => splitBsfChainAux rest false false (next :: rev) 0 stages
+      else if c == '\'' then
+        splitBsfChainAux cs false true rev trailing stages
+      else if c == ',' then
+        let stage := String.ofList ((rev.drop trailing).reverse)
+        -- av_bsf_list_parse_str tolerates one comma immediately before EOF.
+        if cs.isEmpty then (stage :: stages).reverse
+        else splitBsfChainAux cs true false [] 0 (stage :: stages)
+      else
+        splitBsfChainAux cs false false (c :: rev)
+          (if isBsfWhitespace c then trailing + 1 else 0) stages
+
+/-- Decode only the outer BSF list; option expressions remain backend semantics.
+    Empty/interior stages survive tokenization so the name gate rejects them.
+    Like upstream, unmatched single quotes consume to EOF without a lexer error. -/
+def splitBsfChain (s : String) : List String :=
+  splitBsfChainAux s.toList true false [] 0 []
 
 def supportedBsfChain (s : String) : Bool :=
-  let stages := splitStrOnChar s ','
+  let stages := splitBsfChain s
   !stages.isEmpty && stages.all supportedBsf
 
 /-- Typed bitstream filter attachment. -/

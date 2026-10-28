@@ -176,3 +176,36 @@ This branch adds no global FATE or performance certification.
 The isolated IAMF candidate adds explicit IAMF format routing, stream-group and stream-ID options, and safe local file-valued graph/group arguments. These paths delegate codec execution to the pinned FFmpeg backend; they do not establish an independent IAMF codec implementation. Numeric input group maps force delegation. Existing lexical path checks remain in force; they do not imply confinement of references inside graph files.
 
 All 14 original paired IAMF recipes passed, with 84 successful process receipts, byte-identical paired media and exact frozen upstream recipe output. Twenty-eight ffprobe invocations are upstream helpers and receive no candidate implementation credit. Parent raw validation passed 722 checks. The current axiom audit reports 8,899 declarations and no forbidden axioms. The full unit suite passed 118/118 with zero skips; the differential suite passed 81/81 with zero skips. No global FATE parity or performance claim follows from these focused results.
+
+## 28 October BSF parser correction
+
+See [the scoped BSF parsing report](BSF_ROUTING_20261028.md). The isolated BSF
+candidate `cb9c6ac` audited 8,897 declarations with no forbidden axioms and
+264/264 tight specs; integrated counts are reported separately below.
+The 8,909-case token-oracle comparison and routing tests are bounded parser
+evidence; they do not close the remaining FATE/media or performance gates.
+
+## Integrated IAMF/PFM/BSF project qualification (28 October 2026)
+
+The integrated candidate combines the reviewed IAMF/PFM base `e2912eb` with the
+BSF correction `cb9c6ac`. One complete local qualification passed all 22 commands:
+build (53 jobs), 53 self-test waves, FFI and kernel checks, 8,899 declarations with
+zero sorryAx/custom axioms, and 264/264 tight specifications across 15 modules.
+Python suites passed **129/129 unit tests and 81/81 differential tests**, with
+zero skips, failures or errors. These are project-suite counts, not upstream FATE
+coverage. The integrated executable SHA256 is
+`7064fdcc027733ee3ffb6218fb9b858e3ca3b349b6b14180f6965fa1a2a1d8c7`.
+
+The retained campaign qualification report passed 313 checks; the independent
+parent terminal review passed 53 checks. Original worktrees, binaries, source
+hashes and the original IAMF build cache were preserved. Earlier PFM/IAMF/BSF
+media results above describe their isolated candidates and are not new integrated
+FATE results. The historical GPL57 run credited 46 CLI cases, retained seven
+failures, and excluded four ffprobe helper cases from candidate credit. Later
+routing corrections are present here, but fresh integrated GPL57 execution
+remains outstanding.
+
+Full FATE provenance/configuration coverage and integrated performance remain
+open. The accepted bounded x86 result of 2.861% slower paired median latency
+belongs to frozen `ae6ed0b`, not this integrated executable. This qualification
+does not claim complete FFmpeg parity, independent delegated codecs, or a speedup.

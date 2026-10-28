@@ -1,0 +1,225 @@
+{
+  "scope": "Parser/name-gate expectations and raw historical values; not codec/media conformance",
+  "source_commit": "bf0e831606938f530326c9679591109407fa8d0d",
+  "gate_vectors": [
+    {
+      "value": "null",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": " null \t",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "null,null",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "null,",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "'null'",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "n'ul'l",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "nu\\ll",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "'null",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "=null",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "===null=",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "null=",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "null=ignored",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "null=\\",
+      "accepted": true,
+      "reason": "Known null BSF isolates list/name parsing; null has no private option class, so options are ignored by bsf_list_append_internal."
+    },
+    {
+      "value": "",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": " \t",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "''",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": ",null",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null,,",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null, ",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null,\t",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null\\",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "\"null\"",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "NULL",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null =ignored",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "'null '",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null\\ ",
+      "accepted": false,
+      "reason": "Empty stage or exact decoded name is not null; reject by source-derived token/name grammar, not by invented quote-balance rules."
+    },
+    {
+      "value": "null\\,null",
+      "accepted": false,
+      "reason": "One escape makes comma literal in name null,null; it is not a stage separator."
+    },
+    {
+      "value": "null\\\\,null",
+      "accepted": false,
+      "reason": "Two escapes decode to literal backslash before a separator; first name null\\ is unknown."
+    },
+    {
+      "value": "'null,null",
+      "accepted": false,
+      "reason": "Unmatched quote itself is permitted lexically, but resulting name null,null is unknown."
+    },
+    {
+      "value": "setts=ts=if(eq(N\\,0)\\,PTS\\,DTS)",
+      "accepted": true,
+      "reason": "Source list parser removes one escaping layer; expression option remains one setts stage. Runtime codec/packet behavior remains delegated."
+    },
+    {
+      "value": "setts=ts='if(eq(N,0),PTS,DTS)'",
+      "accepted": true,
+      "reason": "Single quotes protect commas at outer list layer; expression is parsed by existing backend option machinery."
+    },
+    {
+      "value": "setts=ts=if(eq(N\\\\,0)\\\\,PTS\\\\,DTS)",
+      "accepted": false,
+      "reason": "Even backslash count does not protect comma; bogus later stage names must not be accepted."
+    }
+  ],
+  "escaped_fate_values": [
+    {
+      "target": "fate-ffmpeg-setts-bsf",
+      "flag": "-bsf:v",
+      "value": "setts=duration=if(eq(NEXT_PTS\\,NOPTS)\\,PREV_OUTDURATION\\,(NEXT_PTS-PTS)/2):ts=PTS/2"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-gap-end",
+      "flag": "-bsf:a",
+      "value": "setts=duration=if(eq(N\\,0)\\,18063360\\,DURATION):pts=PTS+if(gte(N\\,1)\\,16257024\\,0),trim=end=9031680"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-gap-start",
+      "flag": "-bsf:a",
+      "value": "setts=duration=if(eq(N\\,0)\\,18063360\\,DURATION):pts=PTS+if(gte(N\\,1)\\,16257024\\,0),trim=start=9031680"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-opus-gap-end",
+      "flag": "-bsf:a",
+      "value": "setts=duration=if(eq(N\\,0)\\,10000\\,DURATION):pts=PTS+if(gte(N\\,1)\\,9040\\,0),trim=end=9188"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-opus-gap-start",
+      "flag": "-bsf:a",
+      "value": "setts=duration=if(eq(N\\,0)\\,10000\\,DURATION):pts=PTS+if(gte(N\\,1)\\,9040\\,0),trim=start=9188"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-priming-gap",
+      "flag": "-bsf:a",
+      "value": "setts=pts=PTS+if(gte(N\\,1)\\,10000\\,0),trim=start=1:start_type=pkt_index"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-priming-gap-duration",
+      "flag": "-bsf:a",
+      "value": "setts=duration=if(eq(N\\,0)\\,11024\\,DURATION):pts=PTS+if(gte(N\\,1)\\,10000\\,0),trim=start=1:start_type=pkt_index"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-priming-nopts",
+      "flag": "-bsf:a",
+      "value": "setts=pts=if(gte(N\\,1)\\,NOPTS\\,PTS),trim=start=1:start_type=pkt_index"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-video-nopts-duration",
+      "flag": "-bsf:v",
+      "value": "setts=pts=if(eq(N\\,0)\\,NOPTS\\,PTS),trim=end=100:end_type=dur_ts"
+    },
+    {
+      "target": "fate-ffmpeg-trim-bsf-video-nopts-rel",
+      "flag": "-bsf:v",
+      "value": "setts=pts=if(eq(N\\,0)\\,NOPTS\\,PTS),trim=start=120:start_rel=1:end=600"
+    }
+  ],
+  "new_names": [
+    "trim",
+    "jpegapp",
+    "apv_metadata",
+    "dv_error_marker",
+    "remove_extra"
+  ]
+}

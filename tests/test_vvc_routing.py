@@ -93,8 +93,10 @@ class VvcRoutingTests(unittest.TestCase):
                 self.assert_delegated(args)
 
     def test_vvc_metadata_preserves_parameters_and_filter_chains(self):
+        # Upstream av_bsf_list_parse_str accepts one terminal comma.
         for value in ("vvc_metadata", "vvc_metadata=aud=pass", "vvc_metadata=aud=insert",
-                      "vvc_metadata=aud=remove", "null,vvc_metadata=aud=pass"):
+                      "vvc_metadata=aud=remove", "null,vvc_metadata=aud=pass",
+                      "vvc_metadata,"):
             for flag in ("-bsf:v", "-bsf:v:0"):
                 with self.subTest(flag=flag, value=value):
                     self.assert_delegated(["-i", str(self.source), "-c:v", "copy",
@@ -121,7 +123,7 @@ class VvcRoutingTests(unittest.TestCase):
         for flag, values in (("-c:v", ("vvcc", "h266", "libvvenc", "")),
                              ("-f", ("vvcc", "vvcx", "")),
                              ("-bsf:v", ("vvcc_metadata", "vvc_mp4toannexb", "",
-                                         "vvc_metadata,", ",vvc_metadata",
+                                         "vvc_metadata,,", ",vvc_metadata",
                                          "vvc_metadata,unknown_bsf"))):
             self.assert_rejected_before_backend(["-i", str(self.source), str(self.output), flag])
             for value in values:
