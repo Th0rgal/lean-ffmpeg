@@ -4,7 +4,7 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`), pairing:
 1. **15 Formal Lean 4 Modules (`LeanAV/*.lean`)**:
-   - **`8,897` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+   - **`8,899` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
    - **`264 / 264` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (56), `Video` (31), `Encoder` (30), `Scale` (28), `NativeKernels` (25), `Spec` (23), `PlanIR` (15), `Bitstream` (13), `Audio` (12), `Core` (11), `Domain` (8), `Cli` (6), `Filter` (6).
    - All plane scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear, 16-bit LE), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance (`@lean_native_luma_acceptance_16x16_u8`, `@lean_native_luma_acceptance_16x16_u16le`), ISO BMFF 32/64-bit box navigation, surgical trailing-`moov` `pwrite` patching (`locateMp4TrailingMoovWindowIO` + `writeMp4WindowIO`), `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
@@ -38,7 +38,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 8,897 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 8,899 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
 # 4. Audit all 15 formal modules in parallel with turbo-lean (264/264 non_vacuous_and_tight)

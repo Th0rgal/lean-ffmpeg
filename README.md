@@ -1,6 +1,6 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`623`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,897`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`623`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,899`** declarations (verified under `v4.35.0`) and **`264 / 264` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
 
 10-bit and 8-bit luma acceptance read U16LE and U8 pixels directly from complete planes
 across all scaling ratios (`1:1`, `2:1`, `3:1`, and general Q8 bilinear), avoiding
@@ -23,6 +23,11 @@ The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
 **1.44× on DGX Spark** for its scale + tonemap + BT.709 CLI workload. Other
 workloads remain slower. These are recorded campaign measurements, not a fresh
 benchmark of the current commit. See [measurement provenance](docs/BENCHMARK_EVIDENCE.md).
+
+A separate [accepted bounded baseline from 28 October](docs/BOUNDED_BASELINE_20261028.md)
+measured an older frozen candidate on 120 frames of 1080p → 540p: **3.25% slower**
+than FFmpeg, with five measured pairs and matching outputs. This result does not
+qualify the current commit; its baseline is pending.
 
 ### End-to-end CLI: FFmpeg and lffmpeg on the same host
 
@@ -82,6 +87,10 @@ Every CLI request is parsed into a typed intermediate representation (`MediaPlan
 
 ## Compatibility: what “100%” covers
 
+[IAMF routing qualification](docs/IAMF_ROUTING_20261028.md) passed all 14 original
+paired media recipes. This adds delegated CLI compatibility; it does not establish
+a native IAMF codec or full upstream FATE parity.
+
 FITS output (`.fits` or `-f fits`) and WBMP image sequences (`.wbmp`) now route
 through FFmpeg delegation. Seven focused comparisons produced identical outputs;
 this is a scoped correctness result, not a full-suite or performance claim. See
@@ -129,7 +138,7 @@ full upstream FATE suite. See [evidence and gaps](docs/BENCHMARK_EVIDENCE.md).
 
 Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`264 / 264` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,897`** kernel-checked declarations (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
+All **15** `LeanAV/*.lean` modules (**`264 / 264` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,899`** kernel-checked declarations (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
 
 ---
 
@@ -144,7 +153,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,897 LeanAV.* declarations
+# Verify 0 sorryAx and 0 custom axioms across all 8,899 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
 # Audit each formal module (compatible with single-file turbo-lean CLIs)

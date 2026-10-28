@@ -1,7 +1,7 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
 The 2026-10-27 MPEG delegated-option validation under Lean v4.35.0 audited
-**8,897 declarations with zero sorryAx/custom axioms** and **264/264 tight
+**8,899 declarations with zero sorryAx/custom axioms** and **264/264 tight
 specifications**. Build, 53 self-test waves, FFI/kernel checks, 64 unit tests and
 74 differential tests passed. This local quality result does not certify FATE
 coverage or performance; historical counts below retain their original scope.
@@ -158,7 +158,7 @@ claims that every case ran on the current CI runner.
 ## 28 October integrated candidate
 
 See [the scoped qualification report](INTEGRATED_CONFORMANCE_20261028.md).
-Current source uses Lean 4.35.0, retains 8,897 declarations and 264 tight specs, and
+Current source uses Lean 4.35.0, retains 8,899 declarations and 264 tight specs, and
 has 623 lines of C-ABI glue. Full FATE parity and current-candidate performance
 remain unproven; historical results above do not certify this candidate.
 
@@ -169,3 +169,10 @@ See [PFM validation](PFM_ROUTING_20261028.md): four scoped image recipe comparis
 52 byte-identical image pairs and matching upstream MD5/size/decode CRC.
 Proof counts remain 8,897 declarations and 264 tight specifications.
 This branch adds no global FATE or performance certification.
+
+
+### IAMF compatibility qualification (2026-10-28, pending project completion)
+
+The isolated IAMF candidate adds explicit IAMF format routing, stream-group and stream-ID options, and safe local file-valued graph/group arguments. These paths delegate codec execution to the pinned FFmpeg backend; they do not establish an independent IAMF codec implementation. Numeric input group maps force delegation. Existing lexical path checks remain in force; they do not imply confinement of references inside graph files.
+
+All 14 original paired IAMF recipes passed, with 84 successful process receipts, byte-identical paired media and exact frozen upstream recipe output. Twenty-eight ffprobe invocations are upstream helpers and receive no candidate implementation credit. Parent raw validation passed 722 checks. The current axiom audit reports 8,899 declarations and no forbidden axioms. The full unit suite passed 118/118 with zero skips; the differential suite passed 81/81 with zero skips. No global FATE parity or performance claim follows from these focused results.

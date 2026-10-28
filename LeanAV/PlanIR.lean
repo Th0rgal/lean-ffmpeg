@@ -536,20 +536,27 @@ def inferContainerFormat (explicitFmt : Option String) (outPath : String) : Stri
           else if ext == "mjpg" || ext == "mjpeg" || ext == "jpg" || ext == "jpeg" || ext == "jls" then "mjpeg"
           else if ext == "lrc" then "lrc"
           else if ext == "ffmeta" || ext == "ffmetadata" then "ffmetadata"
+          else if ext == "iamf" then "iamf"
           else if ext == "fits" then "fits"
           else if ["png", "bmp", "pam", "pbm", "pgm", "pgmyuv", "ppm", "tga",
                    "tif", "tiff", "dpx", "sgi", "sun", "pcx", "qoi", "xbm", "xwd", "wbmp", "pfm"].contains ext then "image2"
           else "unknown"
 
+/-- Recognize group selectors for delegated validation; group IDs and tails remain upstream-owned. -/
+def isDelegatedGroupMapSpec (s : String) : Bool :=
+  match splitStrOnChar s ':' with
+  | input :: "g" :: tail => (parseNonNegNatSpec input).isSome && !tail.isEmpty
+  | _ => false
+
 /-- Check whether a `-map` token is a valid negative map (`-0:a`), filtergraph label (`[v]`), or attachment map (`0:t`). -/
 def isExtendedMapSpec (s : String) : Bool :=
   if strStartsWithFast s "-" then
     let rest := String.ofList (s.toList.drop 1)
-    (parseStreamMapSpec rest).isSome || rest == "0:t" || rest == "0:t:0"
+    (parseStreamMapSpec rest).isSome || isDelegatedGroupMapSpec rest || rest == "0:t" || rest == "0:t:0"
   else if strStartsWithFast s "[" && strEndsWithFast s "]" then
     s.toList.length > 2
   else
-    s == "0:t" || s == "0:t?" || s == "0:t:0" || s == "0:t:0?"
+    isDelegatedGroupMapSpec s || s == "0:t" || s == "0:t?" || s == "0:t:0" || s == "0:t:0?"
 
 /-- Check whether a scale dimension char list is supported by the native MP4 pixel-SIMD pipeline. -/
 def isNativeMp4ScaleDimChars (cs : List Char) : Bool :=
@@ -679,6 +686,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-min_frag_duration", "-write_tmcd", "-write_bext", "-write_id3v1", "-write_id3v2",
      "-id3v2_version", "-write_xing", "-write_apetag", "-write_peak", "-mpegts_copyts", "-mpegts_flags",
      "-mpegts_transport_stream_id", "-loopstart", "-loopend", "-sample_rate", "-strip_number_adaptivity",
+     "-streamid", "-stream_group", "-/stream_group", "-/filter_complex", "-use_stream_ids_as_track_ids",
      "-serial_offset", "-muxrate", "-gifflags", "-final_delay", "-update", "-update_filemtime",
      "-start_number", "-pattern_type", "-ts_from_file", "-attach", "-dump_attachment",
      "-aac_coder", "-lpc_type", "-lpc_passes", "-exact_rice_parameters", "-multi_dim_quant"].contains tok
@@ -688,6 +696,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
     FFmpeg's value grammar and are validated by the delegated backend. -/
 def isValidExtendedFlagValue (tok value : String) : Bool :=
   if value == "" then false
+  else if tok == "-/stream_group" || tok == "-/filter_complex" then isSafeLocalMediaPath value
   else if tok == "-mpv_flags" then isValidMpvFlags value
   else if tok == "-intra_vlc" || tok == "-data_partitioning" then
     value == "0" || value == "1"
@@ -778,6 +787,10 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
   else if tok == "-filter_complex" then
     if value == "" then { acc with extraErrors := acc.extraErrors ++ [.emptyValue "-filter_complex"] }
     else { acc with hasExtraDelegatedFlags := true, hasLavfiInput := acc.hasLavfiInput || hasLavfiSourceFilter value }
+  else if tok == "-/filter_complex" then
+    if isSafeLocalMediaPath value then
+      { acc with hasExtraDelegatedFlags := true, hasLavfiInput := true }
+    else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag (tok ++ " " ++ value)] }
   else if tok == "-map" then
     match parseStreamMapSpec value with
     | some m => { acc with maps := acc.maps ++ [m] }

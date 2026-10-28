@@ -333,7 +333,7 @@ def supportedFormat (s : String) : Bool :=
   ["mp4", "matroska", "mkv", "webm", "mov", "wav", "flac", "ogg", "mpegts", "ts", "ivf",
    "null", "framecrc", "framemd5", "md5", "crc", "rawvideo", "s16le", "image2", "lavfi",
    "m4v", "3gp", "3g2", "ipod", "m4a", "f4v", "ismv", "psp", "mka", "mks",
-   "m2ts", "mts", "mpeg", "mpg", "vob", "svcd", "dvd", "mpeg1video", "mpeg2video", "m2v",
+   "iamf", "m2ts", "mts", "mpeg", "mpg", "vob", "svcd", "dvd", "mpeg1video", "mpeg2video", "m2v",
    "avi", "asf", "wmv", "wma", "flv", "swf", "rm", "nut", "gxf", "mxf", "mxf_d10", "mxf_opatom",
    "wtv", "dv", "roq", "smjpeg", "wc3movie", "film_cpk", "segafilm",
    "w64", "rf64", "aiff", "aif", "au", "caf", "voc", "sox", "ircam", "avr", "ast", "oma",

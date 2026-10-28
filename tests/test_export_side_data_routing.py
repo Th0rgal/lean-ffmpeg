@@ -187,11 +187,15 @@ class ExportSideDataRoutingTests(unittest.TestCase):
                     self.assertFalse(self.log.exists())
                     self.assertFalse(self.output.exists())
 
-    def test_filtergraph_file_option_remains_rejected(self):
+    def test_filtergraph_file_option_delegates_safe_paths_only(self):
         graph = self.root / "graph.txt"
         graph.write_text("null")
-        self.assert_rejected(["-i", str(self.source), "-export_side_data", "venc_params",
-                              "-/filter_complex", str(graph), str(self.output)])
+        self.assert_delegated(["-i", str(self.source), "-export_side_data", "venc_params",
+                               "-/filter_complex", str(graph), str(self.output)])
+        for unsafe in ("../graph.txt", "https://example.invalid/graph.txt"):
+            with self.subTest(unsafe=unsafe):
+                self.assert_rejected(["-i", str(self.source), "-export_side_data", "venc_params",
+                                      "-/filter_complex", unsafe, str(self.output)])
 
     def test_native_plan_without_side_data_remains_unchanged(self):
         # Plan only: the placeholder must never be sent through the native route.
