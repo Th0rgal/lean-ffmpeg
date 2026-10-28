@@ -24,10 +24,12 @@ The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
 workloads remain slower. These are recorded campaign measurements, not a fresh
 benchmark of the current commit. See [measurement provenance](docs/BENCHMARK_EVIDENCE.md).
 
-A separate [accepted bounded baseline from 28 October](docs/BOUNDED_BASELINE_20261028.md)
-measured an older frozen candidate on 120 frames of 1080p → 540p: **3.25% slower**
-than FFmpeg, with five measured pairs and matching outputs. This result does not
-qualify the current commit; its baseline is pending.
+The [accepted bounded baseline from 28 October](docs/BOUNDED_BASELINE_20261028.md)
+measured compiler-integrated candidate `ae6ed0b` on an x86 Xeon E3-1245 V2:
+**2.86% slower** than FFmpeg 6.1.1 for 120 frames of lossless H.264 1080p → 540p,
+with five measured pairs and all fourteen outputs byte-identical to the oracle.
+This shared-host measurement does not qualify later routing corrections or other
+workloads; it supersedes no historical run.
 
 ### End-to-end CLI: FFmpeg and lffmpeg on the same host
 
