@@ -1572,9 +1572,40 @@ def runVerifyKernels : IO UInt32 := do
   IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"u16le_acceptance_ok\":{u16AcceptanceOk},\"bench_us\":{(t1 - t0) / 1000}}"
   return if allOk then 0 else 1
 
+def runLosslessCodec (args : List String) : IO UInt32 := do
+  match args with
+  | "zlib-encode" :: mode :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    IO.FS.writeBinFile output (zlibEncode data (mode == "dynamic"))
+    return 0
+  | "zlib-decode" :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    match zlibDecode (ByteSlice.ofByteArray data) with
+    | some decoded => IO.FS.writeBinFile output decoded; return 0
+    | none => IO.eprintln "invalid zlib stream"; return 1
+  | "png-decode" :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    match pngDecode (ByteSlice.ofByteArray data) with
+    | some img =>
+      IO.FS.writeBinFile output img.pixels
+      IO.println s!"png {img.width}x{img.height} depth={img.bitDepth} color={img.colorType} palette={img.palette.size}"
+      return 0
+    | none => IO.eprintln "invalid png"; return 1
+  | "png-encode" :: w :: h :: depth :: color :: input :: output :: rest =>
+    let pixels ← IO.FS.readBinFile input
+    let palette ← match rest with
+      | p :: _ => IO.FS.readBinFile p
+      | [] => pure ByteArray.empty
+    let img : PngImage := ⟨w.toNat!, h.toNat!, depth.toNat!, color.toNat!, pixels, palette, ByteArray.empty⟩
+    match pngEncode img with
+    | some bytes => IO.FS.writeBinFile output bytes; return 0
+    | none => IO.eprintln "invalid png image"; return 1
+  | _ => IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode ..."; return 2
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
+  | "lossless-codec" :: rest => runLosslessCodec rest
   | "plan" :: rest | "dump-plan" :: rest => do
     let plan := parseArgsToPlanIR rest
     IO.println (serializePlanIRJson plan)
