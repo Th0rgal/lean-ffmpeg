@@ -2986,35 +2986,121 @@ def pngBytesPerPixel (channels bitDepth : Nat) : Nat := Nat.max 1 ((channels * b
 
 def pngPaeth (a b c : UInt8) : UInt8 := paethPredictor a b c
 
-def pngUnfilterRow (filter : Nat) (row prev : ByteArray) (bpp : Nat) : Option ByteArray := Id.run do
-  if row.size != prev.size then return none
-  let mut out : ByteArray := ByteArray.empty
-  for i in [0:row.size] do
-    let x := row.data.getD i 0
-    let a := if i ≥ bpp then out.data.getD (i - bpp) 0 else 0
-    let b := prev.data.getD i 0
-    let c := if i ≥ bpp then prev.data.getD (i - bpp) 0 else 0
-    let pred := match filter with
-      | 0 => 0 | 1 => a | 2 => b | 3 => ((a.toNat + b.toNat) / 2).toUInt8 | 4 => pngPaeth a b c
-      | _ => 0
-    if filter > 4 then return none
-    out := out.push (x + pred)
-  return some out
+def pngPred (f : Nat) (a b c : UInt8) : UInt8 :=
+  match f with
+  | 0 => 0 | 1 => a | 2 => b | 3 => ((a.toNat + b.toNat) / 2).toUInt8 | 4 => pngPaeth a b c
+  | _ => 0
 
-def pngFilterRow (filter : Nat) (row prev : ByteArray) (bpp : Nat) : Option ByteArray := Id.run do
-  if row.size != prev.size then return none
-  let mut out : ByteArray := ByteArray.empty
-  for i in [0:row.size] do
-    let x := row.data.getD i 0
-    let a := if i ≥ bpp then row.data.getD (i - bpp) 0 else 0
-    let b := prev.data.getD i 0
-    let c := if i ≥ bpp then prev.data.getD (i - bpp) 0 else 0
-    let pred := match filter with
-      | 0 => 0 | 1 => a | 2 => b | 3 => ((a.toNat + b.toNat) / 2).toUInt8 | 4 => pngPaeth a b c
-      | _ => 0
-    if filter > 4 then return none
-    out := out.push (x - pred)
-  return some out
+def pngLeft (xs : Array UInt8) (bpp i : Nat) : UInt8 := if bpp ≤ i then xs.getD (i - bpp) 0 else 0
+
+def pngFilterRowA (f bpp : Nat) (row prev : Array UInt8) : Array UInt8 :=
+  Array.ofFn (n := row.size) fun i =>
+    row.getD i 0 - pngPred f (pngLeft row bpp i) (prev.getD i 0) (pngLeft prev bpp i)
+
+def pngUnfilterGo (f bpp : Nat) (fr prev : Array UInt8) (i : Nat) (acc : Array UInt8) : Array UInt8 :=
+  if i < fr.size then
+    pngUnfilterGo f bpp fr prev (i + 1)
+      (acc.push (fr.getD i 0 + pngPred f (pngLeft acc bpp i) (prev.getD i 0) (pngLeft prev bpp i)))
+  else acc
+termination_by fr.size - i
+
+def pngUnfilterRowA (f bpp : Nat) (fr prev : Array UInt8) : Array UInt8 := pngUnfilterGo f bpp fr prev 0 #[]
+
+theorem pngLeft_extract (row : Array UInt8) (bpp i : Nat) (hb : 0 < bpp) :
+    pngLeft (row.extract 0 i) bpp i = pngLeft row bpp i := by
+  unfold pngLeft
+  split
+  · simp only [Array.getD_eq_getD_getElem?, Array.getElem?_extract]
+    by_cases h2 : i - bpp < row.size
+    · rw [if_pos (by omega)]
+      simp
+    · rw [if_neg (by omega)]
+      simp [Array.getElem?_eq_none (by omega : row.size ≤ i - bpp)]
+  · rfl
+
+theorem pngFilterRowA_size (f bpp : Nat) (row prev : Array UInt8) :
+    (pngFilterRowA f bpp row prev).size = row.size := by simp [pngFilterRowA]
+
+theorem pngUnfilterGo_spec (f bpp : Nat) (hb : 0 < bpp) (row prev : Array UInt8) :
+    ∀ k i, i + k = row.size →
+      pngUnfilterGo f bpp (pngFilterRowA f bpp row prev) prev i (row.extract 0 i) = row := by
+  intro k
+  induction k with
+  | zero =>
+    intro i hi
+    unfold pngUnfilterGo
+    rw [if_neg (by rw [pngFilterRowA_size]; omega)]
+    simp [show row.size ≤ i by omega]
+  | succ k ih =>
+    intro i hi
+    unfold pngUnfilterGo
+    have hi' : i < row.size := by omega
+    rw [if_pos (by rw [pngFilterRowA_size]; omega)]
+    have hget : (pngFilterRowA f bpp row prev).getD i 0 =
+        row.getD i 0 - pngPred f (pngLeft row bpp i) (prev.getD i 0) (pngLeft prev bpp i) := by
+      simp [pngFilterRowA, Array.getD_eq_getD_getElem?, hi']
+    rw [hget, pngLeft_extract row bpp i hb, UInt8.sub_add_cancel]
+    have hpush : (row.extract 0 i).push (row.getD i 0) = row.extract 0 (i + 1) := by
+      apply Array.ext
+      · simp; omega
+      · intro j h1 h2
+        simp only [Array.size_push, Array.size_extract] at h1
+        rw [Array.getElem_push]
+        split
+        · simp
+        · rename_i hn
+          simp only [Array.size_extract] at hn
+          have hj : j = i := by omega
+          subst hj
+          simp [Array.getElem_extract]
+    rw [hpush]
+    exact ih (i + 1) (by omega)
+
+theorem pngUnfilterRowA_filter (f bpp : Nat) (hb : 0 < bpp) (row prev : Array UInt8) :
+    pngUnfilterRowA f bpp (pngFilterRowA f bpp row prev) prev = row := by
+  have := pngUnfilterGo_spec f bpp hb row prev row.size 0 (by omega)
+  simpa [pngUnfilterRowA] using this
+
+def pngUnfilterRow (filter : Nat) (row prev : ByteArray) (bpp : Nat) : Option ByteArray :=
+  if row.size != prev.size || filter > 4 then none else some ⟨pngUnfilterRowA filter bpp row.data prev.data⟩
+
+def pngFilterRow (filter : Nat) (row prev : ByteArray) (bpp : Nat) : Option ByteArray :=
+  if row.size != prev.size || filter > 4 then none else some ⟨pngFilterRowA filter bpp row.data prev.data⟩
+
+def pngFilterRowsA (f bpp : Nat) (prev : Array UInt8) : List (Array UInt8) → List (Array UInt8)
+  | [] => []
+  | r :: rs => pngFilterRowA f bpp r prev :: pngFilterRowsA f bpp r rs
+
+def pngUnfilterRowsA (f bpp : Nat) (prev : Array UInt8) : List (Array UInt8) → List (Array UInt8)
+  | [] => []
+  | r :: rs =>
+    let d := pngUnfilterRowA f bpp r prev
+    d :: pngUnfilterRowsA f bpp d rs
+
+theorem pngUnfilterRowsA_filter (f bpp : Nat) (hb : 0 < bpp) :
+    ∀ (rows : List (Array UInt8)) (prev : Array UInt8),
+      pngUnfilterRowsA f bpp prev (pngFilterRowsA f bpp prev rows) = rows
+  | [], _ => rfl
+  | r :: rs, prev => by
+    simp only [pngFilterRowsA, pngUnfilterRowsA, pngUnfilterRowA_filter f bpp hb]
+    rw [pngUnfilterRowsA_filter f bpp hb rs r]
+
+theorem pngUnfilterRow_filter (f bpp : Nat) (hb : 0 < bpp) (hf : f ≤ 4) (row prev : ByteArray)
+    (hs : row.size = prev.size) (enc : ByteArray) (he : pngFilterRow f row prev bpp = some enc) :
+    pngUnfilterRow f enc prev bpp = some row := by
+  unfold pngFilterRow at he
+  have hc : (row.size != prev.size || decide (f > 4)) = false := by simp [hs]; omega
+  rw [hc] at he
+  simp at he
+  subst he
+  unfold pngUnfilterRow
+  have hsz : (⟨pngFilterRowA f bpp row.data prev.data⟩ : ByteArray).size = row.size := by
+    show (pngFilterRowA f bpp row.data prev.data).size = row.data.size
+    exact pngFilterRowA_size f bpp row.data prev.data
+  have hc2 : ((⟨pngFilterRowA f bpp row.data prev.data⟩ : ByteArray).size != prev.size || decide (f > 4)) = false := by
+    rw [hsz]; simp [hs]; omega
+  rw [hc2]
+  simp [pngUnfilterRowA_filter f bpp hb]
 
 def pngUnfilterScanlines (data : ByteArray) (width height channels bitDepth : Nat) : Option ByteArray := Id.run do
   let rowBytes := pngRowBytes width channels bitDepth
