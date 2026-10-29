@@ -6872,4 +6872,412 @@ theorem mp4BoxLocator_and_bePatch_verified :
     baRdU32BE patched 0 = 0x00000024 := by
   decide
 
+inductive NativeRemuxResult where
+  | remuxed (bytes : ByteArray)
+  | fallback
+  | invalid (reason : String)
+  deriving Inhabited
+
+def nativePacketInWindow (pts startTick endTick : Nat) : Bool :=
+  pts ≥ startTick && (endTick == 0 || pts < endTick)
+
+def NativePacketWindowSafe (x : Nat × Nat × Nat) : Prop :=
+  x.1 ≥ x.2.1 ∧ (x.2.2 = 0 ∨ x.1 < x.2.2)
+
+def nativePacketWindowGateSpec : AVGateSpec (Nat × Nat × Nat) NativePacketWindowSafe where
+  gate x := nativePacketInWindow x.1 x.2.1 x.2.2
+  posWitness := (5, 5, 6)
+  negWitness := (4, 5, 6)
+  sound x h := by
+    unfold nativePacketInWindow at h
+    unfold NativePacketWindowSafe
+    simp only [Bool.and_eq_true, decide_eq_true_eq, Bool.or_eq_true, beq_iff_eq] at h
+    exact ⟨h.1, h.2⟩
+  complete x h := by
+    unfold nativePacketInWindow
+    unfold NativePacketWindowSafe at h
+    simp only [Bool.and_eq_true, decide_eq_true_eq, Bool.or_eq_true, beq_iff_eq]
+    exact h
+  nonVacuous := rfl
+  tight := rfl
+
+theorem nativePacketWindow_bounds_universal (pts startTick endTick : Nat)
+    (h : nativePacketInWindow pts startTick endTick = true) :
+    pts ≥ startTick ∧ (endTick = 0 ∨ pts < endTick) := by
+  exact nativePacketWindowGateSpec.sound (pts, startTick, endTick) h
+
+def readU24BE (s : ByteSlice) (off : Nat) : Nat :=
+  (s.getByteD off 0).toNat <<< 16 |||
+  (s.getByteD (off + 1) 0).toNat <<< 8 |||
+  (s.getByteD (off + 2) 0).toNat
+
+def validateNativeFlacStream (s : ByteSlice) : Bool := Id.run do
+  if s.len < 42 || !fourCCEq s 0 'f' 'L' 'a' 'C' then return false
+  let mut pos := 4
+  let mut sawInfo := false
+  let mut sawLast := false
+  let mut fuel := 4096
+  while pos + 4 ≤ s.len && fuel > 0 && !sawLast do
+    fuel := fuel - 1
+    let hdr := s.getByteD pos 0
+    let blockType := hdr &&& 0x7F
+    let blockLen := readU24BE s (pos + 1)
+    if pos + 4 + blockLen > s.len then return false
+    if !sawInfo && (blockType != 0 || blockLen != 34) then return false
+    if blockType == 0 then sawInfo := true
+    if (hdr &&& 0x80) != 0 then sawLast := true
+    pos := pos + 4 + blockLen
+  return sawInfo && sawLast && pos + 2 ≤ s.len &&
+    s.getByteD pos 0 == 0xFF && (s.getByteD (pos + 1) 0 &&& 0xFE) == 0xF8
+
+def validateNativeWavStream (s : ByteSlice) : Bool := Id.run do
+  if s.len < 44 || !fourCCEq s 0 'R' 'I' 'F' 'F' || !fourCCEq s 8 'W' 'A' 'V' 'E' then return false
+  let declared := (readU32LE s 4).toNat
+  if declared + 8 > s.len then return false
+  let mut pos := 12
+  let mut sawFmt := false
+  let mut sawData := false
+  let mut fuel := 4096
+  while pos + 8 ≤ s.len && fuel > 0 do
+    fuel := fuel - 1
+    let chunkLen := (readU32LE s (pos + 4)).toNat
+    if pos + 8 + chunkLen > s.len then return false
+    if fourCCEq s pos 'f' 'm' 't' ' ' && chunkLen ≥ 16 then sawFmt := true
+    if fourCCEq s pos 'd' 'a' 't' 'a' then sawData := true
+    pos := pos + 8 + chunkLen + chunkLen % 2
+  return sawFmt && sawData
+
+def hasNativeMkvSegment (s : ByteSlice) : Bool := Id.run do
+  if !probeEbmlMatroska s then return false
+  let mut pos := 4
+  while pos + 4 ≤ s.len do
+    if s.getByteD pos 0 == 0x18 && s.getByteD (pos + 1) 0 == 0x53 &&
+       s.getByteD (pos + 2) 0 == 0x80 && s.getByteD (pos + 3) 0 == 0x67 then
+      return true
+    pos := pos + 1
+  return false
+
+def trimNativePacketViews (packets : Array AVPacketView) (startTick endTick : Nat) : Option (Array AVPacketView) := Id.run do
+  let mut out : Array AVPacketView := #[]
+  let mut started := startTick == 0
+  let mut baseDts := 0
+  for pkt in packets do
+    let dts := pkt.dts.toNat
+    if endTick > 0 && dts ≥ endTick then break
+    if !started && dts ≥ startTick && pkt.isKeyframe then
+      started := true
+      baseDts := dts
+    if started && dts ≥ startTick then
+      if pkt.pts.toNat < baseDts then return none
+      out := out.push { pkt with
+        pts := (pkt.pts.toNat - baseDts).toUInt64
+        dts := (dts - baseDts).toUInt64 }
+  return if out.isEmpty then none else some out
+
+def trimNativeIsoSamples (samples : Array IsoMp4SampleDesc) (startTick endTick : Nat) : Option (Array IsoMp4SampleDesc) := Id.run do
+  let mut out : Array IsoMp4SampleDesc := #[]
+  let mut started := startTick == 0
+  let mut baseDts := 0
+  for sample in samples do
+    let dts := sample.dts.toNat
+    if endTick > 0 && dts ≥ endTick then break
+    if !started && dts ≥ startTick && sample.frameType == .iFrame then
+      started := true
+      baseDts := dts
+    if started && dts ≥ startTick then
+      if sample.pts.toNat < baseDts then return none
+      out := out.push { sample with
+        sampleIdx := out.size
+        pts := (sample.pts.toNat - baseDts).toUInt64
+        dts := (dts - baseDts).toUInt64 }
+  return if out.isEmpty then none else some out
+
+def probeNativeMp4CodecBoxes (boxes : Array Mp4BoxView) (depth : Nat) : Option CodecId :=
+  match depth with
+  | 0 => none
+  | d + 1 => Id.run do
+    for b in boxes do
+      if b.fourcc == "moov" || b.fourcc == "trak" || b.fourcc == "mdia" ||
+         b.fourcc == "minf" || b.fourcc == "stbl" then
+        if let some codec := probeNativeMp4CodecBoxes (parseMp4Boxes b.bodySlice) d then
+          return some codec
+      else if b.fourcc == "stsd" && b.bodySlice.len ≥ 16 then
+        if let some entries := b.bodySlice.subSlice? 8 (b.bodySlice.len - 8) then
+          for entry in parseMp4Boxes entries do
+            if entry.fourcc == "avc1" || entry.fourcc == "avc3" then return some .h264
+            if entry.fourcc == "hvc1" || entry.fourcc == "hev1" then return some .hevc
+            if entry.fourcc == "av01" then return some .av1
+    return none
+
+def countNativeMp4Tracks (s : ByteSlice) : Nat := Id.run do
+  let mut count := 0
+  for b in parseMp4Boxes s do
+    if b.fourcc == "moov" then
+      for child in parseMp4Boxes b.bodySlice do
+        if child.fourcc == "trak" then count := count + 1
+  return count
+
+def validNativeMp4Container (s : ByteSlice) : Bool := Id.run do
+  let boxes := parseMp4Boxes s
+  let mut sawFtyp := false
+  let mut sawMoov := false
+  let mut sawMdat := false
+  for b in boxes do
+    if b.fourcc == "ftyp" then sawFtyp := true
+    if b.fourcc == "moov" then sawMoov := true
+    if b.fourcc == "mdat" then sawMdat := true
+  return sawFtyp && sawMoov && sawMdat
+
+def nativeMp4MetadataTag (key : String) : Option UInt32 :=
+  if key == "title" then some 0xA96E616D
+  else if key == "comment" then some 0xA9636D74
+  else if key == "artist" then some 0xA9415254
+  else if key == "album" then some 0xA9616C62
+  else if key == "date" then some 0xA9646179
+  else if key == "encoder" then some 0xA9746F6F
+  else none
+
+def nativeMp4MetadataSupported (entries : List (String × String)) : Bool :=
+  entries.all (fun kv => (nativeMp4MetadataTag kv.1).isSome)
+
+def wrapMp4BoxTag (tag : UInt32) (body : ByteArray) : ByteArray :=
+  pushU32BE (pushU32BE ByteArray.empty (8 + body.size).toUInt32) tag ++ body
+
+def buildNativeMp4Metadata (entries : List (String × String)) : ByteArray := Id.run do
+  let mut ilstBody := ByteArray.empty
+  for (key, value) in entries do
+    if !value.isEmpty then
+      if let some tag := nativeMp4MetadataTag key then
+        let dataBody := pushU32BE (pushU32BE ByteArray.empty 1) 0 ++ value.toUTF8
+        ilstBody := ilstBody ++ wrapMp4BoxTag tag (wrapMp4Box 'd' 'a' 't' 'a' dataBody)
+  if ilstBody.isEmpty then return ByteArray.empty
+  let ilst := wrapMp4Box 'i' 'l' 's' 't' ilstBody
+  let mut hdlrBody := ByteArray.empty
+  hdlrBody := pushU32BE hdlrBody 0
+  hdlrBody := pushU32BE hdlrBody 0
+  hdlrBody := pushFourCC hdlrBody 'm' 'd' 'i' 'r'
+  hdlrBody := pushFourCC hdlrBody 'a' 'p' 'p' 'l'
+  hdlrBody := pushZeros hdlrBody 8
+  let hdlr := wrapMp4Box 'h' 'd' 'l' 'r' hdlrBody
+  let metaBox := wrapMp4Box 'm' 'e' 't' 'a' (pushU32BE ByteArray.empty 0 ++ hdlr ++ ilst)
+  return wrapMp4Box 'u' 'd' 't' 'a' metaBox
+
+def shiftNativeChunkOffsetTable (body : ByteSlice) (delta : Nat) (wide : Bool) : Option ByteArray := Id.run do
+  if body.len < 8 then return none
+  let count := (readU32BE body 4).toNat
+  let width := if wide then 8 else 4
+  if 8 + count * width != body.len then return none
+  let mut out := ByteArray.emptyWithCapacity body.len
+  out := pushU32BE out (readU32BE body 0)
+  out := pushU32BE out count.toUInt32
+  for i in [:count] do
+    let off := 8 + i * width
+    if wide then
+      out := pushU64BE out (shiftMp4ChunkOffset (readU64BE body off).toNat delta true).toUInt64
+    else
+      let shifted := shiftMp4ChunkOffset (readU32BE body off).toNat delta true
+      if shifted ≥ 4294967296 then return none
+      out := pushU32BE out shifted.toUInt32
+  return some out
+
+def shiftNativeMp4ChunkOffsets (boxes : Array Mp4BoxView) (delta : Nat) : Nat → Option ByteArray
+  | 0 => none
+  | fuel + 1 => Id.run do
+    let mut out := ByteArray.empty
+    for b in boxes do
+      if b.headerBytes != 8 then return none
+      let tag := readU32BE b.boxSlice 4
+      if b.fourcc == "trak" || b.fourcc == "mdia" || b.fourcc == "minf" || b.fourcc == "stbl" then
+        let some body := shiftNativeMp4ChunkOffsets (parseMp4Boxes b.bodySlice) delta fuel | return none
+        out := out ++ wrapMp4BoxTag tag body
+      else if b.fourcc == "stco" || b.fourcc == "co64" then
+        let some body := shiftNativeChunkOffsetTable b.bodySlice delta (b.fourcc == "co64") | return none
+        out := out ++ wrapMp4BoxTag tag body
+      else
+        out := out ++ b.boxSlice.toByteArray
+    return some out
+
+def injectNativeMp4Metadata (bytes : ByteArray) (entries : List (String × String)) : Option ByteArray := Id.run do
+  let udta := buildNativeMp4Metadata entries
+  if udta.isEmpty then return some bytes
+  let s := ByteSlice.ofByteArray bytes
+  let boxes := parseMp4Boxes s
+  let mut out := ByteArray.emptyWithCapacity (bytes.size + udta.size)
+  let mut found := false
+  let mut sawMdat := false
+  for b in boxes do
+    if b.fourcc == "mdat" then sawMdat := true
+    if b.fourcc == "moov" && b.headerBytes == 8 then
+      if found then return none
+      found := true
+      let mut kept := ByteArray.emptyWithCapacity b.bodySlice.len
+      for child in parseMp4Boxes b.bodySlice do
+        if child.fourcc != "udta" then kept := kept ++ child.boxSlice.toByteArray
+      let newSize := 8 + kept.size + udta.size
+      let body ←
+        if sawMdat || newSize ≤ b.boxSlice.len then
+          if !sawMdat && newSize < b.boxSlice.len then return none
+          pure (kept ++ udta)
+        else
+          let delta := newSize - b.boxSlice.len
+          match shiftNativeMp4ChunkOffsets (parseMp4Boxes (ByteSlice.ofByteArray kept)) delta 8 with
+          | some shifted => pure (shifted ++ udta)
+          | none => return none
+      out := out ++ wrapMp4Box 'm' 'o' 'o' 'v' body
+    else
+      out := out ++ b.boxSlice.toByteArray
+  return if found then some out else none
+
+def remuxNativeMp4 (s : ByteSlice) (startMs durMs : Nat) (metadata : List (String × String)) : Option ByteArray := Id.run do
+  if !validNativeMp4Container s || countNativeMp4Tracks s != 1 || !nativeMp4MetadataSupported metadata then return none
+  let some codec := probeNativeMp4CodecBoxes (parseMp4Boxes s) 8 | return none
+  let some demux := demuxIsoMp4Track s | return none
+  if demux.samples.isEmpty then return none
+  let payloadBytes := demux.samples.foldl (fun n sample => n + sample.slice.len) 0
+  if payloadBytes != demux.mdatBytes || demux.avcCBytes.isEmpty then return none
+  let startTick := startMs * demux.timescale.toNat / 1000
+  let endTick := if durMs == 0 then 0 else startTick + durMs * demux.timescale.toNat / 1000
+  let some samples := trimNativeIsoSamples demux.samples startTick endTick | return none
+  let muxed := muxIsoMp4TrackCodec codec demux.width demux.height demux.timescale demux.avcCBytes samples
+  return injectNativeMp4Metadata muxed metadata
+
+inductive NativeIvfCodec where
+  | vp8
+  | vp9
+  | av1
+  | other
+  deriving DecidableEq, Inhabited
+
+def nativeIvfCodec (s : ByteSlice) : NativeIvfCodec :=
+  if fourCCEq s 8 'V' 'P' '8' '0' then .vp8
+  else if fourCCEq s 8 'V' 'P' '9' '0' then .vp9
+  else if fourCCEq s 8 'A' 'V' '0' '1' then .av1
+  else .other
+
+def nativeIvfPacketIsKeyframe (codec : NativeIvfCodec) (pkt : AVPacketView) : Option Bool :=
+  if pkt.slice.len == 0 then some false
+  else
+    let b0 : UInt8 := pkt.slice.getByteD 0 0
+    let one : UInt8 := 1
+    match codec with
+    | .vp8 => some ((b0 &&& one) == 0)
+    | .vp9 =>
+      if (b0 >>> 6) != 2 then none
+      else
+        let profile : UInt8 := ((b0 >>> 5) &&& one) ||| (((b0 >>> 4) &&& one) <<< one)
+        let shift : UInt8 := if profile == 3 then 1 else 0
+        let showExisting : UInt8 := (b0 >>> ((3 : UInt8) - shift)) &&& one
+        let frameType : UInt8 := (b0 >>> ((2 : UInt8) - shift)) &&& one
+        some (showExisting == 0 && frameType == 0)
+    | _ => none
+
+def validateNativeIvfFrames (s : ByteSlice) : Option Nat := Id.run do
+  if s.len < 32 || !fourCCEq s 0 'D' 'K' 'I' 'F' || (readU16LE s 6).toNat != 32 then return none
+  let mut pos := 32
+  let mut count := 0
+  while pos + 12 ≤ s.len do
+    let frameBytes := (readU32LE s pos).toNat
+    if pos + 12 + frameBytes > s.len then return none
+    pos := pos + 12 + frameBytes
+    count := count + 1
+  return if pos == s.len && count > 0 then some count else none
+
+def remuxNativeIvf (s : ByteSlice) (startMs durMs : Nat) : Option ByteArray := Id.run do
+  let some frameCount := validateNativeIvfFrames s | return none
+  if startMs == 0 && durMs == 0 then return some s.toByteArray
+  let some (hdr, packets) := demuxIvfStream s | return none
+  if packets.size != frameCount then return none
+  let codec := nativeIvfCodec s
+  let mut flagged : Array AVPacketView := Array.mkEmpty packets.size
+  for pkt in packets do
+    let isKey ←
+      if startMs == 0 && flagged.isEmpty then pure true
+      else match nativeIvfPacketIsKeyframe codec pkt with
+        | some k => pure k
+        | none => return none
+    flagged := flagged.push { pkt with isKeyframe := isKey }
+  let tbNum := hdr.timebase.num.toNat
+  let tbDen := hdr.timebase.den.toNat
+  if tbNum == 0 then return none
+  let startTick := startMs * tbDen / (1000 * tbNum)
+  let endTick := if durMs == 0 then 0 else startTick + (durMs * tbDen + 1000 * tbNum - 1) / (1000 * tbNum)
+  let some trimmed := trimNativePacketViews flagged startTick endTick | return none
+  let mut out := ByteArray.emptyWithCapacity s.len
+  for i in [:24] do out := out.push (s.getByteD i 0)
+  out := pushU32LE out trimmed.size.toUInt32
+  for i in [28:32] do out := out.push (s.getByteD i 0)
+  for pkt in trimmed do
+    out := pushU32LE out pkt.slice.len.toUInt32
+    out := pushU64LE out pkt.pts
+    out := out ++ pkt.slice.toByteArray
+  return some out
+
+def trimNativeAudioFrame (af : AudioFrame) (startMs durMs : Nat) : Option AudioFrame := Id.run do
+  let start := startMs * af.sampleRate.toNat / 1000
+  if start ≥ af.numSamples then return none
+  let available := af.numSamples - start
+  let requested := if durMs == 0 then available else durMs * af.sampleRate.toNat / 1000
+  let count := Nat.min available requested
+  if count == 0 then return none
+  let channels := af.channels.toNat
+  let mut samples : Array Int32 := Array.mkEmpty (channels * count)
+  for ch in [:channels] do
+    for i in [:count] do
+      samples := samples.push (af.getSample ch (start + i))
+  return some { af with
+    numSamples := count
+    pts := 0
+    duration := count.toUInt64
+    samples := samples }
+
+def remuxNativeWav (s : ByteSlice) (startMs durMs : Nat) : Option ByteArray := Id.run do
+  if !validateNativeWavStream s then return none
+  if startMs == 0 && durMs == 0 then return some s.toByteArray
+  let some af := demuxWavPcm16LE s | return none
+  let some trimmed := trimNativeAudioFrame af startMs durMs | return none
+  return some (muxWavPcm16LE trimmed)
+
+def nativeRemuxBytes (inFmt outFmt : ContainerFormat) (bytes : ByteArray)
+    (startMs durMs : Nat) (metadata : List (String × String)) : NativeRemuxResult := Id.run do
+  if inFmt != outFmt then return .fallback
+  if !metadata.isEmpty && inFmt != .mp4 then return .fallback
+  let s := ByteSlice.ofByteArray bytes
+  match inFmt with
+  | .mp4 =>
+    if !validNativeMp4Container s then return .invalid "invalid_or_truncated_mp4"
+    if countNativeMp4Tracks s != 1 then return .fallback
+    match remuxNativeMp4 s startMs durMs metadata with
+    | some out => return .remuxed out
+    | none => return .invalid "unsupported_or_invalid_mp4_sample_tables"
+  | .ivf =>
+    match remuxNativeIvf s startMs durMs with
+    | some out => return .remuxed out
+    | none => return .invalid "invalid_or_truncated_ivf"
+  | .wav =>
+    if !validateNativeWavStream s then return .invalid "invalid_or_truncated_wav"
+    if startMs > 0 || durMs > 0 then
+      if (demuxWavPcm16LE s).isNone then return .fallback
+    match remuxNativeWav s startMs durMs with
+    | some out => return .remuxed out
+    | none => return .invalid "wav_trim_outside_stream"
+  | .flacRaw =>
+    if startMs > 0 || durMs > 0 then return .fallback
+    if !validateNativeFlacStream s then return .invalid "invalid_or_truncated_flac"
+    return .remuxed bytes
+  | .mkv | .webm =>
+    if startMs > 0 || durMs > 0 then return .fallback
+    if !hasNativeMkvSegment s then return .invalid "invalid_or_truncated_matroska"
+    return .remuxed bytes
+  | _ => return .fallback
+
+theorem nativeRemux_wav_passthrough (s : ByteSlice) (h : validateNativeWavStream s = true) :
+    remuxNativeWav s 0 0 = some s.toByteArray := by
+  simp [remuxNativeWav, h]
+
+theorem nativeRemux_window_gate_roundtrip :
+    nativePacketWindowGateSpec.gate (5, 5, 6) = true ∧
+    nativePacketWindowGateSpec.gate (6, 5, 6) = false ∧
+    nativePacketInWindow 0 0 0 = true := by
+  decide
+
 end LeanAV.Format

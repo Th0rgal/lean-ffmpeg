@@ -1198,9 +1198,115 @@ def isIntrospectionFlag (s : String) : Bool :=
    "-sample_fmts", "-dispositions", "-colors", "-L", "-buildconf",
    "-hwaccels", "-sources", "-sinks"].contains s
 
+def nativeIntrospectionLines (flag : String) : Option (List String) :=
+  let nativeFormats := [
+    " DE  ivf             On2 IVF",
+    " DE  matroska        Matroska (byte-preserving stream copy)",
+    " DE  mov,mp4         QuickTime / MOV / ISO BMFF (single track)",
+    " DE  flac            raw FLAC (byte-preserving stream copy)",
+    " DE  wav             WAV / WAVE (Waveform Audio)",
+    " DE  webm            WebM (byte-preserving stream copy)"]
+  if flag == "-version" || flag == "--version" then
+    some ["lffmpeg version 0.3.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Maxwell Verified)",
+          "native independent_verified stream copy: mp4, ivf, wav, flac, matroska, webm",
+          "unsupported codec/container/feature combinations fail closed or delegate explicitly"]
+  else if flag == "-buildconf" then
+    some ["  configuration:", "    --lean-toolchain=v4.35.0", "    --native-remux=mp4,ivf,wav,flac,matroska,webm",
+          "    --runtime-ffmpeg-for-introspection=no"]
+  else if flag == "-formats" then
+    some (["File formats:", " D. = Demuxing supported", " .E = Muxing supported", " --"] ++ nativeFormats)
+  else if flag == "-muxers" then
+    some (["File formats:", " .E = Muxing supported", " --"] ++ nativeFormats.map (fun l => " .E" ++ String.ofList (l.toList.drop 3)))
+  else if flag == "-demuxers" then
+    some (["File formats:", " D. = Demuxing supported", " --"] ++ nativeFormats.map (fun l => " D." ++ String.ofList (l.toList.drop 3)))
+  else if flag == "-codecs" then
+    some ["Codecs:", " D..... = Decoding supported", " .E.... = Encoding supported", " -------",
+          " DEV.L. av1                  Alliance for Open Media AV1", " DEV.LS h264                 H.264 / AVC",
+          " DEV.L. hevc                 H.265 / HEVC", " DEA.L. aac                  AAC",
+          " DEA..S flac                 FLAC", " DEA..S pcm_s16le            PCM signed 16-bit little-endian",
+          " ..V... copy                 native stream copy"]
+  else if flag == "-decoders" then
+    some ["Decoders:", " ------", " V..... av1", " V..... h264", " V..... hevc", " A..... aac", " A..... flac", " A..... pcm_s16le"]
+  else if flag == "-encoders" then
+    some ["Encoders:", " ------", " V..... h264", " V..... hevc", " V..... av1", " A..... aac", " A..... flac", " A..... pcm_s16le"]
+  else if flag == "-bsfs" then
+    some ["Bitstream filters:", "null"]
+  else if flag == "-filters" then
+    some ["Filters:", " ... scale            V->V  native scaling", " ... hflip            V->V  native horizontal flip",
+          " ... vflip            V->V  native vertical flip", " ... crop             V->V  native crop"]
+  else if flag == "-pix_fmts" then
+    some ["Pixel formats:", "FLAGS NAME            NB_COMPONENTS BITS_PER_PIXEL", "-----",
+          "IO... yuv420p                3            12", "IO... yuv444p                3            24",
+          "IO... nv12                   3            12", "IO... rgb24                  3            24"]
+  else if flag == "-protocols" then
+    some ["Supported file protocols:", "Input:", "  file", "Output:", "  file"]
+  else if flag == "-h" || flag == "-help" || flag == "--help" || flag == "-?" then
+    some ["usage: lffmpeg [options] [[infile options] -i infile]... {[outfile options] outfile}...",
+          "native stream copy: -i IN -c copy [-ss S] [-t S] [-metadata title=...] OUT.{mp4,ivf,wav,flac,mkv,webm}",
+          "introspection: -version -buildconf -formats -muxers -demuxers -codecs -decoders -encoders -bsfs -filters -pix_fmts -protocols",
+          "unsupported options fail closed rather than being silently ignored"]
+  else none
+
+def runNativeIntrospection (args : List String) : IO (Option UInt32) := do
+  match args.find? (fun a => (nativeIntrospectionLines a).isSome) with
+  | some flag =>
+    for line in (nativeIntrospectionLines flag).getD [] do IO.println line
+    return some 0
+  | none => return none
+
+def containerFormatOfName (name : String) : Option ContainerFormat :=
+  if name == "mp4" || name == "mov" then some .mp4
+  else if name == "ivf" then some .ivf
+  else if name == "wav" then some .wav
+  else if name == "flac" then some .flacRaw
+  else if name == "matroska" || name == "mkv" then some .mkv
+  else if name == "webm" then some .webm
+  else none
+
+def nativeInputContainerFormat (path : String) : Option ContainerFormat :=
+  let lower := strToLowerAscii path
+  if strEndsWithFast lower ".m4v" || strEndsWithFast lower ".mov" then some .mp4
+  else containerFormatOfName (inferContainerFormat none path)
+
+def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO (Option UInt32) := do
+  let inPath := cfg.inputs.headD ""
+  let some out := plan.outputs.head? | return none
+  let some outFmt := containerFormatOfName out.format | return none
+  let some inFmt := nativeInputContainerFormat inPath | return none
+  if !cfg.overwrite && (← System.FilePath.pathExists out.path) then
+    if cfg.jsonOutput || args.contains "-n" then
+      return some (← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists")
+    if !cliQuiet cfg.logLevel then
+      IO.eprintln s!"File '{out.path}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+    return some 0
+  let t0 ← IO.monoNanosNow
+  let bytes ← IO.FS.readBinFile inPath
+  let startMs := (plan.timeline.startMs.getD 0).toNat
+  let durMs := (plan.timeline.durationMs.getD 0).toNat
+  let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
+  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata with
+  | .fallback => return none
+  | .invalid reason =>
+    return some (← reportCliError cfg
+      s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-native-copy\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}"
+      s!"Native stream copy rejected {inPath}: {reason}")
+  | .remuxed outBytes =>
+    match ← writeMediaFileAtomic out.path outBytes with
+    | .ok _ =>
+      let t1 ← IO.monoNanosNow
+      if cfg.jsonOutput then
+        IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-native-copy\",\"tier\":\"independent_verified\",\"format\":\"{jsonEscape out.format}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape out.path}\",\"in_bytes\":{bytes.size},\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+      return some 0
+    | .error _ =>
+      return some (← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-native-copy\",\"error\":\"output write failed\"}"
+        s!"Native stream copy failed to write {out.path}")
+
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
   if !args.contains "-i" && !args.contains "-lavfi" && !args.contains "-filter_complex" && !args.contains "-/filter_complex" && args.any isIntrospectionFlag then
+    if let some rc ← runNativeIntrospection args then return rc
     if !verifyExecArgvHygiene args then return 1
     let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
     return rc
@@ -1263,6 +1369,14 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return ← reportCliError validCfg
             "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
             (s!"{inP}: No such file or directory")
+    let plan ←
+      if plan.backend.tier == .independentVerified then
+        match ← runNativeStreamCopy validCfg plan args with
+        | some rc => return rc
+        | none => pure { plan with backend := { plan.backend with
+            tier := .delegatedFaithful, delegatedContainer := true,
+            reasons := ["native_stream_copy_layout_unsupported"] } }
+      else pure plan
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
@@ -1582,20 +1696,6 @@ def main (args : List String) : IO UInt32 := do
   | "verify-ffi" :: mp4Path :: _ => runVerifyFfi (some mp4Path)
   | "verify-ffi" :: [] => runVerifyFfi none
   | "verify-kernels" :: _ => runVerifyKernels
-  | "-version" :: _ => printLffmpegVersion
-  | "--version" :: _ => printLffmpegVersion
-  | "-codecs" :: _ => printLffmpegCodecs
-  | "-formats" :: _ => printLffmpegFormats
-  | "-h" :: _ => do
-    IO.println "usage: lffmpeg -i INPUT [-c:v h264|hevc|av1|copy] [-c:a aac|copy] [options] OUTPUT.mp4"
-    IO.println "options: -y | -n, -vf FILTER, -ss SECONDS, -t SECONDS, -f mp4, -pix_fmt, -preset, -crf, -b:v, -b:a, -r, -json"
-    IO.println "unsupported options fail closed rather than being silently ignored"
-    return 0
-  | "--help" :: _ => do
-    IO.println "usage: lffmpeg -i INPUT [-c:v h264|hevc|av1|copy] [-c:a aac|copy] [options] OUTPUT.mp4"
-    IO.println "options: -y | -n, -vf FILTER, -ss SECONDS, -t SECONDS, -f mp4, -pix_fmt, -preset, -crf, -b:v, -b:a, -r, -json"
-    IO.println "unsupported options fail closed rather than being silently ignored"
-    return 0
   | "bench" :: itStr :: _ => runBench (itStr.toNat?.getD 500)
   | "bench" :: [] => runBench 500
   | "bench-real" :: mediaDir :: itStr :: _ => runBenchRealFiles mediaDir (itStr.toNat?.getD 200)

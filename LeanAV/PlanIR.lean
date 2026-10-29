@@ -1286,6 +1286,31 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     (cfgAudioCodec.isSome && cfgAudioCodec != some .copy && cfgAudioCodec != some .aac) ||
     isDelegatedVideoCodec
 
+  let nativeCopyFormat := ["mp4", "mov", "ivf", "wav", "flac", "matroska", "mkv", "webm"].contains inferredFmt
+  let nativeTrimFormat := ["mp4", "mov", "ivf", "wav"].contains inferredFmt
+  let nativeMetadataOk := extMetadataEntries.isEmpty ||
+    ((inferredFmt == "mp4" || inferredFmt == "mov") && extMetadataEntries.all (fun kv => (nativeMp4MetadataTag kv.key).isSome))
+  let nativeFamily (f : String) : String :=
+    if f == "mov" then "mp4" else if f == "mkv" then "matroska" else f
+  let nativeSingleInput := match inputSpecs with
+    | [i] =>
+      let lowerIn := strToLowerAscii i.path
+      let inFmt := if strEndsWithFast lowerIn ".m4v" then "mp4" else inferContainerFormat none i.path
+      !anyConcatInput && nativeFamily inFmt == nativeFamily inferredFmt
+    | _ => false
+  let isNativeStreamCopy : Bool :=
+    nativeCopyFormat && nativeSingleInput && nativeMetadataOk &&
+    (nativeTrimFormat || (cfgStartSec.isNone && cfgDurationSec.isNone)) &&
+    cfgVideoCodec == some .copy && cfgAudioCodec == some .copy &&
+    !cfgNoVideo && !cfgNoAudio &&
+    extExtraOutputs.isEmpty && !extHasExtraDelegatedFlags && extMpegOptions.isEmpty &&
+    !extNoSubtitle && extMaps.isEmpty && extMapMetadataSource == -1 && extMapChaptersSource == -1 &&
+    extSubtitleCodec.isNone && extBsfs.isEmpty && cfgVideoFilter.isNone && cfgAudioFilter.isNone &&
+    cfgVideoFrames.isNone && cfgVideoSize.isNone && cfgAudioRate.isNone && cfgAudioChannels.isNone &&
+    cfgPixelFormat.isNone && cfgThreads.isNone && cfgBFrames.isNone && cfgGopSize.isNone &&
+    cfgMovflags.isNone && cfgPreset.isNone && cfgCrf.isNone && cfgVideoBitrate.isNone &&
+    cfgAudioBitrate.isNone && cfgFrameRate.isNone
+
   let (tier, reasons) : BackendTier × List String :=
     if !allErrors.isEmpty then
       (.unsupported, ["cli_parse_or_validation_error"])
@@ -1299,6 +1324,8 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       (.unsupported, ["unrecognized_output_container_format"])
     else if inputSpecs.isEmpty || outputSpecs.isEmpty then
       (.unsupported, ["at_least_one_input_and_one_output_required"])
+    else if isNativeStreamCopy then
+      (.independentVerified, ["native_stream_copy"])
     else if isDelegatedContainerOrOption then
       (.delegatedFaithful, ["phase4_structured_argv_delegation"])
     else if cfgStartSec.isSome || cfgDurationSec.isSome || cfgVideoCodec != some .copy then
@@ -1343,7 +1370,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     errors := allErrors
     backend := {
       tier := tier
-      delegatedContainer := isDelegatedContainerOrOption
+      delegatedContainer := isDelegatedContainerOrOption && !isNativeStreamCopy
       fallbackAllowed := true
       reasons := reasons
     } }
@@ -1898,7 +1925,8 @@ theorem planIR_cli_roundtrip_verified :
     parseArgsToPlanIR (planIRToCliArgs pPhase4) = pPhase4 ∧
     formatCliSeconds { num := 50, den := 10000 } = "0.005" ∧
     formatCliSeconds { num := 10005, den := 10000 } = "1.0005" ∧
-    pCopy.backend.tier = .delegatedFaithful ∧
+    pCopy.backend.tier = .independentVerified ∧
+    pCopy.backend.delegatedContainer = false ∧
     pTrans.backend.tier = .translatedPartial ∧
     pPhase4.backend.tier = .delegatedFaithful ∧
     pPhase4.backend.delegatedContainer = true := by
