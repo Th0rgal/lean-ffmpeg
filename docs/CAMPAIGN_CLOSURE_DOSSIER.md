@@ -1,11 +1,29 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
-The 2026-10-29 Wave 2 integrated validation under Lean v4.35.0 audited
+The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
 **8,916 declarations with zero sorryAx/custom axioms** and **266/266 tight
 specifications** (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28,
 `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
-`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). Build, 53 self-test waves,
-FFI/kernel checks, 136 unit tests and 58 differential tests (4 skipped) passed.
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with `16/16` `LNIR_WIRE_V1`
+kernels passing `SymbolicTV` (`validate-tv --samples 64`) and certificate
+verification (`verify-certs`: `verified: true`, `11 VerifiedKernelProof`,
+`4 TranslationValidated`, `1 Tested`, all `chainValid: true` and
+`theoremsValid: true`), and a `1,166`-line C-ABI/POSIX/SIMD bridge
+(`c/leanav_simd_kernels.c`). In the Wave 2 FATE sweep across the `6,133`
+retained inventory rows (`5,721` configured + `412` disabled = `6,065` real
+upstream targets; `reports/fate-sweep-wave2-complete-20261029.json`), all
+`5,721/5,721` configured baseline targets exited status-zero and all
+`5,370/5,370` disjoint candidate-CLI-exercised targets passed (`0` candidate
+failures; `659` non-CLI helper rows kept at `0` candidate credit; `1`
+non-candidate upstream `astcenc 5.4.0` API failure; `35` hardware/arch-gated
+not runnable; `global_parity: false` pending full-suite eBPF syscall-provenance
+certification). Stage-1 untimed `1080p120` equivalence passed `17,577` checks,
+and Stage-2 `paired-baseline-v5-wave2-357e1a4-thp-a` passed `14/14` byte-exact
+oracle outputs (`quality_passed: true`) while failing closed on shared-host SMT
+timing noise (`CV = 6.851%` / `6.350%`, `timing_valid: false`); the accepted
+bounded timing baseline remains `paired-baseline-v5-ae6ed0b-thp-a` (`10.5057 s`
+vs `10.2235 s`, `+2.86%` slower, `CV = 1.417%` / `0.382%`, `timing_valid: true`).
 
 The 2026-10-27 MPEG delegated-option validation under Lean v4.35.0 audited
 **8,899 declarations with zero sorryAx/custom axioms** and **264/264 tight

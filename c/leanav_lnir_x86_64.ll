@@ -6784,7 +6784,7 @@ done:
   ret void
 }
 
-; LNIRDecl: swscale_luma_gain_bias_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.singleThreaded, isaMask=1)
+; LNIRDecl: swscale_luma_gain_bias_simd (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.singleThreaded, isaMask=1)
 define dso_local ptr @swscale_luma_gain_bias_simd(ptr noalias noundef %arg_v0, i64 noundef %arg_v1, i64 noundef %arg_v2) #0 {
 entry:
   %slot_v0 = alloca ptr, align 8
@@ -6873,7 +6873,7 @@ loop_exit_20:
   ret ptr %ldp_38
 }
 
-; LNIRDecl: flac_lpc_autocorr_dot_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+; LNIRDecl: flac_lpc_autocorr_dot_simd (assurance=Tested, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
 define dso_local ptr @flac_lpc_autocorr_dot_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
 entry:
   %slot_v0 = alloca ptr, align 8
@@ -6974,7 +6974,7 @@ par_exit_14:
   ret ptr %ldp_25
 }
 
-; LNIRDecl: av1_wiener_3tap_sym_gpu (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+; LNIRDecl: av1_wiener_3tap_sym_gpu (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
 define dso_local ptr @av1_wiener_3tap_sym_gpu(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
 entry:
   %slot_v0 = alloca ptr, align 8
@@ -7109,7 +7109,7 @@ par_exit_14:
   ret ptr %ldp_35
 }
 
-; LNIRDecl: h264_idct_tuple_accum_sroa (assurance=VerifiedKernelProof, isGpuCand=false, rcMode=LeanNative.IR.RcMode.freestanding, isaMask=1)
+; LNIRDecl: h264_idct_tuple_accum_sroa (assurance=TranslationValidated, isGpuCand=false, rcMode=LeanNative.IR.RcMode.freestanding, isaMask=1)
 define dso_local i64 @h264_idct_tuple_accum_sroa(i64 noundef %arg_v0, i64 noundef %arg_v1) #0 {
 entry:
   %slot_v0 = alloca i64, align 8
@@ -7611,7 +7611,7 @@ par_exit_14:
   ret ptr %ldp_38
 }
 
-; LNIRDecl: swscale_down3to2_bilinear_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+; LNIRDecl: swscale_down3to2_bilinear_simd (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
 define dso_local ptr @swscale_down3to2_bilinear_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
 entry:
   %slot_v0 = alloca ptr, align 8

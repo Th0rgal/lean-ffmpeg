@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
-        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
+        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 077775ba387f1eeb2976cb8763b4633b8d5ce313
       - name: Install Lean
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
           "$HOME/.elan/bin/lean" --version
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install FFmpeg runtime and libav headers
@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: lake build
       - name: Install & cache turbo-lean
-        uses: Th0rgal/turbo-lean@c301cfb10d25372de9fcf2b49830ecb25f55d4b7
+        uses: Th0rgal/turbo-lean@dc1656dc948f1d7bfc25d165575ae3819a2e8b97
         with:
           project-dir: "."
           command: cache-only
@@ -29,12 +29,24 @@ jobs:
         run: |
           python3 - <<'PY'
           import glob, json, subprocess, sys
+          total_audited = 0
+          total_tight = 0
           for path in sorted(glob.glob("LeanAV/*.lean")):
               res = subprocess.run(["turbo-lean", "--json", "audit-spec", path], capture_output=True, text=True, check=True)
               data = json.loads(res.stdout)
-              print(f"{path}: audited={data['total_specs_audited']} tight={data['tight_specs']} vacuous={data['vacuous_specs']} trivial={data['trivial_specs']}")
-              if not data.get("ok") or data.get("vacuous_specs", 0) != 0 or data.get("trivial_specs", 0) != 0:
+              audited = data["total_specs_audited"]
+              tight = data["tight_specs"]
+              vacuous = data.get("vacuous_specs", 0)
+              trivial = data.get("trivial_specs", 0)
+              shadowed = len(data.get("shadowed_constants", []))
+              total_audited += audited
+              total_tight += tight
+              print(f"{path}: ok={data.get('ok')} audited={audited} tight={tight} vacuous={vacuous} trivial={trivial} shadowed={shadowed}")
+              if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
+          print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
+          if total_audited != 266 or total_tight != 266:
+              sys.exit(1)
           PY
       - name: Self-test & C-ABI / LNIR Kernel Verification
         run: |
@@ -63,21 +75,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
-        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 9a3fda9180d8e9a2e429ca38046b74467f68866b
+        run: git clone https://github.com/Th0rgal/lean-sys.git ../lean-sys && git -C ../lean-sys checkout 077775ba387f1eeb2976cb8763b4633b8d5ce313
       - run: brew install ffmpeg
-      - name: Patch lean-sys socket portability
+      - name: Patch lean-sys macOS SOCK_CLOEXEC portability
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path('../lean-sys/c/lean_sys_shim.c')
           s = p.read_text()
-          s = s.replace('int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;', 'int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;')
-          s = s.replace('accept4((int)lfd, NULL, NULL, SOCK_CLOEXEC)', 'accept((int)lfd, NULL, NULL)')
+          s = s.replace('socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)', 'socket(AF_INET, SOCK_STREAM, 0)')
           p.write_text(s)
           PY
       - name: Install Lean
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
           "$HOME/.elan/bin/lean" --version
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: lake build

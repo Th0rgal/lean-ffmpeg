@@ -304,13 +304,13 @@ theorem aacChannelLayout_rejects_unmasked_6ch_and_accepts_stereo :
   decide
 
 /--
-  ITU-R BS.775 5.1 (`FL, FR, FC, LFE, BL, BR`) to Stereo (`L, R`) Q10 fixed-point downmix kernel:
+  ITU-R BS.775 5.1 (`FL, FR, FC, BL, BR`; ITU-R BS.775 omits LFE from stereo downmix) to Stereo (`L, R`) Q10 fixed-point downmix kernel:
   `L = clipInt16((1024 * FL + 724 * FC + 724 * BL + 512) >> 10)`
   `R = clipInt16((1024 * FR + 724 * FC + 724 * BR + 512) >> 10)`
   where `724 / 1024 ≈ 0.70703` (`-3 dB`).
 -/
 @[inline]
-def downmix5p1SampleToStereoQ10 (fl fr fc _lfe bl br : Int32) : Int32 × Int32 :=
+def downmix5p1SampleToStereoQ10 (fl fr fc bl br : Int32) : Int32 × Int32 :=
   let lAcc : Int64 := 1024 * fl.toInt64 + 724 * fc.toInt64 + 724 * bl.toInt64 + 512
   let rAcc : Int64 := 1024 * fr.toInt64 + 724 * fc.toInt64 + 724 * br.toInt64 + 512
   let lOut := clipInt16 (lAcc >>> 10).toInt32
@@ -319,8 +319,8 @@ def downmix5p1SampleToStereoQ10 (fl fr fc _lfe bl br : Int32) : Int32 × Int32 :
 
 /-- Theorem: `downmix5p1SampleToStereoQ10` preserves silence (`0 -> (0, 0)`) and symmetric center-channel pan (`FC = 1000 -> L = R = 707`). -/
 theorem downmix5p1SampleToStereoQ10_center_symmetric :
-    downmix5p1SampleToStereoQ10 0 0 0 0 0 0 = (0, 0) ∧
-    downmix5p1SampleToStereoQ10 0 0 1000 0 0 0 = (707, 707) := by
+    downmix5p1SampleToStereoQ10 0 0 0 0 0 = (0, 0) ∧
+    downmix5p1SampleToStereoQ10 0 0 1000 0 0 = (707, 707) := by
   decide
 
 /-! ## 5. Law 11: Two-Tier FFmpeg Bounded Acceptance Oracle (`verifyFFmpegAcceptance` / `≈ε`) -/

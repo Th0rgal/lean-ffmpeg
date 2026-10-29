@@ -1,176 +1,127 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs pure **Lean 4** container/DSP/scaling/transcode pipelines and **16 LeanNative (`LNIR_WIRE_V1`)** DSP/stencil kernels + **14 LLVM 18 2D strided/reduction/filter/16-bit routines** compiled through LLVM 18 (`leanav_lnir_x86_64.ll` and `leanav_lnir_arm64.ll`) and NVIDIA PTX 8.0 (`sm_90`) with a minimal **`1,166`-line** irreducible C-ABI bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** across **`8,916`** declarations (verified under `v4.35.0`) and **`266 / 266` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean).
+Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **15 formal Lean 4 modules** (`LeanAV/*.lean`, `27,147` LOC), **21 direct `@[export]` C-ABI entrypoints** (`leanav_lean_*`), **16 compiled `LNIR_WIRE_V1` DSP/stencil kernels** (`c/leanav_lnir_kernels.lnir`), and **14 LLVM 18 2D strided/reduction/filter/16-bit routines** (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, plus NVIDIA PTX 8.0 `sm_90`) with a **`1,166`-line** C-ABI/POSIX/SIMD bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** and **`0` custom axioms** across **`8,916`** declarations (`scripts/check_axioms.lean`) and **`266 / 266` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean) (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`).
 
-10-bit and 8-bit luma acceptance read U16LE and U8 pixels directly from complete planes
-across all scaling ratios (`1:1`, `2:1`, `3:1`, and general Q8 bilinear), avoiding
-temporary full-frame 8-bit plane allocations. The u8 and u16le kernels share the same block
-grid and reductions; each U16LE pixel is decoded as `(value >> 2) & 255` before reference
-averaging or Q8 interpolation. Short buffers retain the fast native MSB extraction fallback.
-`verify-kernels` checks parity against pure extraction plus acceptance, including odd
-sizes, truncated buffers, and the full UInt16 range.
-
+`lffmpeg` is currently a **formally gated hybrid multimedia pipeline**, not yet a standalone zero-dependency replacement for `ffmpeg`:
+- **Native in-process execution (`independent_verified` & pure Lean/LNIR stages of `translated_partial`)**: CLI parsing and `MediaPlanIR` validation, fail-closed path/protocol security gates, exact `AVRational` timestamp rescaling, 8-bit and 10-bit (`U16LE`) plane scaling (`1:1` zero-copy identity, `2:1`, `3:1`, `3:2`, and general Q8 bilinear), 64-bit SWAR Annex-B NAL scanning, PQ10/BT.2020 -> BT.709 colorimetry and tonemapping, AV1 CDEF/Wiener and HEVC SAO filtering, Order-4 FLAC LPC prediction/decoding, 16x16 macroblock PSNR/SAD luma acceptance, and ISO BMFF (`moov`, `colr`, `clli`, `mdcv`, `pasp`, `edts`/`elst`), IVF, Matroska (`SimpleBlock`), and 188-byte MPEG-TS container parsing/patching execute in Lean 4 + compiled LNIR/LLVM routines.
+- **External `ffmpeg` process delegation (`translated_partial` raw bitstream pipes & `delegated_faithful`)**: Full entropy/transform video/audio codec bitstream decode/encode (`h264`, `hevc`, `av1`, `aac`, etc.) in `translated_partial` pipelines uses ring-buffered POSIX pipes to `ffmpeg` without `/bin/sh`, and general container/filtergraph/muxer workflows in `delegated_faithful` lower through `MediaPlanIR` to structured `fork` + `execvp` calls against a pinned reference `ffmpeg` (`6.1.1`).
 
 ---
 
-## Performance across x86, DGX Spark and Apple Silicon
+## Architecture, Execution Tiers & Trusted Computing Base (TCB)
 
-Current integration and conformance limits are documented in the
-[28 October qualification report](docs/INTEGRATED_CONFORMANCE_20261028.md).
-Full upstream FATE parity remains unproven. The [PFM routing correction](docs/PFM_ROUTING_20261028.md) passes the four affected image recipe comparisons; this is scoped conformance evidence.
+### Qualification Tiers (`MediaPlanIR`)
 
-The historical Maxwell campaign reports **1.89× speedup on Ryzen 9 9950X** and
-**1.44× on DGX Spark** for its scale + tonemap + BT.709 CLI workload. Other
-workloads remain slower. These are recorded campaign measurements, not a fresh
-benchmark of the current commit. See [measurement provenance](docs/BENCHMARK_EVIDENCE.md).
+Every CLI invocation is parsed into [`MediaPlanIR`](LeanAV/PlanIR.lean), checked against a fail-closed security policy (formally proved rejection of network protocols, `/dev/*` device nodes except `/dev/null`, and `..` path traversals), and routed to one of four runtime execution tiers:
 
-The [accepted bounded baseline from 28 October](docs/BOUNDED_BASELINE_20261028.md)
-measured compiler-integrated candidate `ae6ed0b` on an x86 Xeon E3-1245 V2:
-**2.86% slower** than FFmpeg 6.1.1 for 120 frames of lossless H.264 1080p → 540p,
-with five measured pairs and all fourteen outputs byte-identical to the oracle.
-This shared-host measurement does not qualify later routing corrections or other
-workloads; it supersedes no historical run.
+| Tier | Execution Mechanism | Scope & Examples |
+| :--- | :--- | :--- |
+| **`independent_verified`** | Pure Lean 4 + compiled `LNIR_WIRE_V1` kernels with zero `ffmpeg` subprocesses; out-of-domain inputs trigger explicit `fallbackDelegated` | `2x2` / `3x3` / `3:2` / Q8 bilinear plane scaling, `3x3` box-blur stencil, luma mean/variance reduction, Order-4 FLAC LPC, AV1 CDEF/Wiener, HEVC SAO, native MP4 / IVF / Matroska (`SimpleBlock`) / MPEG-TS (`188B`) demux/mux, exact `AVRational` PTS rescaling |
+| **`translated_partial`** | Pure Lean 4 + LLVM/SIMD scaling, colorimetry (`PQ10`/`BT.2020` -> `BT.709`), 16x16 luma PSNR/SAD acceptance, and surgical ISO BMFF box patching, paired with ring-buffered POSIX pipe `ffmpeg` raw-frame decode/encode (zero `/bin/sh`) | MP4 transcoding (`h264`, `hevc`, `av1`, `aac`, `-ss`, `-t`, `-vf scale/colorspace=bt709/tonemap`), JSON media probing |
+| **`delegated_faithful`** | Validated `MediaPlanIR` lowered to structured `fork` + `execvp` (zero shell interpolation) against reference `ffmpeg` | General muxers/demuxers (`.mkv`, `.webm`, `.mov`, `.wav`, `.flac`, `.ogg`, `.ts`, `.avi`, `.fits`, `.pfm`, `.wbmp`, `hls`, `dash`, `iamf`, `spdif`), `-map`, `-metadata`, `-disposition`, `-bsf`, `-filter_complex` |
+| **`unsupported`** | Deterministic fail-closed rejection with structured diagnostics (`stdout` in `-json` mode, `stderr` otherwise) and zero partial output artifacts | Network/unsafe protocols (`http://`, `rtsp://`, `lavfi:`, `concat:`, `/dev/*`, `..`), contradictory codec/filter flags (`-c:v copy -vf ...`) |
 
-### End-to-end CLI: FFmpeg and lffmpeg on the same host
+### Verification Boundary & Unverified TCB
 
-Wall time in milliseconds; lower is better. **Speedup = FFmpeg time / lffmpeg time**;
-values below 1 mean lffmpeg is slower. These reported pipeline comparisons include
-decode/encode and I/O; they do not establish identical output quality or codec settings.
+| Layer | Component | Verification Status |
+| :--- | :--- | :--- |
+| **Verified Lean 4 Core** | 15 `LeanAV/*.lean` modules (`8,916` declarations) | Kernel-checked under Lean `v4.35.0` (`0 sorryAx`, `0` custom axioms; standard axioms `{propext, Quot.sound, Classical.choice}` only) |
+| **Specification Audit** | `266 / 266` `AVGateSpec` & theorem specs | Audited by `turbo-lean@dc1656d` (`audit-spec` v2.1): `266/266 non_vacuous_and_tight`, `0 vacuous`, `0 trivial`, `0 shadowed` |
+| **Compiled `LNIR_WIRE_V1` Kernels** | 16 1D DSP/stencil kernels in `c/leanav_lnir_kernels.lnir` | `16/16` pass `lean-native-core validate-tv --samples 64` (`SymbolicTV` UB/domain/poison/return/memory refinement); `verify-certs` passes (`verified: true`, `chainValid: true`, `theoremsValid: true` across all 16 kernels: `11 VerifiedKernelProof`, `4 TranslationValidated`, `1 Tested`) |
+| **Unverified TCB** | `c/leanav_simd_kernels.c` (`1,166` lines), 14 handwritten 2D strided/16-bit LLVM IR routines in `c/leanav_lnir_{x86_64,arm64}.ll`, Lean 4 runtime + `lean-sys` POSIX shim (`63` lines), LLVM 18 backend, and external `ffmpeg` (`6.1.1`) when delegated | Differential, unit, IR-structural (`tests/test_u16le_kernels_ir.py`, `tests/test_pixel_filters_ir.py`), and runtime (`verify-ffi`, `verify-kernels`) tested, **not formally proved in Lean** |
+
+---
+
+## Upstream FFmpeg FATE Conformance Evidence (2026-10-29 Wave 2)
+
+Upstream FFmpeg (`bf0e831606938f530326c9679591109407fa8d0d`) defines **`6,133` inventory rows** (`reports/fate-inventory-v3.json`): **`5,721` configured baseline targets** plus **`412` build-disabled rows** (`344` real disabled upstream targets + `68` source-scanner overapproximations), yielding **`6,065` real upstream FATE targets**.
+
+In the Wave 2 sweep (`reports/fate-sweep-wave2-complete-20261029.json`, SHA-256 `43c08c087c812e3a8feac4c3e757c848fceda80c17d1b09e2e6a1f3c23367147`), exact-arm `target_exec.py` substitution replaced only the `ffmpeg` binary with `lffmpeg` (while `LEANAV_FFMPEG_BIN` pointed to each suite's isolated scratch reference `ffmpeg`, and `ffprobe` / C API test binaries ran directly without candidate credit):
+
+| FATE Partition | Targets | Status-Zero | Candidate-CLI Exercised Passes | Non-CLI / Helper Passes (`0` Credit) | Notes |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **Configured baseline (`full_configured_5721`)** | 5,721 | **5,721 / 5,721** | **5,086 / 5,086** | 635 | Includes `221` wrapper/helper rows (`libavformat/tests/seek`, `libswresample/tests/rematrix`, `ffprobe`) kept at `0` candidate credit |
+| **Isolated `zlib` suite (`suite_b_zlib_209`)** | 209 | **209 / 209** | **203 / 203** | 6 | PNG/APNG/ZLIB/Matroska-zlib targets |
+| **Isolated `--enable-gpl` suite (`suite_c_gpl_57`)** | 57 | **57 / 57** | **53 / 53** | 4 | GPL filter/muxer targets |
+| **Isolated external-lib suites (`suite_d_ext_37`)** | 37 | **36 / 37** | **28 / 28** | 8 | `1` non-candidate C API helper failure (`fate-api-astc-profile` in `astcenc 5.4.0`, `lffmpeg` never invoked; fails identically upstream) |
+| **x86asm + host-runnable HW helpers** | 6 | **6 / 6** | 0 | 6 | `fate-sws-*-x86`, `fate-av1-levels`, `fate-sws-*-spirv`, `fate-hwcontext-cuda` |
+| **Unavailable host hardware / arch** | 35 | Not runnable | — | — | `33` `fate-filter-scale_cuda-*` (no NVIDIA GPU on host; all `33` argvs verified clean via `lffmpeg -dump-plan`) + `2` native `aarch64` (`fate-sws-*-aarch64`) |
+| **Disjoint Total (`6,065` real targets)** | **6,065** | **6,029 / 6,030 run** | **5,370 / 5,370 (`0` candidate failures)** | **659** | **Scoped conformance evidence (`global_parity: false`)** |
+
+**Scope limitations on FATE conformance**:
+1. Passing FATE targets through `delegated_faithful` or `translated_partial` validates CLI parsing, `MediaPlanIR` lowering, path/option hygiene, and pipeline compatibility—**not** standalone native codec parity.
+2. Full-suite (`5,721`-target) kernel eBPF syscall-provenance certification has not yet been executed (`full_fate_syscall_provenance_certified: false`, `global_parity: false`).
+3. Repository CI runs the project unit/differential suites (`136` unit tests + `62` differential tests locally with `58` passed and `4` skipped; platform-dependent subsets on GitHub-hosted runners), not the multi-gigabyte upstream `fate-suite` corpus.
+
+---
+
+## Performance & Bounded Baselines
+
+Output correctness (`quality_passed`) and timing repeatability (`timing_valid`, requiring paired & per-arm `CV < 3.0%`) are tracked strictly separately. See [`docs/BOUNDED_BASELINE_20261028.md`](docs/BOUNDED_BASELINE_20261028.md) and [`docs/BENCHMARK_EVIDENCE.md`](docs/BENCHMARK_EVIDENCE.md).
+
+### Stage-2 Bounded Paired Baselines (`1080p120` YUV420p -> `960x540` Lossless H.264, Xeon E3-1245 V2)
+
+Workload: 120 frames of `1920x1080` YUV420p scaled to `960x540` H.264 lossless (`-preset veryfast -crf 0`), 2 warmups + 5 alternating pairs, pinned to `cpu0-3` with THP enabled; all 14 outputs per run verified byte-exact (`81,424,133` bytes, SHA-256 `e31886830cff40551868345f60259ffea0ee279b9b2af6515c46198ab06c94de`):
+
+| Candidate | Quality (`14/14` Oracle Byte-Exact) | Candidate Median | FFmpeg 6.1.1 Median | Median Paired Ratio | Candidate / Ref CV | Timing Status |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- |
+| **`ae6ed0b` (`paired-baseline-v5-ae6ed0b-thp-a`)** | `quality_passed: true` | `10.5057 s` | `10.2235 s` | `1.028612` (**`+2.86%` slower**) | `1.417%` / `0.382%` | **Accepted (`timing_valid: true`)** |
+| **Wave 2 `357e1a4` (`paired-baseline-v5-wave2-357e1a4-thp-a`)** | `quality_passed: true` (+ Stage-1 `17,577` checks) | `10.8803 s` (noisy) | `11.0227 s` (noisy) | `0.995431` *(unvalidated)* | `6.851%` / `6.350%` | **Fail-closed rejected (`timing_valid: false`, `CV > 3%`)** |
+
+In the Wave 2 `357e1a4` run (which added the 64-slot POSIX pipe/pthread ring buffer `execPipeTranscodeU8IO` and `<16 x i32>` AVX2/NEON row accumulators), external sibling-tenant workloads on `cpu4-7` SMT threads caused `CV > 3.0%` mid-run; uncontended `pair-0` observed `10.2768 s` (`lffmpeg`) vs `10.3239 s` (`ffmpeg`), but **no speedup claim is accepted** until a quiet-host rerun passes `CV < 3.0%`.
+
+### Historical Cross-Hardware Campaign Measurements
+
+Recorded in [`docs/benchmark-campaign-excerpt.json`](docs/benchmark-campaign-excerpt.json) from an earlier revision (not a measurement of the current commit; includes decode/encode I/O; **Speedup = FFmpeg time / lffmpeg time**, `< 1.0×` means slower):
 
 | Hardware | Workload | FFmpeg 6.1.1 | lffmpeg | Speedup |
 | :--- | :--- | ---: | ---: | ---: |
-| **x86 — Ryzen 9 9950X (Zen 5)** | 1080p → 540p | 486.39 ms | **443.78 ms** | **1.10×** |
-| x86 — Ryzen 9 9950X | 1080p → 480p, Q8 | 478.41 ms | 501.88 ms | 0.95× |
+| **x86 — Ryzen 9 9950X (Zen 5)** | 1080p -> 540p | 486.39 ms | **443.78 ms** | **1.10×** |
+| x86 — Ryzen 9 9950X | 1080p -> 480p, Q8 | 478.41 ms | 501.88 ms | 0.95× |
 | **x86 — Ryzen 9 9950X** | 540p + tonemap + BT.709 | 946.64 ms | **500.16 ms** | **1.89×** |
 | x86 — Ryzen 9 9950X | Stream copy | 38.46 ms | 51.69 ms | 0.74× |
-| **DGX Spark — ARM64 CPU** | 1080p → 540p | 225.77 ms | 309.03 ms | 0.73× |
-| DGX Spark — ARM64 CPU | 1080p → 480p, Q8 | 209.78 ms | 350.85 ms | 0.60× |
+| **DGX Spark — ARM64 CPU** | 1080p -> 540p | 225.77 ms | 309.03 ms | 0.73× |
+| DGX Spark — ARM64 CPU | 1080p -> 480p, Q8 | 209.78 ms | 350.85 ms | 0.60× |
 | **DGX Spark — ARM64 CPU** | 540p + tonemap + BT.709 | 446.96 ms | **310.62 ms** | **1.44×** |
 | DGX Spark — ARM64 CPU | Stream copy | 51.11 ms | 79.16 ms | 0.65× |
-| **MacBook Air M2** | Comparative CLI benchmarks | — | — | **Not measured in the retained evidence** |
+| **MacBook Air M2** | Comparative CLI benchmarks | — | — | **Not measured** |
 
-DGX Spark timings above use the CPU path, not CUDA kernel execution. PTX assembly
-checks are separate from GPU runtime performance. The passing macOS CI validates
-its runner; it is **not a MacBook Air M2 benchmark**.
-
-### Native CPU kernels: throughput by architecture
-
-Historical in-memory measurements; these exclude the full FFmpeg CLI workload.
-There is no matched FFmpeg kernel baseline in the retained table, so these numbers
-must not be used to claim a speedup over an entire FFmpeg transcode.
-
-| Native workload | x86 Xeon E3-1245 V2 | x86 Ryzen 9 9950X | DGX Spark ARM64 CPU | MacBook Air M2 |
-| :--- | ---: | ---: | ---: | :--- |
-| 4K → 1080p, 2×2 plane scale | 623–693 fps | 1,611–2,128 fps | **2,005–2,469 fps** | Not measured |
-| 4K → 720p, 3×3 plane scale | 686–833 fps | 2,140–2,147 fps | **1,547–2,896 fps** | Not measured |
-| 1080p → 720p, 3:2 plane scale | 1,243–2,195 fps | **6,617–9,075 fps** | 4,651–6,722 fps | Not measured |
-| CDEF filter, 101 × 64×64 planes | 8,561 µs | **1,452 µs** | 4,232 µs | Not measured |
-| MP4 demux, 500 iterations | 229 µs | 182 µs | **89 µs** | Not measured |
-| Order-4 FLAC LPC round-trip, 500 iterations | 76 µs | **20 µs** | 33 µs | Not measured |
-
-The earlier 234×–1,382× CDEF figures compare against a scalar Lean reference,
-not FFmpeg's optimized CDEF implementation. Synthetic Pipeline D throughput is
-also excluded from the FFmpeg comparison because its workload differs.
-
----
-
-## Qualification Tiers (`MediaPlanIR`)
-
-Every CLI request is parsed into a typed intermediate representation (`MediaPlanIR` in [`LeanAV/PlanIR.lean`](LeanAV/PlanIR.lean)), checked against a fail-closed security policy (formally proved rejection of network protocols, `/dev/*` device nodes, and `..` path traversals), and routed to one of four execution tiers:
-
-| Tier | Role | Examples |
-| :--- | :--- | :--- |
-| **`independent_verified`** | Pure Lean 4 + compiled `LNIR` (`lean-native-core`) kernels verified without FFmpeg dependencies, with explicit fallback (`fallbackDelegated`) | 2x2 / 3x3 / 3:2 / Q8 bilinear plane downscaling (`scale`), 3x3 box-blur stencil, luma mean/variance reduction, Order-4 FLAC LPC predictor/decoder, AV1 CDEF/Wiener filtering, HEVC SAO, native MP4 / IVF / Matroska (`SimpleBlock`) / MPEG-TS (`188B`) demux/mux, exact `AVRational` timestamp rescaling |
-| **`translated_partial`** | Pure Lean 4 transcode orchestration (`IO.Process.spawn` without `/bin/sh`) with pure Lean 4 scaling, PQ10/BT.2020 colorimetry, 16x16 macroblock PSNR/SAD acceptance, and ISO BMFF `colr`/`clli`/`mdcv`/`pasp`/`edts` box patching | MP4 transcoding (`h264`, `hevc`, `av1`, `aac`, `-ss`, `-t`, `-vf scale/colorspace=bt709/tonemap`), JSON probing |
-| **`delegated_faithful`** | Structured `fork`/`execvp` execution (zero shell interpolation) against reference `ffmpeg` | `.mkv`, `.webm`, `.mov`, `.wav`, `.flac`, `.ogg`, `.ts`, `.avi`, `.ast`, `-map`, `-metadata`, `-disposition`, `-bsf`, `-filter_complex` |
-| **`unsupported`** | Deterministic fail-closed rejection with structured diagnostics and zero partial output files | Unsafe protocols (`http://`, `rtsp://`, `pipe:`, `/dev/*`, `..`), invalid flag combinations (`-c:v copy -vf ...`) |
-
----
-
-## Compatibility: what “100%” covers
-
-[IAMF routing qualification](docs/IAMF_ROUTING_20261028.md) passed all 14 original
-paired media recipes. This adds delegated CLI compatibility; it does not establish
-a native IAMF codec or full upstream FATE parity.
-
-FITS output (`.fits` or `-f fits`) and WBMP image sequences (`.wbmp`) now route
-through FFmpeg delegation. Seven focused comparisons produced identical outputs;
-this is a scoped correctness result, not a full-suite or performance claim. See
-[FITS/WBMP validation](docs/FITS_WBMP_ROUTING_20261028.md).
-
-Bitstream-filter routing now preserves escaped/quoted commas and recognizes five
-additional upstream filter names. The parser matches the frozen upstream token
-oracle on 8,909 deterministic cases; this is not FATE/media or performance credit.
-See [BSF parsing validation](docs/BSF_ROUTING_20261028.md).
-
-**We do not claim to pass 100% of the full FFmpeg test suite.** The historical
-FATE result is **129/129 of the reference-passing tests in a selected 187-case
-run**. This is useful compatibility evidence, but is neither all 187 cases passing
-nor coverage of the full upstream FATE suite. The broader 120-case compatibility
-suite still has one recorded mismatch. Full codecs and some CLI operations use
-FFmpeg delegation; passing compatibility tests does not imply standalone parity.
-
-The 2026-10-27 MPEG option wave adds delegated `-mpv_flags`, `-intra_vlc` and
-`-data_partitioning` support. Its isolated 34-target FATE run passed all reference
-targets; the candidate passed 24 and retained 10 known co-blocker failures.
-Independent receipt auditing accepted that scoped result. All 6,133 inventory
-rows remain accounted for; this selection does not update the full-suite totals
-or establish native MPEG codec parity.
-
-The SPDIF wave adds explicit `-f spdif` routing through the delegated backend.
-An independent audit accepted 11 candidate CLI passes and three retained
-co-blocker failures from 14 isolated FATE targets; all 14 reference targets
-passed. The 6,133-row inventory and global totals remain unchanged. See the
-[per-target result and provenance](docs/SPDIF_ROUTING_20261027.md).
-
-| Suite / environment | Result | Scope and limitations |
-| :--- | :--- | :--- |
-| Local SPDIF-wave Python suites, 2026-10-27 | **148 passed, 0 skipped** | 74 unit + 74 differential tests; corrected runtime environment, earlier failed attempts retained |
-| Local MPEG-wave Python suites, 2026-10-27 | **138 passed, 0 skipped** | 64 unit + 74 differential tests; project tests, not upstream FATE |
-| Linux CI, `68936da` | **60 passed, 4 skipped** | 30 unit + 34 differential cases counted; skips excluded from passes |
-| macOS CI, `68936da` | **43 passed, 6 skipped** | 15 unit + 34 differential cases counted; some IR classes unavailable on this runner |
-| CLI self-test / FFI / kernels | **Passed on Linux and macOS** | 53 self-test waves; [CI run](https://github.com/Th0rgal/lean-ffmpeg/actions/runs/40462499784) |
-| Historical `bench.py` compatibility matrix | **119/120 matched (99.2%)** | 111 byte-exact, 5 lossy-signature matches, 3 both-fail; remaining mismatch not reclassified without evidence |
-| Historical `test_diff.py` matrix | **79/79 matched** | Exit codes and ffprobe signatures, not universal bit-exactness |
-| Historical selected FATE run | **129/129 reference-passing cases** | Selection: 187 cases; 58 outside this passing subset. Reported 186 matching non-empty outputs is a separate output comparison, not 186 passing tests |
-
-Historical compatibility totals are retained from the campaign dossier; their full
-per-case reports and external harnesses are not checked into this repository and
-were not reproduced during this documentation update. Current CI does not run the
-full upstream FATE suite. See [evidence and gaps](docs/BENCHMARK_EVIDENCE.md).
+DGX Spark figures above measure the Grace ARM64 CPU path (PTX assembly validation is separate from live GPU dispatch). In-memory native kernel microbenchmarks (excluding codec I/O) are archived in [`docs/BENCHMARK_EVIDENCE.md`](docs/BENCHMARK_EVIDENCE.md).
 
 ---
 
 ## Declarative Formal Specifications (`AVGateSpec`) & Zero-Trust Audit (`turbo-lean`)
 
-Each safety and conformance gate implements the [`AVGateSpec`](LeanAV/Spec.lean) meta-specification connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
+Each safety and conformance gate implements [`AVGateSpec`](LeanAV/Spec.lean), connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`264 / 264` specifications**) pass `turbo-lean --json audit-spec` as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,899`** kernel-checked declarations (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
+All **15** `LeanAV/*.lean` modules (**`266 / 266` specifications**) pass `turbo-lean --json audit-spec` (`dc1656d`, v2.1) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,916`** kernel-checked declarations (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
 
 ---
 
 ## Build & Verification
 
+Requires Lean `v4.35.0` ([`lean-toolchain`](lean-toolchain)), sibling checkout [`Th0rgal/lean-sys`](https://github.com/Th0rgal/lean-sys) (`../lean-sys` at `077775ba387f1eeb2976cb8763b4633b8d5ce313`), `clang`, and `ffmpeg` (`>= 6.1`) for differential/delegated tests.
+
 ```bash
-# Build LeanAV, the 16 LLVM-compiled LNIR kernels + 14 2D/stats/filter/16-bit routines, and the 623-line C-ABI bridge (0 sorryAx)
+# 1. Build LeanAV, 16 LNIR kernels + 14 2D/16-bit LLVM routines, and the 1,166-line C-ABI bridge
 lake build
 
-# Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
+# 2. Run all 53 formal self-test waves, C-ABI gates, and compiled LNIR kernel checks
 ./.lake/build/bin/lffmpeg self-test
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# Verify 0 sorryAx and 0 custom axioms across all 8,899 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 8,916 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# Audit each formal module (compatible with single-file turbo-lean CLIs)
+# 4. Audit all 15 formal modules with turbo-lean (266/266 non_vacuous_and_tight)
 for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done
 
-# Validate the 16 LNIR_WIRE_V1 kernels via translation validation and certificate checking
+# 5. Validate the 16 LNIR_WIRE_V1 kernels via SymbolicTV and certificate checking
 lean-native-core validate-tv --input c/leanav_lnir_kernels.lnir --samples 64
 lean-native-core verify-certs --input c/leanav_lnir_kernels.lnir
 
-# Run the Python suites; report executed tests and skips separately
+# 6. Run unit, IR-structural, and differential test suites
 python3 -m unittest discover -s tests -p "test_*.py"
 python3 -m unittest discover -s tests/differential -p "test_*.py"
 ```
@@ -179,30 +130,9 @@ python3 -m unittest discover -s tests/differential -p "test_*.py"
 
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 15 formal modules (`0 sorryAx`, `264/264` audited specifications): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`. All pixel scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance, ISO BMFF 32/64-bit box navigation and `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` transcode orchestration are defined in pure Lean 4.
+- [`LeanAV/`](LeanAV/): 15 formal Lean 4 modules (`0 sorryAx`, `8,916` declarations, `266/266` tight specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `IO.lean`, `Main.lean`.
 - [`c/`](c/):
-  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c): Minimal **`623`-line** irreducible C-ABI bridge (reduced by **84.6%** from `4,022` lines after migrating all DSP, scaling, ISO BMFF container probing/patching, and transcode orchestration to pure Lean 4 and `LNIR_WIRE_V1`):
-    1. POSIX `fork` + `execvp` delegation shim (`leanav_c_exec_delegated_ffmpeg`),
-    2. Phase 5 FFI ABI contract & `__ATOMIC_SEQ_CST` cancellation shims (`leanav_c_verify_plane_ffi_contract`, `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate`, `leanav_c_ffi_probe_mp4_contract`), and
-    3. Zero-copy `ByteArray` (`lean_sarray_object` / `lean_sarray_cptr`) bridge to the 16 compiled `LNIR_WIRE_V1` LLVM IR kernels and 7 vectorized 2D strided/reduction runtime routines (`leanav_c_exec_lnir_unary_ba`, `leanav_c_exec_lnir_binary_ba`, `leanav_c_exec_lnir_ternary_ba`, `leanav_c_exec_lnir_scale2d_ba` dispatching `kernel_id` `0..4` including `@lean_native_stencil2d_box3x3_u8` at `kernel_id = 4`, fused 3-plane YUV420p `leanav_c_exec_lnir_scale2d_yuv420p_ba`, `leanav_c_exec_lnir_cdef_ba`, and `leanav_c_exec_lnir_luma_stats_ba`).
-  - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 16 distinct `LNIR_WIRE_V1` DSP/stencil kernels + 7 vectorized 2D strided/reduction routines validated (`validate-tv` + `verify-certs`) and lowered to LLVM 18 IR (`x86_64` AVX2 and `arm64` NEON) and NVIDIA PTX 8.0 (`sm_90`) by `lean-native-core`, compiled and linked into `libleanav_dsp.a`.
-- [`tests/`](tests/): Python unit and differential tests (execution counts and skips listed above) against `ffmpeg`/`ffprobe`.
-- [`docs/`](docs/): Maxwell parity plan ([`FFMPEG_PARITY_MAXWELL_PLAN.md`](docs/FFMPEG_PARITY_MAXWELL_PLAN.md)), capability registry ([`capability-registry.json`](docs/capability-registry.json)), contracts ([`docs/contracts/`](docs/contracts/)), and closure dossier ([`CAMPAIGN_CLOSURE_DOSSIER.md`](docs/CAMPAIGN_CLOSURE_DOSSIER.md)).
-
-The 10-bit identity gate is checked in both the frame scaler and the transcode
-loop. Exact-size frames reuse the source buffer; padded scaler inputs are trimmed
-to the packed YUV420 footprint. Compiled unit and differential tests check pointer
-reuse, all UInt16 bit patterns, native-call counts, raw pipeline bytes, metrics,
-resize fallbacks, truncated input, and encoder failure:
-
-```bash
-python3 -m unittest discover -s tests/differential -p "test_u16le_identity.py" -v
-```
-
-
-Validation provenance: the green Linux and macOS CI at `68936da` uses Lean
-4.31.0 and audits **8,993 declarations with zero sorryAx/custom axioms**. The
-historical local Lean 4.35.0 report counts 8,887. These counts depend on the
-toolchain. The identity test now uses portable C instrumentation; neither its
-pointer-reuse checks nor its native-call positive control is skipped to make
-macOS pass.
+  - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c) (`1,166` lines): POSIX `fork` + `execvp` delegation shim, `pread`/`pwrite` window I/O shims, 64-slot ring-buffered POSIX pipe/pthread `leanav_c_exec_pipe_transcode_u8` raw-frame bridge, Phase 5 FFI ABI / `__ATOMIC_SEQ_CST` cancellation shims, and zero-copy `lean_sarray_object` wrappers for the compiled LLVM routines.
+  - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 16 `LNIR_WIRE_V1` DSP/stencil kernels + 14 vectorized 2D strided/reduction/filter/16-bit LLVM 18 IR routines (`x86_64` SSE4.2/AVX2 and `arm64` NEON) linked into `libleanav_dsp.a`.
+- [`tests/`](tests/): Python unit, LLVM IR structural, and differential test suites against `ffmpeg`/`ffprobe` (including portable C-instrumented zero-copy 10-bit identity tests in `tests/differential/test_u16le_identity.py`).
+- [`docs/`](docs/): Maxwell parity plan ([`FFMPEG_PARITY_MAXWELL_PLAN.md`](docs/FFMPEG_PARITY_MAXWELL_PLAN.md)), capability registry ([`capability-registry.json`](docs/capability-registry.json)), contracts ([`docs/contracts/`](docs/contracts/)), bounded baseline reports ([`BOUNDED_BASELINE_20261028.md`](docs/BOUNDED_BASELINE_20261028.md), [`BENCHMARK_EVIDENCE.md`](docs/BENCHMARK_EVIDENCE.md)), and closure dossier ([`CAMPAIGN_CLOSURE_DOSSIER.md`](docs/CAMPAIGN_CLOSURE_DOSSIER.md)).
