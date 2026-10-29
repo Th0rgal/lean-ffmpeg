@@ -1268,6 +1268,25 @@ def nativeInputContainerFormat (path : String) : Option ContainerFormat :=
   if strEndsWithFast lower ".m4v" || strEndsWithFast lower ".mov" then some .mp4
   else containerFormatOfName (inferContainerFormat none path)
 
+def demoteNativePlan (plan : MediaPlanIR) : MediaPlanIR :=
+  { plan with backend := { plan.backend with
+      tier := .delegatedFaithful, delegatedContainer := true,
+      reasons := ["native_stream_copy_layout_unsupported"] } }
+
+def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
+  if plan.backend.tier != .independentVerified then return plan
+  let some inp := plan.inputs.head? | return plan
+  let some out := plan.outputs.head? | return plan
+  let some outFmt := containerFormatOfName out.format | return demoteNativePlan plan
+  let some inFmt := nativeInputContainerFormat inp.path | return demoteNativePlan plan
+  if !(← System.FilePath.pathExists inp.path) then return plan
+  let bytes ← IO.FS.readBinFile inp.path
+  let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
+  match nativeRemuxBytes inFmt outFmt bytes (plan.timeline.startMs.getD 0).toNat
+      (plan.timeline.durationMs.getD 0).toNat metadata with
+  | .fallback => return demoteNativePlan plan
+  | _ => return plan
+
 def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO (Option UInt32) := do
   let inPath := cfg.inputs.headD ""
   let some out := plan.outputs.head? | return none
@@ -1310,7 +1329,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     if !verifyExecArgvHygiene args then return 1
     let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
     return rc
-  let (cfg0, ext, plan) := parseArgsWithPlanIR args
+  let (cfg0, ext, plan0) := parseArgsWithPlanIR args
+  let plan ← refinePlanWithInput plan0
   let cfg : CliConfig :=
     if cfg0.inputs.isEmpty && ext.hasLavfiInput then { cfg0 with inputs := ["lavfi_graph"] }
     else cfg0
@@ -1373,9 +1393,7 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       if plan.backend.tier == .independentVerified then
         match ← runNativeStreamCopy validCfg plan args with
         | some rc => return rc
-        | none => pure { plan with backend := { plan.backend with
-            tier := .delegatedFaithful, delegatedContainer := true,
-            reasons := ["native_stream_copy_layout_unsupported"] } }
+        | none => pure (demoteNativePlan plan)
       else pure plan
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
@@ -1690,7 +1708,7 @@ def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
   | "plan" :: rest | "dump-plan" :: rest => do
-    let plan := parseArgsToPlanIR rest
+    let plan ← refinePlanWithInput (parseArgsToPlanIR rest)
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1
   | "verify-ffi" :: mp4Path :: _ => runVerifyFfi (some mp4Path)

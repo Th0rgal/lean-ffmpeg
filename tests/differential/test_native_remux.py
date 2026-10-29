@@ -167,6 +167,14 @@ class NativeRemuxTests(unittest.TestCase):
                 res = subprocess.run([str(BINARY), "plan", "-y", *argv], capture_output=True, text=True, cwd=self.tmp)
                 backend = json.loads(res.stdout)["backend"]
                 self.assertEqual(backend["tier"], "delegated_faithful")
+        res = subprocess.run([str(BINARY), "plan", "-y", "-i", "av.mp4", "-c", "copy", "o.mp4"],
+                             capture_output=True, text=True, cwd=self.tmp)
+        backend = json.loads(res.stdout)["backend"]
+        self.assertEqual(backend["tier"], "delegated_faithful")
+        self.assertEqual(backend["reasons"], ["native_stream_copy_layout_unsupported"])
+        res = subprocess.run([str(BINARY), "plan", "-y", "-i", "in.mp4", "-c", "copy", "o.mp4"],
+                             capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(json.loads(res.stdout)["backend"]["tier"], "independent_verified")
         res, _ = self.native("-json", "-y", "-i", "av.mp4", "-c", "copy", "o.mp4")
         lines = [l for l in res.stdout.splitlines() if l.startswith("{")]
         if res.returncode == 0:
