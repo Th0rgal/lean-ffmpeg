@@ -8090,6 +8090,958 @@ par_exit_14:
   ret ptr %ldp_37
 }
 
+; LNIRDecl: extract_u16le_msb8_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @extract_u16le_msb8_simd(ptr noalias noundef %arg_v0) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca i64, align 8
+  store i64 0, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v1, align 8
+  %ld_3 = load i64, ptr %slot_v1, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v0, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v2, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %alu_24 = lshr i64 %cs_value_23, 2
+  %alu_25 = and i64 %alu_24, 255
+  %p_out_26 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %alu_25, ptr %p_out_26, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_27 = load ptr, ptr %slot_v2, align 8
+  ret ptr %ldp_27
+}
+
+; LNIRDecl: luma_stats_moments_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @luma_stats_moments_simd(ptr noalias noundef %arg_v0) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca i64, align 8
+  store i64 0, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v1, align 8
+  %ld_3 = load i64, ptr %slot_v1, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v0, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v2, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %alu_24 = mul i64 %cs_value_23, %cs_value_23
+  %alu_25 = shl i64 %alu_24, 16
+  %alu_26 = or i64 %alu_25, %cs_value_23
+  %p_out_27 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %alu_26, ptr %p_out_27, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  ret ptr %ldp_28
+}
+
+; LNIRDecl: luma_stats_pack_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @luma_stats_pack_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca i64, align 8
+  store i64 0, ptr %slot_v2, align 8
+  %slot_v3 = alloca ptr, align 8
+  store ptr null, ptr %slot_v3, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v2, align 8
+  %ld_3 = load i64, ptr %slot_v2, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v3, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %alu_28 = and i64 %cs_value_23, 65535
+  %div_z_31 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_30 = select i1 %div_z_31, i64 1, i64 %cs_value_27
+  %div_raw_32 = udiv i64 %alu_28, %div_rhs_30
+  %alu_29 = select i1 %div_z_31, i64 0, i64 %div_raw_32
+  %alu_33 = and i64 %cs_value_23, 65535
+  %div_z_36 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_35 = select i1 %div_z_36, i64 1, i64 %cs_value_27
+  %div_raw_37 = udiv i64 %alu_33, %div_rhs_35
+  %alu_34 = select i1 %div_z_36, i64 0, i64 %div_raw_37
+  %alu_38 = mul i64 %alu_29, %alu_34
+  %alu_39 = lshr i64 %cs_value_23, 16
+  %div_z_42 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_41 = select i1 %div_z_42, i64 1, i64 %cs_value_27
+  %div_raw_43 = udiv i64 %alu_39, %div_rhs_41
+  %alu_40 = select i1 %div_z_42, i64 0, i64 %div_raw_43
+  %cmp_lt_45 = icmp ult i64 %alu_38, %alu_40
+  %alu_44 = zext i1 %cmp_lt_45 to i64
+  %alu_46 = lshr i64 %cs_value_23, 16
+  %div_z_49 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_48 = select i1 %div_z_49, i64 1, i64 %cs_value_27
+  %div_raw_50 = udiv i64 %alu_46, %div_rhs_48
+  %alu_47 = select i1 %div_z_49, i64 0, i64 %div_raw_50
+  %alu_51 = and i64 %cs_value_23, 65535
+  %div_z_54 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_53 = select i1 %div_z_54, i64 1, i64 %cs_value_27
+  %div_raw_55 = udiv i64 %alu_51, %div_rhs_53
+  %alu_52 = select i1 %div_z_54, i64 0, i64 %div_raw_55
+  %alu_56 = and i64 %cs_value_23, 65535
+  %div_z_59 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_58 = select i1 %div_z_59, i64 1, i64 %cs_value_27
+  %div_raw_60 = udiv i64 %alu_56, %div_rhs_58
+  %alu_57 = select i1 %div_z_59, i64 0, i64 %div_raw_60
+  %alu_61 = mul i64 %alu_52, %alu_57
+  %alu_62 = sub i64 %alu_47, %alu_61
+  %sel_cond_63 = icmp ne i64 %alu_44, 0
+  %sel_64 = select i1 %sel_cond_63, i64 %alu_62, i64 0
+  %alu_65 = shl i64 %sel_64, 32
+  %alu_66 = and i64 %cs_value_23, 65535
+  %div_z_69 = icmp eq i64 %cs_value_27, 0
+  %div_rhs_68 = select i1 %div_z_69, i64 1, i64 %cs_value_27
+  %div_raw_70 = udiv i64 %alu_66, %div_rhs_68
+  %alu_67 = select i1 %div_z_69, i64 0, i64 %div_raw_70
+  %alu_71 = and i64 %alu_67, 4294967295
+  %alu_72 = or i64 %alu_65, %alu_71
+  %p_out_73 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %alu_72, ptr %p_out_73, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_74 = load ptr, ptr %slot_v3, align 8
+  ret ptr %ldp_74
+}
+
+; LNIRDecl: luma_acceptance_accum_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @luma_acceptance_accum_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca i64, align 8
+  store i64 0, ptr %slot_v2, align 8
+  %slot_v3 = alloca ptr, align 8
+  store ptr null, ptr %slot_v3, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v2, align 8
+  %ld_3 = load i64, ptr %slot_v2, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v3, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %cmp_le_29 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_28 = zext i1 %cmp_le_29 to i64
+  %alu_30 = sub i64 %cs_value_23, %cs_value_27
+  %alu_31 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_32 = icmp ne i64 %alu_28, 0
+  %sel_33 = select i1 %sel_cond_32, i64 %alu_30, i64 %alu_31
+  %cmp_le_35 = icmp ule i64 16, %cs_value_23
+  %alu_34 = zext i1 %cmp_le_35 to i64
+  %alu_36 = sub i64 %cs_value_23, 16
+  %alu_37 = sub i64 16, %cs_value_23
+  %sel_cond_38 = icmp ne i64 %alu_34, 0
+  %sel_39 = select i1 %sel_cond_38, i64 %alu_36, i64 %alu_37
+  %alu_40 = shl i64 %sel_39, 16
+  %alu_41 = or i64 %sel_33, %alu_40
+  %alu_42 = shl i64 %cs_value_23, 32
+  %alu_43 = or i64 %alu_41, %alu_42
+  %cmp_le_45 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_44 = zext i1 %cmp_le_45 to i64
+  %alu_46 = sub i64 %cs_value_23, %cs_value_27
+  %alu_47 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_48 = icmp ne i64 %alu_44, 0
+  %sel_49 = select i1 %sel_cond_48, i64 %alu_46, i64 %alu_47
+  %cmp_le_51 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_50 = zext i1 %cmp_le_51 to i64
+  %alu_52 = sub i64 %cs_value_23, %cs_value_27
+  %alu_53 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_54 = icmp ne i64 %alu_50, 0
+  %sel_55 = select i1 %sel_cond_54, i64 %alu_52, i64 %alu_53
+  %alu_56 = mul i64 %sel_49, %sel_55
+  %alu_57 = shl i64 %alu_56, 48
+  %alu_58 = or i64 %alu_43, %alu_57
+  %p_out_59 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %alu_58, ptr %p_out_59, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_60 = load ptr, ptr %slot_v3, align 8
+  ret ptr %ldp_60
+}
+
+; LNIRDecl: luma_acceptance_gate_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @luma_acceptance_gate_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v3 = alloca i64, align 8
+  store i64 0, ptr %slot_v3, align 8
+  %slot_v4 = alloca ptr, align 8
+  store ptr null, ptr %slot_v4, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  store ptr %arg_v2, ptr %slot_v2, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v3, align 8
+  %ld_3 = load i64, ptr %slot_v3, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v4, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  %cs_ptr_29 = getelementptr inbounds i64, ptr %ldp_28, i64 3
+  %cs_at_30 = getelementptr inbounds i64, ptr %cs_ptr_29, i64 %par_iv_15
+  %cs_value_31 = load i64, ptr %cs_at_30, align 8
+  %cmp_le_33 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_32 = zext i1 %cmp_le_33 to i64
+  %cmp_le_35 = icmp ule i64 6144, %cs_value_31
+  %alu_34 = zext i1 %cmp_le_35 to i64
+  %sel_cond_36 = icmp ne i64 %alu_34, 0
+  %sel_37 = select i1 %sel_cond_36, i64 0, i64 1
+  %sel_cond_38 = icmp ne i64 %alu_32, 0
+  %sel_39 = select i1 %sel_cond_38, i64 0, i64 %sel_37
+  %p_out_40 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_39, ptr %p_out_40, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_41 = load ptr, ptr %slot_v4, align 8
+  ret ptr %ldp_41
+}
+
+; LNIRDecl: bilinear_q8_blend_simd (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @bilinear_q8_blend_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v3 = alloca i64, align 8
+  store i64 0, ptr %slot_v3, align 8
+  %slot_v4 = alloca ptr, align 8
+  store ptr null, ptr %slot_v4, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  store ptr %arg_v2, ptr %slot_v2, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v3, align 8
+  %ld_3 = load i64, ptr %slot_v3, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v4, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  %cs_ptr_29 = getelementptr inbounds i64, ptr %ldp_28, i64 3
+  %cs_at_30 = getelementptr inbounds i64, ptr %cs_ptr_29, i64 %par_iv_15
+  %cs_value_31 = load i64, ptr %cs_at_30, align 8
+  %alu_32 = sub i64 256, %cs_value_31
+  %alu_33 = mul i64 %cs_value_27, %cs_value_31
+  %fma_mul_34 = mul i64 %cs_value_23, %alu_32
+  %fma_add_35 = add i64 %fma_mul_34, %alu_33
+  %p_out_36 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %fma_add_35, ptr %p_out_36, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_37 = load ptr, ptr %slot_v4, align 8
+  ret ptr %ldp_37
+}
+
+; LNIRDecl: bilinear_q8_pack_simd (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @bilinear_q8_pack_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v3 = alloca i64, align 8
+  store i64 0, ptr %slot_v3, align 8
+  %slot_v4 = alloca ptr, align 8
+  store ptr null, ptr %slot_v4, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  store ptr %arg_v2, ptr %slot_v2, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v3, align 8
+  %ld_3 = load i64, ptr %slot_v3, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v4, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  %cs_ptr_29 = getelementptr inbounds i64, ptr %ldp_28, i64 3
+  %cs_at_30 = getelementptr inbounds i64, ptr %cs_ptr_29, i64 %par_iv_15
+  %cs_value_31 = load i64, ptr %cs_at_30, align 8
+  %alu_32 = sub i64 256, %cs_value_31
+  %alu_33 = mul i64 %cs_value_27, %cs_value_31
+  %fma_mul_34 = mul i64 %cs_value_23, %alu_32
+  %fma_add_35 = add i64 %fma_mul_34, %alu_33
+  %alu_36 = add i64 %fma_add_35, 32768
+  %alu_37 = lshr i64 %alu_36, 16
+  %p_out_38 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %alu_37, ptr %p_out_38, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_39 = load ptr, ptr %slot_v4, align 8
+  ret ptr %ldp_39
+}
+
+; LNIRDecl: bilinear_q8_clamp10_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @bilinear_q8_clamp10_simd(ptr noalias noundef %arg_v0) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca i64, align 8
+  store i64 0, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v1, align 8
+  %ld_3 = load i64, ptr %slot_v1, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v0, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v2, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %cmp_lt_25 = icmp ult i64 1023, %cs_value_23
+  %alu_24 = zext i1 %cmp_lt_25 to i64
+  %sel_cond_26 = icmp ne i64 %alu_24, 0
+  %sel_27 = select i1 %sel_cond_26, i64 1023, i64 %cs_value_23
+  %p_out_28 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_27, ptr %p_out_28, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_29 = load ptr, ptr %slot_v2, align 8
+  ret ptr %ldp_29
+}
+
+; LNIRDecl: av1_cdef_tap_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @av1_cdef_tap_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v3 = alloca i64, align 8
+  store i64 0, ptr %slot_v3, align 8
+  %slot_v4 = alloca ptr, align 8
+  store ptr null, ptr %slot_v4, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  store ptr %arg_v2, ptr %slot_v2, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v3, align 8
+  %ld_3 = load i64, ptr %slot_v3, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v4, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  %cs_ptr_29 = getelementptr inbounds i64, ptr %ldp_28, i64 3
+  %cs_at_30 = getelementptr inbounds i64, ptr %cs_ptr_29, i64 %par_iv_15
+  %cs_value_31 = load i64, ptr %cs_at_30, align 8
+  %cmp_le_33 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_32 = zext i1 %cmp_le_33 to i64
+  %cmp_le_35 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_34 = zext i1 %cmp_le_35 to i64
+  %alu_36 = sub i64 %cs_value_23, %cs_value_27
+  %alu_37 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_38 = icmp ne i64 %alu_34, 0
+  %sel_39 = select i1 %sel_cond_38, i64 %alu_36, i64 %alu_37
+  %alu_40 = lshr i64 %sel_39, 1
+  %cmp_le_42 = icmp ule i64 %cs_value_31, %alu_40
+  %alu_41 = zext i1 %cmp_le_42 to i64
+  %cmp_le_44 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_43 = zext i1 %cmp_le_44 to i64
+  %alu_45 = sub i64 %cs_value_23, %cs_value_27
+  %alu_46 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_47 = icmp ne i64 %alu_43, 0
+  %sel_48 = select i1 %sel_cond_47, i64 %alu_45, i64 %alu_46
+  %cmp_le_50 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_49 = zext i1 %cmp_le_50 to i64
+  %alu_51 = sub i64 %cs_value_23, %cs_value_27
+  %alu_52 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_53 = icmp ne i64 %alu_49, 0
+  %sel_54 = select i1 %sel_cond_53, i64 %alu_51, i64 %alu_52
+  %alu_55 = lshr i64 %sel_54, 1
+  %alu_56 = sub i64 %cs_value_31, %alu_55
+  %cmp_le_58 = icmp ule i64 %sel_48, %alu_56
+  %alu_57 = zext i1 %cmp_le_58 to i64
+  %cmp_le_60 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_59 = zext i1 %cmp_le_60 to i64
+  %alu_61 = sub i64 %cs_value_23, %cs_value_27
+  %alu_62 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_63 = icmp ne i64 %alu_59, 0
+  %sel_64 = select i1 %sel_cond_63, i64 %alu_61, i64 %alu_62
+  %cmp_le_66 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_65 = zext i1 %cmp_le_66 to i64
+  %alu_67 = sub i64 %cs_value_23, %cs_value_27
+  %alu_68 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_69 = icmp ne i64 %alu_65, 0
+  %sel_70 = select i1 %sel_cond_69, i64 %alu_67, i64 %alu_68
+  %alu_71 = lshr i64 %sel_70, 1
+  %alu_72 = sub i64 %cs_value_31, %alu_71
+  %sel_cond_73 = icmp ne i64 %alu_57, 0
+  %sel_74 = select i1 %sel_cond_73, i64 %sel_64, i64 %alu_72
+  %sel_cond_75 = icmp ne i64 %alu_41, 0
+  %sel_76 = select i1 %sel_cond_75, i64 0, i64 %sel_74
+  %cmp_le_78 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_77 = zext i1 %cmp_le_78 to i64
+  %alu_79 = sub i64 %cs_value_23, %cs_value_27
+  %alu_80 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_81 = icmp ne i64 %alu_77, 0
+  %sel_82 = select i1 %sel_cond_81, i64 %alu_79, i64 %alu_80
+  %alu_83 = lshr i64 %sel_82, 1
+  %cmp_le_85 = icmp ule i64 %cs_value_31, %alu_83
+  %alu_84 = zext i1 %cmp_le_85 to i64
+  %cmp_le_87 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_86 = zext i1 %cmp_le_87 to i64
+  %alu_88 = sub i64 %cs_value_23, %cs_value_27
+  %alu_89 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_90 = icmp ne i64 %alu_86, 0
+  %sel_91 = select i1 %sel_cond_90, i64 %alu_88, i64 %alu_89
+  %cmp_le_93 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_92 = zext i1 %cmp_le_93 to i64
+  %alu_94 = sub i64 %cs_value_23, %cs_value_27
+  %alu_95 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_96 = icmp ne i64 %alu_92, 0
+  %sel_97 = select i1 %sel_cond_96, i64 %alu_94, i64 %alu_95
+  %alu_98 = lshr i64 %sel_97, 1
+  %alu_99 = sub i64 %cs_value_31, %alu_98
+  %cmp_le_101 = icmp ule i64 %sel_91, %alu_99
+  %alu_100 = zext i1 %cmp_le_101 to i64
+  %cmp_le_103 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_102 = zext i1 %cmp_le_103 to i64
+  %alu_104 = sub i64 %cs_value_23, %cs_value_27
+  %alu_105 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_106 = icmp ne i64 %alu_102, 0
+  %sel_107 = select i1 %sel_cond_106, i64 %alu_104, i64 %alu_105
+  %cmp_le_109 = icmp ule i64 %cs_value_27, %cs_value_23
+  %alu_108 = zext i1 %cmp_le_109 to i64
+  %alu_110 = sub i64 %cs_value_23, %cs_value_27
+  %alu_111 = sub i64 %cs_value_27, %cs_value_23
+  %sel_cond_112 = icmp ne i64 %alu_108, 0
+  %sel_113 = select i1 %sel_cond_112, i64 %alu_110, i64 %alu_111
+  %alu_114 = lshr i64 %sel_113, 1
+  %alu_115 = sub i64 %cs_value_31, %alu_114
+  %sel_cond_116 = icmp ne i64 %alu_100, 0
+  %sel_117 = select i1 %sel_cond_116, i64 %sel_107, i64 %alu_115
+  %sel_cond_118 = icmp ne i64 %alu_84, 0
+  %sel_119 = select i1 %sel_cond_118, i64 0, i64 %sel_117
+  %alu_120 = sub i64 0, %sel_119
+  %sel_cond_121 = icmp ne i64 %alu_32, 0
+  %sel_122 = select i1 %sel_cond_121, i64 %sel_76, i64 %alu_120
+  %p_out_123 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_122, ptr %p_out_123, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_124 = load ptr, ptr %slot_v4, align 8
+  ret ptr %ldp_124
+}
+
+; LNIRDecl: down2x2_fused_eq_simd (assurance=TranslationValidated, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @down2x2_fused_eq_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1, ptr noalias noundef %arg_v2) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca ptr, align 8
+  store ptr null, ptr %slot_v2, align 8
+  %slot_v3 = alloca i64, align 8
+  store i64 0, ptr %slot_v3, align 8
+  %slot_v4 = alloca ptr, align 8
+  store ptr null, ptr %slot_v4, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  store ptr %arg_v2, ptr %slot_v2, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v3, align 8
+  %ld_3 = load i64, ptr %slot_v3, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v4, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %ldp_28 = load ptr, ptr %slot_v2, align 8
+  %cs_ptr_29 = getelementptr inbounds i64, ptr %ldp_28, i64 3
+  %cs_at_30 = getelementptr inbounds i64, ptr %cs_ptr_29, i64 %par_iv_15
+  %cs_value_31 = load i64, ptr %cs_at_30, align 8
+  %alu_32 = add i64 %cs_value_23, %cs_value_27
+  %alu_33 = add i64 %alu_32, 2
+  %alu_34 = lshr i64 %alu_33, 2
+  %alu_35 = sub i64 %alu_34, 128
+  %fma_mul_36 = mul i64 %alu_35, %cs_value_31
+  %fma_add_37 = add i64 %fma_mul_36, 128
+  %alu_38 = ashr i64 %fma_add_37, 8
+  %alu_39 = add i64 %alu_38, 128
+  %cmp_le_41 = icmp ule i64 %alu_39, 255
+  %alu_40 = zext i1 %cmp_le_41 to i64
+  %alu_42 = add i64 %cs_value_23, %cs_value_27
+  %alu_43 = add i64 %alu_42, 2
+  %alu_44 = lshr i64 %alu_43, 2
+  %alu_45 = sub i64 %alu_44, 128
+  %fma_mul_46 = mul i64 %alu_45, %cs_value_31
+  %fma_add_47 = add i64 %fma_mul_46, 128
+  %alu_48 = ashr i64 %fma_add_47, 8
+  %alu_49 = add i64 %alu_48, 128
+  %alu_50 = add i64 %cs_value_23, %cs_value_27
+  %alu_51 = add i64 %alu_50, 2
+  %alu_52 = lshr i64 %alu_51, 2
+  %alu_53 = sub i64 %alu_52, 128
+  %fma_mul_54 = mul i64 %alu_53, %cs_value_31
+  %fma_add_55 = add i64 %fma_mul_54, 128
+  %alu_56 = ashr i64 %fma_add_55, 8
+  %alu_57 = add i64 %alu_56, 128
+  %alu_58 = lshr i64 %alu_57, 63
+  %sel_cond_59 = icmp ne i64 %alu_58, 0
+  %sel_60 = select i1 %sel_cond_59, i64 0, i64 255
+  %sel_cond_61 = icmp ne i64 %alu_40, 0
+  %sel_62 = select i1 %sel_cond_61, i64 %alu_49, i64 %sel_60
+  %p_out_63 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_62, ptr %p_out_63, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_64 = load ptr, ptr %slot_v4, align 8
+  ret ptr %ldp_64
+}
+
+; LNIRDecl: down2x2_fused_brightness_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @down2x2_fused_brightness_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca i64, align 8
+  store i64 0, ptr %slot_v2, align 8
+  %slot_v3 = alloca ptr, align 8
+  store ptr null, ptr %slot_v3, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v2, align 8
+  %ld_3 = load i64, ptr %slot_v2, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v3, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %alu_28 = add i64 %cs_value_23, %cs_value_27
+  %cmp_le_30 = icmp ule i64 %alu_28, 255
+  %alu_29 = zext i1 %cmp_le_30 to i64
+  %alu_31 = add i64 %cs_value_23, %cs_value_27
+  %alu_32 = add i64 %cs_value_23, %cs_value_27
+  %alu_33 = lshr i64 %alu_32, 63
+  %sel_cond_34 = icmp ne i64 %alu_33, 0
+  %sel_35 = select i1 %sel_cond_34, i64 0, i64 255
+  %sel_cond_36 = icmp ne i64 %alu_29, 0
+  %sel_37 = select i1 %sel_cond_36, i64 %alu_31, i64 %sel_35
+  %p_out_38 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_37, ptr %p_out_38, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_39 = load ptr, ptr %slot_v3, align 8
+  ret ptr %ldp_39
+}
+
+; LNIRDecl: yuv420p_studio_range_simd (assurance=VerifiedKernelProof, isGpuCand=true, rcMode=LeanNative.IR.RcMode.atomic, isaMask=257)
+define dso_local ptr @yuv420p_studio_range_simd(ptr noalias noundef %arg_v0, ptr noalias noundef %arg_v1) #0 {
+entry:
+  %slot_v0 = alloca ptr, align 8
+  store ptr null, ptr %slot_v0, align 8
+  %slot_v1 = alloca ptr, align 8
+  store ptr null, ptr %slot_v1, align 8
+  %slot_v2 = alloca i64, align 8
+  store i64 0, ptr %slot_v2, align 8
+  %slot_v3 = alloca ptr, align 8
+  store ptr null, ptr %slot_v3, align 8
+  %slot_v10 = alloca i64, align 8
+  store i64 0, ptr %slot_v10, align 8
+  store ptr %arg_v0, ptr %slot_v0, align 8
+  store ptr %arg_v1, ptr %slot_v1, align 8
+  %ldp_0 = load ptr, ptr %slot_v0, align 8
+  %sz_ptr_1 = getelementptr inbounds i64, ptr %ldp_0, i64 1
+  %sz_val_2 = load i64, ptr %sz_ptr_1, align 8
+  store i64 %sz_val_2, ptr %slot_v2, align 8
+  %ld_3 = load i64, ptr %slot_v2, align 8
+  %ldp_4 = load ptr, ptr %slot_v0, align 8
+  %ldp_5 = load ptr, ptr %slot_v1, align 8
+  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition
+  %par_out_6 = call ptr @lean_native_ensure_exclusive_uninit(ptr %ldp_4)
+  store ptr %par_out_6, ptr %slot_v3, align 8
+  %par_out_data_7 = getelementptr inbounds i64, ptr %par_out_6, i64 3
+  %par_in0_data_8 = getelementptr inbounds i64, ptr %ldp_4, i64 3
+  %par_in1_data_9 = getelementptr inbounds i64, ptr %ldp_5, i64 3
+  br label %par_prehdr_10
+par_prehdr_10:
+  br label %par_cond_11
+par_cond_11:
+  %par_iv_15 = phi i64 [ 0, %par_prehdr_10 ], [ %par_iv_next_16, %par_latch_13 ]
+  %par_cmp_17 = icmp ult i64 %par_iv_15, %ld_3
+  br i1 %par_cmp_17, label %par_body_12, label %par_exit_14
+par_body_12:
+  %p_in0_18 = getelementptr inbounds i64, ptr %par_in0_data_8, i64 %par_iv_15
+  %v_in0_19 = load i64, ptr %p_in0_18, align 8
+  %ldp_20 = load ptr, ptr %slot_v0, align 8
+  %cs_ptr_21 = getelementptr inbounds i64, ptr %ldp_20, i64 3
+  %cs_at_22 = getelementptr inbounds i64, ptr %cs_ptr_21, i64 %par_iv_15
+  %cs_value_23 = load i64, ptr %cs_at_22, align 8
+  %ldp_24 = load ptr, ptr %slot_v1, align 8
+  %cs_ptr_25 = getelementptr inbounds i64, ptr %ldp_24, i64 3
+  %cs_at_26 = getelementptr inbounds i64, ptr %cs_ptr_25, i64 %par_iv_15
+  %cs_value_27 = load i64, ptr %cs_at_26, align 8
+  %alu_28 = and i64 %cs_value_27, 1
+  %cmp_lt_30 = icmp ult i64 %cs_value_23, 16
+  %alu_29 = zext i1 %cmp_lt_30 to i64
+  %cmp_lt_32 = icmp ult i64 240, %cs_value_23
+  %alu_31 = zext i1 %cmp_lt_32 to i64
+  %sel_cond_33 = icmp ne i64 %alu_31, 0
+  %sel_34 = select i1 %sel_cond_33, i64 240, i64 %cs_value_23
+  %sel_cond_35 = icmp ne i64 %alu_29, 0
+  %sel_36 = select i1 %sel_cond_35, i64 16, i64 %sel_34
+  %cmp_lt_38 = icmp ult i64 %cs_value_23, 16
+  %alu_37 = zext i1 %cmp_lt_38 to i64
+  %cmp_lt_40 = icmp ult i64 235, %cs_value_23
+  %alu_39 = zext i1 %cmp_lt_40 to i64
+  %sel_cond_41 = icmp ne i64 %alu_39, 0
+  %sel_42 = select i1 %sel_cond_41, i64 235, i64 %cs_value_23
+  %sel_cond_43 = icmp ne i64 %alu_37, 0
+  %sel_44 = select i1 %sel_cond_43, i64 16, i64 %sel_42
+  %sel_cond_45 = icmp ne i64 %alu_28, 0
+  %sel_46 = select i1 %sel_cond_45, i64 %sel_36, i64 %sel_44
+  %p_out_47 = getelementptr inbounds i64, ptr %par_out_data_7, i64 %par_iv_15
+  store i64 %sel_46, ptr %p_out_47, align 8
+  br label %par_latch_13
+par_latch_13:
+  %par_iv_next_16 = add nuw nsw i64 %par_iv_15, 1
+  br label %par_cond_11, !llvm.loop !0
+par_exit_14:
+  %ldp_48 = load ptr, ptr %slot_v3, align 8
+  ret ptr %ldp_48
+}
+
 ; Lean 4 C-ABI Wrapper Thunk for swscale_luma_gain_bias_simd
 define dso_local ptr @lean_native_abi_swscale_luma_gain_bias_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
 entry:
@@ -8210,6 +9162,90 @@ entry:
 define dso_local ptr @lean_native_abi_av1_cdef_dir_filter_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
 entry:
   %ret = call ptr @av1_cdef_dir_filter_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for extract_u16le_msb8_simd
+define dso_local ptr @lean_native_abi_extract_u16le_msb8_simd(ptr %abi_arg0) #0 {
+entry:
+  %ret = call ptr @extract_u16le_msb8_simd(ptr %abi_arg0)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for luma_stats_moments_simd
+define dso_local ptr @lean_native_abi_luma_stats_moments_simd(ptr %abi_arg0) #0 {
+entry:
+  %ret = call ptr @luma_stats_moments_simd(ptr %abi_arg0)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for luma_stats_pack_simd
+define dso_local ptr @lean_native_abi_luma_stats_pack_simd(ptr %abi_arg0, ptr %abi_arg1) #0 {
+entry:
+  %ret = call ptr @luma_stats_pack_simd(ptr %abi_arg0, ptr %abi_arg1)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for luma_acceptance_accum_simd
+define dso_local ptr @lean_native_abi_luma_acceptance_accum_simd(ptr %abi_arg0, ptr %abi_arg1) #0 {
+entry:
+  %ret = call ptr @luma_acceptance_accum_simd(ptr %abi_arg0, ptr %abi_arg1)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for luma_acceptance_gate_simd
+define dso_local ptr @lean_native_abi_luma_acceptance_gate_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
+entry:
+  %ret = call ptr @luma_acceptance_gate_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for bilinear_q8_blend_simd
+define dso_local ptr @lean_native_abi_bilinear_q8_blend_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
+entry:
+  %ret = call ptr @bilinear_q8_blend_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for bilinear_q8_pack_simd
+define dso_local ptr @lean_native_abi_bilinear_q8_pack_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
+entry:
+  %ret = call ptr @bilinear_q8_pack_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for bilinear_q8_clamp10_simd
+define dso_local ptr @lean_native_abi_bilinear_q8_clamp10_simd(ptr %abi_arg0) #0 {
+entry:
+  %ret = call ptr @bilinear_q8_clamp10_simd(ptr %abi_arg0)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for av1_cdef_tap_simd
+define dso_local ptr @lean_native_abi_av1_cdef_tap_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
+entry:
+  %ret = call ptr @av1_cdef_tap_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for down2x2_fused_eq_simd
+define dso_local ptr @lean_native_abi_down2x2_fused_eq_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2) #0 {
+entry:
+  %ret = call ptr @down2x2_fused_eq_simd(ptr %abi_arg0, ptr %abi_arg1, ptr %abi_arg2)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for down2x2_fused_brightness_simd
+define dso_local ptr @lean_native_abi_down2x2_fused_brightness_simd(ptr %abi_arg0, ptr %abi_arg1) #0 {
+entry:
+  %ret = call ptr @down2x2_fused_brightness_simd(ptr %abi_arg0, ptr %abi_arg1)
+  ret ptr %ret
+}
+
+; Lean 4 C-ABI Wrapper Thunk for yuv420p_studio_range_simd
+define dso_local ptr @lean_native_abi_yuv420p_studio_range_simd(ptr %abi_arg0, ptr %abi_arg1) #0 {
+entry:
+  %ret = call ptr @yuv420p_studio_range_simd(ptr %abi_arg0, ptr %abi_arg1)
   ret ptr %ret
 }
 

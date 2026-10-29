@@ -430,11 +430,16 @@ def runSelfTest : IO UInt32 := do
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1I) false == .iFrame &&
     classifyAv1ObuSample (LeanSys.Posix.ByteSlice.ofByteArray w13Av1B) false == .bFrame
 
-  -- 22. Wave 14: 16-Kernel Distinct LNIR Wire & 4-Tap Lanczos Normalization Gate
+  -- 22. Wave 14: 28-Kernel Distinct LNIR Wire & 4-Tap Lanczos Normalization Gate
   let w14LanczosOk := specLanczos4TapNormalizedPixel 180 180 180 180 == 180 &&
     evalLnirKernel .fmaBlend [360, 200] [9, 9] [-360, -200] == [2880, 1600]
+  let w14PixelCoreOk :=
+    evalLnirKernel .down2x2FusedEq [0, 1020, 512] [0, 0, 0] [512, 512, 256] == [0, 255, 128] &&
+    evalLnirKernel .down2x2FusedBrightness [100, 250, 10] [-200, 20, 5] [] == [0, 255, 15] &&
+    evalLnirKernel .yuv420pStudioRange [0, 250, 250] [0, 0, 1] [] == [16, 235, 240] &&
+    evalLnirKernel .av1CdefTap [10, 0] [0, 10] [8, 8] == [3, -3]
   let w14Tokens := emitLeanAvLnirWire.splitOn "|"
-  let w14Ok := w14LanczosOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "16"
+  let w14Ok := w14LanczosOk && w14PixelCoreOk && w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "28"
 
   -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
   let w15ShI : HevcSliceSegmentHeaderView := {

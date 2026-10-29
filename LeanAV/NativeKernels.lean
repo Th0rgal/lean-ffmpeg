@@ -1,7 +1,7 @@
 /-
   LeanAV.NativeKernels: Verified LNIR DSP Module Emitter & C-ABI Bridge for `lean-native-core`
 
-  Emits a lossless `LNIR_WIRE_V1` module (`LeanAV.DSP.Kernels`) containing 16 genuinely distinct
+  Emits a lossless `LNIR_WIRE_V1` module (`LeanAV.DSP.Kernels`) containing 28 genuinely distinct
   FFmpeg DSP kernels compiled by `lean-native-core compile-static-lib` and linked into `libleanav_dsp.a`:
   1.  `swscale_luma_gain_bias_simd`: In-place scalar array loop (`HoistExclusivity` + `S_fma`)
   2.  `flac_lpc_autocorr_dot_simd`: Data-parallel LPC autocorrelation product (`CancelRedundantRC` + `K_dot`)
@@ -44,6 +44,274 @@ private def mkLnirSaxpyDecl (declName p0 p1 alpha : String) : List String := [
   "C_par", "3", "2", "2", "0", "1", "T_i64", "K_saxpy", alpha,
   "C_ret", "3"
 ]
+
+/--
+  Typed LNIR Data-Parallel Kernel AST (`LnirKernelAst`) modeling all distinct SIMD/GPU kernel primitives
+  in `LeanAV.DSP.Kernels` lowered by `lean-native-core`.
+-/
+inductive LnirKernelAst where
+  /-- `swscale_luma_gain_bias_simd`: Elementwise `xs[i] * gain + bias`. -/
+  | gainBias (gain bias : Int64)
+  /-- `flac_lpc_autocorr_dot_simd` (`K_dot`): Pairwise product map `xs[i] * ys[i]`. -/
+  | dotPairwise
+  /-- `opus_celt_pvq_mix_saxpy_gpu` / `bframe_bipred_blend_gpu` (`K_saxpy alpha`): `alpha * xs[i] + ys[i]`. -/
+  | saxpy (alpha : Int64)
+  /-- `av1_wiener_3tap_sym_gpu`: 3-tap symmetric Wiener filter `3 * xs[i] + 10 * ys[i] + 3 * zs[i]`. -/
+  | wiener3TapSym
+  /-- `av1_cdef_fma_blend_gpu`: 3-input FMA `xs[i] * ys[i] + zs[i]`. -/
+  | fmaBlend
+  /-- `hevc_sao_band_offset_add_gpu` (`K_za`): Elementwise `xs[i] + ys[i]`. -/
+  | zipAdd
+  /-- `aac_imdct_window_mul_gpu` (`K_zm`): Elementwise `xs[i] * ys[i]`. -/
+  | zipMul
+  /-- `prores_qscale_map_simd` (`K_msa scale bias`): Elementwise `xs[i] * scale + bias`. -/
+  | mapScaleAdd (scale bias : Int64)
+  /-- `boxblur_div9_recip_shift_simd`: Elementwise unsigned reciprocal shift `((xs[i] + 4) * 7282) >>> 16`. -/
+  | boxBlurDiv9Recip
+  /-- `pq10_studio_clamp_select_simd`: Branchless `S_sel` clamp to 10-bit studio range `[64, 940]`. -/
+  | pq10StudioClamp
+  /-- `swscale_down2x2_box_simd`: Pairwise 2x2 box downscale `(xs[i] + ys[i] + 2) >>> 2`. -/
+  | down2x2Box
+  /-- `swscale_down3x3_box_simd`: 3-row 3x3 box downscale `((xs[i] + ys[i] + zs[i] + 4) * 7282) >>> 16`. -/
+  | down3x3Box
+  /-- `swscale_down3to2_bilinear_simd`: 3:2 bilinear row blend `((xs[i] * 2 + ys[i] + 4) * 7282) >>> 16`. -/
+  | down3to2Bilinear
+  /-- `av1_cdef_dir_filter_simd`: AV1 CDEF directional tap blend `xs[i] + ((ys[i] + zs[i] + 2) >>> 2)`. -/
+  | av1CdefDirFilter
+  /-- `extract_u16le_msb8_simd`: extract the scaled most-significant byte. -/
+  | extractU16LeMsb8
+  /-- `luma_stats_moments_simd`: pack one sample and its square. -/
+  | lumaStatsMoments
+  /-- `luma_stats_pack_simd`: derive packed mean/variance from moments and count. -/
+  | lumaStatsPack
+  /-- `luma_acceptance_accum_simd`: pack SAD, black/reference sums, and SSE. -/
+  | lumaAcceptanceAccum
+  /-- `luma_acceptance_gate_simd`: block-level brightness/SAD acceptance decision. -/
+  | lumaAcceptanceGate
+  /-- `bilinear_q8_blend_simd`: fixed-point horizontal blend. -/
+  | bilinearQ8Blend
+  /-- `bilinear_q8_pack_simd`: vertical blend and one final rounding. -/
+  | bilinearQ8Pack
+  /-- `bilinear_q8_clamp10_simd`: unsigned clamp to ten-bit range. -/
+  | bilinearQ8Clamp10
+  /-- `av1_cdef_tap_simd`: one constrained directional tap at unit damping. -/
+  | av1CdefTap
+  /-- `down2x2_fused_eq_simd`: box average and signed Q8 contrast, zero brightness. -/
+  | down2x2FusedEq
+  /-- `down2x2_fused_brightness_simd`: signed brightness and byte saturation. -/
+  | down2x2FusedBrightness
+  /-- `yuv420p_studio_range_simd`: luma/chroma studio-range saturation. -/
+  | yuv420pStudioRange
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Emit the canonical `LNIR_WIRE_V1` kernel descriptor tokens for a typed `LnirKernelAst`. -/
+def LnirKernelAst.toWireTokens : LnirKernelAst → List String
+  | .gainBias _ _ => ["E_scalar", "S_fma", "S_var", "8", "S_var", "1", "S_var", "2"]
+  | .dotPairwise => ["K_dot"]
+  | .saxpy alpha => ["K_saxpy", toString alpha.toInt]
+  | .wiener3TapSym => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_add",
+        "S_bin", "B_add",
+          "S_bin", "B_mul", "S_var", "0", "S_u64", "3",
+          "S_bin", "B_mul", "S_var", "1", "S_u64", "10",
+        "S_bin", "B_mul", "S_var", "2", "S_u64", "3"
+    ]
+  | .fmaBlend => ["K_cust", "10", "3", "0", "1", "2", "S_fma", "S_var", "0", "S_var", "1", "S_var", "2"]
+  | .zipAdd => ["K_za"]
+  | .zipMul => ["K_zm"]
+  | .mapScaleAdd s b => ["K_msa", toString s.toInt, toString b.toInt]
+  | .boxBlurDiv9Recip => [
+      "K_cust", "10", "1", "0",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add", "S_var", "0", "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16"
+    ]
+  | .pq10StudioClamp => [
+      "K_cust", "10", "1", "0",
+      "S_sel",
+        "S_bin", "B_lt", "S_var", "0", "S_u64", "64",
+        "S_u64", "64",
+        "S_sel",
+          "S_bin", "B_lt", "S_u64", "940", "S_var", "0",
+          "S_u64", "940",
+          "S_var", "0"
+    ]
+  | .down2x2Box => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_add",
+          "S_bin", "B_add", "S_var", "0", "S_var", "1",
+          "S_u64", "2",
+        "S_u64", "2"
+    ]
+  | .down3x3Box => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_add", "S_var", "0", "S_var", "1",
+              "S_var", "2",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16"
+    ]
+  | .down3to2Bilinear => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_shr",
+        "S_bin", "B_mul",
+          "S_bin", "B_add",
+            "S_bin", "B_add",
+              "S_bin", "B_mul", "S_var", "0", "S_u64", "2",
+              "S_var", "1",
+            "S_u64", "4",
+          "S_u64", "7282",
+        "S_u64", "16"
+    ]
+  | .av1CdefDirFilter => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_add",
+        "S_var", "0",
+        "S_bin", "B_shr",
+          "S_bin", "B_add",
+            "S_bin", "B_add", "S_var", "1", "S_var", "2",
+            "S_u64", "2",
+          "S_u64", "2"
+    ]
+  | .extractU16LeMsb8 => [
+      "K_cust", "10", "1", "0",
+      "S_bin", "B_bitAnd", "S_bin", "B_shr", "S_var", "0", "S_u64", "2", "S_u64", "255"
+    ]
+  | .lumaStatsMoments => [
+      "K_cust", "10", "1", "0",
+      "S_bin", "B_bitOr",
+        "S_bin", "B_shl", "S_bin", "B_mul", "S_var", "0", "S_var", "0", "S_u64", "16",
+        "S_var", "0"
+    ]
+  | .lumaStatsPack => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_bitOr",
+        "S_bin", "B_shl",
+          "S_sel",
+            "S_bin", "B_lt",
+              "S_bin", "B_mul",
+                "S_bin", "B_div", "S_bin", "B_bitAnd", "S_var", "0", "S_u64", "65535", "S_var", "1",
+                "S_bin", "B_div", "S_bin", "B_bitAnd", "S_var", "0", "S_u64", "65535", "S_var", "1",
+              "S_bin", "B_div", "S_bin", "B_shr", "S_var", "0", "S_u64", "16", "S_var", "1",
+            "S_bin", "B_sub",
+              "S_bin", "B_div", "S_bin", "B_shr", "S_var", "0", "S_u64", "16", "S_var", "1",
+              "S_bin", "B_mul",
+                "S_bin", "B_div", "S_bin", "B_bitAnd", "S_var", "0", "S_u64", "65535", "S_var", "1",
+                "S_bin", "B_div", "S_bin", "B_bitAnd", "S_var", "0", "S_u64", "65535", "S_var", "1",
+            "S_u64", "0",
+          "S_u64", "32",
+        "S_bin", "B_bitAnd",
+          "S_bin", "B_div", "S_bin", "B_bitAnd", "S_var", "0", "S_u64", "65535", "S_var", "1",
+          "S_u64", "4294967295"
+    ]
+  | .lumaAcceptanceAccum => [
+      "K_cust", "10", "2", "0", "1",
+      "S_bin", "B_bitOr", "S_bin", "B_bitOr", "S_bin", "B_bitOr", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var",
+      "0", "S_bin", "B_sub", "S_var", "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var",
+      "0", "S_bin", "B_shl", "S_sel", "S_bin", "B_le", "S_u64", "16", "S_var", "0", "S_bin", "B_sub",
+      "S_var", "0", "S_u64", "16", "S_bin", "B_sub", "S_u64", "16", "S_var", "0", "S_u64", "16",
+      "S_bin", "B_shl", "S_var", "0", "S_u64", "32", "S_bin", "B_shl", "S_bin", "B_mul", "S_sel", "S_bin",
+      "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "0", "S_var", "1", "S_bin",
+      "B_sub", "S_var", "1", "S_var", "0", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0",
+      "S_bin", "B_sub", "S_var", "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0",
+      "S_u64", "48"
+    ]
+  | .lumaAcceptanceGate => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_u64", "0",
+        "S_sel", "S_bin", "B_le", "S_u64", "6144", "S_var", "2", "S_u64", "0", "S_u64", "1"
+    ]
+  | .bilinearQ8Blend => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_add",
+        "S_bin", "B_mul", "S_var", "0", "S_bin", "B_sub", "S_u64", "256", "S_var", "2",
+        "S_bin", "B_mul", "S_var", "1", "S_var", "2"
+    ]
+  | .bilinearQ8Pack => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_bin", "B_shr",
+        "S_bin", "B_add",
+          "S_bin", "B_add",
+            "S_bin", "B_mul", "S_var", "0", "S_bin", "B_sub", "S_u64", "256", "S_var", "2",
+            "S_bin", "B_mul", "S_var", "1", "S_var", "2",
+          "S_u64", "32768",
+        "S_u64", "16"
+    ]
+  | .bilinearQ8Clamp10 => [
+      "K_cust", "10", "1", "0",
+      "S_sel", "S_bin", "B_lt", "S_u64", "1023", "S_var", "0", "S_u64", "1023", "S_var", "0"
+    ]
+  | .av1CdefTap => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_sel", "S_bin", "B_le", "S_var", "2",
+      "S_bin", "B_shr", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var",
+      "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_u64", "1", "S_u64",
+      "0", "S_sel", "S_bin", "B_le", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin",
+      "B_sub", "S_var", "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_bin",
+      "B_sub", "S_var", "2", "S_bin", "B_shr", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0",
+      "S_bin", "B_sub", "S_var", "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0",
+      "S_u64", "1", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var",
+      "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var",
+      "2", "S_bin", "B_shr", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub",
+      "S_var", "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_u64", "1",
+      "S_bin", "B_sub", "S_u64", "0", "S_sel", "S_bin", "B_le", "S_var", "2", "S_bin", "B_shr", "S_sel",
+      "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "0", "S_var", "1",
+      "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_u64", "1", "S_u64", "0", "S_sel", "S_bin",
+      "B_le", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "0",
+      "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "2",
+      "S_bin", "B_shr", "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var",
+      "0", "S_var", "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_u64", "1", "S_sel",
+      "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "0", "S_var", "1",
+      "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "2", "S_bin", "B_shr",
+      "S_sel", "S_bin", "B_le", "S_var", "1", "S_var", "0", "S_bin", "B_sub", "S_var", "0", "S_var",
+      "1", "S_bin", "B_sub", "S_var", "1", "S_var", "0", "S_u64", "1"
+    ]
+  | .down2x2FusedEq => [
+      "K_cust", "10", "3", "0", "1", "2",
+      "S_sel", "S_bin", "B_le", "S_bin", "B_add", "S_bin", "B_sar", "S_bin", "B_add", "S_bin", "B_mul", "S_bin",
+      "B_sub", "S_bin", "B_shr", "S_bin", "B_add", "S_bin", "B_add", "S_var", "0", "S_var", "1", "S_u64",
+      "2", "S_u64", "2", "S_u64", "128", "S_var", "2", "S_u64", "128", "S_u64", "8", "S_u64",
+      "128", "S_u64", "255", "S_bin", "B_add", "S_bin", "B_sar", "S_bin", "B_add", "S_bin", "B_mul", "S_bin",
+      "B_sub", "S_bin", "B_shr", "S_bin", "B_add", "S_bin", "B_add", "S_var", "0", "S_var", "1", "S_u64",
+      "2", "S_u64", "2", "S_u64", "128", "S_var", "2", "S_u64", "128", "S_u64", "8", "S_u64",
+      "128", "S_sel", "S_bin", "B_shr", "S_bin", "B_add", "S_bin", "B_sar", "S_bin", "B_add", "S_bin", "B_mul",
+      "S_bin", "B_sub", "S_bin", "B_shr", "S_bin", "B_add", "S_bin", "B_add", "S_var", "0", "S_var", "1",
+      "S_u64", "2", "S_u64", "2", "S_u64", "128", "S_var", "2", "S_u64", "128", "S_u64", "8",
+      "S_u64", "128", "S_u64", "63", "S_u64", "0", "S_u64", "255"
+    ]
+  | .down2x2FusedBrightness => [
+      "K_cust", "10", "2", "0", "1",
+      "S_sel", "S_bin", "B_le", "S_bin", "B_add", "S_var", "0", "S_var", "1", "S_u64", "255", "S_bin",
+      "B_add", "S_var", "0", "S_var", "1", "S_sel", "S_bin", "B_shr", "S_bin", "B_add", "S_var", "0",
+      "S_var", "1", "S_u64", "63", "S_u64", "0", "S_u64", "255"
+    ]
+  | .yuv420pStudioRange => [
+      "K_cust", "10", "2", "0", "1",
+      "S_sel", "S_bin", "B_bitAnd", "S_var", "1", "S_u64", "1",
+        "S_sel", "S_bin", "B_lt", "S_var", "0", "S_u64", "16", "S_u64", "16",
+          "S_sel", "S_bin", "B_lt", "S_u64", "240", "S_var", "0", "S_u64", "240", "S_var", "0",
+        "S_sel", "S_bin", "B_lt", "S_var", "0", "S_u64", "16", "S_u64", "16",
+          "S_sel", "S_bin", "B_lt", "S_u64", "235", "S_var", "0", "S_u64", "235", "S_var", "0"
+    ]
+
+/-- Build an `A_L3` data-parallel `LNIR_WIRE_V1` declaration whose `C_par` kernel body is exactly
+    `k.toWireTokens`, so the emitted wire and the typed `LnirKernelAst` coincide by construction. -/
+private def mkLnirPixelCoreDecl (declName : String) (params : List String) (k : LnirKernelAst) : List String :=
+  let n := params.length
+  let paramToks := (params.zipIdx).flatMap fun (nm, i) =>
+    [toString i, hexEncodeString nm, "1", "T_sarray", "T_i64"]
+  ["D_decl", hexEncodeString declName, "A_L3", "1", toString n] ++ paramToks ++
+  ["T_sarray", "T_i64", "C_let", toString n, "T_i64", "E_salen", "0",
+   "C_par", toString (n + 1), toString n, toString n] ++ (List.range n).map toString ++
+  ["T_i64"] ++ k.toWireTokens ++ ["C_ret", toString (n + 1)]
 
 private def mkLnirBinaryParDecl (declName p0 p1 kTok : String) : List String := [
   "D_decl", hexEncodeString declName, "A_L3", "1", "2",
@@ -283,124 +551,47 @@ def emitLeanAvLnirWire : String :=
     "C_ret", "4"
   ]
 
-  let declTokens := d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12 ++ d13 ++ d14 ++ d15 ++ d16
-  let allTokens := ["LNIR_WIRE_V1", modHex, "16"] ++ declTokens
+  -- 17. `extract_u16le_msb8_simd`: `(sample >>> 2) & 255`, including 16-bit samples.
+  let d17 := mkLnirPixelCoreDecl "extract_u16le_msb8_simd" ["samples"] .extractU16LeMsb8
+
+  -- 18. `luma_stats_moments_simd`: packed `(sumSq[47:16] | sum)` for one sample.
+  let d18 := mkLnirPixelCoreDecl "luma_stats_moments_simd" ["samples"] .lumaStatsMoments
+
+  -- 19. `luma_stats_pack_simd`: `(variance <<< 32) | mean` from packed moments and count.
+  let d19 := mkLnirPixelCoreDecl "luma_stats_pack_simd" ["moments", "counts"] .lumaStatsPack
+
+  -- 20. `luma_acceptance_accum_simd`: packed `(sad | blackSum<<16 | refSum<<32 | sse<<48)`.
+  let d20 := mkLnirPixelCoreDecl "luma_acceptance_accum_simd" ["source", "reconstructed"] .lumaAcceptanceAccum
+
+  -- 21. `luma_acceptance_gate_simd`: reject non-flat, sufficiently bright bad blocks.
+  let d21 := mkLnirPixelCoreDecl "luma_acceptance_gate_simd" ["sad", "blackSum", "refSum"] .lumaAcceptanceGate
+
+  -- 22. `bilinear_q8_blend_simd`: four weighted pixels, fixed-point horizontal fraction.
+  let d22 := mkLnirPixelCoreDecl "bilinear_q8_blend_simd" ["p00", "p01", "fx"] .bilinearQ8Blend
+
+  -- 23. `bilinear_q8_pack_simd`: weighted top/bottom rows, rounded once at 16 bits.
+  let d23 := mkLnirPixelCoreDecl "bilinear_q8_pack_simd" ["top", "bottom", "fy"] .bilinearQ8Pack
+
+  -- 24. `bilinear_q8_clamp10_simd`: clamp the rounded sample to `[0, 1023]`.
+  let d24 := mkLnirPixelCoreDecl "bilinear_q8_clamp10_simd" ["sample"] .bilinearQ8Clamp10
+
+  -- 25. `av1_cdef_tap_simd`: constrained signed difference for one directional tap.
+  let d25 := mkLnirPixelCoreDecl "av1_cdef_tap_simd" ["neighbor", "center", "strength"] .av1CdefTap
+
+  -- 26. `down2x2_fused_eq_simd`: rounded 2x2 average, signed Q8 EQ, byte clamp.
+  let d26 := mkLnirPixelCoreDecl "down2x2_fused_eq_simd" ["row0PairSum", "row1PairSum", "contrastQ8"] .down2x2FusedEq
+
+  -- 27. `down2x2_fused_brightness_simd`: add signed brightness and clamp to a byte.
+  let d27 := mkLnirPixelCoreDecl "down2x2_fused_brightness_simd" ["contrastCentered", "brightness"] .down2x2FusedBrightness
+
+  -- 28. `yuv420p_studio_range_simd`: independently clamp one Y/U/V sample.
+  let d28 := mkLnirPixelCoreDecl "yuv420p_studio_range_simd" ["sample", "isChroma"] .yuv420pStudioRange
+
+  let declTokens := d1 ++ d2 ++ d3 ++ d4 ++ d5 ++ d6 ++ d7 ++ d8 ++ d9 ++ d10 ++ d11 ++ d12 ++ d13 ++ d14 ++ d15 ++ d16 ++ d17 ++ d18 ++ d19 ++ d20 ++ d21 ++ d22 ++ d23 ++ d24 ++ d25 ++ d26 ++ d27 ++ d28
+  let allTokens := ["LNIR_WIRE_V1", modHex, "28"] ++ declTokens
   String.intercalate "|" allTokens
 
 /-! ## Typed `LnirKernelAst`, Formal Evaluator `evalLnirKernel`, & Universal Equivalence Theorems -/
-
-/--
-  Typed LNIR Data-Parallel Kernel AST (`LnirKernelAst`) modeling all distinct SIMD/GPU kernel primitives
-  in `LeanAV.DSP.Kernels` lowered by `lean-native-core`.
--/
-inductive LnirKernelAst where
-  /-- `swscale_luma_gain_bias_simd`: Elementwise `xs[i] * gain + bias`. -/
-  | gainBias (gain bias : Int64)
-  /-- `flac_lpc_autocorr_dot_simd` (`K_dot`): Pairwise product map `xs[i] * ys[i]`. -/
-  | dotPairwise
-  /-- `opus_celt_pvq_mix_saxpy_gpu` / `bframe_bipred_blend_gpu` (`K_saxpy alpha`): `alpha * xs[i] + ys[i]`. -/
-  | saxpy (alpha : Int64)
-  /-- `av1_wiener_3tap_sym_gpu`: 3-tap symmetric Wiener filter `3 * xs[i] + 10 * ys[i] + 3 * zs[i]`. -/
-  | wiener3TapSym
-  /-- `av1_cdef_fma_blend_gpu`: 3-input FMA `xs[i] * ys[i] + zs[i]`. -/
-  | fmaBlend
-  /-- `hevc_sao_band_offset_add_gpu` (`K_za`): Elementwise `xs[i] + ys[i]`. -/
-  | zipAdd
-  /-- `aac_imdct_window_mul_gpu` (`K_zm`): Elementwise `xs[i] * ys[i]`. -/
-  | zipMul
-  /-- `prores_qscale_map_simd` (`K_msa scale bias`): Elementwise `xs[i] * scale + bias`. -/
-  | mapScaleAdd (scale bias : Int64)
-  /-- `boxblur_div9_recip_shift_simd`: Elementwise unsigned reciprocal shift `((xs[i] + 4) * 7282) >>> 16`. -/
-  | boxBlurDiv9Recip
-  /-- `pq10_studio_clamp_select_simd`: Branchless `S_sel` clamp to 10-bit studio range `[64, 940]`. -/
-  | pq10StudioClamp
-  /-- `swscale_down2x2_box_simd`: Pairwise 2x2 box downscale `(xs[i] + ys[i] + 2) >>> 2`. -/
-  | down2x2Box
-  /-- `swscale_down3x3_box_simd`: 3-row 3x3 box downscale `((xs[i] + ys[i] + zs[i] + 4) * 7282) >>> 16`. -/
-  | down3x3Box
-  /-- `swscale_down3to2_bilinear_simd`: 3:2 bilinear row blend `((xs[i] * 2 + ys[i] + 4) * 7282) >>> 16`. -/
-  | down3to2Bilinear
-  /-- `av1_cdef_dir_filter_simd`: AV1 CDEF directional tap blend `xs[i] + ((ys[i] + zs[i] + 2) >>> 2)`. -/
-  | av1CdefDirFilter
-  deriving Repr, DecidableEq, Inhabited
-
-/-- Emit the canonical `LNIR_WIRE_V1` kernel descriptor tokens for a typed `LnirKernelAst`. -/
-def LnirKernelAst.toWireTokens : LnirKernelAst → List String
-  | .gainBias _ _ => ["E_scalar", "S_fma", "S_var", "8", "S_var", "1", "S_var", "2"]
-  | .dotPairwise => ["K_dot"]
-  | .saxpy alpha => ["K_saxpy", toString alpha.toInt]
-  | .wiener3TapSym => [
-      "K_cust", "10", "3", "0", "1", "2",
-      "S_bin", "B_add",
-        "S_bin", "B_add",
-          "S_bin", "B_mul", "S_var", "0", "S_u64", "3",
-          "S_bin", "B_mul", "S_var", "1", "S_u64", "10",
-        "S_bin", "B_mul", "S_var", "2", "S_u64", "3"
-    ]
-  | .fmaBlend => ["K_cust", "10", "3", "0", "1", "2", "S_fma", "S_var", "0", "S_var", "1", "S_var", "2"]
-  | .zipAdd => ["K_za"]
-  | .zipMul => ["K_zm"]
-  | .mapScaleAdd s b => ["K_msa", toString s.toInt, toString b.toInt]
-  | .boxBlurDiv9Recip => [
-      "K_cust", "10", "1", "0",
-      "S_bin", "B_shr",
-        "S_bin", "B_mul",
-          "S_bin", "B_add", "S_var", "0", "S_u64", "4",
-          "S_u64", "7282",
-        "S_u64", "16"
-    ]
-  | .pq10StudioClamp => [
-      "K_cust", "10", "1", "0",
-      "S_sel",
-        "S_bin", "B_lt", "S_var", "0", "S_u64", "64",
-        "S_u64", "64",
-        "S_sel",
-          "S_bin", "B_lt", "S_u64", "940", "S_var", "0",
-          "S_u64", "940",
-          "S_var", "0"
-    ]
-  | .down2x2Box => [
-      "K_cust", "10", "2", "0", "1",
-      "S_bin", "B_shr",
-        "S_bin", "B_add",
-          "S_bin", "B_add", "S_var", "0", "S_var", "1",
-          "S_u64", "2",
-        "S_u64", "2"
-    ]
-  | .down3x3Box => [
-      "K_cust", "10", "3", "0", "1", "2",
-      "S_bin", "B_shr",
-        "S_bin", "B_mul",
-          "S_bin", "B_add",
-            "S_bin", "B_add",
-              "S_bin", "B_add", "S_var", "0", "S_var", "1",
-              "S_var", "2",
-            "S_u64", "4",
-          "S_u64", "7282",
-        "S_u64", "16"
-    ]
-  | .down3to2Bilinear => [
-      "K_cust", "10", "2", "0", "1",
-      "S_bin", "B_shr",
-        "S_bin", "B_mul",
-          "S_bin", "B_add",
-            "S_bin", "B_add",
-              "S_bin", "B_mul", "S_var", "0", "S_u64", "2",
-              "S_var", "1",
-            "S_u64", "4",
-          "S_u64", "7282",
-        "S_u64", "16"
-    ]
-  | .av1CdefDirFilter => [
-      "K_cust", "10", "3", "0", "1", "2",
-      "S_bin", "B_add",
-        "S_var", "0",
-        "S_bin", "B_shr",
-          "S_bin", "B_add",
-            "S_bin", "B_add", "S_var", "1", "S_var", "2",
-            "S_u64", "2",
-          "S_u64", "2"
-    ]
 
 /-- Single-element unsigned reciprocal shift `((x.toUInt64 + 4) * 7282) >>> 16` for `boxblur_div9_recip_shift_simd`. -/
 @[inline]
@@ -432,6 +623,64 @@ def evalDown3to2BilinearElem (rA rB : Int64) : Int64 :=
 @[inline]
 def evalAv1CdefDirFilterElem (c tPos tNeg : Int64) : Int64 :=
   (c.toUInt64 + ((tPos.toUInt64 + tNeg.toUInt64 + 2) >>> 2)).toInt64
+
+def evalExtractU16LeMsb8Elem (sample : Int64) : Int64 :=
+  ((sample.toUInt64 >>> 2) &&& 255).toInt64
+
+def evalLumaStatsMomentsElem (sample : Int64) : Int64 :=
+  let u := sample.toUInt64
+  ((u * u <<< 16) ||| u).toInt64
+
+def evalLumaStatsPackElem (moments count : Int64) : Int64 :=
+  let u := moments.toUInt64
+  let mean := (u &&& 65535) / count.toUInt64
+  let meanSq := (u >>> 16) / count.toUInt64
+  let variance := if mean * mean < meanSq then meanSq - mean * mean else 0
+  ((variance <<< 32) ||| (mean &&& 0xFFFFFFFF)).toInt64
+
+def evalLumaAcceptanceAccumElem (src dst : Int64) : Int64 :=
+  let s := src.toUInt64
+  let d := dst.toUInt64
+  let ad := if d ≤ s then s - d else d - s
+  let black := if 16 ≤ s then s - 16 else 16 - s
+  (ad ||| (black <<< 16) ||| (s <<< 32) ||| (ad * ad <<< 48)).toInt64
+
+def evalLumaAcceptanceGateElem (sad blackSum refSum : Int64) : Int64 :=
+  if blackSum.toUInt64 ≤ sad.toUInt64 then 0 else if 6144 ≤ refSum.toUInt64 then 0 else 1
+
+def evalBilinearQ8BlendElem (p00 p01 fx : Int64) : Int64 :=
+  (p00.toUInt64 * (256 - fx.toUInt64) + p01.toUInt64 * fx.toUInt64).toInt64
+
+def evalBilinearQ8PackElem (top bottom fy : Int64) : Int64 :=
+  ((top.toUInt64 * (256 - fy.toUInt64) + bottom.toUInt64 * fy.toUInt64 + 32768) >>> 16).toInt64
+
+def evalBilinearQ8Clamp10Elem (sample : Int64) : Int64 :=
+  (if 1023 < sample.toUInt64 then 1023 else sample.toUInt64).toInt64
+
+def evalAv1CdefTapElem (neighbor center strength : Int64) : Int64 :=
+  let n := neighbor.toUInt64
+  let c := center.toUInt64
+  let ad := if c ≤ n then n - c else c - n
+  let magnitude := if strength.toUInt64 ≤ (ad >>> 1) then 0
+    else if ad ≤ strength.toUInt64 - (ad >>> 1) then ad else strength.toUInt64 - (ad >>> 1)
+  (if c ≤ n then magnitude else 0 - magnitude).toInt64
+
+/-- Signed saturation of a two's-complement `UInt64` value to `[0, 255]`. -/
+def clampByteU64 (x : UInt64) : UInt64 :=
+  if x ≤ 255 then x else if x >>> 63 != 0 then 0 else 255
+
+def evalDown2x2FusedEqElem (r0 r1 contrastQ8 : Int64) : Int64 :=
+  let average := (r0.toUInt64 + r1.toUInt64 + 2) >>> 2
+  let scaled := (((average - 128) * contrastQ8.toUInt64 + 128).toInt64 >>> 8).toUInt64 + 128
+  (clampByteU64 scaled).toInt64
+
+def evalDown2x2FusedBrightnessElem (centered brightness : Int64) : Int64 :=
+  (clampByteU64 (centered.toUInt64 + brightness.toUInt64)).toInt64
+
+def evalYuv420pStudioRangeElem (sample isChroma : Int64) : Int64 :=
+  let u := sample.toUInt64
+  let upper : UInt64 := if isChroma.toUInt64 &&& 1 = 0 then 235 else 240
+  (if u < 16 then 16 else if upper < u then upper else u).toInt64
 
 /--
   Formal denotational evaluator `evalLnirKernel` for `LnirKernelAst` over arbitrary-length streams `xs ys zs : List Int64`.
@@ -468,6 +717,18 @@ def evalLnirKernel (k : LnirKernelAst) (xs ys zs : List Int64) : List Int64 :=
     List.zipWith evalDown3to2BilinearElem xs ys
   | .av1CdefDirFilter =>
     List.zipWith (fun p z => evalAv1CdefDirFilterElem p.1 p.2 z) (List.zip xs ys) zs
+  | .extractU16LeMsb8 => xs.map evalExtractU16LeMsb8Elem
+  | .lumaStatsMoments => xs.map evalLumaStatsMomentsElem
+  | .lumaStatsPack => List.zipWith evalLumaStatsPackElem xs ys
+  | .lumaAcceptanceAccum => List.zipWith evalLumaAcceptanceAccumElem xs ys
+  | .lumaAcceptanceGate => List.zipWith (fun p z => evalLumaAcceptanceGateElem p.1 p.2 z) (List.zip xs ys) zs
+  | .bilinearQ8Blend => List.zipWith (fun p z => evalBilinearQ8BlendElem p.1 p.2 z) (List.zip xs ys) zs
+  | .bilinearQ8Pack => List.zipWith (fun p z => evalBilinearQ8PackElem p.1 p.2 z) (List.zip xs ys) zs
+  | .bilinearQ8Clamp10 => xs.map evalBilinearQ8Clamp10Elem
+  | .av1CdefTap => List.zipWith (fun p z => evalAv1CdefTapElem p.1 p.2 z) (List.zip xs ys) zs
+  | .down2x2FusedEq => List.zipWith (fun p z => evalDown2x2FusedEqElem p.1 p.2 z) (List.zip xs ys) zs
+  | .down2x2FusedBrightness => List.zipWith evalDown2x2FusedBrightnessElem xs ys
+  | .yuv420pStudioRange => List.zipWith evalYuv420pStudioRangeElem xs ys
 
 /-- Pure Lean reference specification for `swscale_luma_gain_bias_simd`. -/
 def leanSpecSwscaleGainBias (plane : List Int64) (gain bias : Int64) : List Int64 :=
@@ -626,6 +887,78 @@ theorem evalLnir_av1_cdef_dir_filter_equiv (centerPx tapPosSum tapNegSum : List 
       leanSpecAv1CdefDirFilter centerPx tapPosSum tapNegSum :=
   rfl
 
+def leanSpecExtractU16LeMsb8 (samples : List Int64) : List Int64 :=
+  samples.map evalExtractU16LeMsb8Elem
+
+def leanSpecLumaStatsMoments (samples : List Int64) : List Int64 :=
+  samples.map evalLumaStatsMomentsElem
+
+def leanSpecLumaStatsPack (moments counts : List Int64) : List Int64 :=
+  List.zipWith evalLumaStatsPackElem moments counts
+
+def leanSpecLumaAcceptanceAccum (source reconstructed : List Int64) : List Int64 :=
+  List.zipWith evalLumaAcceptanceAccumElem source reconstructed
+
+def leanSpecLumaAcceptanceGate (sad blackSum refSum : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalLumaAcceptanceGateElem p.1 p.2 z) (List.zip sad blackSum) refSum
+
+def leanSpecBilinearQ8Blend (p00 p01 fx : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalBilinearQ8BlendElem p.1 p.2 z) (List.zip p00 p01) fx
+
+def leanSpecBilinearQ8Pack (top bottom fy : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalBilinearQ8PackElem p.1 p.2 z) (List.zip top bottom) fy
+
+def leanSpecBilinearQ8Clamp10 (samples : List Int64) : List Int64 :=
+  samples.map evalBilinearQ8Clamp10Elem
+
+def leanSpecAv1CdefTap (neighbor center strength : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalAv1CdefTapElem p.1 p.2 z) (List.zip neighbor center) strength
+
+def leanSpecDown2x2FusedEq (r0 r1 contrastQ8 : List Int64) : List Int64 :=
+  List.zipWith (fun p z => evalDown2x2FusedEqElem p.1 p.2 z) (List.zip r0 r1) contrastQ8
+
+def leanSpecDown2x2FusedBrightness (centered brightness : List Int64) : List Int64 :=
+  List.zipWith evalDown2x2FusedBrightnessElem centered brightness
+
+def leanSpecYuv420pStudioRange (samples isChroma : List Int64) : List Int64 :=
+  List.zipWith evalYuv420pStudioRangeElem samples isChroma
+
+theorem evalLnir_extract_u16le_msb8_equiv (samples : List Int64) :
+    evalLnirKernel .extractU16LeMsb8 samples [] [] = leanSpecExtractU16LeMsb8 samples := rfl
+
+theorem evalLnir_luma_stats_moments_equiv (samples : List Int64) :
+    evalLnirKernel .lumaStatsMoments samples [] [] = leanSpecLumaStatsMoments samples := rfl
+
+theorem evalLnir_luma_stats_pack_equiv (moments counts : List Int64) :
+    evalLnirKernel .lumaStatsPack moments counts [] = leanSpecLumaStatsPack moments counts := rfl
+
+theorem evalLnir_luma_acceptance_accum_equiv (source reconstructed : List Int64) :
+    evalLnirKernel .lumaAcceptanceAccum source reconstructed [] = leanSpecLumaAcceptanceAccum source reconstructed := rfl
+
+theorem evalLnir_luma_acceptance_gate_equiv (sad blackSum refSum : List Int64) :
+    evalLnirKernel .lumaAcceptanceGate sad blackSum refSum = leanSpecLumaAcceptanceGate sad blackSum refSum := rfl
+
+theorem evalLnir_bilinear_q8_blend_equiv (p00 p01 fx : List Int64) :
+    evalLnirKernel .bilinearQ8Blend p00 p01 fx = leanSpecBilinearQ8Blend p00 p01 fx := rfl
+
+theorem evalLnir_bilinear_q8_pack_equiv (top bottom fy : List Int64) :
+    evalLnirKernel .bilinearQ8Pack top bottom fy = leanSpecBilinearQ8Pack top bottom fy := rfl
+
+theorem evalLnir_bilinear_q8_clamp10_equiv (samples : List Int64) :
+    evalLnirKernel .bilinearQ8Clamp10 samples [] [] = leanSpecBilinearQ8Clamp10 samples := rfl
+
+theorem evalLnir_av1_cdef_tap_equiv (neighbor center strength : List Int64) :
+    evalLnirKernel .av1CdefTap neighbor center strength = leanSpecAv1CdefTap neighbor center strength := rfl
+
+theorem evalLnir_down2x2_fused_eq_equiv (r0 r1 contrastQ8 : List Int64) :
+    evalLnirKernel .down2x2FusedEq r0 r1 contrastQ8 = leanSpecDown2x2FusedEq r0 r1 contrastQ8 := rfl
+
+theorem evalLnir_down2x2_fused_brightness_equiv (centered brightness : List Int64) :
+    evalLnirKernel .down2x2FusedBrightness centered brightness [] = leanSpecDown2x2FusedBrightness centered brightness := rfl
+
+theorem evalLnir_yuv420p_studio_range_equiv (samples isChroma : List Int64) :
+    evalLnirKernel .yuv420pStudioRange samples isChroma [] = leanSpecYuv420pStudioRange samples isChroma := rfl
+
 /-- Theorem: Typed `LnirKernelAst.toWireTokens` matches the exact wire tokens emitted in `emitLeanAvLnirWire`. -/
 theorem lnirKernelAst_wire_tokens_match :
     (LnirKernelAst.saxpy 4).toWireTokens = ["K_saxpy", "4"] ∧
@@ -634,6 +967,7 @@ theorem lnirKernelAst_wire_tokens_match :
     LnirKernelAst.zipMul.toWireTokens = ["K_zm"] ∧
     (LnirKernelAst.mapScaleAdd 16 8).toWireTokens = ["K_msa", "16", "8"] := by
   decide
+
 
 /-! ## Exact Pixel & Reciprocal Arithmetic Refinements (2x2 Box, 3x3 Box, 4-Tap Lanczos) -/
 
@@ -860,16 +1194,19 @@ theorem specPq10StudioClampNat_bounds_and_idempotent (u : Nat) :
 opaque execLnirH264IdctTupleSroaC (blocks : UInt64) (dcInit : UInt64) : UInt64
 
 /-- Zero-copy `ByteArray` unary LNIR dispatcher
-    (`0=swscale_gain_bias`, `1=prores_qscale`, `2=boxblur_div9_recip`, `3=pq10_studio_clamp`). -/
+    (`0=swscale_gain_bias`, `1=prores_qscale`, `2=boxblur_div9_recip`, `3=pq10_studio_clamp`,
+    `4=extract_u16le_msb8`, `5=luma_stats_moments`, `6=bilinear_q8_clamp10`). -/
 @[extern "leanav_c_exec_lnir_unary_ba"]
 opaque execLnirUnaryBaC (kernelId : UInt32) (ba0 : ByteArray) (arg0 : UInt64) (arg1 : UInt64) : ByteArray
 
 /-- Zero-copy `ByteArray` binary LNIR dispatcher
-    (`0=flac_lpc_dot`, `1=opus_celt_saxpy`, `2=bframe_bipred`, `3=hevc_sao_add`, `4=aac_imdct_mul`, `5=swscale_down2x2_box`, `6=swscale_down3to2_bilinear`). -/
+    (`0=flac_lpc_dot`, `1=opus_celt_saxpy`, `2=bframe_bipred`, `3=hevc_sao_add`, `4=aac_imdct_mul`, `5=swscale_down2x2_box`, `6=swscale_down3to2_bilinear`,
+    `7=luma_stats_pack`, `8=luma_acceptance_accum`, `9=down2x2_fused_brightness`, `10=yuv420p_studio_range`). -/
 @[extern "leanav_c_exec_lnir_binary_ba"]
 opaque execLnirBinaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) : ByteArray
 
-/-- Zero-copy `ByteArray` ternary LNIR dispatcher (`0=av1_wiener_3tap`, `1=av1_cdef_fma`, `2=swscale_down3x3_box`, `3=av1_cdef_dir_filter`). -/
+/-- Zero-copy `ByteArray` ternary LNIR dispatcher (`0=av1_wiener_3tap`, `1=av1_cdef_fma`, `2=swscale_down3x3_box`, `3=av1_cdef_dir_filter`,
+    `4=luma_acceptance_gate`, `5=bilinear_q8_blend`, `6=bilinear_q8_pack`, `7=av1_cdef_tap`, `8=down2x2_fused_eq`). -/
 @[extern "leanav_c_exec_lnir_ternary_ba"]
 opaque execLnirTernaryBaC (kernelId : UInt32) (ba0 : ByteArray) (ba1 : @& ByteArray) (ba2 : @& ByteArray) : ByteArray
 
@@ -975,6 +1312,43 @@ def execLnirAv1CdefFmaC (xs : Array Int64) (ys : Array Int64) (zs : Array Int64)
 def execLnirPq10StudioClampC (xs : Array Int64) : Array Int64 :=
   (unpackInt64LanesLe (execLnirUnaryBaC 3 (packInt64LanesLe xs.toList) 0 0)).toArray
 
+/-- Execute the 12 per-pixel arithmetic-core LNIR kernels (`extract_u16le_msb8_simd` through
+    `yuv420p_studio_range_simd`) compiled into `libleanav_dsp.a` over adversarial 8-lane vectors
+    (sign boundaries, zero divisors, clamp edges) and compare bit-for-bit with `evalLnirKernel`. -/
+def verifyCompiledPixelCoreSuiteC (_ : Unit) : Bool :=
+  let run1 (id : UInt32) (a : List Int64) := unpackInt64LanesLe (execLnirUnaryBaC id (packInt64LanesLe a) 0 0)
+  let run2 (id : UInt32) (a b : List Int64) :=
+    unpackInt64LanesLe (execLnirBinaryBaC id (packInt64LanesLe a) (packInt64LanesLe b))
+  let run3 (id : UInt32) (a b c : List Int64) :=
+    unpackInt64LanesLe (execLnirTernaryBaC id (packInt64LanesLe a) (packInt64LanesLe b) (packInt64LanesLe c))
+  let s16 : List Int64 := [0, 3, 4, 1020, 1023, 4095, 65535, -1]
+  let px : List Int64 := [0, 1, 15, 16, 128, 235, 240, 255]
+  let px2 : List Int64 := [255, 0, 16, 15, 127, 236, 241, 1000]
+  let moments : List Int64 := [0, 655360100, 262144120, 65535, 65536, 7, 0, 300]
+  let counts : List Int64 := [1, 1, 2, 0, 3, 7, 5, 1]
+  let sad : List Int64 := [0, 10, 100, 5, 6144, 1, 2, 3]
+  let black : List Int64 := [1, 10, 50, 6, 7000, 2, 2, 100]
+  let refs : List Int64 := [0, 0, 0, 6143, 6144, 9000, 1, 0]
+  let fq8 : List Int64 := [0, 1, 128, 255, 256, 64, 200, 17]
+  let pairSum : List Int64 := [0, 510, 255, 256, 128, 64, 1, 300]
+  let contrast : List Int64 := [256, 512, 0, 128, 1024, -256, 300, 256]
+  let centered : List Int64 := [-300, -129, -128, 0, 127, 128, 200, 300]
+  let bright : List Int64 := [0, 0, 128, -1, 128, 127, 100, -300]
+  let chroma : List Int64 := [0, 1, 0, 1, 2, 3, 0, 1]
+  let strength : List Int64 := [0, 1, 2, 4, 8, 16, 63, 3]
+  run1 4 s16 == evalLnirKernel .extractU16LeMsb8 s16 [] [] &&
+  run1 5 px == evalLnirKernel .lumaStatsMoments px [] [] &&
+  run1 6 s16 == evalLnirKernel .bilinearQ8Clamp10 s16 [] [] &&
+  run2 7 moments counts == evalLnirKernel .lumaStatsPack moments counts [] &&
+  run2 8 px px2 == evalLnirKernel .lumaAcceptanceAccum px px2 [] &&
+  run2 9 centered bright == evalLnirKernel .down2x2FusedBrightness centered bright [] &&
+  run2 10 px2 chroma == evalLnirKernel .yuv420pStudioRange px2 chroma [] &&
+  run3 4 sad black refs == evalLnirKernel .lumaAcceptanceGate sad black refs &&
+  run3 5 px px2 fq8 == evalLnirKernel .bilinearQ8Blend px px2 fq8 &&
+  run3 6 px2 px fq8 == evalLnirKernel .bilinearQ8Pack px2 px fq8 &&
+  run3 7 px2 px strength == evalLnirKernel .av1CdefTap px2 px strength &&
+  run3 8 pairSum px2 contrast == evalLnirKernel .down2x2FusedEq pairSum px2 contrast
+
 /-- Execute all 12 `lean-native-core`-compiled LNIR DSP kernels linked in `libleanav_dsp.a`
     directly from Lean 4 over adversarial 8-lane vectors, returning `1` iff every compiled
     machine-code symbol matches the formal `evalLnirKernel` / `leanSpecH264IdctTupleAccumSroa` semantics bit-for-bit. -/
@@ -1067,6 +1441,7 @@ def verifyCompiledLnirSuiteC (_ : Unit) : UInt32 :=
     (acc2x2Exact &&& 0xFFFFFF) == 0 && ((acc2x2Exact >>> 24) &&& 0xFFFF) == 480 && ((acc2x2Exact >>> 40) &&& 1) == 1 &&
     ((accSmall >>> 24) &&& 0xFFFF) == 450 &&
     accInvalidShort == 0
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 && ok22 then 1 else 0
+  let ok23 := verifyCompiledPixelCoreSuiteC ()
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 && ok22 && ok23 then 1 else 0
 
 end LeanAV.NativeKernels
