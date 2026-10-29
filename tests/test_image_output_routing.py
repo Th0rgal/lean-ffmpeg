@@ -167,7 +167,12 @@ class ImageOutputRoutingTests(unittest.TestCase):
         self.assert_rejected(["-i", str(self.source), str(self.root / "out.fits"), "-f"])
 
     def test_protocol_and_traversal_rejections_are_unchanged(self):
-        for unsafe in ("concat:first.fits|second.fits", "https://invalid.example/image.fits",
+        self.assert_rejected(["-i", str(self.source), "-f", "fits",
+                              "concat:first.fits|second.fits"],
+                             "unsafe_protocol_or_path_traversal")
+        for unsafe in ("concat:first.fits|../second.fits", "concat:single.fits",
+                       "concat:https://invalid.example/a.fits|b.fits",
+                       "https://invalid.example/image.fits",
                        "file:image.fits", "pipe:0", "/proc/self/mem", "frames/../image.wbmp"):
             for position in ("input", "output"):
                 with self.subTest(unsafe=unsafe, position=position):

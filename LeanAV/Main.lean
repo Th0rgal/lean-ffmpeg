@@ -1191,15 +1191,16 @@ def tryFastHeaderProbeTranscode
       return false
 
 def isIntrospectionFlag (s : String) : Bool :=
-  ["-version", "--version", "-h", "--help", "-?", "-help",
+  ["-version", "--version", "-h", "--help", "-?", "-help", "-license",
    "-formats", "-muxers", "-demuxers", "-devices",
    "-codecs", "-decoders", "-encoders", "-bsfs",
    "-protocols", "-filters", "-pix_fmts", "-layouts",
-   "-sample_fmts", "-colors", "-L", "-buildconf", "-hwaccels"].contains s
+   "-sample_fmts", "-dispositions", "-colors", "-L", "-buildconf",
+   "-hwaccels", "-sources", "-sinks"].contains s
 
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
 def runFFmpegCli (args : List String) : IO UInt32 := do
-  if !args.contains "-i" && !args.contains "-lavfi" && args.any isIntrospectionFlag then
+  if !args.contains "-i" && !args.contains "-lavfi" && !args.contains "-filter_complex" && !args.contains "-/filter_complex" && args.any isIntrospectionFlag then
     if !verifyExecArgvHygiene args then return 1
     let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
     return rc
@@ -1228,11 +1229,15 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     let inPath := validCfg.inputs.headD ""
     let outPath := validCfg.output.getD ""
     let anyUnsafeIn := plan.inputs.any (fun i => !i.safePath)
-    let outSafe := isSafeOutputTarget outPath validCfg.format.isSome
-    if anyUnsafeIn || !outSafe then
+    let anyUnsafeOut := plan.outputs.any (fun o => !o.safePath)
+    if anyUnsafeIn || anyUnsafeOut then
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"unsafe protocol, device node, or path traversal rejected\"}"
         "Unsafe protocol, device node, or path traversal rejected"
+    if plan.outputs.any (fun o => o.format == "unknown") then
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"unrecognized output container format\"}"
+        "Unable to choose an output format"
     if validCfg.startSec.isSome && plan.timeline.startMs.isNone then
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-ss milliseconds overflow\"}"
@@ -1247,7 +1252,14 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         "Unsupported execution options: -daemon/-golden"
     for inP in cfg0.inputs do
       if !ext.hasLavfiFmt && !(inP.toList.contains '%') then
-        if !(← System.FilePath.pathExists inP) then
+        if strStartsWithFast inP "concat:" then
+          let body := String.ofList (inP.toList.drop 7)
+          for seg in splitStrOnChar body '|' do
+            if !(← System.FilePath.pathExists seg) then
+              return ← reportCliError validCfg
+                "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
+                (s!"{seg}: No such file or directory")
+        else if !(← System.FilePath.pathExists inP) then
           return ← reportCliError validCfg
             "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
             (s!"{inP}: No such file or directory")
@@ -1255,28 +1267,33 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
     if (plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer) || plainStreamCopy then
+      for o in plan.outputs do
+        let oSpecial :=
+          o.path == "-" || o.path == "/dev/null" || o.path == "md5:" ||
+          strStartsWithFast o.path "md5:" || strStartsWithFast o.path "pipe:" ||
+          isNoFileOutputFormat o.format o.path || o.path.toList.contains '%'
+        if !validCfg.overwrite && !oSpecial then
+          if (← System.FilePath.pathExists o.path) then
+            if validCfg.jsonOutput then
+              return ← reportCliError validCfg
+                "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+                "File exists"
+            else if !(args.contains "-n") then
+              if !cliQuiet validCfg.logLevel then
+                IO.eprintln s!"File '{o.path}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+              return 0
+            else
+              return ← reportCliError validCfg
+                "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+                "File exists"
       let isSpecialOut :=
         outPath == "-" || outPath == "/dev/null" || outPath == "md5:" ||
         strStartsWithFast outPath "md5:" || strStartsWithFast outPath "pipe:" ||
         validCfg.format == some "null" || outPath.toList.contains '%'
-      if !validCfg.overwrite && !isSpecialOut then
-        if (← System.FilePath.pathExists outPath) then
-          if validCfg.jsonOutput then
-            return ← reportCliError validCfg
-              "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-              "File exists"
-          else if !(args.contains "-n") then
-            if !cliQuiet validCfg.logLevel then
-              IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-            return 0
-          else
-            return ← reportCliError validCfg
-              "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-              "File exists"
       let t0Del ← IO.monoNanosNow
       let argv := buildDelegatedFfmpegArgv plan ext.passthroughArgs
       let stdoutPipeLike :=
-        outPath == "-" || outPath == "md5:" || strStartsWithFast outPath "pipe:" ||
+        plan.outputs.any (fun o => o.path == "-" || o.path == "md5:" || strStartsWithFast o.path "pipe:") ||
         (outPath == "/dev/null" && ext.hasLavfiInput)
       let suppress : UInt32 :=
         if stdoutPipeLike && !validCfg.jsonOutput then 0
@@ -1437,7 +1454,7 @@ def runVerifyFfi (mp4PathOpt : Option String) : IO UInt32 := do
   return if allOk then 0 else 1
 
 /-- Direct U16LE acceptance agrees with pure extraction, including fallback geometries. -/
-private def verifyLumaAcceptanceU16Le : Bool := Id.run do
+private def verifyLumaAcceptanceU16Le (_ : Unit) : Bool := Id.run do
   let plane (n seed : Nat) : ByteArray := Id.run do
     let mut out := ByteArray.emptyWithCapacity (2 * n)
     for i in [:n] do
@@ -1524,8 +1541,8 @@ def runVerifyKernels : IO UInt32 := do
 
   -- 4. Runtime execution of `lean-native-core`-compiled LNIR machine code (`c/leanav_lnir_x86_64.ll` / `arm64.ll`)
   --    verified bit-for-bit against formal `evalLnirKernel` and `leanSpecH264IdctTupleAccumSroa`
-  let u16AcceptanceOk := verifyLumaAcceptanceU16Le
-  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative && verifyU16LeNative && u16AcceptanceOk
+  let u16AcceptanceOk := verifyLumaAcceptanceU16Le ()
+  let lnirSuiteOk := verifyCompiledLnirSuiteC () == 1 && verifyPixelFiltersNative () && verifyU16LeNative () && u16AcceptanceOk
   let lnirSroaOk  := execLnirH264IdctTupleSroaC 16 7 == leanSpecH264IdctTupleAccumSroa 16 7
   let vX : List Int64 := [0, 16, 63, 64, 128, 512, 940, 1023]
   let vY : List Int64 := [3, -5, 10, 20, -15, 7, 4, 2]
@@ -1558,7 +1575,7 @@ def runVerifyKernels : IO UInt32 := do
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
-  | "plan" :: rest => do
+  | "plan" :: rest | "dump-plan" :: rest => do
     let plan := parseArgsToPlanIR rest
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1

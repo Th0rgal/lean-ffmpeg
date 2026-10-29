@@ -172,12 +172,16 @@ class SpdifRoutingTests(unittest.TestCase):
         self.assertIn("unrecognized_output_container_format",
                       plan["backend"]["reasons"])
 
-    def test_three_known_group_co_blockers_remain_rejected(self):
+    def test_spdif_flags_and_dtshd_rate_delegate_and_unknown_flag_rejected(self):
         for flag, value in (("-spdif_flags", "+be"), ("-dtshd_rate", "192000"),
                             ("-dtshd_rate", "96000")):
             with self.subTest(flag=flag, value=value):
-                self.assert_rejected(["-i", str(self.source), "-c", "copy",
-                                      flag, value, "-f", "spdif", str(self.output)])
+                result, plan = self.plan(["-i", str(self.source), "-c", "copy",
+                                          flag, value, "-f", "spdif", str(self.output)])
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
+        self.assert_rejected(["-i", str(self.source), "-c", "copy",
+                              "-spdif_unknown_flag", "1", "-f", "spdif", str(self.output)])
 
     def test_native_plan_without_explicit_spdif_remains_unchanged(self):
         # Never execute the native route on a placeholder input.

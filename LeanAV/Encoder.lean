@@ -1587,7 +1587,7 @@ def computeLumaStatsU16LeFast (src : @& ByteArray) (nPixels : Nat) : UInt64 × U
   else computeLumaStatsU16LePure src nPixels
 
 /-- Differential runtime coverage of native U16LE paths against their pure specifications. -/
-def verifyU16LeNative : Bool := Id.run do
+def verifyU16LeNative (_ : Unit) : Bool := Id.run do
   for (sw, sh, dw, dh) in [(2, 2, 2, 2), (20, 12, 10, 6), (12, 12, 6, 6),
       (30, 18, 10, 6), (14, 10, 8, 6), (6, 4, 14, 10)] do
     for fullRange in [false, true] do
@@ -1966,6 +1966,19 @@ def locateMp4TrailingMoovWindowIO (path : String) (fileSz : UInt64) :
 opaque writeMp4WindowIO (path : @& String) (offset : UInt64)
     (bytes : @& ByteArray) : IO Unit
 
+/-- POSIX pipe/pthread ring-buffered 8-bit `yuv420p` LNIR transcode bridge (`leanav_c_exec_pipe_transcode_u8`). -/
+@[extern "leanav_c_exec_pipe_transcode_u8"]
+opaque execPipeTranscodeU8IO
+    (ffmpegBin : @& String)
+    (decArgs : @& Array String)
+    (encArgs : @& Array String)
+    (srcW srcH dstW dstH : UInt64)
+    (kernelId filterFlags : UInt32)
+    (frameLimit : UInt64)
+    (eagerEnc : UInt32)
+    (lumaStep : UInt64)
+    (acceptFastOk : UInt32) : IO (UInt64 × UInt64)
+
 def patchMp4HdrAndElstBoxesIO (_inPath outPath : String) (inMoovBuf : @& ByteArray) (copyElst : Bool) : IO Unit := do
   if inMoovBuf.isEmpty then return ()
   if (patchMp4HdrAndElstBoxesPure inMoovBuf inMoovBuf copyElst).isNone then return ()
@@ -2286,13 +2299,13 @@ def transcodeMp4GeneralVerifiedIO
   let tArgs  : Array String := if durMs > 0 then #["-t", formatMsSec3 durMs] else #[]
 
   let decArgs : Array String :=
-    #["-v", "error", "-nostdin", "-threads", "4"] ++
+    #["-v", "error", "-nostdin", "-threads", "8"] ++
     ssArgs ++ tArgs ++
     #["-i", inPath, "-fps_mode", "passthrough", "-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", rawPixFmt, "-"]
 
   let encArgs : Array String :=
     let base :=
-      #["-y", "-v", "error", "-threads", "4", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
+      #["-y", "-v", "error", "-filter_threads", "1", "-threads", "1", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
       rawInColorArgsForCs hdrCs ++
       #["-s", s!"{dstW}x{dstH}", "-r", fpsStr, "-i", "-"] ++
       ssArgs ++ tArgs ++ #["-threads", "1", "-i", inPath]
@@ -2312,6 +2325,53 @@ def transcodeMp4GeneralVerifiedIO
   let bps := if is10bit then 2 else 1
   let frameBytes := (srcYSz + 2 * srcUvSz) * bps
   let dstYSz := dstW * dstH
+  let dstUvSz := (dstW / 2) * (dstH / 2)
+  let dstFrameBytes := dstYSz + 2 * dstUvSz
+  let eagerEncBool : Bool := !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0))
+
+  let canFastPipeU8 : Bool :=
+    !is10bit &&
+    srcW >= 2 && srcH >= 2 && dstW >= 2 && dstH >= 2 &&
+    srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0 &&
+    srcW <= 32768 && srcH <= 32768 && dstW <= 32768 && dstH <= 32768 &&
+    ((filterFlags &&& 3) == 0 || LeanAV.Scale.yuv420pFilterGateSpec.gate (dstYSz, dstUvSz, dstFrameBytes)) &&
+    (dstW < 16 || dstH < 16 ||
+      lumaAcceptanceFastPathGateSpec.gate ⟨srcW, srcH, frameBytes, dstW, dstH, dstFrameBytes⟩)
+
+  if canFastPipeU8 then
+    let kernelId : UInt32 :=
+      if srcW == dstW && srcH == dstH then 1
+      else if srcW == dstW * 2 && srcH == dstH * 2 then 0
+      else if srcW == dstW * 3 && srcH == dstH * 3 then 2
+      else if (dstW / 2) >= 2 && (dstH / 2) >= 2 && (dstW / 2) % 2 == 0 && (dstH / 2) % 2 == 0 &&
+          srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 then 3
+      else 5
+    let lumaStep : UInt64 :=
+      if dstYSz == 0 then 0
+      else if lumaStatsStepSelectionGateSpec.gate (false, dstYSz) then 16
+      else 1
+    let acceptFastOk : UInt32 :=
+      if lumaAcceptanceFastPathGateSpec.gate ⟨srcW, srcH, frameBytes, dstW, dstH, dstFrameBytes⟩ then 1 else 0
+    let (report, acceptPacked) ← execPipeTranscodeU8IO
+      ffmpegBin decArgs encArgs
+      srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
+      kernelId filterFlags outputFrameLimit
+      (if eagerEncBool then 1 else 0) lumaStep acceptFastOk
+    if report == 0 then
+      if !isSpecialOut && !existedBefore then
+        try IO.FS.removeFile outPath catch _ => pure ()
+      return 0
+    let framesDoneFast : UInt64 := (report >>> 48) &&& 0x7FFF
+    if cliOpts.showStats then
+      let outBytes ← getFileSizeU64IO outPath
+      let summaryAudio : UInt64 := if effWithAudio && outBytes > 1024 then outBytes / 10 else 0
+      let summaryVideo : UInt64 := if outBytes > summaryAudio then outBytes - summaryAudio else outBytes
+      let overheadUpct := computeMuxingOverheadMicroPctU64 summaryVideo summaryAudio outBytes
+      IO.eprintln s!"frame={framesDoneFast} Lsize={outBytes / 1024}KiB muxing overhead: {overheadUpct / 1000000}.{overheadUpct % 1000000}%"
+    lastAcceptanceMetricsRef.set acceptPacked
+    if (filterFlags &&& 3) == 0 then
+      patchMp4HdrAndElstBoxesIO inPath outPath inMoovBuf (startMs == 0 && durMs == 0)
+    return report
 
   let needTabs : Bool :=
     ((is10bit && !LeanAV.Scale.yuv420p10leScaleGateSpec.gate (srcW, srcH, dstW, dstH, frameBytes)) ||

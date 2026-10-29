@@ -166,15 +166,25 @@ class BsfRoutingTests(unittest.TestCase):
                 self.assert_delegated(self.arguments(value), 1)
                 self.assertFalse(marker.exists())
 
-    def test_missing_value_and_unrelated_co_blockers_remain_rejected(self):
+    def test_missing_value_and_unknown_flags_remain_rejected(self):
         self.assert_rejected(["-i", str(self.source), str(self.output), "-bsf:v"])
+        for option in (["-bsf:v", "unknown_bsf"], ["-unknown_bsf_flag", "1"]):
+            with self.subTest(option=option):
+                self.assert_rejected(["-i", str(self.source), *option, str(self.output)])
         for option in (["-xerror"], ["-stream_loop", "2"], ["-c:v", "apv"], ["-f", "apv"]):
             with self.subTest(option=option):
-                self.assert_rejected(["-i", str(self.source), "-bsf:v", "trim=end=5",
-                                      *option, str(self.output)])
+                result, plan = self.plan(["-i", str(self.source), "-bsf:v", "trim=end=5",
+                                          *option, str(self.output)])
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
 
     def test_path_and_protocol_security_is_unchanged(self):
-        for unsafe in ("concat:first.mp4|second.mp4", "https://invalid.example/input.mp4",
+        self.assert_rejected(["-i", str(self.source), "-bsf:v", "'trim'=end=5",
+                              "concat:first.mp4|second.mp4"],
+                             "unsafe_protocol_or_path_traversal")
+        for unsafe in ("concat:first.mp4|../second.mp4", "concat:single.mp4",
+                       "concat:http://invalid.example/a.mp4|b.mp4",
+                       "https://invalid.example/input.mp4",
                        "file:input.mp4", "pipe:0", "/proc/self/mem", "media/../outside.mp4"):
             for position in ("input", "output"):
                 with self.subTest(unsafe=unsafe, position=position):

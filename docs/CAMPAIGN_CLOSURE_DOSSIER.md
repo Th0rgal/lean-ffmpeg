@@ -1,5 +1,12 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-29 Wave 2 integrated validation under Lean v4.35.0 audited
+**8,916 declarations with zero sorryAx/custom axioms** and **266/266 tight
+specifications** (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28,
+`NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). Build, 53 self-test waves,
+FFI/kernel checks, 136 unit tests and 58 differential tests (4 skipped) passed.
+
 The 2026-10-27 MPEG delegated-option validation under Lean v4.35.0 audited
 **8,899 declarations with zero sorryAx/custom axioms** and **264/264 tight
 specifications**. Build, 53 self-test waves, FFI/kernel checks, 64 unit tests and

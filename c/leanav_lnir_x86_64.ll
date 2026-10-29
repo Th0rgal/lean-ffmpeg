@@ -357,23 +357,29 @@ vec.body:
   %vp01 = getelementptr inbounds i8, ptr %r0_ptr, i64 %vsx1
   %vp10 = getelementptr inbounds i8, ptr %r1_ptr, i64 %vsx0
   %vp11 = getelementptr inbounds i8, ptr %r1_ptr, i64 %vsx1
-  %vr0_lo = load <16 x i8>, ptr %vp00, align 1
-  %vr0_hi = load <16 x i8>, ptr %vp01, align 1
-  %vr1_lo = load <16 x i8>, ptr %vp10, align 1
-  %vr1_hi = load <16 x i8>, ptr %vp11, align 1
-  %r0_even = shufflevector <16 x i8> %vr0_lo, <16 x i8> %vr0_hi, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
-  %r0_odd  = shufflevector <16 x i8> %vr0_lo, <16 x i8> %vr0_hi, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
-  %r1_even = shufflevector <16 x i8> %vr1_lo, <16 x i8> %vr1_hi, <16 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14, i32 16, i32 18, i32 20, i32 22, i32 24, i32 26, i32 28, i32 30>
-  %r1_odd  = shufflevector <16 x i8> %vr1_lo, <16 x i8> %vr1_hi, <16 x i32> <i32 1, i32 3, i32 5, i32 7, i32 9, i32 11, i32 13, i32 15, i32 17, i32 19, i32 21, i32 23, i32 25, i32 27, i32 29, i32 31>
-  %z00 = zext <16 x i8> %r0_even to <16 x i16>
-  %z01 = zext <16 x i8> %r0_odd to <16 x i16>
-  %z10 = zext <16 x i8> %r1_even to <16 x i16>
-  %z11 = zext <16 x i8> %r1_odd to <16 x i16>
-  %vs0 = add nuw nsw <16 x i16> %z00, %z01
-  %vs1 = add nuw nsw <16 x i16> %z10, %z11
-  %vsum = add nuw nsw <16 x i16> %vs0, %vs1
-  %vrnd = add nuw nsw <16 x i16> %vsum, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
-  %vavg = lshr <16 x i16> %vrnd, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+  %w0_lo = load <8 x i16>, ptr %vp00, align 1
+  %w0_hi = load <8 x i16>, ptr %vp01, align 1
+  %w1_lo = load <8 x i16>, ptr %vp10, align 1
+  %w1_hi = load <8 x i16>, ptr %vp11, align 1
+  %e0_lo = and <8 x i16> %w0_lo, <i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255>
+  %o0_lo = lshr <8 x i16> %w0_lo, <i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8>
+  %e0_hi = and <8 x i16> %w0_hi, <i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255>
+  %o0_hi = lshr <8 x i16> %w0_hi, <i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8>
+  %e1_lo = and <8 x i16> %w1_lo, <i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255>
+  %o1_lo = lshr <8 x i16> %w1_lo, <i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8>
+  %e1_hi = and <8 x i16> %w1_hi, <i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255>
+  %o1_hi = lshr <8 x i16> %w1_hi, <i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8>
+  %s0_lo = add nuw nsw <8 x i16> %e0_lo, %o0_lo
+  %s1_lo = add nuw nsw <8 x i16> %e1_lo, %o1_lo
+  %sum_lo = add nuw nsw <8 x i16> %s0_lo, %s1_lo
+  %rnd_lo = add nuw nsw <8 x i16> %sum_lo, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+  %avg_lo = lshr <8 x i16> %rnd_lo, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+  %s0_hi = add nuw nsw <8 x i16> %e0_hi, %o0_hi
+  %s1_hi = add nuw nsw <8 x i16> %e1_hi, %o1_hi
+  %sum_hi = add nuw nsw <8 x i16> %s0_hi, %s1_hi
+  %rnd_hi = add nuw nsw <8 x i16> %sum_hi, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+  %avg_hi = lshr <8 x i16> %rnd_hi, <i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2, i16 2>
+  %vavg = shufflevector <8 x i16> %avg_lo, <8 x i16> %avg_hi, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
   %vout = trunc <16 x i16> %vavg to <16 x i8>
   %vdst_p = getelementptr inbounds i8, ptr %dst_row, i64 %vdx
   store <16 x i8> %vout, ptr %vdst_p, align 1
@@ -1183,72 +1189,97 @@ stride.check:
   %strided = icmp eq i64 %step, 16
   br i1 %strided, label %vec4.check, label %scalar.check
 vec16.check:
-  %vec16.idx = phi i64 [ 0, %dispatch ], [ %vec16.idx.next, %vec16.body ]
-  %vec16.sum = phi i64 [ 0, %dispatch ], [ %vec16.sum.next, %vec16.body ]
-  %vec16.sumSq = phi i64 [ 0, %dispatch ], [ %vec16.sumSq.next, %vec16.body ]
-  %vec16.cnt = phi i64 [ 0, %dispatch ], [ %vec16.cnt.next, %vec16.body ]
+  %vec16.idx = phi i64 [ 0, %dispatch ], [ %vec16.idx.next, %vec16.reduce ]
+  %vec16.sum = phi i64 [ 0, %dispatch ], [ %vec16.sum.next, %vec16.reduce ]
+  %vec16.sumSq = phi i64 [ 0, %dispatch ], [ %vec16.sumSq.next, %vec16.reduce ]
+  %vec16.cnt = phi i64 [ 0, %dispatch ], [ %vec16.cnt.next, %vec16.reduce ]
   %vec16.remaining = sub i64 %nPixels, %vec16.idx
   %vec16.enough = icmp uge i64 %vec16.remaining, 16
-  br i1 %vec16.enough, label %vec16.body, label %scalar.check
+  br i1 %vec16.enough, label %vec16.chunk.ph, label %scalar.check
+vec16.chunk.ph:
+  %vec16.chunk.max = icmp ugt i64 %vec16.remaining, 65536
+  %vec16.chunk.rem = select i1 %vec16.chunk.max, i64 65536, i64 %vec16.remaining
+  %vec16.chunk.bytes = and i64 %vec16.chunk.rem, -16
+  %vec16.chunk.end = add nuw i64 %vec16.idx, %vec16.chunk.bytes
+  br label %vec16.body
 vec16.body:
-  %vp = getelementptr i8, ptr %src, i64 %vec16.idx
+  %v16.i = phi i64 [ %vec16.idx, %vec16.chunk.ph ], [ %v16.i.next, %vec16.body ]
+  %v16.accS = phi <16 x i32> [ zeroinitializer, %vec16.chunk.ph ], [ %v16.accS.next, %vec16.body ]
+  %v16.accSq = phi <16 x i32> [ zeroinitializer, %vec16.chunk.ph ], [ %v16.accSq.next, %vec16.body ]
+  %vp = getelementptr i8, ptr %src, i64 %v16.i
   %vb = load <16 x i8>, ptr %vp, align 1
-  %vraw = zext <16 x i8> %vb to <16 x i32>
-  %v16 = add <16 x i32> %vraw, zeroinitializer
+  %v16 = zext <16 x i8> %vb to <16 x i32>
   %vec16.sq = mul nuw <16 x i32> %v16, %v16
-  %vec16.sum.r = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %v16)
+  %v16.accS.next = add nuw <16 x i32> %v16.accS, %v16
+  %v16.accSq.next = add nuw <16 x i32> %v16.accSq, %vec16.sq
+  %v16.i.next = add nuw i64 %v16.i, 16
+  %v16.done = icmp eq i64 %v16.i.next, %vec16.chunk.end
+  br i1 %v16.done, label %vec16.reduce, label %vec16.body
+vec16.reduce:
+  %vec16.sum.r = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %v16.accS.next)
   %vec16.sum.wide = zext i32 %vec16.sum.r to i64
   %vec16.sum.next = add i64 %vec16.sum, %vec16.sum.wide
-  %vec16.sumSq.r = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %vec16.sq)
+  %vec16.sumSq.r = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %v16.accSq.next)
   %vec16.sumSq.wide = zext i32 %vec16.sumSq.r to i64
   %vec16.sumSq.next = add i64 %vec16.sumSq, %vec16.sumSq.wide
-  %vec16.cnt.next = add nuw i64 %vec16.cnt, 16
-  %vec16.idx.next = add nuw i64 %vec16.idx, 16
+  %vec16.cnt.next = add nuw i64 %vec16.cnt, %vec16.chunk.bytes
+  %vec16.idx.next = add nuw i64 %vec16.idx, %vec16.chunk.bytes
   br label %vec16.check
 vec4.check:
-  %vec4.idx = phi i64 [ 0, %stride.check ], [ %vec4.idx.next, %vec4.body ]
-  %vec4.sum = phi i64 [ 0, %stride.check ], [ %vec4.sum.next, %vec4.body ]
-  %vec4.sumSq = phi i64 [ 0, %stride.check ], [ %vec4.sumSq.next, %vec4.body ]
-  %vec4.cnt = phi i64 [ 0, %stride.check ], [ %vec4.cnt.next, %vec4.body ]
+  %vec4.idx = phi i64 [ 0, %stride.check ], [ %vec4.idx.next, %vec4.reduce ]
+  %vec4.sum = phi i64 [ 0, %stride.check ], [ %vec4.sum.next, %vec4.reduce ]
+  %vec4.sumSq = phi i64 [ 0, %stride.check ], [ %vec4.sumSq.next, %vec4.reduce ]
+  %vec4.cnt = phi i64 [ 0, %stride.check ], [ %vec4.cnt.next, %vec4.reduce ]
   %vec4.remaining = sub i64 %nPixels, %vec4.idx
   %vec4.enough = icmp uge i64 %vec4.remaining, 49
   br i1 %vec4.enough, label %vec4.body, label %scalar.check
 vec4.body:
-  %si0 = add i64 %vec4.idx, 0
+  %v4.i = phi i64 [ %vec4.idx, %vec4.check ], [ %v4.i.next, %vec4.body ]
+  %v4.accS = phi <4 x i32> [ zeroinitializer, %vec4.check ], [ %v4.accS.next, %vec4.body ]
+  %v4.accSq = phi <4 x i32> [ zeroinitializer, %vec4.check ], [ %v4.accSq.next, %vec4.body ]
+  %v4.iters = phi i64 [ 0, %vec4.check ], [ %v4.iters.next, %vec4.body ]
+  %si0 = add i64 %v4.i, 0
   %sp0 = getelementptr i8, ptr %src, i64 %si0
   %sb0 = load i8, ptr %sp0, align 1
-  %sr0 = zext i8 %sb0 to i32
-  %sv0 = add i32 %sr0, 0
+  %sv0 = zext i8 %sb0 to i32
   %pack0 = insertelement <4 x i32> poison, i32 %sv0, i32 0
-  %si1 = add i64 %vec4.idx, 16
+  %si1 = add i64 %v4.i, 16
   %sp1 = getelementptr i8, ptr %src, i64 %si1
   %sb1 = load i8, ptr %sp1, align 1
-  %sr1 = zext i8 %sb1 to i32
-  %sv1 = add i32 %sr1, 0
+  %sv1 = zext i8 %sb1 to i32
   %pack1 = insertelement <4 x i32> %pack0, i32 %sv1, i32 1
-  %si2 = add i64 %vec4.idx, 32
+  %si2 = add i64 %v4.i, 32
   %sp2 = getelementptr i8, ptr %src, i64 %si2
   %sb2 = load i8, ptr %sp2, align 1
-  %sr2 = zext i8 %sb2 to i32
-  %sv2 = add i32 %sr2, 0
+  %sv2 = zext i8 %sb2 to i32
   %pack2 = insertelement <4 x i32> %pack1, i32 %sv2, i32 2
-  %si3 = add i64 %vec4.idx, 48
+  %si3 = add i64 %v4.i, 48
   %sp3 = getelementptr i8, ptr %src, i64 %si3
   %sb3 = load i8, ptr %sp3, align 1
-  %sr3 = zext i8 %sb3 to i32
-  %sv3 = add i32 %sr3, 0
+  %sv3 = zext i8 %sb3 to i32
   %pack3 = insertelement <4 x i32> %pack2, i32 %sv3, i32 3
   %vec4.sq = mul nuw <4 x i32> %pack3, %pack3
-  %vec4.sum.r = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %pack3)
+  %v4.accS.next = add nuw <4 x i32> %v4.accS, %pack3
+  %v4.accSq.next = add nuw <4 x i32> %v4.accSq, %vec4.sq
+  %v4.iters.next = add nuw i64 %v4.iters, 4
+  %v4.rem.cur = sub i64 %nPixels, %v4.i
+  %v4.advance = add i64 %v4.i, 64
+  %v4.more = icmp ugt i64 %v4.rem.cur, 64
+  %v4.i.next = select i1 %v4.more, i64 %v4.advance, i64 %nPixels
+  %v4.rem.next = sub i64 %nPixels, %v4.i.next
+  %v4.can.cont = icmp uge i64 %v4.rem.next, 49
+  %v4.cap.ok = icmp ult i64 %v4.iters.next, 65536
+  %v4.cont = and i1 %v4.can.cont, %v4.cap.ok
+  br i1 %v4.cont, label %vec4.body, label %vec4.reduce
+vec4.reduce:
+  %vec4.sum.r = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %v4.accS.next)
   %vec4.sum.wide = zext i32 %vec4.sum.r to i64
   %vec4.sum.next = add i64 %vec4.sum, %vec4.sum.wide
-  %vec4.sumSq.r = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %vec4.sq)
+  %vec4.sumSq.r = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %v4.accSq.next)
   %vec4.sumSq.wide = zext i32 %vec4.sumSq.r to i64
   %vec4.sumSq.next = add i64 %vec4.sumSq, %vec4.sumSq.wide
-  %vec4.cnt.next = add nuw i64 %vec4.cnt, 4
-  %vec4.advance = add i64 %vec4.idx, 64
-  %vec4.more = icmp ugt i64 %vec4.remaining, 64
-  %vec4.idx.next = select i1 %vec4.more, i64 %vec4.advance, i64 %nPixels
+  %vec4.cnt.next = add nuw i64 %vec4.cnt, %v4.iters.next
+  %vec4.idx.next = add i64 %v4.i.next, 0
   br label %vec4.check
 scalar.check:
   %initial.idx = phi i64 [ 0, %stride.check ], [ %vec16.idx, %vec16.check ], [ %vec4.idx, %vec4.check ]
@@ -1603,10 +1634,10 @@ bx:
   br label %row
 row:
   %y = phi i64 [ 0, %bx ], [ %yn, %reduce ]
-  %sad = phi i32 [ 0, %bx ], [ %sadn, %reduce ]
-  %black = phi i32 [ 0, %bx ], [ %blackn, %reduce ]
-  %refsum = phi i32 [ 0, %bx ], [ %refn, %reduce ]
-  %sse = phi i32 [ 0, %bx ], [ %ssen, %reduce ]
+  %vsad = phi <16 x i32> [ zeroinitializer, %bx ], [ %vsadn, %reduce ]
+  %vblack = phi <16 x i32> [ zeroinitializer, %bx ], [ %vblackn, %reduce ]
+  %vrefsum = phi <16 x i32> [ zeroinitializer, %bx ], [ %vrefn, %reduce ]
+  %vsse = phi <16 x i32> [ zeroinitializer, %bx ], [ %vssen, %reduce ]
   %dy = add i64 %byi, %y
   %dr = mul i64 %dy, %dstW
   %di = add i64 %dr, %bxi
@@ -3454,18 +3485,18 @@ reduce:
   %b16 = sub <16 x i32> <i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16, i32 16>, %r
   %bd = select <16 x i1> %rge, <16 x i32> %r16, <16 x i32> %b16
   %sq = mul <16 x i32> %ad, %ad
-  %rsad = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %ad)
-  %rblack = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %bd)
-  %rref = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %r)
-  %rsse = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %sq)
-  %sadn = add i32 %sad, %rsad
-  %blackn = add i32 %black, %rblack
-  %refn = add i32 %refsum, %rref
-  %ssen = add i32 %sse, %rsse
+  %vsadn = add nuw <16 x i32> %vsad, %ad
+  %vblackn = add nuw <16 x i32> %vblack, %bd
+  %vrefn = add nuw <16 x i32> %vrefsum, %r
+  %vssen = add nuw <16 x i32> %vsse, %sq
   %yn = add i64 %y, 1
   %rowdone = icmp eq i64 %yn, 16
   br i1 %rowdone, label %blockend, label %row
 blockend:
+  %sadn = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %vsadn)
+  %blackn = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %vblackn)
+  %refn = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %vrefn)
+  %ssen = call i32 @llvm.vector.reduce.add.v16i32(<16 x i32> %vssen)
   %sad64 = zext i32 %sadn to i64
   %sq64 = zext i32 %ssen to i64
   %larger = icmp ugt i64 %sad64, %oldmax
@@ -7833,7 +7864,7 @@ entry:
   ret ptr %ret
 }
 
-attributes #0 = { nounwind uwtable "target-cpu"="x86-64-v2" }
+attributes #0 = { nounwind uwtable }
 attributes #1 = { noinline nounwind optnone uwtable }
 attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }
 

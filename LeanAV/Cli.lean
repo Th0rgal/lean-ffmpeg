@@ -60,8 +60,12 @@ def isOtherFFmpegCodecName (s : String) : Bool :=
   let isPcm := ['p', 'c', 'm', '_'].isPrefixOf cs && cs.length > 4
   let isAdpcm := ['a', 'd', 'p', 'c', 'm', '_'].isPrefixOf cs && cs.length > 6
   isPcm || isAdpcm ||
-  ["ljpeg", "jpegls", "apng", "bmp", "pam", "pbm", "pgm", "pgmyuv", "ppm", "pnm", "targa", "tiff",
+  ["ljpeg", "jpegls", "jpeg2000", "apng", "bmp", "pam", "pbm", "pgm", "pgmyuv", "ppm", "pnm", "targa", "tiff",
    "dpx", "sgi", "sunrast", "pcx", "qoi", "webp", "libwebp", "libwebp_anim", "xbm", "xwd",
+   "alias_pix", "avui", "apv", "brender_pix", "comfortnoise", "dsd_msbf", "dvbsub", "dxv",
+   "fits", "flashsv", "flashsv2", "libastcenc", "pdv", "vbn",
+   "ffvhuff420p12", "ffvhuff422p10left", "ffvhuff444", "ffvhuff444p16",
+   "huffyuvbgr24", "huffyuvbgra", "mp3float", "msrle", "rpza", "s302m", "smc", "xface",
    "dnxhd", "dvvideo", "flv", "flv1", "h261", "h263", "h263p", "msmpeg4", "msmpeg4v2", "msmpeg4v1",
    "wmv1", "wmv2", "rv10", "rv20", "svq1", "qtrle", "cinepak", "msvideo1", "cljr",
    "r210", "v210", "v308", "v408", "v410", "y41p", "yuv4", "zlib", "snow", "asv1", "asv2",
@@ -297,6 +301,8 @@ def parseVideoSizeSpec (s : String) : Option (Nat × Nat) :=
   else if s == "hd720" then some (1280, 720)
   else if s == "hd1080" then some (1920, 1080)
   else if s == "2k" then some (2048, 1080)
+  else if s == "2kflat" then some (1998, 1080)
+  else if s == "2kscope" then some (2048, 858)
   else if s == "4k" || s == "uhd2160" then some (3840, 2160)
   else if s == "uhd4320" then some (7680, 4320)
   else
@@ -342,12 +348,14 @@ def supportedFormat (s : String) : Bool :=
    "sbc", "dfpwm", "rso", "mmf", "aea", "ilbc", "adx", "flm",
    "s16be", "s24le", "s24be", "s32le", "s32be", "s8", "u8",
    "u16le", "u16be", "u24le", "u24be", "u32le", "u32be", "f32le", "f32be", "f64le", "f64be", "alaw", "mulaw", "vidc",
-   "h264", "hevc", "vvc", "av1", "mjpeg", "dnxhd", "h261", "h263", "yuv4mpegpipe", "y4m",
-   "image2pipe", "apng", "gif", "webp", "fits",
+   "h264", "hevc", "vvc", "av1", "apv", "obu", "mjpeg", "dnxhd", "h261", "h263", "yuv4mpegpipe", "y4m",
+   "image2pipe", "jpeg_pipe", "jpeg_mpf", "png_pipe", "alias_pix", "avif", "apng", "gif", "webp",
+   "fits", "astc", "ktx", "pdv", "data",
+   "alp", "apm", "aptx", "aptx_hd", "argo_asf", "daud", "kvag", "wsaud",
    "srt", "subrip", "webvtt", "vtt", "ass", "ssa", "jacosub", "microdvd", "mpl2", "pjs",
-   "realtext", "sami", "scc", "stl", "subviewer", "ttml", "vplayer", "lrc",
+   "realtext", "sami", "scc", "mcc", "rcwt", "sup", "vobsub", "stl", "subviewer", "ttml", "vplayer", "lrc",
    "ffmetadata", "hash", "framehash", "streamhash",
-   "tee", "fifo", "segment", "stream_segment", "hls", "dash"].contains s
+   "tee", "fifo", "segment", "ssegment", "stream_segment", "hls", "dash", "webm_dash_manifest"].contains s
 
 /-- Supported `-preset` encoder tokens. -/
 def supportedPreset (s : String) : Bool :=
@@ -367,10 +375,10 @@ def supportedPixFmt (s : String) : Bool :=
    "yuvj420p", "yuvj422p", "yuvj444p", "yuvj411p", "yuvj440p",
    "yuva420p", "yuva422p", "yuva444p",
    "yuv420p9le", "yuv420p9be", "yuv422p9le", "yuv422p9be", "yuv444p9le", "yuv444p9be",
-   "yuv420p10be", "yuv422p10", "yuv422p10le", "yuv422p10be", "yuv444p10le", "yuv444p10be",
-   "yuv420p12le", "yuv420p12be", "yuv422p12le", "yuv422p12be", "yuv444p12le", "yuv444p12be",
+   "yuv420p10", "yuv420p10be", "yuv422p10", "yuv422p10le", "yuv422p10be", "yuv444p10", "yuv444p10le", "yuv444p10be",
+   "yuv420p12", "yuv420p12le", "yuv420p12be", "yuv422p12", "yuv422p12le", "yuv422p12be", "yuv444p12", "yuv444p12le", "yuv444p12be",
    "yuv420p14le", "yuv420p14be", "yuv422p14le", "yuv422p14be", "yuv444p14le", "yuv444p14be",
-   "yuv420p16le", "yuv420p16be", "yuv422p16le", "yuv422p16be", "yuv444p16le", "yuv444p16be",
+   "yuv420p16le", "yuv420p16be", "yuv422p16le", "yuv422p16be", "yuv444p16", "yuv444p16le", "yuv444p16be",
    "nv21", "nv16", "nv24", "nv42", "p010be", "p016le", "p016be",
    "p410le", "p410be", "p412le", "p412be", "p416le", "p416be",
    "gray", "gray8", "ya8", "gray9le", "gray9be", "gray10le", "gray10be",
@@ -378,12 +386,12 @@ def supportedPixFmt (s : String) : Bool :=
    "monow", "monob", "pal8",
    "rgb24", "bgr24", "argb", "rgba", "abgr", "bgra", "0rgb", "rgb0", "0bgr", "bgr0",
    "rgb32", "bgr32", "rgb565", "bgr565", "rgb555", "bgr555", "rgb444", "bgr444",
-   "rgb48le", "rgb48be", "bgr48le", "bgr48be", "rgba64le", "rgba64be", "bgra64le", "bgra64be",
+   "rgb48", "rgb48le", "rgb48be", "bgr48le", "bgr48be", "rgba64le", "rgba64be", "bgra64le", "bgra64be",
    "rgb565le", "rgb565be", "rgb555le", "rgb555be", "rgb444le", "rgb444be",
    "bgr565le", "bgr565be", "bgr555le", "bgr555be", "bgr444le", "bgr444be",
    "rgb8", "bgr8", "rgb4_byte", "bgr4_byte", "rgb4", "bgr4",
    "uyvy422", "yuyv422", "yvyu422", "uyyv411",
-   "gbrp", "gbrp9le", "gbrp9be", "gbrp10le", "gbrp10be", "gbrp12le", "gbrp12be",
+   "gbrp", "gbrp9le", "gbrp9be", "gbrp10le", "gbrp10be", "gbrp12", "gbrp12le", "gbrp12be",
    "gbrp14le", "gbrp14be", "gbrp16le", "gbrp16be",
    "gbrap", "gbrap10le", "gbrap10be", "gbrap12le", "gbrap12be", "gbrap16le", "gbrap16be",
    "xyz12le", "xyz12be", "ayuv64le", "ayuv64be",
@@ -396,7 +404,7 @@ def supportedPixFmt (s : String) : Bool :=
    "yuv444p12msble", "yuva420p10be", "yuva420p10le", "yuva420p16be", "yuva420p16le",
    "yuva420p9be", "yuva420p9le", "yuva422p10be", "yuva422p10le", "yuva422p12be", "yuva422p12le",
    "yuva422p16be", "yuva422p16le", "yuva422p9be", "yuva422p9le", "yuva444p10be", "yuva444p10le",
-   "yuva444p12be", "yuva444p12le", "yuva444p16be", "yuva444p16le", "yuva444p9be", "yuva444p9le"].contains s
+   "yuva444p12be", "yuva444p12le", "yuva444p16", "yuva444p16be", "yuva444p16le", "yuva444p9be", "yuva444p9le"].contains s
 
 /-- Supported `-loglevel` / `-v` tokens. -/
 def supportedLogLevel (s : String) : Bool :=
@@ -409,14 +417,18 @@ def isValidCrfSpec (s : String) : Bool :=
   | some sec => sec.den > 0 && sec.num <= 63 * sec.den
   | none => false
 
-/-- Check if a string is a valid bitrate token (`"4M"`, `"4500k"`, `"192k"`, `"5000000"`). -/
+/-- Check if a string is a valid bitrate token (`"4M"`, `"4500k"`, `"6.3k"`, `"192k"`, `"5000000"`). -/
 def isValidBitrateSpec (s : String) : Bool :=
   let chars := s.toList
   match chars.reverse with
   | [] => false
   | last :: revInit =>
     if last == 'k' || last == 'K' || last == 'm' || last == 'M' then
-      (parseNatCharsLoop revInit.reverse 0 false).isSome
+      let body := revInit.reverse
+      (parseNatCharsLoop body 0 false).isSome ||
+      (match parseDecimalSecondsChars body with
+       | some sec => sec.num > 0 && sec.den > 0
+       | none     => false)
     else
       (parseNatCharsLoop chars 0 false).isSome
 
@@ -523,7 +535,7 @@ def applyCliFlagValue (flag value : String) (cfg : CliConfig) : CliConfig :=
     | some n => { cfg with bFrames := some n }
     | none => cfg.fail (.unsupportedCodecOrFlag ("-bf " ++ value))
   else if flag == "-g" then
-    match parsePosNatSpec value with
+    match parseNonNegNatSpec value with
     | some n => { cfg with gopSize := some n }
     | none => cfg.fail (.unsupportedCodecOrFlag ("-g " ++ value))
   else if flag == "-frames:v" || flag == "-vframes" || flag == "-frames" then
