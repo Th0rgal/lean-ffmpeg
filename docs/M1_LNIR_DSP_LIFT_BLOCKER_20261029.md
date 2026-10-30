@@ -81,9 +81,11 @@ Consequences:
   routines and wired via direct LLVM `call i64 @lnir_px_*` calls to **17 compiled scalar
   `LNIR_WIRE_V1` pixel-core declarations** (1-based decls 30–46, bindings `d29..d45`, in `LeanAV/NativeKernels.lean`,
   plus SIMD decl 29, binding `d28b`, `bt2020_to_bt709_uv_simd`, bringing `c/leanav_lnir_kernels.lnir` to
-  **46/46** `SymbolicTV`-validated and `verify-certs`-certified declarations and
-  `turbo-lean audit-spec` to **300/300** `non_vacuous_and_tight` specs across **9,065**
-  Lean declarations).
+  **46/46** `SymbolicTV`-validated and `verify-certs`-certified declarations (`184` pass
+  certificates) and `turbo-lean audit-spec` to **300/300** `non_vacuous_and_tight` specs
+  across **9,065** Lean declarations on the M1-A2 branch, integrated into
+  `campaign/m1-complete-20261029` at **428/428** `non_vacuous_and_tight` specs across
+  **12,019** Lean declarations in 20 modules / `38,045` LOC).
 - **§6.8 Explicit TCB Disclosure**: the 14 thin outer shells (`1,454` lines in
   `c/leanav_lnir_{x86_64,arm64}.ll`, deterministically emitted by
   `scripts/gen_lnir_outer_shells.py` and checked for zero drift by

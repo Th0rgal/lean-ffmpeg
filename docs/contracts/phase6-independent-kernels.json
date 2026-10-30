@@ -51,6 +51,63 @@
       ]
     },
     {
+      "id": "native_zero_exec_stream_copy_and_remux",
+      "entry_point": "LeanAV.Format.nativeRemuxBytes",
+      "underlying_spec": "LeanAV.Format.remuxNativeMp4Container / LeanAV.Format.remuxNativeMkv",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Format.isExplicitSdrCodePoint_accepts_sdr_and_rejects_unspecified_or_hdr",
+        "LeanAV.Format.nativeCoalescableMp4Pcm_audio_only_universal",
+        "LeanAV.Format.nativeSelectedStreamsCopiedOk_single_universal",
+        "LeanAV.Format.elst_rescale_mvhd_mdhd_mismatch"
+      ],
+      "fallback_conditions": [
+        "cross_container_stream_copy_requested",
+        "native_stream_copy_layout_unsupported",
+        "multi_entry_stsd_sample_description",
+        "duplicate_or_combined_pre_and_post_seek_flags"
+      ]
+    },
+    {
+      "id": "standalone_png_zlib_and_flac_lossless_codecs",
+      "entry_point": "LeanAV.PlanIR.decodePngIndependentOrFallback / LeanAV.PlanIR.decodeFlacIndependentOrFallback",
+      "underlying_spec": "LeanAV.Video.pngEncode / LeanAV.Audio.flacEncodeStream",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Bitstream.zlibHeaderGateSpec_iff",
+        "LeanAV.Bitstream.deflateTreeGateSpec_iff",
+        "LeanAV.Video.pngEncodeWith_decode_all_filters_roundtrip",
+        "LeanAV.Video.pngDownscale16To8_rep_exact",
+        "LeanAV.Audio.flacStream_and_stereo_modes_roundtrip",
+        "LeanAV.Audio.flacRiceResidualGateSpec_iff",
+        "LeanAV.Audio.flacAudioFrame_all_depths_roundtrip",
+        "LeanAV.PlanIR.standaloneLosslessPlanGateSpec_iff",
+        "LeanAV.PlanIR.losslessDecode3Way_trichotomy_verified"
+      ],
+      "fallback_conditions": [
+        "unsupported_png_color_type_or_bit_depth_combination",
+        "unsupported_wav_or_pcm_channel_layout_or_sample_format",
+        "out_of_domain_filter_or_resampling_requested"
+      ]
+    },
+    {
+      "id": "lnir_wire_v1_dsp_and_pixel_core_suite",
+      "entry_point": "LeanAV.NativeKernels.emitLeanAvLnirWire",
+      "underlying_spec": "LeanAV.NativeKernels.evalLnirKernel (46 LNIR_WIRE_V1 declarations, 184 pass certificates, 14 zero-drift outer shells)",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.NativeKernels.checkLnirKernel_sound",
+        "LeanAV.NativeKernels.verifyLnirSArrayContract_sound",
+        "LeanAV.NativeKernels.evalLnir_swscale_down2x2_box_equiv",
+        "LeanAV.NativeKernels.evalLnir_swscale_down3x3_box_equiv",
+        "LeanAV.NativeKernels.evalLnir_swscale_down3to2_bilinear_equiv",
+        "LeanAV.NativeKernels.evalLnir_av1_cdef_dir_filter_equiv"
+      ],
+      "fallback_conditions": [
+        "plane_sarray_alignment_or_bounds_contract_violation"
+      ]
+    },
+    {
       "id": "ffv1_v3_lossless_codec_and_containers",
       "entry_point": "LeanAV.Ffv1Pipeline.executeFfv1Pure",
       "underlying_spec": "LeanAV.Ffv1.encodeFrameV3 / LeanAV.Ffv1.decodeFrameV3",
