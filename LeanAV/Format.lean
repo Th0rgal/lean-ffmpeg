@@ -6872,4 +6872,147 @@ theorem mp4BoxLocator_and_bePatch_verified :
     baRdU32BE patched 0 = 0x00000024 := by
   decide
 
+def muxWavPcmLE (channelsData : Array (Array Int32)) (sampleRate : UInt32) (bps : Nat) : ByteArray := Id.run do
+  let numChannels := channelsData.size
+  let numSamples := if numChannels == 0 then 0 else (channelsData.getD 0 #[]).size
+  let bytesPerSample := (bps + 7) / 8
+  let dataBytes := numSamples * numChannels * bytesPerSample
+  let riffSize := 36 + dataBytes
+  let byteRate := sampleRate * numChannels.toUInt32 * bytesPerSample.toUInt32
+  let blockAlign : UInt16 := (numChannels * bytesPerSample).toUInt16
+  let mut out := ByteArray.emptyWithCapacity (44 + dataBytes)
+  out := pushFourCC out 'R' 'I' 'F' 'F'
+  out := pushU32LE out riffSize.toUInt32
+  out := pushFourCC out 'W' 'A' 'V' 'E'
+  out := pushFourCC out 'f' 'm' 't' ' '
+  out := pushU32LE out 16
+  out := pushU16LE out 1
+  out := pushU16LE out numChannels.toUInt16
+  out := pushU32LE out sampleRate
+  out := pushU32LE out byteRate
+  out := pushU16LE out blockAlign
+  out := pushU16LE out (bytesPerSample * 8).toUInt16
+  out := pushFourCC out 'd' 'a' 't' 'a'
+  out := pushU32LE out dataBytes.toUInt32
+  for i in [:numSamples] do
+    for ch in [:numChannels] do
+      let v := (channelsData.getD ch #[]).getD i 0
+      if bytesPerSample == 1 then
+        out := out.push ((v + 128).toUInt32 &&& 0xFF).toUInt8
+      else
+        let u := v.toUInt32
+        for b in [:bytesPerSample] do
+          out := out.push ((u >>> (8 * b).toUInt32) &&& 0xFF).toUInt8
+  return out
+
+def demuxWavPcmLE (s : ByteSlice) : Option (Array (Array Int32) × UInt32 × Nat) := Id.run do
+  if s.len < 44 then return none
+  if !fourCCEq s 0 'R' 'I' 'F' 'F' || !fourCCEq s 8 'W' 'A' 'V' 'E' then return none
+  let mut pos : Nat := 12
+  let mut channels : Nat := 0
+  let mut sampleRate : UInt32 := 0
+  let mut bps : Nat := 0
+  let mut audioFmt : Nat := 0
+  let mut dataOff : Nat := 0
+  let mut dataBytes : Nat := 0
+  let mut fuel : Nat := 64
+  while pos + 8 <= s.len && fuel > 0 do
+    fuel := fuel - 1
+    let cSize := (readU32LE s (pos + 4)).toNat
+    if fourCCEq s pos 'f' 'm' 't' ' ' && pos + 8 + cSize <= s.len && cSize >= 16 then
+      audioFmt := (readU16LE s (pos + 8)).toNat
+      channels := (readU16LE s (pos + 10)).toNat
+      sampleRate := readU32LE s (pos + 12)
+      bps := (readU16LE s (pos + 22)).toNat
+      if audioFmt == 0xFFFE && cSize >= 40 then
+        let validBps := (readU16LE s (pos + 26)).toNat
+        let subFmt := (readU16LE s (pos + 32)).toNat
+        if subFmt == 1 then
+          audioFmt := 1
+          if validBps > 0 then bps := validBps
+    else if fourCCEq s pos 'd' 'a' 't' 'a' && pos + 8 + cSize <= s.len then
+      dataOff := pos + 8
+      dataBytes := cSize
+      break
+    let padded := cSize + (cSize % 2)
+    pos := pos + 8 + padded
+  if audioFmt != 1 || channels == 0 || channels > 8 || sampleRate == 0 || dataOff == 0 then return none
+  if bps != 8 && bps != 16 && bps != 24 && bps != 32 then return none
+  if dataOff + dataBytes > s.len then return none
+  let bytesPerSample := bps / 8
+  let frameBytes := channels * bytesPerSample
+  if frameBytes == 0 then return none
+  let numSamples := dataBytes / frameBytes
+  let mut chans := Array.replicate channels (Array.mkEmpty numSamples)
+  for i in [:numSamples] do
+    for ch in [:channels] do
+      let off := dataOff + i * frameBytes + ch * bytesPerSample
+      let v : Int32 :=
+        if bytesPerSample == 1 then
+          Int32.ofInt (((s.getByteD off 0).toNat : Int) - 128)
+        else if bytesPerSample == 2 then
+          let u := (readU16LE s off).toNat
+          if u >= 0x8000 then Int32.ofInt ((u : Int) - 65536) else Int32.ofInt (u : Int)
+        else if bytesPerSample == 3 then
+          let u := (s.getByteD off 0).toNat ||| ((s.getByteD (off + 1) 0).toNat <<< 8) |||
+            ((s.getByteD (off + 2) 0).toNat <<< 16)
+          if u >= 0x800000 then Int32.ofInt ((u : Int) - 0x1000000) else Int32.ofInt (u : Int)
+        else
+          let u := (readU32LE s off).toNat
+          if u >= 0x80000000 then Int32.ofInt ((u : Int) - 0x100000000) else Int32.ofInt (u : Int)
+      chans := chans.set! ch ((chans.getD ch #[]).push v)
+  return some (chans, sampleRate, bps)
+
+def pcmRawLEToChannels (s : ByteSlice) (channels bps : Nat) : Option (Array (Array Int32)) := Id.run do
+  if channels == 0 || channels > 8 then return none
+  if bps != 8 && bps != 16 && bps != 24 && bps != 32 then return none
+  let bytesPerSample := bps / 8
+  let frameBytes := channels * bytesPerSample
+  if s.len % frameBytes != 0 then return none
+  let numSamples := s.len / frameBytes
+  let mut chans := Array.replicate channels (Array.mkEmpty numSamples)
+  for i in [:numSamples] do
+    for ch in [:channels] do
+      let off := i * frameBytes + ch * bytesPerSample
+      let v : Int32 :=
+        if bytesPerSample == 1 then
+          Int32.ofInt (((s.getByteD off 0).toNat : Int) - 128)
+        else if bytesPerSample == 2 then
+          let u := (readU16LE s off).toNat
+          if u >= 0x8000 then Int32.ofInt ((u : Int) - 65536) else Int32.ofInt (u : Int)
+        else if bytesPerSample == 3 then
+          let u := (s.getByteD off 0).toNat ||| ((s.getByteD (off + 1) 0).toNat <<< 8) |||
+            ((s.getByteD (off + 2) 0).toNat <<< 16)
+          if u >= 0x800000 then Int32.ofInt ((u : Int) - 0x1000000) else Int32.ofInt (u : Int)
+        else
+          let u := (readU32LE s off).toNat
+          if u >= 0x80000000 then Int32.ofInt ((u : Int) - 0x100000000) else Int32.ofInt (u : Int)
+      chans := chans.set! ch ((chans.getD ch #[]).push v)
+  return some chans
+
+def channelsToPcmRawLE (channelsData : Array (Array Int32)) (bps : Nat) : ByteArray := Id.run do
+  let numChannels := channelsData.size
+  let numSamples := if numChannels == 0 then 0 else (channelsData.getD 0 #[]).size
+  let bytesPerSample := (bps + 7) / 8
+  let mut out := ByteArray.emptyWithCapacity (numSamples * numChannels * bytesPerSample)
+  for i in [:numSamples] do
+    for ch in [:numChannels] do
+      let v := (channelsData.getD ch #[]).getD i 0
+      if bytesPerSample == 1 then
+        out := out.push ((v + 128).toUInt32 &&& 0xFF).toUInt8
+      else
+        let u := v.toUInt32
+        for b in [:bytesPerSample] do
+          out := out.push ((u >>> (8 * b).toUInt32) &&& 0xFF).toUInt8
+  return out
+
+def scaleAudioSampleBps (v : Int32) (srcBps dstBps : Nat) : Int32 :=
+  if srcBps == dstBps then v
+  else if dstBps > srcBps then v <<< Int32.ofNat (dstBps - srcBps)
+  else v >>> Int32.ofNat (srcBps - dstBps)
+
+def scaleChannelsBps (channelsData : Array (Array Int32)) (srcBps dstBps : Nat) : Array (Array Int32) :=
+  if srcBps == dstBps then channelsData
+  else channelsData.map (fun ch => ch.map (fun v => scaleAudioSampleBps v srcBps dstBps))
+
 end LeanAV.Format

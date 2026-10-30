@@ -2977,6 +2977,25 @@ def pngIhdrGateSpec : AVGateSpec PngIhdr PngIhdrSafe where
   nonVacuous := by decide
   tight := by decide
 
+theorem pngIhdrGateSpec_iff (h : PngIhdr) : pngIhdrGateSpec.gate h = true ↔ PngIhdrSafe h :=
+  pngIhdrGateSpec.iff_safe h
+
+def pngFilterTypeSafe (f : Nat) : Prop := f ≤ 4
+
+instance (f : Nat) : Decidable (pngFilterTypeSafe f) := inferInstanceAs (Decidable (_ ≤ _))
+
+def pngFilterGateSpec : AVGateSpec Nat pngFilterTypeSafe where
+  gate := fun f => decide (pngFilterTypeSafe f)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := 4
+  negWitness := 5
+  nonVacuous := by decide
+  tight := by decide
+
+theorem pngFilterGateSpec_iff (f : Nat) : pngFilterGateSpec.gate f = true ↔ pngFilterTypeSafe f :=
+  pngFilterGateSpec.iff_safe f
+
 def pngChannels (colorType : Nat) : Nat :=
   match colorType with | 0 | 3 => 1 | 2 => 3 | 4 => 2 | 6 => 4 | _ => 0
 
@@ -3006,15 +3025,23 @@ termination_by fr.size - i
 
 def pngUnfilterRowA (f bpp : Nat) (fr prev : Array UInt8) : Array UInt8 := pngUnfilterGo f bpp fr prev 0 #[]
 
+def pngUnfilterListGo (f bpp : Nat) (fr : List UInt8) (prev : Array UInt8) (i : Nat) (acc : List UInt8) : Array UInt8 :=
+  match fr with
+  | [] => acc.toArray
+  | b :: rest =>
+    let cur := acc.toArray
+    let v := b + pngPred f (pngLeft cur bpp i) (prev.getD i 0) (pngLeft prev bpp i)
+    pngUnfilterListGo f bpp rest prev (i + 1) (acc ++ [v])
+
 theorem pngLeft_extract (row : Array UInt8) (bpp i : Nat) (hb : 0 < bpp) :
     pngLeft (row.extract 0 i) bpp i = pngLeft row bpp i := by
   unfold pngLeft
   split
   · simp only [Array.getD_eq_getD_getElem?, Array.getElem?_extract]
     by_cases h2 : i - bpp < row.size
-    · rw [if_pos (by omega)]
+    · rw [ite_eq_left_iff.mpr (fun h => absurd (by omega) h)]
       simp
-    · rw [if_neg (by omega)]
+    · rw [ite_eq_right_iff.mpr (fun h => absurd h (by omega))]
       simp [Array.getElem?_eq_none (by omega : row.size ≤ i - bpp)]
   · rfl
 
@@ -3029,13 +3056,13 @@ theorem pngUnfilterGo_spec (f bpp : Nat) (hb : 0 < bpp) (row prev : Array UInt8)
   | zero =>
     intro i hi
     unfold pngUnfilterGo
-    rw [if_neg (by rw [pngFilterRowA_size]; omega)]
+    rw [ite_eq_right_iff.mpr (fun h => by rw [pngFilterRowA_size] at h; omega)]
     simp [show row.size ≤ i by omega]
   | succ k ih =>
     intro i hi
     unfold pngUnfilterGo
     have hi' : i < row.size := by omega
-    rw [if_pos (by rw [pngFilterRowA_size]; omega)]
+    rw [ite_eq_left_iff.mpr (fun h => by rw [pngFilterRowA_size] at h; omega)]
     have hget : (pngFilterRowA f bpp row prev).getD i 0 =
         row.getD i 0 - pngPred f (pngLeft row bpp i) (prev.getD i 0) (pngLeft prev bpp i) := by
       simp [pngFilterRowA, Array.getD_eq_getD_getElem?, hi']
@@ -3061,6 +3088,12 @@ theorem pngUnfilterRowA_filter (f bpp : Nat) (hb : 0 < bpp) (row prev : Array UI
   have := pngUnfilterGo_spec f bpp hb row prev row.size 0 (by omega)
   simpa [pngUnfilterRowA] using this
 
+def pngFilterListGo (f bpp : Nat) (row : Array UInt8) (prev : Array UInt8) (i : Nat) : List UInt8 → List UInt8
+  | [] => []
+  | b :: rest =>
+    let v := b - pngPred f (pngLeft row bpp i) (prev.getD i 0) (pngLeft prev bpp i)
+    v :: pngFilterListGo f bpp row prev (i + 1) rest
+
 def pngUnfilterRow (filter : Nat) (row prev : ByteArray) (bpp : Nat) : Option ByteArray :=
   if row.size != prev.size || filter > 4 then none else some ⟨pngUnfilterRowA filter bpp row.data prev.data⟩
 
@@ -3085,6 +3118,26 @@ theorem pngUnfilterRowsA_filter (f bpp : Nat) (hb : 0 < bpp) :
     simp only [pngFilterRowsA, pngUnfilterRowsA, pngUnfilterRowA_filter f bpp hb]
     rw [pngUnfilterRowsA_filter f bpp hb rs r]
 
+def pngFilterAdaptiveRowsA (bpp : Nat) (prev : Array UInt8) :
+    List (Nat × Array UInt8) → List (Nat × Array UInt8)
+  | [] => []
+  | (f, r) :: rs => (f, pngFilterRowA f bpp r prev) :: pngFilterAdaptiveRowsA bpp r rs
+
+def pngUnfilterAdaptiveRowsA (bpp : Nat) (prev : Array UInt8) :
+    List (Nat × Array UInt8) → List (Array UInt8)
+  | [] => []
+  | (f, r) :: rs =>
+    let d := pngUnfilterRowA f bpp r prev
+    d :: pngUnfilterAdaptiveRowsA bpp d rs
+
+theorem pngUnfilterAdaptiveRowsA_filter (bpp : Nat) (hb : 0 < bpp) :
+    ∀ (rows : List (Nat × Array UInt8)) (prev : Array UInt8),
+      pngUnfilterAdaptiveRowsA bpp prev (pngFilterAdaptiveRowsA bpp prev rows) = rows.map Prod.snd
+  | [], _ => rfl
+  | (f, r) :: rs, prev => by
+    simp only [pngFilterAdaptiveRowsA, pngUnfilterAdaptiveRowsA, pngUnfilterRowA_filter f bpp hb, List.map]
+    rw [pngUnfilterAdaptiveRowsA_filter bpp hb rs r]
+
 theorem pngUnfilterRow_filter (f bpp : Nat) (hb : 0 < bpp) (hf : f ≤ 4) (row prev : ByteArray)
     (hs : row.size = prev.size) (enc : ByteArray) (he : pngFilterRow f row prev bpp = some enc) :
     pngUnfilterRow f enc prev bpp = some row := by
@@ -3102,38 +3155,102 @@ theorem pngUnfilterRow_filter (f bpp : Nat) (hb : 0 < bpp) (hf : f ≤ 4) (row p
   rw [hc2]
   simp [pngUnfilterRowA_filter f bpp hb]
 
-def pngUnfilterScanlines (data : ByteArray) (width height channels bitDepth : Nat) : Option ByteArray := Id.run do
-  let rowBytes := pngRowBytes width channels bitDepth
-  let bpp := pngBytesPerPixel channels bitDepth
-  if data.size != height * (rowBytes + 1) then return none
-  let mut out : ByteArray := ByteArray.empty
-  let mut prev : ByteArray := ⟨Array.replicate rowBytes 0⟩
-  for y in [0:height] do
+def pngSliceRange (b : ByteArray) (off len : Nat) : ByteArray :=
+  if b.data.toList.length ≤ 1024 then
+    { data := ((b.data.toList.drop off).take len).toArray }
+  else
+    b.extract off (off + len)
+
+def pngAppendBytes (a b : ByteArray) : ByteArray :=
+  if a.data.toList.length + b.data.toList.length ≤ 1024 then
+    { data := (a.data.toList ++ b.data.toList).toArray }
+  else
+    a ++ b
+
+def pngUnfilterScanlinesLoop (data : ByteArray) (rowBytes bpp y height : Nat)
+    (prev out : ByteArray) : Option ByteArray :=
+  match height with
+  | 0 => some out
+  | rem + 1 =>
     let off := y * (rowBytes + 1)
     let filter := (data.data.getD off 0).toNat
-    let row := data.extract (off + 1) (off + 1 + rowBytes)
-    match pngUnfilterRow filter row prev bpp with
-    | none => return none
-    | some decoded =>
-      out := out ++ decoded
-      prev := decoded
-  return some out
+    if filter > 4 then none
+    else
+      let row := pngSliceRange data (off + 1) rowBytes
+      if row.data.toList.length != prev.data.toList.length then none
+      else
+        let decoded : ByteArray :=
+          if rowBytes ≤ 64 then
+            ⟨pngUnfilterListGo filter bpp row.data.toList prev.data 0 []⟩
+          else
+            ⟨pngUnfilterRowA filter bpp row.data prev.data⟩
+        pngUnfilterScanlinesLoop data rowBytes bpp (y + 1) rem decoded (pngAppendBytes out decoded)
 
-def pngFilterScanlines (pixels : ByteArray) (width height channels bitDepth filter : Nat) : Option ByteArray := Id.run do
+def pngUnfilterScanlines (data : ByteArray) (width height channels bitDepth : Nat) : Option ByteArray :=
   let rowBytes := pngRowBytes width channels bitDepth
   let bpp := pngBytesPerPixel channels bitDepth
-  if pixels.size != height * rowBytes then return none
-  let mut out : ByteArray := ByteArray.empty
-  let mut prev : ByteArray := ⟨Array.replicate rowBytes 0⟩
-  for y in [0:height] do
-    let row := pixels.extract (y * rowBytes) ((y + 1) * rowBytes)
-    match pngFilterRow filter row prev bpp with
-    | none => return none
-    | some encoded =>
-      out := out.push filter.toUInt8
-      out := out ++ encoded
-      prev := row
-  return some out
+  if data.data.toList.length != height * (rowBytes + 1) then none
+  else
+    pngUnfilterScanlinesLoop data rowBytes bpp 0 height ⟨(List.replicate rowBytes 0).toArray⟩ { data := #[] }
+
+def pngRowSad (fr : Array UInt8) : Nat :=
+  fr.toList.foldl (fun acc b => acc + (if b.toNat ≤ 127 then b.toNat else 256 - b.toNat)) 0
+
+def pngBestFilterRowList (bpp : Nat) (row prev : Array UInt8) : Nat × List UInt8 :=
+  let c0 := pngFilterListGo 0 bpp row prev 0 row.toList
+  let init := (0, c0, pngRowSad c0.toArray)
+  let step (st : Nat × List UInt8 × Nat) (f : Nat) : Nat × List UInt8 × Nat :=
+    let cand := pngFilterListGo f bpp row prev 0 row.toList
+    let cost := pngRowSad cand.toArray
+    if cost < st.2.2 then (f, cand, cost) else st
+  let (bf, br, _) := ([1, 2, 3, 4] : List Nat).foldl step init
+  (bf, br)
+
+def pngBestFilterRowA (bpp : Nat) (row prev : Array UInt8) : Nat × Array UInt8 := Id.run do
+  let f0 := pngFilterRowA 0 bpp row prev
+  let mut bestF := 0
+  let mut bestRow := f0
+  let mut bestCost := pngRowSad f0
+  for f in [1, 2, 3, 4] do
+    let cand := pngFilterRowA f bpp row prev
+    let cost := pngRowSad cand
+    if cost < bestCost then
+      bestF := f
+      bestRow := cand
+      bestCost := cost
+  return (bestF, bestRow)
+
+def pngFilterScanlinesLoop (pixels : ByteArray) (rowBytes bpp filter y : Nat) :
+    Nat → ByteArray → ByteArray → Option ByteArray
+  | 0, _, out => some out
+  | rem + 1, prev, out =>
+    let row := pngSliceRange pixels (y * rowBytes) rowBytes
+    if filter == 5 then
+      let (fBest, encBytes) :=
+        if rowBytes ≤ 64 then
+          let (fb, rl) := pngBestFilterRowList bpp row.data prev.data
+          (fb, ({ data := rl.toArray } : ByteArray))
+        else
+          let (fb, ra) := pngBestFilterRowA bpp row.data prev.data
+          (fb, ⟨ra⟩)
+      let stepOut := pngAppendBytes (pngAppendBytes out { data := #[fBest.toUInt8] }) encBytes
+      pngFilterScanlinesLoop pixels rowBytes bpp filter (y + 1) rem row stepOut
+    else if filter > 4 || row.data.toList.length != prev.data.toList.length then none
+    else
+      let encBytes : ByteArray :=
+        if rowBytes ≤ 64 then
+          { data := (pngFilterListGo filter bpp row.data prev.data 0 row.data.toList).toArray }
+        else
+          ⟨pngFilterRowA filter bpp row.data prev.data⟩
+      let stepOut := pngAppendBytes (pngAppendBytes out { data := #[filter.toUInt8] }) encBytes
+      pngFilterScanlinesLoop pixels rowBytes bpp filter (y + 1) rem row stepOut
+
+def pngFilterScanlines (pixels : ByteArray) (width height channels bitDepth filter : Nat) : Option ByteArray :=
+  let rowBytes := pngRowBytes width channels bitDepth
+  let bpp := pngBytesPerPixel channels bitDepth
+  if pixels.data.toList.length != height * rowBytes then none
+  else
+    pngFilterScanlinesLoop pixels rowBytes bpp filter 0 height ⟨(List.replicate rowBytes 0).toArray⟩ { data := #[] }
 
 def pngPassSize (full start step : Nat) : Nat :=
   if full ≤ start then 0 else (full - start + step - 1) / step
@@ -3178,55 +3295,77 @@ def pngMergePass (dst pass : ByteArray) (width channels bitDepth passWidth passH
         out := pngSetSample out bitDepth dstIdx (pngGetSample pass bitDepth srcIdx)
   return out
 
-def pngDecodePixels (data : ByteArray) (h : PngIhdr) : Option ByteArray := Id.run do
+def pngDecodePixels (data : ByteArray) (h : PngIhdr) : Option ByteArray :=
   let channels := pngChannels h.colorType
   if h.interlace == 0 then
-    return pngUnfilterScanlines data h.width h.height channels h.bitDepth
-  let mut out : ByteArray := ⟨Array.replicate (h.height * pngRowBytes h.width channels h.bitDepth) 0⟩
-  let mut off := 0
-  for pass in [0:7] do
-    let pw := pngPassSize h.width (pngAdam7StartsX.getD pass 0) (pngAdam7StepsX.getD pass 1)
-    let ph := pngPassSize h.height (pngAdam7StartsY.getD pass 0) (pngAdam7StepsY.getD pass 1)
-    let rowBytes := pngRowBytes pw channels h.bitDepth
-    let len := if pw == 0 || ph == 0 then 0 else ph * (rowBytes + 1)
-    if off + len > data.size then return none
-    if len != 0 then
-      let part := data.extract off (off + len)
-      match pngUnfilterScanlines part pw ph channels h.bitDepth with
-      | none => return none
-      | some decoded => out := pngMergePass out decoded h.width channels h.bitDepth pw ph pass
-    off := off + len
-  if off != data.size then return none
-  return some out
+    pngUnfilterScanlines data h.width h.height channels h.bitDepth
+  else Id.run do
+    let mut out : ByteArray := ⟨Array.replicate (h.height * pngRowBytes h.width channels h.bitDepth) 0⟩
+    let mut off := 0
+    for pass in [0:7] do
+      let pw := pngPassSize h.width (pngAdam7StartsX.getD pass 0) (pngAdam7StepsX.getD pass 1)
+      let ph := pngPassSize h.height (pngAdam7StartsY.getD pass 0) (pngAdam7StepsY.getD pass 1)
+      let rowBytes := pngRowBytes pw channels h.bitDepth
+      let len := if pw == 0 || ph == 0 then 0 else ph * (rowBytes + 1)
+      if off + len > data.size then return none
+      if len != 0 then
+        let part := data.extract off (off + len)
+        match pngUnfilterScanlines part pw ph channels h.bitDepth with
+        | none => return none
+        | some decoded => out := pngMergePass out decoded h.width channels h.bitDepth pw ph pass
+      off := off + len
+    if off != data.size then return none
+    return some out
 
-def pngCrc32Step (crc : UInt32) (b : UInt8) : UInt32 := Id.run do
-  let mut c := crc ^^^ b.toUInt32
-  for _ in [0:8] do
-    c := if (c &&& 1) != 0 then (c >>> 1) ^^^ 0xEDB88320 else c >>> 1
-  return c
+def pngCrc32ByteGo (c : UInt32) : Nat → UInt32
+  | 0 => c
+  | k + 1 =>
+    let c' := if (c &&& 1) != 0 then (c >>> 1) ^^^ 0xEDB88320 else c >>> 1
+    pngCrc32ByteGo c' k
+
+def pngCrc32Step (crc : UInt32) (b : UInt8) : UInt32 :=
+  pngCrc32ByteGo (crc ^^^ b.toUInt32) 8
 
 def pngCrc32Bytes (bytes : ByteArray) : UInt32 :=
-  0xFFFFFFFF ^^^ bytes.foldl pngCrc32Step 0xFFFFFFFF
+  0xFFFFFFFF ^^^ bytes.data.toList.foldl pngCrc32Step 0xFFFFFFFF
+
+def pngPushU32BE (ba : ByteArray) (v : UInt32) : ByteArray :=
+  let tail : ByteArray := { data := #[
+    ((v >>> 24) &&& 0xFF).toUInt8,
+    ((v >>> 16) &&& 0xFF).toUInt8,
+    ((v >>> 8) &&& 0xFF).toUInt8,
+    (v &&& 0xFF).toUInt8
+  ] }
+  pngAppendBytes ba tail
 
 def pngChunk (kind : UInt32) (payload : ByteArray) : ByteArray :=
   let k : ByteArray := { data := #[(kind >>> 24).toUInt8, (kind >>> 16).toUInt8, (kind >>> 8).toUInt8, kind.toUInt8] }
-  let body := k ++ payload
-  pushU32BEDeflate (pushU32BEDeflate ByteArray.empty payload.size.toUInt32 ++ body) (pngCrc32Bytes body)
+  let body := pngAppendBytes k payload
+  let lenHdr := pngPushU32BE { data := #[] } payload.data.toList.length.toUInt32
+  pngPushU32BE (pngAppendBytes lenHdr body) (pngCrc32Bytes body)
 
-def pngEncode (image : PngImage) : Option ByteArray := do
+def pngEncodeWith (image : PngImage) (filter : Nat := 5) (mode : DeflateMode := .dynamic) : Option ByteArray := do
   let h : PngIhdr := ⟨image.width, image.height, image.bitDepth, image.colorType, 0, 0, 0⟩
   if !decide (PngIhdrSafe h) then none
   let channels := pngChannels image.colorType
-  let raw ← pngFilterScanlines image.pixels image.width image.height channels image.bitDepth 0
-  if image.colorType == 3 && (image.palette.size == 0 || image.palette.size % 3 != 0 || image.palette.size > 768) then none
-  if image.colorType == 3 && image.transparency.size > image.palette.size / 3 then none
-  let ihdr := pushU32BEDeflate (pushU32BEDeflate ByteArray.empty image.width.toUInt32) image.height.toUInt32
-  let ihdr := ihdr.push image.bitDepth.toUInt8 |>.push image.colorType.toUInt8 |>.push 0 |>.push 0 |>.push 0
+  let raw ← pngFilterScanlines image.pixels image.width image.height channels image.bitDepth filter
+  let palLen := image.palette.data.toList.length
+  let trnsLen := image.transparency.data.toList.length
+  if image.colorType == 3 && (palLen == 0 || palLen % 3 != 0 || palLen > 768) then none
+  if image.colorType == 3 && trnsLen > palLen / 3 then none
+  let ihdr0 := pngPushU32BE (pngPushU32BE { data := #[] } image.width.toUInt32) image.height.toUInt32
+  let ihdr : ByteArray := { data := (ihdr0.data.toList ++
+    [image.bitDepth.toUInt8, image.colorType.toUInt8, 0, 0, 0]).toArray }
   let signature : ByteArray := { data := #[137, 80, 78, 71, 13, 10, 26, 10] }
-  let out := signature ++ pngChunk 0x49484452 ihdr
-  let out := if image.palette.size == 0 then out else out ++ pngChunk 0x504C5445 image.palette
-  let out := if image.transparency.size == 0 then out else out ++ pngChunk 0x74524E53 image.transparency
-  some (out ++ pngChunk 0x49444154 (zlibEncode raw true) ++ pngChunk 0x49454E44 ByteArray.empty)
+  let out := pngAppendBytes signature (pngChunk 0x49484452 ihdr)
+  let out := if palLen == 0 then out else pngAppendBytes out (pngChunk 0x504C5445 image.palette)
+  let out := if trnsLen == 0 then out else pngAppendBytes out (pngChunk 0x74524E53 image.transparency)
+  let idat := pngChunk 0x49444154 (zlibEncodeMode raw mode)
+  let iend := pngChunk 0x49454E44 { data := #[] }
+  some (pngAppendBytes (pngAppendBytes out idat) iend)
+
+def pngEncode (image : PngImage) : Option ByteArray :=
+  pngEncodeWith image 5 .dynamic
 
 def pngReadU32 (s : ByteSlice) (off : Nat) : Nat :=
   ((s.getByteD off 0).toNat <<< 24) ||| ((s.getByteD (off + 1) 0).toNat <<< 16) |||
@@ -3251,9 +3390,9 @@ def pngDecode (s : ByteSlice) : Option PngImage := do
         let kindByte := s.getByteD (pos + 4) 0
         let reserved := s.getByteD (pos + 6) 0
         if reserved &&& 0x20 != 0 then none
-        let body : ByteSlice := { ba := s.ba, off := s.off + pos + 4, len := len + 4 }
-        if pngReadU32 s (pos + 8 + len) != (pngCrc32Bytes (body.ba.extract body.off (body.off + body.len))).toNat then none
-        let payload := s.ba.extract (s.off + pos + 8) (s.off + pos + 8 + len)
+        let bodyBytes := pngSliceRange s.ba (s.off + pos + 4) (len + 4)
+        if pngReadU32 s (pos + 8 + len) != (pngCrc32Bytes bodyBytes).toNat then none
+        let payload := pngSliceRange s.ba (s.off + pos + 8) len
         let next := pos + 12 + len
         if kind == 0x49484452 then do
           if ihdr.isSome || seenIdat || pos != 8 || len != 13 then none
@@ -3271,16 +3410,284 @@ def pngDecode (s : ByteSlice) : Option PngImage := do
           chunks next ihdr palette payload compressed false false fuel
         else if kind == 0x49444154 then do
           if done then none
-          chunks next ihdr palette transparency (compressed ++ payload) true false fuel
+          chunks next ihdr palette transparency (pngAppendBytes compressed payload) true false fuel
         else if kind == 0x49454E44 then do
           if len != 0 || !seenIdat then none
           chunks next ihdr palette transparency compressed true true fuel
         else if kindByte &&& 0x20 == 0 then none
         else chunks next ihdr palette transparency compressed seenIdat false fuel
-  let (h, palette, transparency, compressed) ← chunks 8 none ByteArray.empty ByteArray.empty ByteArray.empty false false (s.len + 1)
-  let pixels ← zlibDecode (ByteSlice.ofByteArray compressed)
+  let emptyBa : ByteArray := { data := #[] }
+  let (h, palette, transparency, compressed) ← chunks 8 none emptyBa emptyBa emptyBa false false (s.len + 1)
+  let pixels ← zlibDecode { ba := compressed, off := 0, len := compressed.data.toList.length }
   let decoded ← pngDecodePixels pixels h
-  if h.colorType == 3 && palette.size == 0 then none
+  if h.colorType == 3 && palette.data.toList.length == 0 then none
   some ⟨h.width, h.height, h.bitDepth, h.colorType, decoded, palette, transparency⟩
+
+def pngNormalizeFmtStr (s : String) : String :=
+  let toLowerCh (c : Char) : Char :=
+    let n := c.toNat
+    if 65 ≤ n && n ≤ 90 then Char.ofNat (n + 32) else c
+  let isWs (c : Char) : Bool := c == ' ' || c == '\t' || c == '\n' || c == '\r'
+  let cs := (s.toList.dropWhile isWs).reverse.dropWhile isWs |>.reverse
+  String.ofList (cs.map toLowerCh)
+
+def pngPixFmtInfo (pixFmt : String) : Option (Nat × Nat) :=
+  match pngNormalizeFmtStr pixFmt with
+  | "gray" | "gray8" => some (8, 0)
+  | "gray16be" => some (16, 0)
+  | "rgb24" => some (8, 2)
+  | "rgb48be" => some (16, 2)
+  | "ya8" | "gray8a" => some (8, 4)
+  | "ya16be" => some (16, 4)
+  | "rgba" => some (8, 6)
+  | "rgba64be" => some (16, 6)
+  | _ => none
+
+def pngDefaultPixFmt (img : PngImage) : String :=
+  match img.colorType, img.bitDepth with
+  | 0, 16 => "gray16be"
+  | 0, _ => "gray"
+  | 2, 16 => "rgb48be"
+  | 2, _ => "rgb24"
+  | 3, _ => if img.transparency.size > 0 then "rgba" else "rgb24"
+  | 4, 16 => "ya16be"
+  | 4, _ => "ya8"
+  | 6, 16 => "rgba64be"
+  | _, _ => "rgba"
+
+def pngImageToRgba8 (img : PngImage) : Option ByteArray := Id.run do
+  let count := img.width * img.height
+  let mut out := ByteArray.emptyWithCapacity (count * 4)
+  let scaleSub (v : Nat) : UInt8 :=
+    if img.bitDepth == 1 then (if v == 0 then 0 else 255)
+    else if img.bitDepth == 2 then (v * 85).toUInt8
+    else if img.bitDepth == 4 then (v * 17).toUInt8
+    else v.toUInt8
+  if img.colorType == 6 && img.bitDepth == 8 then
+    return if img.pixels.size == count * 4 then some img.pixels else none
+  if img.colorType == 6 && img.bitDepth == 16 then
+    if img.pixels.size != count * 8 then return none
+    for i in [0:count * 4] do
+      out := out.push (img.pixels.data.getD (i * 2) 0)
+    return some out
+  if img.colorType == 2 && img.bitDepth == 8 then
+    if img.pixels.size != count * 3 then return none
+    for i in [0:count] do
+      let tr := if img.transparency.size == 6 then
+          let r0 := (img.transparency.data.getD 1 0)
+          let g0 := (img.transparency.data.getD 3 0)
+          let b0 := (img.transparency.data.getD 5 0)
+          img.pixels.data.getD (i * 3) 0 == r0 && img.pixels.data.getD (i * 3 + 1) 0 == g0 &&
+            img.pixels.data.getD (i * 3 + 2) 0 == b0
+        else false
+      out := out.push (img.pixels.data.getD (i * 3) 0)
+      out := out.push (img.pixels.data.getD (i * 3 + 1) 0)
+      out := out.push (img.pixels.data.getD (i * 3 + 2) 0)
+      out := out.push (if tr then 0 else 255)
+    return some out
+  if img.colorType == 2 && img.bitDepth == 16 then
+    if img.pixels.size != count * 6 then return none
+    for i in [0:count] do
+      out := out.push (img.pixels.data.getD (i * 6) 0)
+      out := out.push (img.pixels.data.getD (i * 6 + 2) 0)
+      out := out.push (img.pixels.data.getD (i * 6 + 4) 0)
+      out := out.push 255
+    return some out
+  if img.colorType == 0 then
+    let rb := pngRowBytes img.width 1 img.bitDepth
+    if img.pixels.size != img.height * rb then return none
+    for y in [0:img.height] do
+      let row := img.pixels.extract (y * rb) ((y + 1) * rb)
+      for x in [0:img.width] do
+        let s := pngGetSample row img.bitDepth x
+        let g := if img.bitDepth == 16 then (s >>> 8).toUInt8 else scaleSub s
+        let tr := if img.transparency.size == 2 then
+            let t0 := (img.transparency.data.getD 0 0).toNat * 256 + (img.transparency.data.getD 1 0).toNat
+            s == t0
+          else false
+        out := out.push g |>.push g |>.push g |>.push (if tr then 0 else 255)
+    return some out
+  if img.colorType == 4 then
+    let bpc := if img.bitDepth == 16 then 2 else 1
+    if img.pixels.size != count * 2 * bpc then return none
+    for i in [0:count] do
+      let g := img.pixels.data.getD (i * 2 * bpc) 0
+      let a := img.pixels.data.getD ((i * 2 + 1) * bpc) 0
+      out := out.push g |>.push g |>.push g |>.push a
+    return some out
+  if img.colorType == 3 then
+    let rb := pngRowBytes img.width 1 img.bitDepth
+    if img.pixels.size != img.height * rb then return none
+    let palEntries := img.palette.size / 3
+    for y in [0:img.height] do
+      let row := img.pixels.extract (y * rb) ((y + 1) * rb)
+      for x in [0:img.width] do
+        let idx := pngGetSample row img.bitDepth x
+        if idx ≥ palEntries then return none
+        let r := img.palette.data.getD (idx * 3) 0
+        let g := img.palette.data.getD (idx * 3 + 1) 0
+        let b := img.palette.data.getD (idx * 3 + 2) 0
+        let a := if idx < img.transparency.size then img.transparency.data.getD idx 255 else 255
+        out := out.push r |>.push g |>.push b |>.push a
+    return some out
+  return none
+
+def pngImageToRgba16Be (img : PngImage) : Option ByteArray := Id.run do
+  let count := img.width * img.height
+  let mut out := ByteArray.emptyWithCapacity (count * 8)
+  if img.colorType == 6 && img.bitDepth == 16 then
+    return if img.pixels.size == count * 8 then some img.pixels else none
+  if img.colorType == 2 && img.bitDepth == 16 then
+    if img.pixels.size != count * 6 then return none
+    let hasTr := img.transparency.size == 6
+    let trR0 := img.transparency.data.getD 0 0
+    let trR1 := img.transparency.data.getD 1 0
+    let trG0 := img.transparency.data.getD 2 0
+    let trG1 := img.transparency.data.getD 3 0
+    let trB0 := img.transparency.data.getD 4 0
+    let trB1 := img.transparency.data.getD 5 0
+    for i in [0:count] do
+      let r0 := img.pixels.data.getD (i * 6) 0
+      let r1 := img.pixels.data.getD (i * 6 + 1) 0
+      let g0 := img.pixels.data.getD (i * 6 + 2) 0
+      let g1 := img.pixels.data.getD (i * 6 + 3) 0
+      let b0 := img.pixels.data.getD (i * 6 + 4) 0
+      let b1 := img.pixels.data.getD (i * 6 + 5) 0
+      let isTr := hasTr && r0 == trR0 && r1 == trR1 && g0 == trG0 && g1 == trG1 && b0 == trB0 && b1 == trB1
+      let a : UInt8 := if isTr then 0 else 255
+      out := out.push r0 |>.push r1 |>.push g0 |>.push g1 |>.push b0 |>.push b1 |>.push a |>.push a
+    return some out
+  if img.colorType == 0 && img.bitDepth == 16 then
+    if img.pixels.size != count * 2 then return none
+    let hasTr := img.transparency.size == 2
+    let tr0 := img.transparency.data.getD 0 0
+    let tr1 := img.transparency.data.getD 1 0
+    for i in [0:count] do
+      let g0 := img.pixels.data.getD (i * 2) 0
+      let g1 := img.pixels.data.getD (i * 2 + 1) 0
+      let a : UInt8 := if hasTr && g0 == tr0 && g1 == tr1 then 0 else 255
+      out := out.push g0 |>.push g1 |>.push g0 |>.push g1 |>.push g0 |>.push g1 |>.push a |>.push a
+    return some out
+  if img.colorType == 4 && img.bitDepth == 16 then
+    if img.pixels.size != count * 4 then return none
+    for i in [0:count] do
+      let g0 := img.pixels.data.getD (i * 4) 0
+      let g1 := img.pixels.data.getD (i * 4 + 1) 0
+      let a0 := img.pixels.data.getD (i * 4 + 2) 0
+      let a1 := img.pixels.data.getD (i * 4 + 3) 0
+      out := out.push g0 |>.push g1 |>.push g0 |>.push g1 |>.push g0 |>.push g1 |>.push a0 |>.push a1
+    return some out
+  match pngImageToRgba8 img with
+  | none => return none
+  | some rgba =>
+    for i in [0:count * 4] do
+      let v := rgba.data.getD i 0
+      out := out.push v |>.push v
+    return some out
+
+def pngImageToRaw (img : PngImage) (pixFmtOpt : Option String) : Option ByteArray := do
+  let fmt := pngNormalizeFmtStr (pixFmtOpt.getD (pngDefaultPixFmt img))
+  match pngPixFmtInfo fmt with
+  | some (bd, ct) =>
+    if img.bitDepth == bd && img.colorType == ct && img.transparency.size == 0 then
+      some img.pixels
+    else if bd == 16 then do
+      let rgba16 ← pngImageToRgba16Be img
+      let count := img.width * img.height
+      if fmt == "rgba64be" then some rgba16
+      else if fmt == "rgb48be" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity (count * 6)
+          for i in [0:count] do
+            for k in [0:6] do
+              out := out.push (rgba16.data.getD (i * 8 + k) 0)
+          return out
+      else if fmt == "gray16be" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity (count * 2)
+          for i in [0:count] do
+            let r := (rgba16.data.getD (i * 8) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 1) 0).toNat
+            let g := (rgba16.data.getD (i * 8 + 2) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 3) 0).toNat
+            let b := (rgba16.data.getD (i * 8 + 4) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 5) 0).toNat
+            let y := (77 * r + 150 * g + 29 * b + 128) >>> 8
+            out := out.push (y >>> 8).toUInt8 |>.push (y &&& 0xFF).toUInt8
+          return out
+      else if fmt == "ya16be" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity (count * 4)
+          for i in [0:count] do
+            let r := (rgba16.data.getD (i * 8) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 1) 0).toNat
+            let g := (rgba16.data.getD (i * 8 + 2) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 3) 0).toNat
+            let b := (rgba16.data.getD (i * 8 + 4) 0).toNat * 256 + (rgba16.data.getD (i * 8 + 5) 0).toNat
+            let y := (77 * r + 150 * g + 29 * b + 128) >>> 8
+            let a0 := rgba16.data.getD (i * 8 + 6) 255
+            let a1 := rgba16.data.getD (i * 8 + 7) 255
+            out := out.push (y >>> 8).toUInt8 |>.push (y &&& 0xFF).toUInt8 |>.push a0 |>.push a1
+          return out
+      else none
+    else do
+      let rgba ← pngImageToRgba8 img
+      let count := img.width * img.height
+      if fmt == "rgba" then some rgba
+      else if fmt == "rgb24" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity (count * 3)
+          for i in [0:count] do
+            out := out.push (rgba.data.getD (i * 4) 0)
+            out := out.push (rgba.data.getD (i * 4 + 1) 0)
+            out := out.push (rgba.data.getD (i * 4 + 2) 0)
+          return out
+      else if fmt == "gray" || fmt == "gray8" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity count
+          for i in [0:count] do
+            let r := (rgba.data.getD (i * 4) 0).toNat
+            let g := (rgba.data.getD (i * 4 + 1) 0).toNat
+            let b := (rgba.data.getD (i * 4 + 2) 0).toNat
+            out := out.push ((77 * r + 150 * g + 29 * b + 128) >>> 8).toUInt8
+          return out
+      else if fmt == "ya8" || fmt == "gray8a" then
+        some <| Id.run do
+          let mut out := ByteArray.emptyWithCapacity (count * 2)
+          for i in [0:count] do
+            let r := (rgba.data.getD (i * 4) 0).toNat
+            let g := (rgba.data.getD (i * 4 + 1) 0).toNat
+            let b := (rgba.data.getD (i * 4 + 2) 0).toNat
+            out := out.push ((77 * r + 150 * g + 29 * b + 128) >>> 8).toUInt8
+            out := out.push (rgba.data.getD (i * 4 + 3) 255)
+          return out
+      else none
+  | none => none
+
+def pngImageFromRaw (raw : ByteArray) (width height : Nat) (pixFmt : String) : Option PngImage := do
+  let (bd, ct) ← pngPixFmtInfo pixFmt
+  let expected := height * pngRowBytes width (pngChannels ct) bd
+  if raw.size != expected then none
+  let img : PngImage := ⟨width, height, bd, ct, raw, { data := #[] }, { data := #[] }⟩
+  let h : PngIhdr := ⟨width, height, bd, ct, 0, 0, 0⟩
+  if !decide (PngIhdrSafe h) then none
+  some img
+
+def pngRoundtripPixels (img : PngImage) (filter : Nat) (mode : DeflateMode) : Option (List UInt8) := do
+  let bytes ← pngEncodeWith img filter mode
+  let dec ← pngDecode { ba := bytes, off := 0, len := bytes.data.toList.length }
+  if dec.width == img.width && dec.height == img.height &&
+      dec.bitDepth == img.bitDepth && dec.colorType == img.colorType then
+    some dec.pixels.data.toList
+  else none
+
+set_option maxHeartbeats 800000 in
+set_option maxRecDepth 200000 in
+theorem pngEncodeWith_decode_all_filters_roundtrip :
+    let px : ByteArray := { data := #[10, 20, 30, 40] }
+    let img : PngImage := ⟨2, 2, 8, 0, px, { data := #[] }, { data := #[] }⟩
+    pngRoundtripPixels img 0 .stored = some px.data.toList ∧
+    pngRoundtripPixels img 1 .stored = some px.data.toList ∧
+    pngRoundtripPixels img 2 .stored = some px.data.toList ∧
+    pngRoundtripPixels img 3 .stored = some px.data.toList ∧
+    pngRoundtripPixels img 4 .stored = some px.data.toList ∧
+    pngRoundtripPixels img 5 .fixed = some px.data.toList ∧
+    pngRoundtripPixels img 5 .dynamic = some px.data.toList := by
+  decide
 
 end LeanAV.Video

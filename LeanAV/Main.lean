@@ -904,9 +904,33 @@ def runSelfTest : IO UInt32 := do
      | .fallbackDelegated _ => false)
   let w53Ok := w53IrOk && w53FfiOk && w53KernelsOk
 
+  let m1cZlibIn : ByteArray := "LeanAV-M1-C1-Lossless-Zlib-PNG-FLAC-0123456789".toUTF8
+  let m1cZlibEnc := zlibEncode m1cZlibIn true
+  let m1cZlibOk := zlibDecode (LeanSys.Posix.ByteSlice.ofByteArray m1cZlibEnc) == some m1cZlibIn
+  let m1cPngImg : PngImage :=
+    ⟨4, 2, 8, 2, ByteArray.mk ((List.range 24).map (fun i => (i * 11).toUInt8)).toArray,
+     ByteArray.empty, ByteArray.empty⟩
+  let m1cPngOk :=
+    match pngEncode m1cPngImg with
+    | some pngBytes =>
+      match decodePngIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray pngBytes) with
+      | .independentVerified dec => dec.width == 4 && dec.height == 2 && dec.pixels == m1cPngImg.pixels
+      | .fallbackDelegated _ => false
+    | none => false
+  let m1cFlacCh0 : Array Int32 := #[0, 320, 610, 840, 990, 1040, 980, 810, 560, 240, -100, -430, -700, -880, -940, -870]
+  let m1cFlacCh1 : Array Int32 := #[20, 300, 580, 800, 940, 990, 930, 770, 530, 220, -90, -400, -660, -830, -890, -820]
+  let m1cFlacOk :=
+    match encodeFlacIndependentOrFallback #[m1cFlacCh0, m1cFlacCh1] 48000 16 16 true with
+    | .independentVerified flacBytes =>
+      match decodeFlacIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray flacBytes) true with
+      | .independentVerified dec => dec.channelsData == #[m1cFlacCh0, m1cFlacCh1]
+      | .fallbackDelegated _ => false
+    | .fallbackDelegated _ => false
+  let m1cLosslessOk := m1cZlibOk && m1cPngOk && m1cFlacOk
+
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
-                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk
+                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
@@ -921,7 +945,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -1199,6 +1223,166 @@ def isIntrospectionFlag (s : String) : Bool :=
    "-hwaccels", "-sources", "-sinks"].contains s
 
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
+def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
+    (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
+  if !validCfg.overwrite then
+    if (← System.FilePath.pathExists outPath) then
+      if validCfg.jsonOutput then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+          "File exists"
+      else if !(args.contains "-n") then
+        if !cliQuiet validCfg.logLevel then
+          IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+        return 0
+      else
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+          "File exists"
+  let t0 ← IO.monoNanosNow
+  let rawIn ← IO.FS.readBinFile inPath
+  let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawIn
+  let isPngJob := plan.backend.reasons.contains "standalone_png_zlib_lossless_codec"
+  if isPngJob then
+    let inFmtLower := ext.inputFmt.map strToLowerAscii
+    let imgOpt : Option PngImage :=
+      if inFmtLower == some "rawvideo" then
+        match ext.inputVideoSize, ext.inputPixFmt with
+        | some (w, h), some pf => pngImageFromRaw rawIn w h pf
+        | _, _ => none
+      else
+        match decodePngIndependentOrFallback inSlice with
+        | .independentVerified img => some img
+        | .fallbackDelegated _ => none
+    let some img := imgOpt | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid PNG or rawvideo input\"}"
+        (s!"Invalid PNG or rawvideo input: {inPath}")
+    let outFmtLower := validCfg.format.map strToLowerAscii
+    let inferredOutFmt := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
+    let isRawOut :=
+      outFmtLower == some "rawvideo" ||
+      (outFmtLower == none && inferredOutFmt == "rawvideo" && validCfg.videoCodec == some .rawvideo)
+    let outBytesOpt : Option ByteArray :=
+      if isRawOut then
+        pngImageToRaw img validCfg.pixelFormat
+      else
+        match validCfg.pixelFormat with
+        | none =>
+          if img.colorType == 3 then
+            match pngImageToRaw img (some (pngDefaultPixFmt img)) with
+            | some converted =>
+              match pngImageFromRaw converted img.width img.height (pngDefaultPixFmt img) with
+              | some img2 => pngEncode img2
+              | none => none
+            | none => none
+          else
+            pngEncode img
+        | some pf =>
+          match pngImageToRaw img (some pf) with
+          | some converted =>
+            match pngImageFromRaw converted img.width img.height pf with
+            | some img2 => pngEncode img2
+            | none => none
+          | none => none
+    let some outBytes := outBytesOpt | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"PNG encode or pixel conversion failed\"}"
+        (s!"PNG encode or pixel conversion failed: {outPath}")
+    match ← writeMediaFileAtomic outPath outBytes with
+    | .ok _ => pure ()
+    | .error _ =>
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"failed to write output file\"}"
+        (s!"Failed to write output file: {outPath}")
+    let t1 ← IO.monoNanosNow
+    if validCfg.jsonOutput then
+      let fmtStr := if isRawOut then "rawvideo" else "png"
+      let j :=
+        s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-independent-verified\",\"tier\":\"independent_verified\"," ++
+        s!"\"codec\":\"png\",\"format\":\"{fmtStr}\",\"width\":{img.width},\"height\":{img.height}," ++
+        s!"\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"," ++
+        s!"\"in_bytes\":{rawIn.size},\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+      IO.println j
+    return 0
+  else
+    let inFmtLower := ext.inputFmt.map strToLowerAscii
+    let lowerIn := strToLowerAscii inPath
+    let audioInOpt : Option (Array (Array Int32) × UInt32 × Nat) :=
+      match inFmtLower.bind isStandalonePcmFmtBps with
+      | some bps =>
+        match ext.inputAudioRate, ext.inputAudioChannels with
+        | some sr, some ch =>
+          (pcmRawLEToChannels inSlice ch bps).map (fun chans => (chans, sr.toUInt32, bps))
+        | _, _ => none
+      | none =>
+        if strEndsWithFast lowerIn ".wav" || inFmtLower == some "wav" then
+          demuxWavPcmLE inSlice
+        else
+          match decodeFlacIndependentOrFallback inSlice true with
+          | .independentVerified dec =>
+            some (dec.channelsData, dec.info.sampleRate, dec.info.bitsPerSample.toNat)
+          | .fallbackDelegated _ => none
+    let some (chansIn, srIn, bpsIn) := audioInOpt | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid FLAC, WAV, or PCM input\"}"
+        (s!"Invalid FLAC, WAV, or PCM input: {inPath}")
+    if let some reqSr := validCfg.audioRate then
+      if reqSr != srIn.toNat then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"resampling requires -af\"}"
+          "Sample rate conversion requires audio filter (-af)"
+    if let some reqCh := validCfg.audioChannels then
+      if reqCh != chansIn.size then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"channel remix requires -af\"}"
+          "Channel count conversion requires audio filter (-af)"
+    let outFmtLower := validCfg.format.map strToLowerAscii
+    let lowerOut := strToLowerAscii outPath
+    let isFlacOut :=
+      (strEndsWithFast lowerOut ".flac" && (outFmtLower == none || outFmtLower == some "flac")) ||
+      outFmtLower == some "flac"
+    let isWavOut :=
+      (strEndsWithFast lowerOut ".wav" && (outFmtLower == none || outFmtLower == some "wav")) ||
+      outFmtLower == some "wav"
+    let outCodecBps := ext.outputAudioCodecRaw.bind isStandalonePcmCodecBps
+    let outFmtPcmBps := outFmtLower.bind isStandalonePcmFmtBps
+    let outBytesOpt : Option (ByteArray × String) :=
+      if isFlacOut then
+        let targetBps := if bpsIn == 8 then 8 else if bpsIn == 24 || bpsIn == 32 then 24 else 16
+        let scaled := scaleChannelsBps chansIn bpsIn targetBps
+        (flacEncodeStream scaled srIn targetBps 4096 true).map (fun b => (b, "flac"))
+      else if isWavOut then
+        let targetBps := outCodecBps.getD (if bpsIn == 8 || bpsIn == 16 || bpsIn == 24 || bpsIn == 32 then bpsIn else 16)
+        let scaled := scaleChannelsBps chansIn bpsIn targetBps
+        some (muxWavPcmLE scaled srIn targetBps, "wav")
+      else
+        match outFmtPcmBps with
+        | some targetBps =>
+          let scaled := scaleChannelsBps chansIn bpsIn targetBps
+          some (channelsToPcmRawLE scaled targetBps, outFmtLower.getD "s16le")
+        | none => none
+    let some (outBytes, fmtStr) := outBytesOpt | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"FLAC or PCM output encoding failed\"}"
+        (s!"FLAC or PCM output encoding failed: {outPath}")
+    match ← writeMediaFileAtomic outPath outBytes with
+    | .ok _ => pure ()
+    | .error _ =>
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"failed to write output file\"}"
+        (s!"Failed to write output file: {outPath}")
+    let t1 ← IO.monoNanosNow
+    if validCfg.jsonOutput then
+      let nSamples := (chansIn.getD 0 #[]).size
+      let j :=
+        s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-independent-verified\",\"tier\":\"independent_verified\"," ++
+        s!"\"codec\":\"flac\",\"format\":\"{jsonEscape fmtStr}\",\"sample_rate\":{srIn},\"channels\":{chansIn.size}," ++
+        s!"\"samples\":{nSamples},\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"," ++
+        s!"\"in_bytes\":{rawIn.size},\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+      IO.println j
+    return 0
+
 def runFFmpegCli (args : List String) : IO UInt32 := do
   if !args.contains "-i" && !args.contains "-lavfi" && !args.contains "-filter_complex" && !args.contains "-/filter_complex" && args.any isIntrospectionFlag then
     if !verifyExecArgvHygiene args then return 1
@@ -1263,6 +1447,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return ← reportCliError validCfg
             "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"input file does not exist\"}"
             (s!"{inP}: No such file or directory")
+    if standaloneLosslessPlanGateSpec.gate plan then
+      return ← runStandaloneLosslessCli args validCfg ext plan inPath outPath
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
@@ -1567,9 +1753,35 @@ def runVerifyKernels : IO UInt32 := do
   let lnirCompiledOk :=
     lnirSuiteOk && lnirSroaOk && lnirSwscaleOk && lnirSaxpyOk && lnirWienerOk && lnirCdefOk && lnirClampOk && lnirZeroCopyBaOk
 
+  let vkPngImg : PngImage :=
+    ⟨4, 4, 8, 6, ByteArray.mk ((List.range 64).map (fun i => (i * 19 + 7).toUInt8)).toArray,
+     ByteArray.empty, ByteArray.empty⟩
+  let pngKernelOk :=
+    (match encodePngIndependentOrFallback vkPngImg with
+     | .independentVerified pngBytes =>
+       match decodePngIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray pngBytes) with
+       | .independentVerified dec => dec.width == 4 && dec.height == 4 && dec.pixels == vkPngImg.pixels
+       | .fallbackDelegated _ => false
+     | .fallbackDelegated _ => false) &&
+    (match decodePngIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray badIvf) with
+     | .independentVerified _ => false
+     | .fallbackDelegated r => r == "invalid_or_corrupt_png_stream")
+  let vkFlacCh0 : Array Int32 := #[0, 410, 790, 1080, 1250, 1290, 1180, 950, 620, 220, -200, -590, -890, -1080, -1120, -1010]
+  let vkFlacCh1 : Array Int32 := #[15, 380, 740, 1010, 1170, 1210, 1110, 890, 580, 200, -190, -550, -830, -1010, -1050, -940]
+  let flacKernelOk :=
+    (match encodeFlacIndependentOrFallback #[vkFlacCh0, vkFlacCh1] 48000 16 16 true with
+     | .independentVerified flacBytes =>
+       match decodeFlacIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray flacBytes) true with
+       | .independentVerified dec => dec.channelsData == #[vkFlacCh0, vkFlacCh1]
+       | .fallbackDelegated _ => false
+     | .fallbackDelegated _ => false) &&
+    (match decodeFlacIndependentOrFallback (LeanSys.Posix.ByteSlice.ofByteArray badIvf) true with
+     | .independentVerified _ => false
+     | .fallbackDelegated r => r == "invalid_or_corrupt_flac_stream")
+
   let t1 ← IO.monoNanosNow
-  let allOk := rescaleOk && scaleOk && ivfOk && lnirCompiledOk
-  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"u16le_acceptance_ok\":{u16AcceptanceOk},\"bench_us\":{(t1 - t0) / 1000}}"
+  let allOk := rescaleOk && scaleOk && ivfOk && lnirCompiledOk && pngKernelOk && flacKernelOk
+  IO.println s!"\{\"ok\":{allOk},\"phase\":6,\"rescale_kernel_ok\":{rescaleOk},\"scale2x2_kernel_ok\":{scaleOk},\"ivf_demux_kernel_ok\":{ivfOk},\"png_zlib_kernel_ok\":{pngKernelOk},\"flac_kernel_ok\":{flacKernelOk},\"lnir_compiled_12_kernels_ok\":{lnirCompiledOk},\"u16le_acceptance_ok\":{u16AcceptanceOk},\"bench_us\":{(t1 - t0) / 1000}}"
   return if allOk then 0 else 1
 
 def runLosslessCodec (args : List String) : IO UInt32 := do
@@ -1600,7 +1812,39 @@ def runLosslessCodec (args : List String) : IO UInt32 := do
     match pngEncode img with
     | some bytes => IO.FS.writeBinFile output bytes; return 0
     | none => IO.eprintln "invalid png image"; return 1
-  | _ => IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode ..."; return 2
+  | "flac-decode" :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    match flacDecodeStream (ByteSlice.ofByteArray data) true with
+    | some dec =>
+      let bps := dec.info.bitsPerSample.toNat
+      let lowerOut := strToLowerAscii output
+      let outBytes :=
+        if strEndsWithFast lowerOut ".wav" then
+          muxWavPcmLE dec.channelsData dec.info.sampleRate bps
+        else
+          channelsToPcmRawLE dec.channelsData bps
+      IO.FS.writeBinFile output outBytes
+      IO.println s!"flac sr={dec.info.sampleRate} ch={dec.info.channels} bps={bps} samples={dec.info.totalSamples}"
+      return 0
+    | none => IO.eprintln "invalid flac stream"; return 1
+  | "flac-encode" :: sr :: ch :: bps :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    let s := ByteSlice.ofByteArray data
+    let lowerIn := strToLowerAscii input
+    let chansOpt : Option (Array (Array Int32) × UInt32 × Nat) :=
+      if strEndsWithFast lowerIn ".wav" then
+        demuxWavPcmLE s
+      else
+        (pcmRawLEToChannels s ch.toNat! bps.toNat!).map (fun c => (c, sr.toNat!.toUInt32, bps.toNat!))
+    match chansOpt with
+    | some (chans, sampleRate, bitsPerSample) =>
+      match flacEncodeStream chans sampleRate bitsPerSample 4096 true with
+      | some bytes => IO.FS.writeBinFile output bytes; return 0
+      | none => IO.eprintln "invalid flac parameters"; return 1
+    | none => IO.eprintln "invalid pcm or wav input"; return 1
+  | _ =>
+    IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode|flac-encode|flac-decode ..."
+    return 2
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -2111,6 +2355,16 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_short_universal
 #print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_bad_sync_universal
 #print axioms LeanAV.Format.isExplicitSdrCodePoint_accepts_sdr_and_rejects_unspecified_or_hdr
+#print axioms LeanAV.Bitstream.zlibHeaderGateSpec_iff
+#print axioms LeanAV.Bitstream.deflateTreeGateSpec_iff
+#print axioms LeanAV.Video.pngIhdrGateSpec_iff
+#print axioms LeanAV.Video.pngFilterGateSpec_iff
+#print axioms LeanAV.Video.pngEncodeWith_decode_all_filters_roundtrip
+#print axioms LeanAV.Audio.flacFrameSyncGateSpec_iff
+#print axioms LeanAV.Audio.flacChannelAssignGateSpec_iff
+#print axioms LeanAV.Audio.flacStream_and_stereo_modes_roundtrip
+#print axioms LeanAV.PlanIR.standaloneLosslessPlanGateSpec_iff
+#print axioms LeanAV.PlanIR.standaloneLossless_routing_and_kernels_verified
 
 
 
