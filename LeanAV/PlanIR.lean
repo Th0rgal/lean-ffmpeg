@@ -780,7 +780,7 @@ def isExtendedDelegatedValueFlag (tok : String) : Bool :=
      "-slices", "-keyint_min", "-sc_threshold", "-b_strategy", "-b_sensitivity", "-refs", "-coder",
      "-subq", "-me_method", "-me_range", "-motion_est", "-trellis", "-mbd", "-cmp", "-subcmp",
      "-mbcmp", "-precmp", "-ildctcmp", "-skip_cmp", "-dia_size", "-last_pred", "-preme",
-     "-pred", "-huffman", "-context", "-strict", "-mpeg_quant", "-alternate_scan",
+      "-pred", "-huffman", "-context", "-slicecrc", "-strict", "-mpeg_quant", "-alternate_scan",
      "-intra_dc_precision", "-non_linear_quant", "-noise_reduction", "-scplx_mask", "-error_rate",
      "-aiv", "-umv", "-ps", "-aic", "-obmc", "-loop", "-part",
      "-wavelet_type",
@@ -879,6 +879,8 @@ def isValidExtendedFlagValue (tok value : String) : Bool :=
   else if tok == "-sseof" || tok == "-itsoffset" || tok == "-output_ts_offset" then
     let stripped := if strStartsWithFast value "-" then String.ofList (value.toList.drop 1) else value
     (parseCliSeconds stripped).isSome
+  else if tok == "-slicecrc" then
+    value == "0" || value == "1"
   else
     true
 
@@ -1678,18 +1680,166 @@ def lowerCliToPlanIR (cfg : CliConfig) : MediaPlanIR :=
   lowerCliWithExtToPlanIR cfg {}
 
 /-- Single-pass parse and lowering returning `(CliConfig, ExtendedPlanFlags, MediaPlanIR)`. -/
-def parseArgsWithPlanIR (args : List String) : CliConfig × ExtendedPlanFlags × MediaPlanIR :=
+def parseArgsWithPlanIRBase (args : List String) : CliConfig × ExtendedPlanFlags × MediaPlanIR :=
   let ext0 := extractExtendedPlanFlagsLoop args {}
   let ext := { ext0 with passthroughArgs := stripInternalLffmpegArgs args }
   let cfg := parseFFmpegArgs ext0.baseArgs
   let plan := lowerCliWithExtToPlanIR cfg ext0
   (cfg, ext, plan)
 
+def isNativeFfv1PixFmt (pf : String) : Bool :=
+  pf == "yuv420p" || pf == "gray" || pf == "rgb24" || pf == "bgr0"
+
+def isNativeFfv1OptionPair (tok val : String) : Bool :=
+  if tok == "-level" || tok == "-level:v" then val == "3"
+  else if tok == "-coder" then
+    val == "0" || val == "1" || val == "2" || val == "-2" ||
+    val == "rice" || val == "ac" || val == "range_def" || val == "range_tab"
+  else if tok == "-context" then val == "0" || val == "1"
+  else if tok == "-slicecrc" then val == "0" || val == "1"
+  else if tok == "-slices" then
+    match parsePosNatSpec val with
+    | some n => n >= 1 && n <= 64
+    | none => false
+  else false
+
+def scanNativeFfv1PreInput : List String → Option String → Bool → Bool → Bool
+  | [], some "rawvideo", hasSize, hasPix => hasSize && hasPix
+  | [], some _, false, false => true
+  | [], none, false, false => true
+  | [], _, _, _ => false
+  | "-y" :: rest, fmt, hs, hp | "-n" :: rest, fmt, hs, hp | "-nostdin" :: rest, fmt, hs, hp |
+    "-hide_banner" :: rest, fmt, hs, hp | "-stats" :: rest, fmt, hs, hp | "-nostats" :: rest, fmt, hs, hp |
+    "-an" :: rest, fmt, hs, hp | "-json" :: rest, fmt, hs, hp | "--json" :: rest, fmt, hs, hp |
+    "-dump-plan" :: rest, fmt, hs, hp | "--dump-plan" :: rest, fmt, hs, hp =>
+    scanNativeFfv1PreInput rest fmt hs hp
+  | "-v" :: _ :: rest, fmt, hs, hp | "-loglevel" :: _ :: rest, fmt, hs, hp =>
+    scanNativeFfv1PreInput rest fmt hs hp
+  | "-f" :: fStr :: rest, _, hs, hp =>
+    let fl := strToLowerAscii fStr
+    if fl == "rawvideo" || fl == "yuv4mpegpipe" || fl == "y4m" ||
+       fl == "matroska" || fl == "mkv" || fl == "mov" || fl == "avi" then
+      scanNativeFfv1PreInput rest (some fl) hs hp
+    else false
+  | "-s" :: sz :: rest, fmt, _, hp | "-video_size" :: sz :: rest, fmt, _, hp =>
+    if (parseVideoSizeSpec sz).isSome then scanNativeFfv1PreInput rest fmt true hp else false
+  | "-pix_fmt" :: pf :: rest, fmt, hs, _ | "-pixel_format" :: pf :: rest, fmt, hs, _ =>
+    if isNativeFfv1PixFmt pf then scanNativeFfv1PreInput rest fmt hs true else false
+  | "-r" :: rStr :: rest, fmt, hs, hp | "-framerate" :: rStr :: rest, fmt, hs, hp =>
+    if isValidFrameRateSpec rStr then scanNativeFfv1PreInput rest fmt hs hp else false
+  | "-c:v" :: cv :: rest, fmt, hs, hp | "-vcodec" :: cv :: rest, fmt, hs, hp |
+    "-codec:v" :: cv :: rest, fmt, hs, hp | "-c" :: cv :: rest, fmt, hs, hp | "-codec" :: cv :: rest, fmt, hs, hp =>
+    if cv == "ffv1" || cv == "rawvideo" then scanNativeFfv1PreInput rest fmt hs hp else false
+  | _, _, _, _ => false
+
+def scanNativeFfv1PostInput : List String → Option String → Option String → Bool → Option (Option String × Option String)
+  | [], outFmt, outPix, true => some (outFmt, outPix)
+  | [], _, _, false => none
+  | "-y" :: rest, ofmt, opix, so | "-n" :: rest, ofmt, opix, so | "-nostdin" :: rest, ofmt, opix, so |
+    "-hide_banner" :: rest, ofmt, opix, so | "-stats" :: rest, ofmt, opix, so | "-nostats" :: rest, ofmt, opix, so |
+    "-an" :: rest, ofmt, opix, so | "-json" :: rest, ofmt, opix, so | "--json" :: rest, ofmt, opix, so |
+    "-dump-plan" :: rest, ofmt, opix, so | "--dump-plan" :: rest, ofmt, opix, so =>
+    scanNativeFfv1PostInput rest ofmt opix so
+  | "-v" :: _ :: rest, ofmt, opix, so | "-loglevel" :: _ :: rest, ofmt, opix, so =>
+    scanNativeFfv1PostInput rest ofmt opix so
+  | "-f" :: fStr :: rest, _, opix, false =>
+    scanNativeFfv1PostInput rest (some (strToLowerAscii fStr)) opix false
+  | "-pix_fmt" :: pf :: rest, ofmt, _, false | "-pixel_format" :: pf :: rest, ofmt, _, false =>
+    if isNativeFfv1PixFmt pf then scanNativeFfv1PostInput rest ofmt (some pf) false else none
+  | "-c:v" :: _ :: rest, ofmt, opix, false | "-vcodec" :: _ :: rest, ofmt, opix, false |
+    "-codec:v" :: _ :: rest, ofmt, opix, false | "-c" :: _ :: rest, ofmt, opix, false |
+    "-codec" :: _ :: rest, ofmt, opix, false | "-r" :: _ :: rest, ofmt, opix, false |
+    "-framerate" :: _ :: rest, ofmt, opix, false | "-frames:v" :: _ :: rest, ofmt, opix, false |
+    "-vframes" :: _ :: rest, ofmt, opix, false | "-frames" :: _ :: rest, ofmt, opix, false |
+    "-g" :: _ :: rest, ofmt, opix, false =>
+    scanNativeFfv1PostInput rest ofmt opix false
+  | tok :: val :: rest, ofmt, opix, false =>
+    if !strStartsWithFast tok "-" || tok == "-" then
+      scanNativeFfv1PostInput (val :: rest) ofmt opix true
+    else if isNativeFfv1OptionPair tok val then
+      scanNativeFfv1PostInput rest ofmt opix false
+    else none
+  | [tok], ofmt, opix, false =>
+    if !strStartsWithFast tok "-" || tok == "-" then some (ofmt, opix) else none
+  | _, _, _, true => none
+
+def splitAtFirstInput : List String → List String → Option (List String × String × List String)
+  | [], _ => none
+  | "-i" :: inPath :: rest, revPre => some (revPre.reverse, inPath, rest)
+  | tok :: rest, revPre => splitAtFirstInput rest (tok :: revPre)
+
+def resolveNativeFfv1PlanFormat (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : Option String :=
+  if !plan.errors.isEmpty || plan.backend.tier == .unsupported ||
+     plan.inputs.length != 1 || plan.outputs.length != 1 then none
+  else
+    match splitAtFirstInput args [], plan.outputs.head? with
+    | some (preArgs, inPath, postArgs), some outSpec =>
+      if !scanNativeFfv1PreInput preArgs none false false then none
+      else
+        match scanNativeFfv1PostInput postArgs none none false with
+        | none => none
+        | some (postFmtOpt, postPixOpt) =>
+          let effOutFmt := strToLowerAscii (inferContainerFormat postFmtOpt outSpec.path)
+          let lowerIn := strToLowerAscii inPath
+          let isRawOrY4mIn :=
+            preArgs.contains "rawvideo" || preArgs.contains "yuv4mpegpipe" ||
+            preArgs.contains "y4m" || strEndsWithFast lowerIn ".y4m"
+          let isFfv1ContIn :=
+            preArgs.contains "matroska" || preArgs.contains "mkv" ||
+            preArgs.contains "mov" || preArgs.contains "avi" ||
+            strEndsWithFast lowerIn ".mkv" || strEndsWithFast lowerIn ".mov" || strEndsWithFast lowerIn ".avi"
+          let ok :=
+            if cfg.videoCodec == some .ffv1 then
+              (isRawOrY4mIn || isFfv1ContIn) &&
+              (effOutFmt == "matroska" || effOutFmt == "mkv" || effOutFmt == "mov" || effOutFmt == "avi" || effOutFmt == "null")
+            else if !isFfv1ContIn || isRawOrY4mIn then
+              false
+            else if postArgs.contains "-level" || postArgs.contains "-level:v" ||
+                    postArgs.contains "-coder" || postArgs.contains "-context" ||
+                    postArgs.contains "-slices" || postArgs.contains "-slicecrc" || cfg.gopSize.isSome then
+              false
+            else if cfg.videoCodec == some .copy then
+              effOutFmt == "matroska" || effOutFmt == "mkv" || effOutFmt == "mov" || effOutFmt == "avi" || effOutFmt == "null"
+            else if cfg.videoCodec.isNone || cfg.videoCodec == some .rawvideo then
+              (effOutFmt == "rawvideo" || effOutFmt == "null" || effOutFmt == "md5" || effOutFmt == "framemd5") ||
+              ((effOutFmt == "yuv4mpegpipe" || effOutFmt == "y4m") &&
+               (postPixOpt.isNone || postPixOpt == some "yuv420p" || postPixOpt == some "gray"))
+            else false
+          if ok then some effOutFmt else none
+    | _, _ => none
+
+def isNativeFfv1ArgvEligible (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : Bool :=
+  (resolveNativeFfv1PlanFormat args cfg plan).isSome
+
+def promoteNativeFfv1Plan (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : MediaPlanIR :=
+  if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "native_stream_copy" then
+    plan
+  else
+    match resolveNativeFfv1PlanFormat args cfg plan with
+    | some effOutFmt =>
+      { plan with
+        outputs := plan.outputs.map fun o =>
+          { o with
+            format := effOutFmt
+            safePath := isSafeOutputTarget o.path (effOutFmt != "unknown") (some effOutFmt) }
+        backend := {
+          tier := .independentVerified
+          delegatedContainer := false
+          fallbackAllowed := cfg.videoCodec != some .ffv1 && !(args.contains "ffv1")
+          reasons := ["ffv1_v3_native_verified_codec"]
+        } }
+    | none => plan
+
+/-- Single-pass parse and lowering returning `(CliConfig, ExtendedPlanFlags, MediaPlanIR)` with FFV1 promotion. -/
+def parseArgsWithPlanIR (args : List String) : CliConfig × ExtendedPlanFlags × MediaPlanIR :=
+  let (cfg, ext, plan0) := parseArgsWithPlanIRBase args
+  (cfg, ext, promoteNativeFfv1Plan args cfg plan0)
+
 /-- Parse raw FFmpeg CLI arguments (including Phase 3/4 flags) directly into a typed `MediaPlanIR`. -/
 def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
   let ext0 := extractExtendedPlanFlagsLoop args {}
   let cfg := parseFFmpegArgs ext0.baseArgs
-  lowerCliWithExtToPlanIR cfg ext0
+  promoteNativeFfv1Plan args cfg (lowerCliWithExtToPlanIR cfg ext0)
 
 def streamKindToNativeKind : StreamKind → NativeStreamKind
   | .video    => .video
@@ -2283,7 +2433,7 @@ theorem standaloneLosslessPlanGateSpec_iff (plan : MediaPlanIR) :
 /-! ## 6. Formal Soundness, Round-Trip & Fallback Theorems (Phases 3, 4, 5 & 6) -/
 
 set_option maxRecDepth 200000
-set_option maxHeartbeats 3200000
+set_option maxHeartbeats 12800000
 
 /--
   Theorem (Phase 3 / Wave D): `parseStreamMapSpec` and `formatStreamMapSpec` form an exact round-trip

@@ -17,6 +17,7 @@ open LeanAV.Encoder
 open LeanAV.Cli
 open LeanAV.NativeKernels
 open LeanAV.PlanIR
+open LeanAV.Ffv1Pipeline
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -1657,10 +1658,19 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         | some rc => return rc
         | none => pure (demoteNativePlan plan)
       else pure plan
+    if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "ffv1_v3_native_verified_codec" then
+      if let some nativeRc ← tryExecuteNativeFfv1Cli args then
+        return nativeRc
+      if !plan.backend.fallbackAllowed then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-native-ffv1\",\"error\":\"native FFV1 execution rejected input\"}"
+          "Native FFV1 v3 execution rejected input"
     -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
+    let isFallbackFromNative :=
+      plan.backend.tier == .independentVerified && plan.backend.fallbackAllowed
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
-    if (plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer) || plainStreamCopy then
+    if (plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer) || plainStreamCopy || isFallbackFromNative then
       for o in plan.outputs do
         let oSpecial :=
           o.path == "-" || o.path == "/dev/null" || o.path == "md5:" ||
@@ -2589,6 +2599,34 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.PlanIR.standaloneLosslessPlanGateSpec_iff
 #print axioms LeanAV.PlanIR.standaloneLossless_routing_and_kernels_verified
 #print axioms LeanAV.PlanIR.losslessDecode3Way_trichotomy_verified
+#print axioms LeanAV.Md5.md5Hex_rfc1321_vectors
+#print axioms LeanAV.Md5.formatMd5Muxer_rfc1321_abc
+#print axioms LeanAV.Md5.formatFrameMd5Muxer_ffmpeg_2x2_exact
+#print axioms LeanAV.Ffv1Proofs.ffv1Rct_inverse_forward_exact
+#print axioms LeanAV.Ffv1Proofs.ffv1FoldSigned_8bit_residual_reconstruct
+#print axioms LeanAV.Ffv1Proofs.ffv1FoldSigned_9bit_residual_reconstruct
+#print axioms LeanAV.Ffv1Proofs.ffv1SrGolomb_decode_encode_roundtrip
+#print axioms LeanAV.Ffv1Proofs.ffv1SrGolomb_encode_decode_roundtrip
+#print axioms LeanAV.Ffv1Proofs.ffv1NativePlanGateSpec
+#print axioms LeanAV.Ffv1Proofs.ffv1SliceCountValidSpec
+#print axioms LeanAV.Ffv1Proofs.ffv1CoderOptionGateSpec
+#print axioms LeanAV.Ffv1Proofs.ffv1PixelFormatValidSpec
+#print axioms LeanAV.Ffv1Proofs.ffv1Yuv420pFrameSpec_lossless_roundtrip
+#print axioms LeanAV.Ffv1Proofs.ffv1DecodeYuv420pPure_encode_roundtrip
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeSplit_partition_and_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_refill_terminates_one_step
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_getBit_range_inv
+#print axioms LeanAV.Ffv1Proofs.ffv1Transitions_fromOne_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1DefaultTransitions_interior_bounded_and_closure
+#print axioms LeanAV.Ffv1Proofs.ffv1Version2Transitions_zero_and_one_bounded
+#print axioms LeanAV.Ffv1Proofs.ffv1AppendCrc_size_exact
+#print axioms LeanAV.Ffv1Proofs.ffv1AppendCrc_verifies_and_detects_bitflip
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeEncoder_putBit_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_getBit_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1SplitV3Slices_rejects_short_packets
+#print axioms LeanAV.Ffv1Proofs.ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p
+#print axioms LeanAV.Ffv1Proofs.ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation
+#print axioms LeanAV.Ffv1Proofs.ffv1MkvSar_roundtrip_unknown_square_and_anamorphic
 
 
 

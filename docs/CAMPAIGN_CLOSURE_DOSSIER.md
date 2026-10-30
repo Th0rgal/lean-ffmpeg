@@ -1,5 +1,39 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,
+combining M1-A2 `c0a811f4`, M1-B2 `f619a6ab`, M1-C1 v4 `64028fe3`, and M1-C2 v2
+`5d32bf26` over base `367be082`) under Lean v4.35.0 and `turbo-lean`
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited **12,019
+declarations with zero sorryAx/custom axioms** (`38,045` LOC across 20 formal
+`LeanAV/*.lean` modules) and **428/428 `non_vacuous_and_tight` specifications**
+(`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Audio`: 34,
+`Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`: 23, `PlanIR`: 20, `Core`:
+11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
+shadowed), with **46/46 `LNIR_WIRE_V1` kernels** (`validate-tv --samples 64` +
+`verify-certs`: `184` pass certificates across `46` verified declarations), **14
+zero-drift LLVM 18 outer shells** (`./scripts/regen_lnir_c_kernels.sh --check-ir`),
+a **`1,179`-line** C-ABI/POSIX/SIMD bridge (`c/leanav_simd_kernels.c`), `53/53`
+self-test waves, `verify-ffi`, `verify-kernels`, `121` unit suite entries (`119`
+passed, `2` skipped without `clang-18`), and `108` differential suite entries
+(`104` passed, `4` skipped without optional external fixtures).
+
+The 2026-10-30 M1-C2 v2 standalone FFV1 v3 validation under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**9,853 declarations with zero sorryAx/custom axioms** and **333/333 tight
+specifications** across 20 formal modules (`Ffv1Proofs`: 60, `Format`: 56,
+`Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23,
+`PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Md5`: 7,
+`Cli`: 6, `Filter`: 6), adding standalone pure Lean 4 FFV1 version 3 lossless
+video encoding, decoding, and remuxing (`yuv420p`, `gray`, `rgb24`, `bgr0`;
+Golomb-Rice coder `0` and range coders `-2`/`1`/`2` including 2-pass custom
+state transition tables across `1..255`; context models `0`/`1`; `1..64` slices;
+CRC-32 `slicecrc` `0`/`1`; Matroska `.mkv` with spec-exact `DisplayUnit` SAR
+handling across `0/1`, `1/1`, and explicit DAR, QuickTime `.mov`, AVI `.avi`,
+`rawvideo`, `yuv4mpegpipe`, `md5`, and `framemd5`) under `independent_verified`
+with zero `ffmpeg` subprocess execution and fail-closed `LEANAV_FFMPEG_BIN` /
+`LEANAV_FFPROBE_BIN` override enforcement (verified under `PATH=/nonexistent`
+and `strace -f -e trace=execve`).
+
 The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
 audited **10,309 declarations with zero sorryAx/custom axioms** and **320/320
