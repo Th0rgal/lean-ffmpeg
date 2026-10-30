@@ -94,7 +94,7 @@ DGX Spark figures above measure the Grace ARM64 CPU path (PTX assembly validatio
 
 Each safety and conformance gate implements [`AVGateSpec`](LeanAV/Spec.lean), connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **15** `LeanAV/*.lean` modules (**`278 / 278` specifications**) pass `turbo-lean --json audit-spec` (`dc1656d`, v2.1) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`8,990`** kernel-checked declarations (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 37, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
+All **15** `LeanAV/*.lean` modules (**`300 / 300` specifications**) pass `turbo-lean --json audit-spec` (`dc1656d`, v2.1) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`9,065`** kernel-checked declarations (`NativeKernels`: 59, `Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6).
 
 ---
 

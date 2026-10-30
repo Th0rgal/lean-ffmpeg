@@ -8,8 +8,8 @@
  *   2. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
  *      `leanav_c_ffi_probe_mp4_contract` with borrowed `lean_inc`).
- *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 16
- *      `LNIR_WIRE_V1` kernels and 7 2D/reduction LLVM 18 routines (`leanav_c_exec_lnir_*_ba`).
+ *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 46
+ *      `LNIR_WIRE_V1` kernels and 14 thin 2D/reduction/filter/16-bit outer shells (`leanav_c_exec_lnir_*_ba`).
  */
 #include <lean/lean.h>
 #include <stdint.h>

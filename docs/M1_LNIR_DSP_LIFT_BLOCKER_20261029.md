@@ -79,8 +79,8 @@ Consequences:
 - The acceptance criterion "no unverified DSP routine remains" is **partially closed
   (M1-A2, 2026-10-30)**: all per-pixel arithmetic has been removed from the 14 outer
   routines and wired via direct LLVM `call i64 @lnir_px_*` calls to **17 compiled scalar
-  `LNIR_WIRE_V1` pixel-core declarations** (decls 30–46 in `LeanAV/NativeKernels.lean`,
-  plus SIMD decl 29 `bt2020_to_bt709_uv_simd`, bringing `c/leanav_lnir_kernels.lnir` to
+  `LNIR_WIRE_V1` pixel-core declarations** (1-based decls 30–46, bindings `d29..d45`, in `LeanAV/NativeKernels.lean`,
+  plus SIMD decl 29, binding `d28b`, `bt2020_to_bt709_uv_simd`, bringing `c/leanav_lnir_kernels.lnir` to
   **46/46** `SymbolicTV`-validated and `verify-certs`-certified declarations and
   `turbo-lean audit-spec` to **300/300** `non_vacuous_and_tight` specs across **9,065**
   Lean declarations).

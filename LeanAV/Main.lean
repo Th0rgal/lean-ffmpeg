@@ -443,7 +443,7 @@ def runSelfTest : IO UInt32 := do
   let w14Ok := w14LanczosOk && w14PixelCoreOk &&
     w14Tokens[0]? == some "LNIR_WIRE_V1" && w14Tokens[2]? == some "46"
 
-  -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 16-Kernel LNIR SAO Edge-Offset Gate
+  -- 23. Wave 15: ITU-T H.265 §7.3.6.1 HEVC Slice Segment Header RBSP Round-Trip & 46-Kernel LNIR SAO Edge-Offset Gate
   let w15ShI : HevcSliceSegmentHeaderView := {
     firstSliceSegmentInPic := true, isIdrRap := true, noOutputOfPriorPics := false,
     ppsId := 0, sliceType := 2, pocLsb8 := 0, saoLumaFlag := true, saoChromaFlag := true, sliceQpDelta := -3
