@@ -935,10 +935,30 @@ def runSelfTest : IO UInt32 := do
       | .fallbackDelegated _ => false
     | .fallbackDelegated _ => false
   let m1cLosslessOk := m1cZlibOk && m1cPngOk && m1cFlacOk
+  let m2b1Mb : LeanAV.H264IntraTransform.H264Yuv420pMb := {
+    y := ((List.range 256).map fun i => ((i * 29 + (i / 16) * 13 + 7) % 256).toUInt8).toArray,
+    u := ((List.range 64).map fun i => ((110 + i * 7) % 256).toUInt8).toArray,
+    v := ((List.range 64).map fun i => ((140 + i * 5) % 256).toUInt8).toArray }
+  let m2b1Nbrs : LeanAV.H264IntraTransform.H264IntraMbNeighbors := {
+    leftAvail := true, topAvail := true, topRightAvail := true, topLeftAvail := true,
+    leftY := Array.replicate 16 96, topY := Array.replicate 16 112,
+    topRightY := Array.replicate 16 128, topLeftY := 104,
+    leftU := Array.replicate 8 120, topU := Array.replicate 8 120, topLeftU := 120,
+    leftV := Array.replicate 8 136, topV := Array.replicate 8 136, topLeftV := 136 }
+  let m2b1Ok :=
+    LeanAV.H264IntraTransform.decodeLosslessIntraMb
+      (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 0 [0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6] 3) m2b1Nbrs == m2b1Mb &&
+    LeanAV.H264IntraTransform.decodeLosslessIntraMb
+      (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 1 [0,1,4,8] 2) m2b1Nbrs == m2b1Mb &&
+    LeanAV.H264IntraTransform.decodeLosslessIntraMb
+      (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 2 [3] 0) m2b1Nbrs == m2b1Mb &&
+    LeanAV.H264IntraTransform.H264Yuv420pMb.valid
+      (LeanAV.H264IntraTransform.reconstructLossyIntraMb
+        (LeanAV.H264IntraTransform.encodeLossyIntraMb m2b1Mb m2b1Nbrs 1 18 0) m2b1Nbrs)
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
-                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk
+                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk && m2b1Ok
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
@@ -953,7 +973,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -2082,6 +2102,7 @@ def runLosslessCodec (args : List String) : IO UInt32 := do
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
+  | "h264-intra-probe" :: rest => LeanAV.H264IntraTransform.runH264IntraProbeCli rest
   | "lossless-codec" :: rest => runLosslessCodec rest
   | "plan" :: rest | "dump-plan" :: rest => do
     let plan ← refinePlanWithInput (parseArgsToPlanIR rest)
@@ -2627,6 +2648,24 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Ffv1Proofs.ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p
 #print axioms LeanAV.Ffv1Proofs.ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation
 #print axioms LeanAV.Ffv1Proofs.ffv1MkvSar_roundtrip_unknown_square_and_anamorphic
+#print axioms LeanAV.H264IntraTransformProofs.h264QpGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264ChromaQpOffsetGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264PixelRangeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264IntraNxNModeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264Intra16x16ModeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264IntraChromaModeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264IntraNxNLegalityGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264ValidYuv420pMbGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264Clip1_valid_and_saturates
+#print axioms LeanAV.H264IntraTransformProofs.h264ClampQp_valid
+#print axioms LeanAV.H264IntraTransformProofs.h264QpcFromQpy_bounded
+#print axioms LeanAV.H264IntraTransformProofs.h264Hadamard2x2_involution_4x
+#print axioms LeanAV.H264IntraTransformProofs.h264Hadamard4x4_involution_16x
+#print axioms LeanAV.H264IntraTransformProofs.h264ResidualDpcm4x4_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264ResidualDpcm8x8_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264LosslessIntraMb_encode_decode_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264ChromaDcDequant_threshold30_no_rounding
+#print axioms LeanAV.H264IntraTransformProofs.h264LumaDcDequant_threshold36_witnesses
 
 
 
