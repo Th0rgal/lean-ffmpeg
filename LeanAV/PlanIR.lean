@@ -364,6 +364,9 @@ structure OutputSpec where
   noVideo       : Bool := false
   noAudio       : Bool := false
   noSubtitle    : Bool := false
+  noData        : Bool := false
+  globalCopy    : Bool := false
+  copyData      : Bool := false
   deriving Repr, DecidableEq, Inhabited
 
 /-- Typed program descriptor in `MediaPlanIR`. -/
@@ -854,6 +857,7 @@ def isValidExtendedFlagValue (tok value : String) : Bool :=
     supportedBsfChain value
   else if strStartsWithFast tok "-c:v:" || strStartsWithFast tok "-c:a:" ||
           strStartsWithFast tok "-codec:v:" || strStartsWithFast tok "-codec:a:" ||
+          tok == "-c:d" || tok == "-dcodec" || tok == "-codec:d" ||
           tok == "-c:0" || tok == "-c:1" || tok == "-c:2" || tok == "-c:3" then
     (parseCliCodec value).isSome || (parseSubtitleCodecSpec value).isSome || isExtendedSubtitleCodec value
   else if strStartsWithFast tok "-c:s:" || strStartsWithFast tok "-codec:s:" then
@@ -882,9 +886,17 @@ structure ExtendedPlanFlags where
   mapChaptersSource      : Int := -1
   subtitleCodec          : Option SubtitleCodecSpec := none
   noSubtitle             : Bool := false
+  noData                 : Bool := false
+  globalCopy             : Bool := false
+  copyData               : Bool := false
   bsfs                   : List BsfSpec := []
   dumpPlan               : Bool := false
   seenInput              : Bool := false
+  seenStartSec           : Bool := false
+  seenDurationSec        : Bool := false
+  hasPostInputSeek       : Bool := false
+  toIsInputOpt           : Bool := false
+  toSec                  : Option CliSeconds := none
   hasLavfiFmt            : Bool := false
   hasLavfiInput          : Bool := false
   hasExtraDelegatedFlags : Bool := false
@@ -923,6 +935,7 @@ def isOneArgExtendedPrimaryFlag (tok : String) : Bool :=
   tok == "-i" || tok == "-lavfi" || tok == "-filter_complex" || tok == "-map" ||
   tok == "-metadata" || tok == "-map_metadata" || tok == "-map_chapters" ||
   tok == "-c:s" || tok == "-scodec" || tok == "-codec:s" ||
+  tok == "-c:d" || tok == "-dcodec" || tok == "-codec:d" ||
   tok == "-bsf:v" || tok == "-bsf:a" || tok == "-bsf:s" ||
   tok == "-bsf" || tok == "-vbsf" || tok == "-absf" || tok == "-sbsf" ||
   tok == "-f" || tok == "-c" || tok == "-codec" ||
@@ -930,7 +943,7 @@ def isOneArgExtendedPrimaryFlag (tok : String) : Bool :=
   tok == "-c:a" || tok == "-acodec" || tok == "-codec:a" ||
   tok == "-s" || tok == "-video_size" || tok == "-r" || tok == "-framerate" ||
   tok == "-ar" || tok == "-ac" || tok == "-pix_fmt" || tok == "-pixel_format" ||
-  tok == "-ss"
+  tok == "-ss" || tok == "-t" || tok == "-to"
 
 def hasLavfiSourceFilter (graph : String) : Bool :=
   ["sine=", "color=", "testsrc", "nullsrc", "aevalsrc", "anullsrc", "smptebars",
@@ -974,11 +987,29 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
     | some idx => { acc with mapChaptersSource := idx, hasExtraDelegatedFlags := true }
     | none => { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-map_chapters " ++ value)] }
   else if tok == "-c:s" || tok == "-scodec" || tok == "-codec:s" then
-    match parseSubtitleCodecSpec value with
-    | some sc => { acc with subtitleCodec := some sc }
-    | none    =>
-      if isExtendedSubtitleCodec value then { acc with hasExtraDelegatedFlags := true }
-      else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:s " ++ value)] }
+    if rest.contains "-i" || acc.seenFirstOutput then
+      if (parseSubtitleCodecSpec value).isSome || isExtendedSubtitleCodec value then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:s " ++ value)] }
+    else
+      match parseSubtitleCodecSpec value with
+      | some sc => { acc with subtitleCodec := some sc }
+      | none    =>
+        if isExtendedSubtitleCodec value then { acc with hasExtraDelegatedFlags := true }
+        else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:s " ++ value)] }
+  else if tok == "-c:d" || tok == "-dcodec" || tok == "-codec:d" then
+    if rest.contains "-i" || acc.seenFirstOutput then
+      if (parseCliCodec value).isSome || (parseSubtitleCodecSpec value).isSome || isExtendedSubtitleCodec value then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:d " ++ value)] }
+    else if value == "copy" then
+      { acc with copyData := true }
+    else if (parseCliCodec value).isSome || (parseSubtitleCodecSpec value).isSome || isExtendedSubtitleCodec value then
+      { acc with copyData := false, hasExtraDelegatedFlags := true }
+    else
+      { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:d " ++ value)] }
   else if tok == "-bsf:v" then
     if supportedBsfChain value then { acc with bsfs := acc.bsfs ++ [{ kind := .video, filterName := value }] }
     else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-bsf:v " ++ value)] }
@@ -1008,7 +1039,10 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
       else
         { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c " ++ value)] }
     else
-      { acc with baseArgs := acc.baseArgs ++ [tok, value] }
+      { acc with
+          globalCopy := value == "copy",
+          copyData := value == "copy",
+          baseArgs := acc.baseArgs ++ [tok, value] }
   else if tok == "-c:v" || tok == "-vcodec" || tok == "-codec:v" then
     if rest.contains "-i" || acc.seenFirstOutput then
       if (parseCliCodec value).isSome then { acc with hasExtraDelegatedFlags := true }
@@ -1052,11 +1086,41 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
     else
       { acc with baseArgs := acc.baseArgs ++ ["-pix_fmt", value] }
   else if tok == "-ss" then
-    if acc.seenFirstOutput then
-      if (parseCliSeconds value).isSome then { acc with hasExtraDelegatedFlags := true }
-      else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ss " ++ value)] }
-    else
-      { acc with hasExtraDelegatedFlags := acc.hasExtraDelegatedFlags || acc.seenInput, baseArgs := acc.baseArgs ++ ["-ss", value] }
+    match parseCliSeconds value with
+    | some _ =>
+      if acc.seenFirstOutput || acc.seenStartSec then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with
+            seenStartSec := true,
+            hasPostInputSeek := acc.hasPostInputSeek || acc.seenInput,
+            baseArgs := acc.baseArgs ++ ["-ss", value] }
+    | none =>
+      if acc.seenFirstOutput then
+        { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ss " ++ value)] }
+      else
+        { acc with baseArgs := acc.baseArgs ++ ["-ss", value] }
+  else if tok == "-t" then
+    match parseCliSeconds value with
+    | some _ =>
+      if acc.seenFirstOutput || acc.seenDurationSec || (acc.seenInput && rest.contains "-i") then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with seenDurationSec := true, baseArgs := acc.baseArgs ++ ["-t", value] }
+    | none =>
+      if acc.seenFirstOutput then
+        { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-t " ++ value)] }
+      else
+        { acc with baseArgs := acc.baseArgs ++ ["-t", value] }
+  else if tok == "-to" then
+    match parseCliSeconds value with
+    | some ts =>
+      if acc.seenFirstOutput || acc.toSec.isSome || (acc.seenInput && rest.contains "-i") then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with toSec := some ts, toIsInputOpt := !acc.seenInput }
+    | none =>
+      { acc with extraErrors := acc.extraErrors ++ [.invalidSeconds "-to" value] }
   else if isValidExtendedFlagValue tok value then
     { acc with
       hasExtraDelegatedFlags := true
@@ -1072,7 +1136,7 @@ def isPassthroughBaseZeroFlag (tok : String) : Bool :=
 
 def isPassthroughBaseOneFlag (tok : String) : Bool :=
   tok == "-vf" || tok == "-filter:v" ||
-  tok == "-af" || tok == "-filter:a" || tok == "-t" || tok == "-crf" ||
+  tok == "-af" || tok == "-filter:a" || tok == "-crf" ||
   tok == "-preset" || tok == "-b:v" || tok == "-vb" || tok == "-b" ||
   tok == "-b:a" || tok == "-ab" || tok == "-threads" ||
   tok == "-bf" || tok == "-g" || tok == "-movflags" || tok == "-frames:v" ||
@@ -1087,11 +1151,12 @@ def extractExtendedPlanFlagsStep : List String → Option String → ExtendedPla
        tok == "-c:v" || tok == "-vcodec" || tok == "-codec:v" ||
        tok == "-c:a" || tok == "-acodec" || tok == "-codec:a" || tok == "-s" || tok == "-video_size" ||
        tok == "-r" || tok == "-framerate" || tok == "-ar" || tok == "-ac" ||
-       tok == "-pix_fmt" || tok == "-pixel_format" || tok == "-ss" then
+       tok == "-pix_fmt" || tok == "-pixel_format" || tok == "-ss" || tok == "-t" then
       { acc with baseArgs := acc.baseArgs ++ [tok] }
     else
       let canon :=
         if tok == "-scodec" || tok == "-codec:s" then "-c:s"
+        else if tok == "-dcodec" || tok == "-codec:d" then "-c:d"
         else if tok == "-bsf:s" || tok == "-vbsf" || tok == "-absf" || tok == "-sbsf" then "-bsf"
         else tok
       { acc with extraErrors := acc.extraErrors ++ [.missingValue canon] }
@@ -1109,6 +1174,8 @@ def extractExtendedPlanFlagsStep : List String → Option String → ExtendedPla
       extractExtendedPlanFlagsStep tail none { acc with dumpPlan := true }
     else if tok == "-sn" then
       extractExtendedPlanFlagsStep tail none { acc with noSubtitle := true, baseArgs := acc.baseArgs ++ ["-sn"] }
+    else if tok == "-dn" then
+      extractExtendedPlanFlagsStep tail none { acc with noData := true }
     else if !strStartsWithFast tok "-" || tok == "-" then
       if !acc.seenFirstOutput then
         extractExtendedPlanFlagsStep tail none
@@ -1140,13 +1207,36 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       cfgCrf cfgVideoBitrate cfgAudioBitrate cfgFrameRate cfgBFrames cfgGopSize
       cfgThreads cfgMovflags cfgErrors =>
   ExtendedPlanFlags.casesOn ext fun _extBaseArgs _extPassthroughArgs extMaps extMetadataEntries
-      extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extBsfs
-      extDumpPlan _extSeenInput extHasLavfiFmt extHasLavfiInput extHasExtraDelegatedFlags
-      extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs =>
+      extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extNoData
+      extGlobalCopy extCopyData extBsfs extDumpPlan _extSeenInput _extSeenStartSec _extSeenDurSec
+      extHasPostInputSeek extToIsInputOpt extToSec extHasLavfiFmt extHasLavfiInput
+      extHasExtraDelegatedFlags extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs =>
+  let toSubtractsStart : Bool := extToIsInputOpt || extHasPostInputSeek
+  let toRangeErr : List CliError :=
+    match extToSec with
+    | none => []
+    | some toVal =>
+      let st := cfgStartSec.getD { num := 0, den := 1 }
+      if toSubtractsStart && cfgInputs.length ≤ 1 && toVal.num * st.den < st.num * toVal.den then
+        [.invalidSeconds "-to" "-to smaller than -ss"]
+      else []
+  let effDurSec : Option CliSeconds :=
+    match cfgDurationSec, extToSec with
+    | some d, _ => some d
+    | none, none => none
+    | none, some toVal =>
+      if !toSubtractsStart then
+        some toVal
+      else
+        let st := cfgStartSec.getD { num := 0, den := 1 }
+        if toVal.num * st.den ≥ st.num * toVal.den then
+          some { num := toVal.num * st.den - st.num * toVal.den, den := toVal.den * st.den }
+        else
+          none
   let startMsOpt := cfgStartSec.bind cliSecondsToMillis
-  let durMsOpt := cfgDurationSec.bind cliSecondsToMillis
+  let durMsOpt := effDurSec.bind cliSecondsToMillis
   let startOverflow := cfgStartSec.isSome && startMsOpt.isNone
-  let durOverflow := cfgDurationSec.isSome && durMsOpt.isNone
+  let durOverflow := effDurSec.isSome && durMsOpt.isNone
   let hasCopyFilterConflict : Bool :=
     (cfgVideoCodec == some .copy && cfgVideoFilter.isSome) ||
     (cfgAudioCodec == some .copy && cfgAudioFilter.isSome)
@@ -1157,7 +1247,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     else []
   let missingInErr : List CliError := if effectiveInputs.isEmpty then [.missingInput] else []
   let missingOutErr : List CliError := if cfgOutput.isNone && cfgDaemon.isNone then [.missingOutput] else []
-  let allErrors := cfgErrors ++ extExtraErrors ++ copyFilterErr ++ missingInErr ++ missingOutErr
+  let allErrors := cfgErrors ++ extExtraErrors ++ toRangeErr ++ copyFilterErr ++ missingInErr ++ missingOutErr
 
   let rec buildInputs (paths : List String) (idx : Nat) : List InputSpec :=
     match paths with
@@ -1170,7 +1260,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
         path := p
         safePath := isSafeIn
         seekStart := if idx == 0 then cfgStartSec else none
-        duration := if idx == 0 then cfgDurationSec else none } :: buildInputs ps (idx + 1)
+        duration := if idx == 0 then effDurSec else none } :: buildInputs ps (idx + 1)
   let inputSpecs := buildInputs effectiveInputs 0
   let anyConcatInput := effectiveInputs.any isSafeConcatInputPath
 
@@ -1209,7 +1299,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
          movflags := cfgMovflags
          noVideo := cfgNoVideo
          noAudio := cfgNoAudio
-         noSubtitle := extNoSubtitle }] ++ extraOutSpecs
+         noSubtitle := extNoSubtitle
+         noData := extNoData
+         globalCopy := extGlobalCopy
+         copyData := extCopyData }] ++ extraOutSpecs
 
   let defaultStreams : List StreamMapSpec :=
     (if cfgNoVideo then [] else [{ inputIdx := 0, kind := .video, streamIdx := some 0, optional := false }]) ++
@@ -1263,8 +1356,12 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     anyConcatInput ||
     !isSingleMp4Input ||
     extHasExtraDelegatedFlags ||
+    extHasPostInputSeek ||
+    extToSec.isSome ||
     !extMpegOptions.isEmpty ||
     extNoSubtitle ||
+    extNoData ||
+    extCopyData ||
     !extMaps.isEmpty ||
     !extMetadataEntries.isEmpty ||
     extMapMetadataSource != -1 ||
@@ -1286,6 +1383,41 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     (cfgAudioCodec.isSome && cfgAudioCodec != some .copy && cfgAudioCodec != some .aac) ||
     isDelegatedVideoCodec
 
+  let nativeCopyFormat := ["mp4", "mov", "ivf", "wav", "flac", "matroska", "mkv", "webm"].contains inferredFmt
+  let nativeMetadataOk := extMetadataEntries.isEmpty ||
+    ((inferredFmt == "mp4" || inferredFmt == "mov") && extMetadataEntries.all (fun kv => (nativeMp4MetadataTag kv.key).isSome))
+  let nativeFamily (f : String) : String :=
+    if f == "mov" then "mp4" else if f == "mkv" then "matroska" else f
+  let nativeSingleInput := match inputSpecs with
+    | [i] =>
+      let lowerIn := strToLowerAscii i.path
+      let inFmt := if strEndsWithFast lowerIn ".m4v" then "mp4" else inferContainerFormat none i.path
+      !anyConcatInput && nativeFamily inFmt == nativeFamily inferredFmt
+    | _ => false
+  let nativeCopyCodecsOk : Bool :=
+    (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy) ||
+    (cfgVideoCodec == some .copy && cfgAudioCodec.isNone) ||
+    (cfgAudioCodec == some .copy && cfgVideoCodec.isNone) ||
+    (extSubtitleCodec == some .copy && cfgVideoCodec.isNone && cfgAudioCodec.isNone) ||
+    (extCopyData && cfgVideoCodec.isNone && cfgAudioCodec.isNone && extSubtitleCodec.isNone)
+  let nativeMapsOk : Bool :=
+    extMaps.all (fun m => m.inputIdx == 0)
+  let nativeSubtitleCodecOk : Bool :=
+    extSubtitleCodec.isNone || extSubtitleCodec == some .copy
+  let nativeToTimelineOk : Bool :=
+    extToSec.isNone || cfgDurationSec.isNone
+  let isNativeStreamCopy : Bool :=
+    nativeCopyFormat && nativeSingleInput && nativeMetadataOk &&
+    nativeCopyCodecsOk && nativeMapsOk && nativeSubtitleCodecOk && nativeToTimelineOk &&
+    !(cfgNoVideo && cfgNoAudio && extNoSubtitle && extNoData) &&
+    extExtraOutputs.isEmpty && !extHasExtraDelegatedFlags && extMpegOptions.isEmpty &&
+    extMapMetadataSource == -1 && extMapChaptersSource == -1 &&
+    extBsfs.isEmpty && cfgVideoFilter.isNone && cfgAudioFilter.isNone &&
+    cfgVideoFrames.isNone && cfgVideoSize.isNone && cfgAudioRate.isNone && cfgAudioChannels.isNone &&
+    cfgPixelFormat.isNone && cfgThreads.isNone && cfgBFrames.isNone && cfgGopSize.isNone &&
+    cfgMovflags.isNone && cfgPreset.isNone && cfgCrf.isNone && cfgVideoBitrate.isNone &&
+    cfgAudioBitrate.isNone && cfgFrameRate.isNone
+
   let (tier, reasons) : BackendTier × List String :=
     if !allErrors.isEmpty then
       (.unsupported, ["cli_parse_or_validation_error"])
@@ -1299,6 +1431,8 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       (.unsupported, ["unrecognized_output_container_format"])
     else if inputSpecs.isEmpty || outputSpecs.isEmpty then
       (.unsupported, ["at_least_one_input_and_one_output_required"])
+    else if isNativeStreamCopy then
+      (.independentVerified, ["native_stream_copy"])
     else if isDelegatedContainerOrOption then
       (.delegatedFaithful, ["phase4_structured_argv_delegation"])
     else if cfgStartSec.isSome || cfgDurationSec.isSome || cfgVideoCodec != some .copy then
@@ -1320,7 +1454,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     }
     timeline := {
       startSec := cfgStartSec
-      durationSec := cfgDurationSec
+      durationSec := effDurSec
       startMs := startMsOpt
       durationMs := durMsOpt
       frameRate := cfgFrameRate
@@ -1343,7 +1477,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     errors := allErrors
     backend := {
       tier := tier
-      delegatedContainer := isDelegatedContainerOrOption
+      delegatedContainer := isDelegatedContainerOrOption && !isNativeStreamCopy
       fallbackAllowed := true
       reasons := reasons
     } }
@@ -1365,6 +1499,40 @@ def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
   let ext0 := extractExtendedPlanFlagsLoop args {}
   let cfg := parseFFmpegArgs ext0.baseArgs
   lowerCliWithExtToPlanIR cfg ext0
+
+def streamKindToNativeKind : StreamKind → NativeStreamKind
+  | .video    => .video
+  | .audio    => .audio
+  | .subtitle => .subtitle
+  | .data     => .data
+  | .all      => .all
+
+def extractNativeRemuxSelectors (plan : MediaPlanIR) : List NativeStreamSelector × Bool :=
+  let outOpt := plan.outputs.head?
+  let outFmt := match outOpt with | some o => o.format | none => ""
+  let noVid := match outOpt with | some o => o.noVideo | none => false
+  let noAud := match outOpt with | some o => o.noAudio | none => false
+  let noSub := match outOpt with | some o => o.noSubtitle | none => false
+  let noDat := match outOpt with | some o => o.noData | none => false
+  let hasSubCodec := match outOpt with | some o => o.subtitleCodec.isSome | none => false
+  let defaultSelectSub :=
+    if outFmt == "mp4" || outFmt == "mov" then hasSubCodec else true
+  let hasExplicitMaps := plan.maps != plan.streams
+  if hasExplicitMaps then
+    let filtered := plan.maps.filter (fun m =>
+      !(m.kind == .video && noVid) &&
+      !(m.kind == .audio && noAud) &&
+      !(m.kind == .subtitle && noSub) &&
+      !(m.kind == .data && noDat))
+    let sels := filtered.map (fun m =>
+      { kind := streamKindToNativeKind m.kind, streamIdx := m.streamIdx, optional := m.optional })
+    (sels, true)
+  else
+    let sels :=
+      (if noVid then [] else [{ kind := .video, streamIdx := some 0, optional := true }]) ++
+      (if noAud then [] else [{ kind := .audio, streamIdx := some 0, optional := true }]) ++
+      (if noSub || !defaultSelectSub then [] else [{ kind := .subtitle, streamIdx := some 0, optional := true }])
+    (sels, false)
 
 /--
   Unified argv renderer for `MediaPlanIR`:
@@ -1423,19 +1591,25 @@ def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :
       OutputSpec.casesOn o fun oPath _oSafe oFormat _oOverwrite oVideoCodec oAudioCodec
           oSubtitleCodec oPixelFormat oPreset oCrf oVideoBitrate oAudioBitrate oFrameRate
           oVideoSize oVideoFrames oAudioRate oAudioChannels oBFrames oGopSize oMovflags
-          oNoVideo oNoAudio oNoSubtitle =>
+          oNoVideo oNoAudio oNoSubtitle oNoData oGlobalCopy oCopyData =>
       (if oNoVideo then ["-vn"] else []) ++
       (if oNoAudio then ["-an"] else []) ++
       (if oNoSubtitle then ["-sn"] else []) ++
+      (if oNoData then ["-dn"] else []) ++
       (if forDelegation then
-        (match oVideoCodec with | some vc => ["-c:v", codecToDelegatedVideoEncoder vc] | none => []) ++
-        (match oAudioCodec with | some ac => ["-c:a", codecToDelegatedAudioEncoder ac] | none => [])
+        (if oGlobalCopy && oVideoCodec == some .copy && oAudioCodec == some .copy then
+          ["-c", "copy"]
+         else
+          (match oVideoCodec with | some vc => ["-c:v", codecToDelegatedVideoEncoder vc] | none => []) ++
+          (match oAudioCodec with | some ac => ["-c:a", codecToDelegatedAudioEncoder ac] | none => []) ++
+          (if oCopyData then ["-c:d", "copy"] else []))
        else
-        match oVideoCodec, oAudioCodec with
-        | some .copy, some .copy => ["-c", "copy"]
-        | vc, ac =>
-          (match vc with | some c => ["-c:v", codecToCanonicalString c] | none => []) ++
-          (match ac with | some c => ["-c:a", codecToCanonicalString c] | none => [])) ++
+        if oGlobalCopy && oVideoCodec == some .copy && oAudioCodec == some .copy then
+          ["-c", "copy"] ++ (if oCopyData && !oGlobalCopy then ["-c:d", "copy"] else [])
+        else
+          (match oVideoCodec with | some c => ["-c:v", codecToCanonicalString c] | none => []) ++
+          (match oAudioCodec with | some c => ["-c:a", codecToCanonicalString c] | none => []) ++
+          (if oCopyData then ["-c:d", "copy"] else [])) ++
       (match oSubtitleCodec with | some sc => ["-c:s", sc.toString] | none => []) ++
       (match oVideoSize with | some (w, h) => ["-s", s!"{w}x{h}"] | none => []) ++
       (match oVideoFrames with | some n => ["-frames:v", s!"{n}"] | none => []) ++
@@ -1817,7 +1991,7 @@ def demuxMpegTsIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (Ar
 /-! ## 6. Formal Soundness, Round-Trip & Fallback Theorems (Phases 3, 4, 5 & 6) -/
 
 set_option maxRecDepth 200000
-set_option maxHeartbeats 1600000
+set_option maxHeartbeats 3200000
 
 /--
   Theorem (Phase 3 / Wave D): `parseStreamMapSpec` and `formatStreamMapSpec` form an exact round-trip
@@ -1898,7 +2072,8 @@ theorem planIR_cli_roundtrip_verified :
     parseArgsToPlanIR (planIRToCliArgs pPhase4) = pPhase4 ∧
     formatCliSeconds { num := 50, den := 10000 } = "0.005" ∧
     formatCliSeconds { num := 10005, den := 10000 } = "1.0005" ∧
-    pCopy.backend.tier = .delegatedFaithful ∧
+    pCopy.backend.tier = .independentVerified ∧
+    pCopy.backend.delegatedContainer = false ∧
     pTrans.backend.tier = .translatedPartial ∧
     pPhase4.backend.tier = .delegatedFaithful ∧
     pPhase4.backend.delegatedContainer = true := by

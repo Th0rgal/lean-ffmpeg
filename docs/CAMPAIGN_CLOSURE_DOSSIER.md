@@ -18,17 +18,25 @@ deterministically by `scripts/gen_lnir_outer_shells.py` and gated by
 cores directly and are explicitly disclosed in the §6.8 Unverified TCB boundary
 (`docs/M1_LNIR_DSP_LIFT_BLOCKER_20261029.md`).
 
-The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
+The 2026-10-30 M1-B2 native zero-exec stream-copy & remux closure under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
-**8,916 declarations with zero sorryAx/custom axioms** and **266/266 tight
-specifications** (`Format`: 56, `Video`: 31, `Encoder`: 30, `Scale`: 28,
+**9,540 declarations with zero sorryAx/custom axioms** and **273/273 tight
+specifications** (`Format`: 63, `Video`: 31, `Encoder`: 30, `Scale`: 28,
 `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with `16/16` `LNIR_WIRE_V1`
 kernels passing `SymbolicTV` (`validate-tv --samples 64`) and certificate
 verification (`verify-certs`: `verified: true`, `11 VerifiedKernelProof`,
 `4 TranslationValidated`, `1 Tested`, all `chainValid: true` and
 `theoremsValid: true`), and a `1,166`-line C-ABI/POSIX/SIMD bridge
-(`c/leanav_simd_kernels.c`). In the Wave 2 FATE sweep across the `6,133`
+(`c/leanav_simd_kernels.c`). Native `independent_verified` stream copy (`-c copy`,
+`-c:v copy`, `-c:a copy`, `-c:s copy`, `-c:d copy`, `-ss`, `-t`, `-to`, `-map`,
+`-vn`/`-an`/`-sn`/`-dn`, `-metadata`, and `/dev/null` output) executes in pure Lean 4
+with zero `ffmpeg` subprocesses across MP4/MOV/M4V/M4A (including `ctts` v0/v1,
+`elst` `mvhd` timescale rescaling with v0->v1 64-bit promotion, `stss`, `co64`,
+uncompressed PCM/G.711 fixed-sample slicing, subtitle/data stream-selection & copy
+gates, and multi-`stsd` safe demotion), Matroska/WebM (`SimpleBlock`, `BlockGroup`,
+`SeekHead`/`Cues`), WAV, FLAC (`STREAMINFO` + `VORBIS_COMMENT`), and IVF, verified by
+21 zero-exec differential & OS-`strace` tests in `tests/differential/test_native_remux.py`. In the Wave 2 FATE sweep across the `6,133`
 retained inventory rows (`5,721` configured + `412` disabled = `6,065` real
 upstream targets; `reports/fate-sweep-wave2-complete-20261029.json`), all
 `5,721/5,721` configured baseline targets exited status-zero and all
@@ -71,7 +79,7 @@ and an 8-lane `<8 x i32>` SIMD interior loop with `shift & 31` normalization in
 `@lean_native_av1_cdef_filter_u8` (`av1CdefInteriorVecGateSpec`). Local
 validation under Lean v4.35.0 passed all 53 self-test waves, `verify-ffi`,
 `verify-kernels`, and the axiom audit: **8,887 declarations, zero sorryAx/custom axioms**.
-The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 56,
+The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 59,
 `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15,
 `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). The bridge
 has 621 lines and links 14 runtime routines. The earlier local report claimed 30 unit/IR and 53 differential tests. The retained
