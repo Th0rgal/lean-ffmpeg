@@ -885,6 +885,9 @@ structure ExtendedPlanFlags where
   bsfs                   : List BsfSpec := []
   dumpPlan               : Bool := false
   seenInput              : Bool := false
+  hasPostInputSeek       : Bool := false
+  toIsInputOpt           : Bool := false
+  toSec                  : Option CliSeconds := none
   hasLavfiFmt            : Bool := false
   hasLavfiInput          : Bool := false
   hasExtraDelegatedFlags : Bool := false
@@ -930,7 +933,7 @@ def isOneArgExtendedPrimaryFlag (tok : String) : Bool :=
   tok == "-c:a" || tok == "-acodec" || tok == "-codec:a" ||
   tok == "-s" || tok == "-video_size" || tok == "-r" || tok == "-framerate" ||
   tok == "-ar" || tok == "-ac" || tok == "-pix_fmt" || tok == "-pixel_format" ||
-  tok == "-ss"
+  tok == "-ss" || tok == "-to"
 
 def hasLavfiSourceFilter (graph : String) : Bool :=
   ["sine=", "color=", "testsrc", "nullsrc", "aevalsrc", "anullsrc", "smptebars",
@@ -1056,7 +1059,16 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
       if (parseCliSeconds value).isSome then { acc with hasExtraDelegatedFlags := true }
       else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ss " ++ value)] }
     else
-      { acc with hasExtraDelegatedFlags := acc.hasExtraDelegatedFlags || acc.seenInput, baseArgs := acc.baseArgs ++ ["-ss", value] }
+      { acc with hasPostInputSeek := acc.hasPostInputSeek || acc.seenInput, baseArgs := acc.baseArgs ++ ["-ss", value] }
+  else if tok == "-to" then
+    match parseCliSeconds value with
+    | some ts =>
+      if acc.seenFirstOutput || acc.toSec.isSome || (acc.seenInput && rest.contains "-i") then
+        { acc with hasExtraDelegatedFlags := true }
+      else
+        { acc with toSec := some ts, toIsInputOpt := !acc.seenInput }
+    | none =>
+      { acc with extraErrors := acc.extraErrors ++ [.invalidSeconds "-to" value] }
   else if isValidExtendedFlagValue tok value then
     { acc with
       hasExtraDelegatedFlags := true
@@ -1141,12 +1153,34 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       cfgThreads cfgMovflags cfgErrors =>
   ExtendedPlanFlags.casesOn ext fun _extBaseArgs _extPassthroughArgs extMaps extMetadataEntries
       extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extBsfs
-      extDumpPlan _extSeenInput extHasLavfiFmt extHasLavfiInput extHasExtraDelegatedFlags
-      extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs =>
+      extDumpPlan _extSeenInput extHasPostInputSeek extToIsInputOpt extToSec extHasLavfiFmt extHasLavfiInput
+      extHasExtraDelegatedFlags extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs =>
+  let toSubtractsStart : Bool := extToIsInputOpt || extHasPostInputSeek
+  let toRangeErr : List CliError :=
+    match extToSec with
+    | none => []
+    | some toVal =>
+      let st := cfgStartSec.getD { num := 0, den := 1 }
+      if toSubtractsStart && cfgInputs.length ≤ 1 && toVal.num * st.den < st.num * toVal.den then
+        [.invalidSeconds "-to" "-to smaller than -ss"]
+      else []
+  let effDurSec : Option CliSeconds :=
+    match cfgDurationSec, extToSec with
+    | some d, _ => some d
+    | none, none => none
+    | none, some toVal =>
+      if !toSubtractsStart then
+        some toVal
+      else
+        let st := cfgStartSec.getD { num := 0, den := 1 }
+        if toVal.num * st.den ≥ st.num * toVal.den then
+          some { num := toVal.num * st.den - st.num * toVal.den, den := toVal.den * st.den }
+        else
+          none
   let startMsOpt := cfgStartSec.bind cliSecondsToMillis
-  let durMsOpt := cfgDurationSec.bind cliSecondsToMillis
+  let durMsOpt := effDurSec.bind cliSecondsToMillis
   let startOverflow := cfgStartSec.isSome && startMsOpt.isNone
-  let durOverflow := cfgDurationSec.isSome && durMsOpt.isNone
+  let durOverflow := effDurSec.isSome && durMsOpt.isNone
   let hasCopyFilterConflict : Bool :=
     (cfgVideoCodec == some .copy && cfgVideoFilter.isSome) ||
     (cfgAudioCodec == some .copy && cfgAudioFilter.isSome)
@@ -1157,7 +1191,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     else []
   let missingInErr : List CliError := if effectiveInputs.isEmpty then [.missingInput] else []
   let missingOutErr : List CliError := if cfgOutput.isNone && cfgDaemon.isNone then [.missingOutput] else []
-  let allErrors := cfgErrors ++ extExtraErrors ++ copyFilterErr ++ missingInErr ++ missingOutErr
+  let allErrors := cfgErrors ++ extExtraErrors ++ toRangeErr ++ copyFilterErr ++ missingInErr ++ missingOutErr
 
   let rec buildInputs (paths : List String) (idx : Nat) : List InputSpec :=
     match paths with
@@ -1170,7 +1204,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
         path := p
         safePath := isSafeIn
         seekStart := if idx == 0 then cfgStartSec else none
-        duration := if idx == 0 then cfgDurationSec else none } :: buildInputs ps (idx + 1)
+        duration := if idx == 0 then effDurSec else none } :: buildInputs ps (idx + 1)
   let inputSpecs := buildInputs effectiveInputs 0
   let anyConcatInput := effectiveInputs.any isSafeConcatInputPath
 
@@ -1263,6 +1297,8 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     anyConcatInput ||
     !isSingleMp4Input ||
     extHasExtraDelegatedFlags ||
+    extHasPostInputSeek ||
+    extToSec.isSome ||
     !extMpegOptions.isEmpty ||
     extNoSubtitle ||
     !extMaps.isEmpty ||
@@ -1299,18 +1335,17 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     | _ => false
   let nativeCopyCodecsOk : Bool :=
     (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy) ||
-    (cfgVideoCodec == some .copy && cfgAudioCodec.isNone &&
-      (cfgNoAudio || (!extMaps.isEmpty && extMaps.all (fun m => m.kind == .video)) || inferredFmt == "ivf")) ||
-    (cfgAudioCodec == some .copy && cfgVideoCodec.isNone &&
-      (cfgNoVideo || (!extMaps.isEmpty && extMaps.all (fun m => m.kind == .audio)) ||
-       inferredFmt == "wav" || inferredFmt == "flac"))
+    (cfgVideoCodec == some .copy && cfgAudioCodec.isNone) ||
+    (cfgAudioCodec == some .copy && cfgVideoCodec.isNone)
   let nativeMapsOk : Bool :=
     extMaps.all (fun m => m.inputIdx == 0)
   let nativeSubtitleCodecOk : Bool :=
     extSubtitleCodec.isNone || extSubtitleCodec == some .copy
+  let nativeToTimelineOk : Bool :=
+    extToSec.isNone || cfgDurationSec.isNone
   let isNativeStreamCopy : Bool :=
     nativeCopyFormat && nativeSingleInput && nativeMetadataOk &&
-    nativeCopyCodecsOk && nativeMapsOk && nativeSubtitleCodecOk &&
+    nativeCopyCodecsOk && nativeMapsOk && nativeSubtitleCodecOk && nativeToTimelineOk &&
     !(cfgNoVideo && cfgNoAudio && extNoSubtitle) &&
     extExtraOutputs.isEmpty && !extHasExtraDelegatedFlags && extMpegOptions.isEmpty &&
     extMapMetadataSource == -1 && extMapChaptersSource == -1 &&
@@ -1356,7 +1391,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     }
     timeline := {
       startSec := cfgStartSec
-      durationSec := cfgDurationSec
+      durationSec := effDurSec
       startMs := startMsOpt
       durationMs := durMsOpt
       frameRate := cfgFrameRate

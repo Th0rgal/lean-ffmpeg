@@ -1,8 +1,8 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
-The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
+The 2026-10-30 M1-B2 native zero-exec stream-copy & remux closure under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
-**9,496 declarations with zero sorryAx/custom axioms** and **271/271 tight
+**9,514 declarations with zero sorryAx/custom axioms** and **271/271 tight
 specifications** (`Format`: 61, `Video`: 31, `Encoder`: 30, `Scale`: 28,
 `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with `16/16` `LNIR_WIRE_V1`
@@ -10,7 +10,14 @@ kernels passing `SymbolicTV` (`validate-tv --samples 64`) and certificate
 verification (`verify-certs`: `verified: true`, `11 VerifiedKernelProof`,
 `4 TranslationValidated`, `1 Tested`, all `chainValid: true` and
 `theoremsValid: true`), and a `1,166`-line C-ABI/POSIX/SIMD bridge
-(`c/leanav_simd_kernels.c`). In the Wave 2 FATE sweep across the `6,133`
+(`c/leanav_simd_kernels.c`). Native `independent_verified` stream copy (`-c copy`,
+`-c:v copy`, `-c:a copy`, `-ss`, `-t`, `-to`, `-map`, `-vn`/`-an`/`-sn`, `-metadata`,
+and `/dev/null` output) executes in pure Lean 4 with zero `ffmpeg` subprocesses
+across MP4/MOV/M4V/M4A (including `ctts` v0/v1, `elst` `mvhd` timescale rescaling,
+`stss`, `co64`, uncompressed PCM fixed-sample slicing, and multi-`stsd` safe
+demotion), Matroska/WebM (`SimpleBlock`, `BlockGroup`, `SeekHead`/`Cues`), WAV,
+FLAC (`STREAMINFO` + `VORBIS_COMMENT`), and IVF, verified by 17 zero-exec
+differential & OS-`strace` tests in `tests/differential/test_native_remux.py`. In the Wave 2 FATE sweep across the `6,133`
 retained inventory rows (`5,721` configured + `412` disabled = `6,065` real
 upstream targets; `reports/fate-sweep-wave2-complete-20261029.json`), all
 `5,721/5,721` configured baseline targets exited status-zero and all

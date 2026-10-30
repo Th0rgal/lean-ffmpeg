@@ -25,6 +25,7 @@ def zero_exec_env(tmp: Path):
         script.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if k not in ("LD_LIBRARY_PATH",)}
     env["PATH"] = f"{poison}:/usr/bin:/bin"
+    env["LEANAV_FFMPEG_BIN"] = str(poison / "ffmpeg")
     return env, marker
 
 
@@ -76,6 +77,11 @@ class NativeRemuxTests(unittest.TestCase):
                 "-movflags", "frag_keyframe+empty_moov",
             ],
             "adpcm.wav": ["-f", "lavfi", "-i", tone48, "-c:a", "adpcm_ima_wav"],
+            "ac3_cbr.mp4": [
+                "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", tone48,
+                "-c:v", "libx264", "-g", "10", "-c:a", "ac3", "-b:a", "384k", "-ar", "48000",
+            ],
+            "audio_only.mp4": ["-f", "lavfi", "-i", tone48, "-c:a", "aac"],
         }
         for name, args in gens.items():
             res = subprocess.run([FFMPEG, "-v", "error", "-y", *args, str(cls.tmp / name)], capture_output=True)
@@ -423,6 +429,195 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertFalse(executed)
         self.assertIn("ivf", res.stdout)
+        self.assertNotIn("single track", res.stdout)
+        self.assertNotIn("byte-preserving stream copy", res.stdout)
+
+    def test_cbr_ac3_in_mp4_preserves_packet_boundaries_not_pcm_rewritten(self):
+        # Bug 1A: 384kbps AC-3 @ 48kHz has byteLen=1536, dur=1536 (byteLen % dur == 0);
+        # must NOT be mistaken for 1-byte-per-sample uncompressed PCM.
+        out = self.tmp / "ac3_out.mp4"
+        res, executed = self.native("-json", "-y", "-i", "ac3_cbr.mp4", "-c", "copy", out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual(self.framemd5(out, "-map", "0:a:0"), self.framemd5(self.tmp / "ac3_cbr.mp4", "-map", "0:a:0"))
+        a_pkts = self.packets(out, "-select_streams", "a:0")
+        self.assertTrue(all(int(p[2]) == 1536 for p in a_pkts))
+
+        out_trim = self.tmp / "ac3_trim.mp4"
+        res, executed = self.native("-json", "-y", "-ss", "0.5", "-t", "1.0", "-i", "ac3_cbr.mp4", "-c", "copy", out_trim)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertTrue(self.framemd5(out_trim, "-map", "0:a:0"))
+
+    def test_non_1000_mvhd_timescale_rescaled_in_elst_without_truncation(self):
+        # Bug 1B: Patch av.mp4 mvhd timescale 1000 -> 600 and scale elst segment_duration * 600 / 1000
+        import struct
+        raw = bytearray((self.tmp / "av.mp4").read_bytes())
+
+        def patch_boxes(buf, start, end, scale_fn):
+            pos = start
+            while pos + 8 <= end:
+                sz = struct.unpack_from(">I", buf, pos)[0]
+                fcc = bytes(buf[pos + 4 : pos + 8]).decode("latin1")
+                if sz < 8 or pos + sz > end:
+                    break
+                scale_fn(buf, pos, sz, fcc)
+                if fcc in ("moov", "trak", "edts"):
+                    patch_boxes(buf, pos + 8, pos + sz, scale_fn)
+                pos += sz
+
+        def rescale_600(buf, pos, sz, fcc):
+            if fcc == "mvhd":
+                ver = buf[pos + 8]
+                if ver == 0:
+                    old_dur = struct.unpack_from(">I", buf, pos + 24)[0]
+                    struct.pack_into(">I", buf, pos + 20, 600)
+                    struct.pack_into(">I", buf, pos + 24, round(old_dur * 600 / 1000))
+            elif fcc == "tkhd":
+                ver = buf[pos + 8]
+                if ver == 0:
+                    old_dur = struct.unpack_from(">I", buf, pos + 28)[0]
+                    struct.pack_into(">I", buf, pos + 28, round(old_dur * 600 / 1000))
+            elif fcc == "elst":
+                ver = buf[pos + 8]
+                cnt = struct.unpack_from(">I", buf, pos + 12)[0]
+                if ver == 0:
+                    for i in range(cnt):
+                        eoff = pos + 16 + i * 12
+                        sd = struct.unpack_from(">I", buf, eoff)[0]
+                        struct.pack_into(">I", buf, eoff, round(sd * 600 / 1000))
+
+        patch_boxes(raw, 0, len(raw), rescale_600)
+        qt600 = self.tmp / "qt600.mov"
+        qt600.write_bytes(bytes(raw))
+        src_dur = float(self.probe(qt600, "-show_format")["format"]["duration"])
+        self.assertGreater(src_dur, 2.3)
+
+        out_mov = self.tmp / "qt600_copy.mov"
+        res, executed = self.native("-json", "-y", "-i", qt600, "-c", "copy", out_mov)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        out_dur = float(self.probe(out_mov, "-show_format")["format"]["duration"])
+        self.assertAlmostEqual(out_dur, src_dur, delta=0.05)
+        self.assertEqual(len(self.framemd5(out_mov, "-map", "0:v:0")),
+                         len(self.framemd5(qt600, "-map", "0:v:0")))
+
+    def test_single_stream_cv_copy_and_ca_copy_native_vs_multitrack_fallback(self):
+        # Bug 1C: -c:v copy on 1-track video MP4/MKV and -c:a copy on 1-track audio MP4 run natively
+        for src_name, flag, val, out_name in (
+            ("in.mp4", "-c:v", "copy", "cv_single.mp4"),
+            ("in.mkv", "-c:v", "copy", "cv_single.mkv"),
+            ("audio_only.mp4", "-c:a", "copy", "ca_single.mp4"),
+        ):
+            with self.subTest(case=out_name):
+                out = self.tmp / out_name
+                res, executed = self.native("-json", "-y", "-i", src_name, flag, val, out)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                self.assertFalse(executed)
+                doc = json.loads(res.stdout)
+                self.assertEqual(doc["tier"], "independent_verified")
+
+        # Multi-track A+V with only -c:v copy (no -c:a copy, no -an) must delegate to transcode audio
+        for src_name, out_name in (("av.mp4", "cv_av.mp4"), ("multi.mkv", "cv_multi.mkv")):
+            with self.subTest(multi=src_name):
+                plan_res = subprocess.run([str(BINARY), "plan", "-y", "-i", src_name, "-c:v", "copy", out_name],
+                                          capture_output=True, text=True, cwd=self.tmp)
+                self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+
+    def test_multi_entry_stsd_demotes_to_delegated_faithful_not_invalid(self):
+        # Bug 2A: Valid MP4 with entry_count=2 in stsd demotes cleanly to delegated_faithful instead of failing closed
+        import struct
+        raw = bytearray((self.tmp / "in.mp4").read_bytes())
+        stsd_idx = raw.find(b"stsd")
+        self.assertGreater(stsd_idx, 4)
+        stsd_pos = stsd_idx - 4
+        stsd_sz = struct.unpack_from(">I", raw, stsd_pos)[0]
+        entry_bytes = bytes(raw[stsd_pos + 16 : stsd_pos + stsd_sz])
+        # Duplicate sample entry in stsd and update parent box sizes (stsd, stbl, minf, mdia, trak, moov)
+        delta = len(entry_bytes)
+
+        def rebuild_with_dup_stsd(buf, start, end):
+            out = bytearray()
+            pos = start
+            while pos + 8 <= end:
+                sz = struct.unpack_from(">I", buf, pos)[0]
+                fcc = bytes(buf[pos + 4 : pos + 8])
+                if fcc in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                    inner = rebuild_with_dup_stsd(buf, pos + 8, pos + sz)
+                    out += struct.pack(">I", 8 + len(inner)) + fcc + inner
+                elif fcc == b"stsd":
+                    body = bytearray(buf[pos + 8 : pos + sz])
+                    struct.pack_into(">I", body, 4, 2)
+                    body += entry_bytes
+                    out += struct.pack(">I", 8 + len(body)) + fcc + body
+                elif fcc == b"stco":
+                    body = bytearray(buf[pos + 8 : pos + sz])
+                    cnt = struct.unpack_from(">I", body, 4)[0]
+                    for i in range(cnt):
+                        off_i = 8 + i * 4
+                        old_co = struct.unpack_from(">I", body, off_i)[0]
+                        if old_co > stsd_pos:
+                            struct.pack_into(">I", body, off_i, old_co + delta)
+                    out += struct.pack(">I", 8 + len(body)) + fcc + body
+                else:
+                    out += buf[pos : pos + sz]
+                pos += sz
+            return out
+
+        multi_stsd = self.tmp / "multi_stsd.mp4"
+        multi_stsd.write_bytes(bytes(rebuild_with_dup_stsd(raw, 0, len(raw))))
+        plan_res = subprocess.run([str(BINARY), "plan", "-y", "-i", str(multi_stsd), "-c", "copy", "o_mstsd.mp4"],
+                                  capture_output=True, text=True, cwd=self.tmp)
+        self.assertEqual(plan_res.returncode, 0, plan_res.stdout + plan_res.stderr)
+        backend = json.loads(plan_res.stdout)["backend"]
+        self.assertEqual(backend["tier"], "delegated_faithful")
+        self.assertEqual(backend["reasons"], ["native_stream_copy_layout_unsupported"])
+
+    def test_post_input_ss_and_pre_or_post_input_to_and_dev_null_native(self):
+        # Bug 3A & 3B: post-input -ss, pre/post-input -to, and /dev/null output without -y
+        out_post_ss = self.tmp / "post_ss.mp4"
+        res, executed = self.native("-json", "-y", "-i", "in.mp4", "-ss", "0.5", "-t", "1.0", "-c", "copy", out_post_ss)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertAlmostEqual(float(self.probe(out_post_ss, "-show_format")["format"]["duration"]), 1.0, delta=0.15)
+
+        out_pre_to = self.tmp / "pre_to.mp4"
+        res, executed = self.native("-json", "-y", "-ss", "0.5", "-to", "1.5", "-i", "in.mp4", "-c", "copy", out_pre_to)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertAlmostEqual(float(self.probe(out_pre_to, "-show_format")["format"]["duration"]), 1.0, delta=0.15)
+
+        out_post_to = self.tmp / "post_to.wav"
+        res, executed = self.native("-json", "-y", "-i", "in.wav", "-to", "1.25", "-c", "copy", out_post_to)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertAlmostEqual(float(self.probe(out_post_to, "-show_format")["format"]["duration"]), 1.25, places=5)
+
+        # -to smaller than pre-input -ss must fail closed
+        bad_to = self.tmp / "bad_to.mp4"
+        res, executed = self.native("-json", "-y", "-ss", "1.5", "-to", "0.5", "-i", "in.mp4", "-c", "copy", bad_to)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertFalse(executed)
+        self.assertFalse(bad_to.exists())
+
+        # /dev/null output without -y succeeds natively (zero execve, no EINVAL fsync or .tmp rename)
+        res, executed = self.native("-json", "-i", "in.mp4", "-f", "mp4", "-c", "copy", "/dev/null")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual(json.loads(res.stdout)["tier"], "independent_verified")
+
+        # OS-level strace -f -e trace=execve check if strace is installed
+        strace_bin = shutil.which("strace")
+        if strace_bin:
+            strace_out = self.tmp / "strace_check.mp4"
+            st = subprocess.run(
+                [strace_bin, "-f", "-e", "trace=execve", str(BINARY), "-json", "-y",
+                 "-ss", "0.5", "-to", "1.5", "-i", str(self.tmp / "av.mp4"), "-c", "copy", str(strace_out)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
+            exec_lines = [ln for ln in st.stderr.splitlines() if "execve(" in ln]
+            self.assertEqual(len(exec_lines), 1, f"Unexpected child execve calls: {exec_lines}")
 
 
 if __name__ == "__main__":

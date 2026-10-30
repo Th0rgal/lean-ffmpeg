@@ -1200,12 +1200,12 @@ def isIntrospectionFlag (s : String) : Bool :=
 
 def nativeIntrospectionLines (flag : String) : Option (List String) :=
   let nativeFormats := [
-    " DE  ivf             On2 IVF",
-    " DE  matroska        Matroska (byte-preserving stream copy)",
-    " DE  mov,mp4         QuickTime / MOV / ISO BMFF (single track)",
-    " DE  flac            raw FLAC (byte-preserving stream copy)",
-    " DE  wav             WAV / WAVE (Waveform Audio)",
-    " DE  webm            WebM (byte-preserving stream copy)"]
+    " DE  ivf             On2 IVF (native stream copy & keyframe trim)",
+    " DE  matroska        Matroska (native multi-track stream copy & trim)",
+    " DE  mov,mp4         QuickTime / MOV / ISO BMFF (native multi-track stream copy & trim)",
+    " DE  flac            raw FLAC (native frame-exact stream copy & trim)",
+    " DE  wav             WAV / WAVE (native sample-exact stream copy & trim)",
+    " DE  webm            WebM (native multi-track stream copy & trim)"]
   if flag == "-version" || flag == "--version" then
     some ["lffmpeg version 0.3.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Maxwell Verified)",
           "native independent_verified stream copy: mp4, ivf, wav, flac, matroska, webm",
@@ -1283,8 +1283,10 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
   let bytes ← IO.FS.readBinFile inp.path
   let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
   let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
+  let copyVideo := out.videoCodec == some .copy
+  let copyAudio := out.audioCodec == some .copy
   match nativeRemuxBytes inFmt outFmt bytes (plan.timeline.startMs.getD 0).toNat
-      (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps with
+      (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps copyVideo copyAudio with
   | .fallback => return demoteNativePlan plan
   | _ => return plan
 
@@ -1293,7 +1295,8 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let some out := plan.outputs.head? | return none
   let some outFmt := containerFormatOfName out.format | return none
   let some inFmt := nativeInputContainerFormat inPath | return none
-  if !cfg.overwrite && (← System.FilePath.pathExists out.path) then
+  let isDevNull := out.path == "/dev/null"
+  if !cfg.overwrite && !isDevNull && (← System.FilePath.pathExists out.path) then
     if cfg.jsonOutput || args.contains "-n" then
       return some (← reportCliError cfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists")
@@ -1306,14 +1309,21 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let durMs := (plan.timeline.durationMs.getD 0).toNat
   let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
   let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
-  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps with
+  let copyVideo := out.videoCodec == some .copy
+  let copyAudio := out.audioCodec == some .copy
+  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps copyVideo copyAudio with
   | .fallback => return none
   | .invalid reason =>
     return some (← reportCliError cfg
       s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-native-copy\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}"
       s!"Native stream copy rejected {inPath}: {reason}")
   | .remuxed outBytes =>
-    match ← writeMediaFileAtomic out.path outBytes with
+    let writeRes ←
+      if isDevNull then
+        writeMediaFileStreaming out.path outBytes
+      else
+        writeMediaFileAtomic out.path outBytes
+    match writeRes with
     | .ok _ =>
       let t1 ← IO.monoNanosNow
       if cfg.jsonOutput then
@@ -1339,8 +1349,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
   if plan.resources.dumpPlan then
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1
-  if !ext.extraErrors.isEmpty then
-    let allErrs := cfg.errors ++ ext.extraErrors
+  if !plan.errors.isEmpty then
+    let allErrs := plan.errors
     if cfg.jsonOutput then
       IO.println s!"\{ \"ok\": false, \"mode\": \"ffmpeg-cli\", \"error_count\": {allErrs.length} }"
     else if !cliQuiet cfg.logLevel then
@@ -1370,10 +1380,10 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-ss milliseconds overflow\"}"
         "-ss value is too large"
-    if validCfg.durationSec.isSome && plan.timeline.durationMs.isNone then
+    if plan.timeline.durationSec.isSome && plan.timeline.durationMs.isNone then
       return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t milliseconds overflow\"}"
-        "-t value is too large"
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"-t/-to milliseconds overflow\"}"
+        "-t/-to value is too large"
     if validCfg.daemon.isSome || validCfg.golden.isSome then
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"unsupported\":\"-daemon/-golden\"}"
