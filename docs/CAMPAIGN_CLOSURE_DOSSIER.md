@@ -1,5 +1,19 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-30 M1-C2 standalone FFV1 v3 validation under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**9,827 declarations with zero sorryAx/custom axioms** and **320/320 tight
+specifications** across 20 formal modules (`Format`: 56, `Ffv1Proofs`: 47,
+`Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23,
+`PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Md5`: 7,
+`Cli`: 6, `Filter`: 6), adding standalone pure Lean 4 FFV1 version 3 lossless
+video encoding, decoding, and remuxing (`yuv420p`, `gray`, `rgb24`, `bgr0`;
+Golomb-Rice coder `0` and range coders `-2`/`1`/`2`; context models `0`/`1`;
+`1..64` slices; CRC-32 `slicecrc` `0`/`1`; Matroska `.mkv`, QuickTime `.mov`,
+AVI `.avi`, `rawvideo`, `yuv4mpegpipe`, `md5`, and `framemd5`) under
+`independent_verified` with zero `ffmpeg` subprocess execution (verified under
+`PATH=/nonexistent` and `strace -f -e trace=execve`).
+
 The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
 **8,916 declarations with zero sorryAx/custom axioms** and **266/266 tight

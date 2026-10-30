@@ -49,6 +49,32 @@
         "invalid_or_truncated_ivf_stream",
         "ivf_packet_integrity_or_dimension_failure"
       ]
+    },
+    {
+      "id": "ffv1_v3_lossless_codec_and_containers",
+      "entry_point": "LeanAV.Ffv1Pipeline.executeFfv1Pure",
+      "underlying_spec": "LeanAV.Ffv1.encodeFrameV3 / LeanAV.Ffv1.decodeFrameV3",
+      "tier": "independent_verified",
+      "theorems": [
+        "LeanAV.Ffv1Proofs.ffv1DecodeYuv420pPure_encode_roundtrip",
+        "LeanAV.Ffv1Proofs.ffv1Yuv420pFrameSpec_lossless_roundtrip",
+        "LeanAV.Ffv1Proofs.ffv1RangeSplit_partition_and_bounds",
+        "LeanAV.Ffv1Proofs.ffv1RangeDecoder_refill_terminates_one_step",
+        "LeanAV.Ffv1Proofs.ffv1RangeDecoder_getBit_range_inv",
+        "LeanAV.Ffv1Proofs.ffv1Rct_inverse_forward_exact",
+        "LeanAV.Ffv1Proofs.ffv1FoldSigned_8bit_residual_reconstruct",
+        "LeanAV.Ffv1Proofs.ffv1FoldSigned_9bit_residual_reconstruct",
+        "LeanAV.Ffv1Proofs.ffv1SrGolomb_decode_encode_roundtrip",
+        "LeanAV.Ffv1Proofs.ffv1SrGolomb_encode_decode_roundtrip",
+        "LeanAV.Ffv1Proofs.ffv1NativePlanGateSpec",
+        "LeanAV.Md5.md5Hex_rfc1321_vectors"
+      ],
+      "fallback_conditions": [
+        "non_ffv1_codec_in_generic_container",
+        "multi_stream_container_with_audio_or_subtitle_tracks",
+        "ffv1_v0_v1_without_configuration_record",
+        "cross_colorspace_pixel_format_conversion_requested"
+      ]
     }
   ]
 }
