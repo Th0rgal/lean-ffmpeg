@@ -200,19 +200,41 @@ def h264HighExtProfileValidSpec : AVGateSpec UInt8 (fun p =>
   nonVacuous := by decide
   tight := by decide
 
+/-- Declarative ITU-T H.264 Table 7-6 `slice_type` domain (`0..9`), independent of `classifyH264SliceType`. -/
+def ValidH264SliceTypeProp (t : UInt8) : Prop :=
+  t.toNat ≤ 9
+
 /-- `slice_type ∈ [0, 9]` (`ISO/IEC 14496-10` Table 7-6) is exactly the domain of `classifyH264SliceType`. -/
-def h264SliceTypeValidSpec : AVGateSpec UInt8 (fun t => (classifyH264SliceType t).isSome) where
+def h264SliceTypeValidSpec : AVGateSpec UInt8 ValidH264SliceTypeProp where
   gate := fun t => (classifyH264SliceType t).isSome
   sound := by
     intro t h
-    exact h
+    unfold ValidH264SliceTypeProp
+    unfold classifyH264SliceType at h
+    by_cases hgt : t > 9
+    · simp [hgt] at h
+    · have hbn : ¬ (9 < t.toBitVec.toNat) := hgt
+      change t.toBitVec.toNat ≤ 9
+      omega
   complete := by
     intro t h
-    exact h
+    unfold ValidH264SliceTypeProp at h
+    unfold classifyH264SliceType
+    have hnotgt : ¬ (t > 9) := by
+      intro hgt
+      have hbn : 9 < t.toBitVec.toNat := hgt
+      have htn : t.toBitVec.toNat ≤ 9 := h
+      omega
+    simp only [hnotgt, ↓reduceIte]
+    split <;> rfl
   posWitness := 2
   negWitness := 10
   nonVacuous := by decide
   tight := by decide
+
+theorem h264SliceTypeValidSpec_iff (t : UInt8) :
+    (classifyH264SliceType t).isSome = true ↔ ValidH264SliceTypeProp t :=
+  h264SliceTypeValidSpec.iff_safe t
 
 /-- A parsed `AvcDecoderConfigRecord` is structurally valid and serializes byte-for-byte back to its source. -/
 def AvccRecordRoundtrip (buf : ByteArray) : Prop :=
@@ -242,15 +264,100 @@ theorem h264_avcc_high444_roundtrip :
         | none => false)
      | none => false) = true := rfl
 
+/-- Declarative `ISO/IEC 14496-15` §5.3.3.1.2 `AVCDecoderConfigurationRecord` structural specification,
+    defined independently in `Prop` without referencing `AvcDecoderConfigRecord.isValid`. -/
+def ValidAvccRecordProp (rec : AvcDecoderConfigRecord) : Prop :=
+  rec.configurationVersion = 1 ∧
+  (rec.lengthSizeMinusOne.toNat + 1 = 1 ∨ rec.lengthSizeMinusOne.toNat + 1 = 2 ∨ rec.lengthSizeMinusOne.toNat + 1 = 4) ∧
+  rec.spsNalus.size ≤ 31 ∧
+  rec.ppsNalus.size ≤ 255 ∧
+  (∀ b ∈ rec.spsNalus.toList, 0 < b.data.size ∧ b.data.size ≤ 0xFFFF) ∧
+  (∀ b ∈ rec.ppsNalus.toList, 0 < b.data.size ∧ b.data.size ≤ 0xFFFF) ∧
+  (rec.hasHighExt = true →
+    ((rec.avcProfileIndication = 100 ∨ rec.avcProfileIndication = 110 ∨ rec.avcProfileIndication = 122 ∨
+      rec.avcProfileIndication = 144 ∨ rec.avcProfileIndication = 244 ∨ rec.avcProfileIndication = 44 ∨
+      rec.avcProfileIndication = 83 ∨ rec.avcProfileIndication = 86 ∨ rec.avcProfileIndication = 118 ∨
+      rec.avcProfileIndication = 128) ∧
+     rec.chromaFormatIdc.toNat ≤ 3 ∧
+     rec.bitDepthLumaMinus8.toNat ≤ 7 ∧
+     rec.bitDepthChromaMinus8.toNat ≤ 7 ∧
+     rec.spsExtNalus.size ≤ 255 ∧
+     (∀ b ∈ rec.spsExtNalus.toList, 0 < b.data.size ∧ b.data.size ≤ 0xFFFF)))
+
 /-- Structural validation of `AvcDecoderConfigRecord` is sound, complete, non-vacuous, and tight. -/
-def h264AvccRecordValidSpec : AVGateSpec AvcDecoderConfigRecord (fun rec => rec.isValid = true) where
+def h264AvccRecordValidSpec : AVGateSpec AvcDecoderConfigRecord ValidAvccRecordProp where
   gate := AvcDecoderConfigRecord.isValid
   sound := by
     intro rec h
-    exact h
+    unfold AvcDecoderConfigRecord.isValid isValidAvccLengthSize isAvccExtProfile at h
+    unfold ValidAvccRecordProp
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', beq_iff_eq,
+      List.all_eq_true, decide_eq_true_eq, gt_iff_lt] at h
+    rcases h with ⟨⟨⟨⟨⟨⟨hver, hlen⟩, hspsSz⟩, hppsSz⟩, hspsAll⟩, hppsAll⟩, hext⟩
+    have hlen' : rec.lengthSizeMinusOne.toNat + 1 = 1 ∨ rec.lengthSizeMinusOne.toNat + 1 = 2 ∨ rec.lengthSizeMinusOne.toNat + 1 = 4 := by
+      rcases hlen with (h1 | h2) | h4
+      · exact Or.inl h1
+      · exact Or.inr (Or.inl h2)
+      · exact Or.inr (Or.inr h4)
+    refine ⟨hver, hlen', hspsSz, hppsSz, hspsAll, hppsAll, ?_⟩
+    intro hHigh
+    rcases hext with hFalse | ⟨⟨⟨⟨⟨hprof, hch⟩, hbl⟩, hbc⟩, hextSz⟩, hextAll⟩
+    · rw [hHigh] at hFalse; cases hFalse
+    · have hprof' : rec.avcProfileIndication = 100 ∨ rec.avcProfileIndication = 110 ∨ rec.avcProfileIndication = 122 ∨
+          rec.avcProfileIndication = 144 ∨ rec.avcProfileIndication = 244 ∨ rec.avcProfileIndication = 44 ∨
+          rec.avcProfileIndication = 83 ∨ rec.avcProfileIndication = 86 ∨ rec.avcProfileIndication = 118 ∨
+          rec.avcProfileIndication = 128 := by
+        rcases hprof with ((((((((h1 | h2) | h3) | h4) | h5) | h6) | h7) | h8) | h9) | h10
+        · exact Or.inl h1
+        · exact Or.inr (Or.inl h2)
+        · exact Or.inr (Or.inr (Or.inl h3))
+        · exact Or.inr (Or.inr (Or.inr (Or.inl h4)))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h5))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h6)))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h7))))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h8)))))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h9))))))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr h10))))))))
+      have hch' : rec.chromaFormatIdc.toNat ≤ 3 := hch
+      have hbl' : rec.bitDepthLumaMinus8.toNat ≤ 7 := hbl
+      have hbc' : rec.bitDepthChromaMinus8.toNat ≤ 7 := hbc
+      exact ⟨hprof', hch', hbl', hbc', hextSz, hextAll⟩
   complete := by
     intro rec h
-    exact h
+    unfold ValidAvccRecordProp at h
+    rcases h with ⟨hver, hlen, hspsSz, hppsSz, hspsAll, hppsAll, hext⟩
+    unfold AvcDecoderConfigRecord.isValid isValidAvccLengthSize isAvccExtProfile
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', beq_iff_eq,
+      List.all_eq_true, decide_eq_true_eq, gt_iff_lt]
+    have hlen' : (rec.lengthSizeMinusOne.toNat + 1 = 1 ∨ rec.lengthSizeMinusOne.toNat + 1 = 2) ∨ rec.lengthSizeMinusOne.toNat + 1 = 4 := by
+      rcases hlen with h1 | h2 | h4
+      · exact Or.inl (Or.inl h1)
+      · exact Or.inl (Or.inr h2)
+      · exact Or.inr h4
+    refine ⟨⟨⟨⟨⟨⟨hver, hlen'⟩, hspsSz⟩, hppsSz⟩, hspsAll⟩, hppsAll⟩, ?_⟩
+    cases hHigh : rec.hasHighExt
+    · exact Or.inl rfl
+    · right
+      rcases hext hHigh with ⟨hprof, hch, hbl, hbc, hextSz, hextAll⟩
+      have hprof' : ((((((((rec.avcProfileIndication = 100 ∨ rec.avcProfileIndication = 110) ∨ rec.avcProfileIndication = 122) ∨
+          rec.avcProfileIndication = 144) ∨ rec.avcProfileIndication = 244) ∨ rec.avcProfileIndication = 44) ∨
+          rec.avcProfileIndication = 83) ∨ rec.avcProfileIndication = 86) ∨ rec.avcProfileIndication = 118) ∨
+          rec.avcProfileIndication = 128 := by
+        rcases hprof with h1 | h2 | h3 | h4 | h5 | h6 | h7 | h8 | h9 | h10
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl h1))))))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inr h2))))))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inr h3)))))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inr h4))))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inl (Or.inr h5)))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inr h6))))
+        · exact Or.inl (Or.inl (Or.inl (Or.inr h7)))
+        · exact Or.inl (Or.inl (Or.inr h8))
+        · exact Or.inl (Or.inr h9)
+        · exact Or.inr h10
+      have hch' : rec.chromaFormatIdc ≤ 3 := hch
+      have hbl' : rec.bitDepthLumaMinus8 ≤ 7 := hbl
+      have hbc' : rec.bitDepthChromaMinus8 ≤ 7 := hbc
+      exact ⟨⟨⟨⟨⟨hprof', hch'⟩, hbl'⟩, hbc'⟩, hextSz⟩, hextAll⟩
   posWitness := {
     avcProfileIndication := 66, profileCompatibility := 0, avcLevelIndication := 30,
     spsNalus := #[{ data := #[0x67] }], ppsNalus := #[{ data := #[0x68] }]
@@ -262,6 +369,10 @@ def h264AvccRecordValidSpec : AVGateSpec AvcDecoderConfigRecord (fun rec => rec.
   }
   nonVacuous := by decide
   tight := by decide
+
+theorem h264AvccRecordValidSpec_iff (rec : AvcDecoderConfigRecord) :
+    rec.isValid = true ↔ ValidAvccRecordProp rec :=
+  h264AvccRecordValidSpec.iff_safe rec
 
 /-! ## 3. Real FFmpeg SPS / PPS Parameter-Set Round-Trip (`1280×720` Baseline) -/
 
@@ -334,6 +445,37 @@ theorem pocType0_mmco5_resets_msb (log2M4 : UInt8) (lsb : UInt32) :
   unfold derivePicOrderCntType0
   simp
 
+/-- ITU-T H.264 §8.2.1.1 Eq. (8-4): for a coded frame (`fieldPicFlag = false`) with
+    `bottom_field_pic_order_in_frame_present_flag = true`, `BottomFieldOrderCnt = TopFieldOrderCnt + delta_pic_order_cnt_bottom`. -/
+theorem pocType0_frame_delta_bottom (st : PocType0State) (log2M4 : UInt8)
+    (isIdr : Bool) (nalRefIdc : UInt8) (hasMmco5 bottomField : Bool)
+    (lsb : UInt32) (deltaPicOrderCntBottom : Int32) :
+    let (topPoc, botPoc, picPoc, _) :=
+      derivePicOrderCntType0 st log2M4 isIdr nalRefIdc hasMmco5 false bottomField true lsb deltaPicOrderCntBottom
+    botPoc = topPoc + deltaPicOrderCntBottom.toInt ∧ picPoc = min topPoc botPoc := by
+  unfold derivePicOrderCntType0
+  simp
+
+/-- ITU-T H.264 §8.2.1.1 Eqs. (8-4)–(8-5): for a coded bottom field picture (`fieldPicFlag = true`, `bottomFieldFlag = true`),
+    `delta_pic_order_cnt_bottom` is ignored and `PicOrderCnt = PicOrderCntMsb + pic_order_cnt_lsb`. -/
+theorem pocType0_field_order_cnt (st : PocType0State) (log2M4 : UInt8)
+    (isIdr : Bool) (nalRefIdc : UInt8) (hasMmco5 bottomPresent : Bool)
+    (lsb : UInt32) (deltaPicOrderCntBottom : Int32) :
+    let (_, botPoc, picPoc, _) :=
+      derivePicOrderCntType0 st log2M4 isIdr nalRefIdc hasMmco5 true true bottomPresent lsb deltaPicOrderCntBottom
+    let maxLsbNat : Nat := 1 <<< (log2M4.toNat + 4)
+    let maxLsb : Int := Int.ofNat maxLsbNat
+    let prevMsb : Int := if isIdr then 0 else st.prevPicOrderCntMsb
+    let prevLsb : Int := if isIdr then 0 else Int.ofNat st.prevPicOrderCntLsb
+    let curLsb : Int := Int.ofNat (lsb.toNat % maxLsbNat)
+    let picOrderCntMsb : Int :=
+      if curLsb < prevLsb && (prevLsb - curLsb) ≥ (maxLsb / 2) then prevMsb + maxLsb
+      else if curLsb > prevLsb && (curLsb - prevLsb) > (maxLsb / 2) then prevMsb - maxLsb
+      else prevMsb
+    picPoc = picOrderCntMsb + curLsb ∧ botPoc = picOrderCntMsb + curLsb := by
+  unfold derivePicOrderCntType0
+  simp
+
 /-! ## 5. RBSP Trailing Stop-Bit & Big-Endian Length Field -/
 
 /-- `finalizeRbspWriter` always emits at least one byte (the `rbsp_trailing_bits` stop bit). -/
@@ -373,13 +515,163 @@ theorem h264_slice_header_idr_roundtrip :
             sliceQpDelta := 0, sliceQpY := 26 + pps.picInitQpMinus26,
             disableDeblockingFilterIdc := 0
           }
-          (match serializeH264SliceHeaderFull idrHdr sps pps with
-           | some nal =>
+          (match writeH264SliceHeaderBits idrHdr sps pps, serializeH264SliceHeaderFull idrHdr sps pps with
+           | some wHdr, some nal =>
              (match parseH264SliceHeaderFull (ByteSlice.ofByteArray nal) sps pps with
               | some parsed =>
                 parsed.nalUnitType == 5 && parsed.sliceKind == .I &&
                 parsed.sliceQpY == idrHdr.sliceQpY &&
+                parsed.sliceDataBitOffset == wHdr.totalBitsWritten &&
                 (serializeH264SliceHeaderFull parsed sps pps).map (fun r => r.data == nal.data) == some true
+              | none => false)
+           | _, _ => false)
+        | none => false)
+     | none => false) = true := rfl
+
+/-- Real FFmpeg `libx264` Main CABAC SPS (`128×96`, `profile_idc = 77`). -/
+def realCabacMainSps : Array UInt8 := #[
+  0x67, 0x4D, 0x40, 0x0A, 0xF2, 0x04, 0x1B, 0x60, 0x22, 0x00, 0x00, 0x03,
+  0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x1E, 0x24, 0x4A, 0x24
+]
+
+/-- Real FFmpeg `libx264` Main CABAC PPS (`entropy_coding_mode_flag = 1`). -/
+def realCabacMainPps : Array UInt8 := #[0x68, 0xEB, 0xE3, 0xCB, 0x20]
+
+/-- Real FFmpeg `libx264` CABAC IDR I-slice prefix (`0x65 0x88 0x84 0x00 0xBF` + first CABAC data bytes `0xFE 0xF6 0xAE`). -/
+def realCabacIdrNalSample : Array UInt8 := #[0x65, 0x88, 0x84, 0x00, 0xBF, 0xFE, 0xF6, 0xAE]
+
+/-- Real FFmpeg `libx264` CABAC non-IDR P-slice prefix (`0x41 0x9A 0x25 0xB1 0x0B 0xFF` + first CABAC data bytes `0xFE 0x8C`). -/
+def realCabacNonIdrNalSample : Array UInt8 := #[0x41, 0x9A, 0x25, 0xB1, 0x0B, 0xFF, 0xFE, 0x8C]
+
+/-- `alignCabacWriterLoop` reaches exact byte alignment (`bitsUsed = 0`) for any `w` with `w.bitsUsed < 8`. -/
+theorem alignCabacWriterLoop_byte_aligned :
+    ∀ (k : Nat) (w : BitWriter),
+      w.bitsUsed < 8 → 8 - w.bitsUsed ≤ k →
+      (alignCabacWriterLoop k w).bitsUsed = 0 ∧
+      (alignCabacWriterLoop k w).totalBitsWritten % 8 = 0
+  | 0, w, _, hk => by
+    have hbu : w.bitsUsed = 0 := by omega
+    unfold alignCabacWriterLoop BitWriter.totalBitsWritten
+    simp [hbu]
+  | k + 1, w, hlt, hk => by
+    unfold alignCabacWriterLoop
+    by_cases h0 : w.bitsUsed = 0
+    · simp [h0, BitWriter.totalBitsWritten]
+    · have hne : (w.bitsUsed == 0) = false := beq_false_of_ne h0
+      simp only [hne, Bool.false_eq_true, ↓reduceIte]
+      by_cases h7 : w.bitsUsed + 1 = 8
+      · have hw1 : (w.writeBit 1).bitsUsed = 0 := by
+          unfold BitWriter.writeBit
+          simp [h7]
+        cases k with
+        | zero =>
+          unfold alignCabacWriterLoop BitWriter.totalBitsWritten
+          simp [hw1]
+        | succ k' =>
+          unfold alignCabacWriterLoop BitWriter.totalBitsWritten
+          simp [hw1]
+      · have hw1_lt : (w.writeBit 1).bitsUsed < 8 := by
+          unfold BitWriter.writeBit
+          have hne8 : (w.bitsUsed + 1 == 8) = false := beq_false_of_ne h7
+          simp [hne8]
+          omega
+        have hw1_rem : 8 - (w.writeBit 1).bitsUsed ≤ k := by
+          unfold BitWriter.writeBit
+          have hne8 : (w.bitsUsed + 1 == 8) = false := beq_false_of_ne h7
+          simp [hne8]
+          omega
+        exact alignCabacWriterLoop_byte_aligned k (w.writeBit 1) hw1_lt hw1_rem
+
+/-- `alignCabacReaderLoop` always produces a byte-aligned `BitReader` (`bitOffset % 8 = 0`). -/
+theorem alignCabacReaderLoop_byte_aligned :
+    ∀ (k : Nat) (r r' : BitReader),
+      alignCabacReaderLoop k r = some r' → r'.bitOffset % 8 = 0
+  | 0, r, r', h => by
+    unfold alignCabacReaderLoop at h
+    by_cases hm : r.bitOffset % 8 = 0
+    · simp [hm] at h; subst h; exact hm
+    · simp [hm] at h
+  | k + 1, r, r', h => by
+    unfold alignCabacReaderLoop at h
+    by_cases hm : r.bitOffset % 8 = 0
+    · simp [hm] at h; subst h; exact hm
+    · have hne : (r.bitOffset % 8 == 0) = false := beq_false_of_ne hm
+      simp only [hne, Bool.false_eq_true, ↓reduceIte] at h
+      cases hrd : r.readBit with
+      | none => simp [hrd] at h
+      | some br =>
+        rcases br with ⟨b, rNext⟩
+        simp only [hrd] at h
+        by_cases hb1 : b = 1
+        · subst hb1
+          simp at h
+          exact alignCabacReaderLoop_byte_aligned k rNext r' h
+        · have hbne : (b != 1) = true := bne_iff_ne.mpr hb1
+          simp [hbne] at h
+
+/-- Append first 3 CABAC slice-data bytes (`0xFE 0xF6 0xAE`) after a CABAC IDR header for splicing proof. -/
+def appendSampleCabacData (w : BitWriter) : BitWriter :=
+  ((w.writeBitsMSB 0xFE 8).writeBitsMSB 0xF6 8).writeBitsMSB 0xAE 8
+
+set_option maxHeartbeats 4000000 in
+set_option maxRecDepth 400000 in
+/-- Real FFmpeg `libx264` CABAC IDR (`NAL 5`, `40` bits) slice header serializes to the exact
+    5-byte `libx264` prefix `#[0x65, 0x88, 0x84, 0x00, 0xBF]` with ZERO spurious `0x80` stop-bit byte,
+    and `serializeH264SliceNal` splices `slice_data` at `sliceDataBitOffset` with exact round-trip. -/
+theorem h264_cabac_idr_prefix_exact_and_offset_roundtrip :
+    (match parseH264SpsFull (ByteSlice.ofByteArray { data := realCabacMainSps }) with
+     | some sps =>
+       (match parseH264PpsFull (ByteSlice.ofByteArray { data := realCabacMainPps }) (some sps) with
+        | some pps =>
+          (match parseH264SliceHeaderFull (ByteSlice.ofByteArray { data := realCabacIdrNalSample }) sps pps with
+           | some shIdr =>
+             (match writeH264SliceHeaderBits shIdr sps pps with
+              | some wIdr =>
+                (match serializeH264SliceHeaderCabacPrefix shIdr sps pps with
+                 | some prefIdr =>
+                   (match serializeH264SliceHeaderFull shIdr sps pps with
+                    | some fullIdr =>
+                      (match serializeH264SliceNal shIdr sps pps appendSampleCabacData false with
+                       | some splicedIdr =>
+                         pps.entropyCodingModeFlag &&
+                         wIdr.bitsUsed == 0 &&
+                         wIdr.totalBitsWritten == shIdr.sliceDataBitOffset &&
+                         shIdr.sliceDataBitOffset == 40 &&
+                         prefIdr.data == #[0x65, 0x88, 0x84, 0x00, 0xBF] &&
+                         fullIdr.data == prefIdr.data &&
+                         splicedIdr.data == realCabacIdrNalSample &&
+                         (parseH264SliceHeaderFull (ByteSlice.ofByteArray fullIdr) sps pps == some shIdr) &&
+                         (parseH264SliceHeaderFull (ByteSlice.ofByteArray splicedIdr) sps pps == some shIdr)
+                       | none => false)
+                    | none => false)
+                 | none => false)
+              | none => false)
+           | none => false)
+        | none => false)
+     | none => false) = true := rfl
+
+set_option maxHeartbeats 4000000 in
+set_option maxRecDepth 400000 in
+/-- Real FFmpeg `libx264` CABAC non-IDR P-slice (`NAL 1`, `48` bits) header serializes to the exact
+    6-byte `libx264` prefix `#[0x41, 0x9A, 0x25, 0xB1, 0x0B, 0xFF]` with ZERO spurious `0x80` stop-bit byte,
+    round-tripping `sliceDataBitOffset == 48` identically. -/
+theorem h264_cabac_nonidr_prefix_exact_and_offset_roundtrip :
+    (match parseH264SpsFull (ByteSlice.ofByteArray { data := realCabacMainSps }) with
+     | some sps =>
+       (match parseH264PpsFull (ByteSlice.ofByteArray { data := realCabacMainPps }) (some sps) with
+        | some pps =>
+          (match parseH264SliceHeaderFull (ByteSlice.ofByteArray { data := realCabacNonIdrNalSample }) sps pps with
+           | some shP =>
+             (match writeH264SliceHeaderBits shP sps pps with
+              | some wP =>
+                (match serializeH264SliceHeaderFull shP sps pps with
+                 | some prefP =>
+                   wP.bitsUsed == 0 &&
+                   wP.totalBitsWritten == shP.sliceDataBitOffset &&
+                   shP.sliceDataBitOffset == 48 &&
+                   prefP.data == #[0x41, 0x9A, 0x25, 0xB1, 0x0B, 0xFF] &&
+                   (parseH264SliceHeaderFull (ByteSlice.ofByteArray prefP) sps pps == some shP)
+                 | none => false)
               | none => false)
            | none => false)
         | none => false)

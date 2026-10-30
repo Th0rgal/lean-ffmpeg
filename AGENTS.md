@@ -4,8 +4,8 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`), pairing:
 1. **22 Formal Lean 4 Modules (`LeanAV/*.lean`)**:
-   - **`13,105` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
-   - **`446 / 446` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, v2.1; `0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (63), `Ffv1Proofs` (60), `NativeKernels` (59), `Video` (46), `Audio` (34), `Encoder` (30), `Scale` (28), `Bitstream` (27), `Spec` (23), `PlanIR` (20), `H264SyntaxProofs` (18), `Core` (11), `Domain` (8), `Md5` (7), `Cli` (6), `Filter` (6).
+   - **`13,167` declarations** (verified under `v4.35.0`) verified with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+   - **`454 / 454` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, v2.1; `0 vacuous`, `0 trivial`, `0 shadowed`): `Format` (63), `Ffv1Proofs` (60), `NativeKernels` (59), `Video` (46), `Audio` (34), `Encoder` (30), `Scale` (28), `Bitstream` (27), `H264SyntaxProofs` (26), `Spec` (23), `PlanIR` (20), `Core` (11), `Domain` (8), `Md5` (7), `Cli` (6), `Filter` (6).
    - Standalone FFV1 version 3 lossless video encode/decode/remux (`LeanAV/Ffv1.lean`, `LeanAV/Ffv1Container.lean`, `LeanAV/Md5.lean`, `LeanAV/Ffv1Pipeline.lean`, `LeanAV/Ffv1Proofs.lean`), standalone lossless Zlib/DEFLATE (RFC 1950 / RFC 1951 stored, fixed, and dynamic canonical Huffman + LZ77), PNG (filters `0..4`, Adam7, `PLTE`/`tRNS`, 8/16-bit rawvideo CLI roundtrip), and FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC subframes, 4 stereo modes, STREAMINFO MD5 + CRC-8/CRC-16, 8/16/24/32-bit WAV & raw PCM CLI roundtrip), verified H.264 / AVC Annex-B + ISO 14496-15 `avcC` / length-prefixed NALU framing, RBSP `0x000003` emulation-prevention strip/insert, SPS (Baseline/Main/High/High10/High422/High444, `seq_scaling_matrix`, VUI/HRD), PPS (Baseline through High `transform_8x8_mode_flag` + `second_chroma_qp_index_offset`), slice headers (`P`/`B`/`I`/`SP`/`SI`, RPLM, `pred_weight_table`, `dec_ref_pic_marking`, CABAC `cabac_alignment_one_bit`), and POC Type 0 / Type 2 derivation (`LeanAV/H264Syntax.lean`, `LeanAV/H264SyntaxProofs.lean`), native zero-exec stream copy & trim across MP4/MOV/M4V/M4A, MKV/WebM, WAV, FLAC, and IVF, plus all plane scaling (`2x2`, `3x3`, `3:2`, `Q8` bilinear, 16-bit LE), 64-bit SWAR Annex-B start-code scanning (`scanAnnexBNalUnitsFast`, `hasZeroByte64`) and verified `UInt64` SWAR primitives (`swarScale2x2U64`, `swarBiPredAvgU64`, `swarXorResidualU64`), color/tonemap filters (`PQ10 -> BT.709`, `BT.2020 -> BT.709`), B-frame bi-pred / XOR residual DSP, 16x16 macroblock PSNR/SAD acceptance (`@lean_native_luma_acceptance_16x16_u8`, `@lean_native_luma_acceptance_16x16_u16le`), ISO BMFF 32/64-bit box navigation, surgical trailing-`moov` `pwrite` patching (`locateMp4TrailingMoovWindowIO` + `writeMp4WindowIO`), `colr`/`clli`/`mdcv`/`pasp`/`edts` patching, `avcC`/`hvcC`/`av1C` pure colorimetry probing, and `IO.Process.spawn` / ring-buffered POSIX pipe (`execPipeTranscodeU8IO`) transcode orchestration are defined in pure Lean 4.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
    - Decision gates, ISO BMFF header/handler/colorimetry classifiers, edit-list (`elst`) timestamp rescaling, bitrate and muxing-overhead estimators, luma mean/variance and PSNR acceptance packers, plane FFI contract checks, and PQ10/BT.2020 color-space helpers live in pure Lean 4 (`LeanAV/Format.lean`, `LeanAV/Scale.lean`, `LeanAV/PlanIR.lean`, `LeanAV/Encoder.lean`) and are exported to C without shadow re-implementations.
@@ -39,10 +39,10 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 13,105 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 13,167 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# 4. Audit all 22 formal modules in parallel with turbo-lean (446/446 non_vacuous_and_tight)
+# 4. Audit all 22 formal modules in parallel with turbo-lean (454/454 non_vacuous_and_tight)
 for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done
 
 # 5. Run Python tests; executed counts depend on platform and available dependencies

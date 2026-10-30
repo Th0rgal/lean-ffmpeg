@@ -2649,7 +2649,9 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264SyntaxProofs.h264AvccLengthSizeValidSpec
 #print axioms LeanAV.H264SyntaxProofs.h264HighExtProfileValidSpec
 #print axioms LeanAV.H264SyntaxProofs.h264SliceTypeValidSpec
+#print axioms LeanAV.H264SyntaxProofs.h264SliceTypeValidSpec_iff
 #print axioms LeanAV.H264SyntaxProofs.h264AvccRecordValidSpec
+#print axioms LeanAV.H264SyntaxProofs.h264AvccRecordValidSpec_iff
 #print axioms LeanAV.H264SyntaxProofs.h264_avcc_high1080_roundtrip
 #print axioms LeanAV.H264SyntaxProofs.h264_avcc_high444_roundtrip
 #print axioms LeanAV.H264SyntaxProofs.h264_real_sps_roundtrip
@@ -2659,8 +2661,14 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264SyntaxProofs.pocType2_ref_value
 #print axioms LeanAV.H264SyntaxProofs.pocType2_wrap_monotone
 #print axioms LeanAV.H264SyntaxProofs.pocType0_mmco5_resets_msb
+#print axioms LeanAV.H264SyntaxProofs.pocType0_frame_delta_bottom
+#print axioms LeanAV.H264SyntaxProofs.pocType0_field_order_cnt
 #print axioms LeanAV.H264SyntaxProofs.finalizeRbspWriter_nonempty
 #print axioms LeanAV.H264SyntaxProofs.bigEndian1_roundtrip
 #print axioms LeanAV.H264SyntaxProofs.h264_avcc_packet_framing_roundtrip
 #print axioms LeanAV.H264SyntaxProofs.h264_slice_header_idr_roundtrip
+#print axioms LeanAV.H264SyntaxProofs.alignCabacWriterLoop_byte_aligned
+#print axioms LeanAV.H264SyntaxProofs.alignCabacReaderLoop_byte_aligned
+#print axioms LeanAV.H264SyntaxProofs.h264_cabac_idr_prefix_exact_and_offset_roundtrip
+#print axioms LeanAV.H264SyntaxProofs.h264_cabac_nonidr_prefix_exact_and_offset_roundtrip
 

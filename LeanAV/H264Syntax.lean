@@ -53,20 +53,20 @@ def stripRbspEmulationList (ebsp : List UInt8) : List UInt8 :=
 def insertRbspEmulationBytes (rbsp : ByteArray) (hasNalHeader : Bool := true) : ByteArray :=
   if hasNalHeader then
     match rbsp.data.toList with
-    | [] => ByteArray.empty
-    | hdr :: body => ByteArray.mk (hdr :: insertRbspEmulationList body).toArray
+    | [] => { data := #[] }
+    | hdr :: body => { data := (hdr :: insertRbspEmulationList body).toArray }
   else
-    ByteArray.mk (insertRbspEmulationList rbsp.data.toList).toArray
+    { data := (insertRbspEmulationList rbsp.data.toList).toArray }
 
 /-- Strip `0x03` emulation prevention bytes from an EBSP `ByteSlice` (preserving byte 0 NAL header when `hasNalHeader == true`). -/
 def stripRbspEmulationBytesH264 (ebsp : ByteSlice) (hasNalHeader : Bool := true) : ByteArray :=
   let xs := (ebsp.ba.data.toList.drop ebsp.off).take ebsp.len
   if hasNalHeader then
     match xs with
-    | [] => ByteArray.empty
-    | hdr :: body => ByteArray.mk (hdr :: stripRbspEmulationList body).toArray
+    | [] => { data := #[] }
+    | hdr :: body => { data := (hdr :: stripRbspEmulationList body).toArray }
   else
-    ByteArray.mk (stripRbspEmulationList xs).toArray
+    { data := (stripRbspEmulationList xs).toArray }
 
 /-- Write `rbsp_trailing_bits()` (`1` stop bit followed by `0` alignment bits) and finalize `BitWriter`. -/
 @[inline]
@@ -871,15 +871,15 @@ def H264SpsFull.constraintByte (sps : H264SpsFull) : UInt8 :=
 /-- Parse a complete H.264 `SPS` NALU (`nal_unit_type = 7`, EBSP input including 1-byte NAL header). -/
 def parseH264SpsFull (nalPayload : ByteSlice) : Option H264SpsFull := Id.run do
   let rbsp := stripRbspEmulationBytesH264 nalPayload true
-  if rbsp.size < 4 then return none
-  let hdr := rbsp.get! 0
+  if rbsp.data.size < 4 then return none
+  let hdr := byteAtPure rbsp 0
   if (hdr &&& 0x80) != 0 || (hdr &&& 0x1F) != 7 then return none
   let some payloadBits := rbspPayloadBitLen rbsp | return none
   let nalRefIdc := (hdr >>> 5) &&& 0x03
-  let profileIdc := rbsp.get! 1
-  let cByte := rbsp.get! 2
-  let levelIdc := rbsp.get! 3
-  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.size }, bitOffset := 32 }
+  let profileIdc := byteAtPure rbsp 1
+  let cByte := byteAtPure rbsp 2
+  let levelIdc := byteAtPure rbsp 3
+  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.data.size }, bitOffset := 32 }
   let some (spsId64, r1) := r0.readUE | return none
   if spsId64 > 31 then return none
   let mut r := r1
@@ -1164,12 +1164,12 @@ structure H264PpsFull where
     Fails closed when `num_slice_groups_minus1 > 0` or any syntax range check fails. -/
 def parseH264PpsFull (nalPayload : ByteSlice) (spsOpt : Option H264SpsFull := none) : Option H264PpsFull := Id.run do
   let rbsp := stripRbspEmulationBytesH264 nalPayload true
-  if rbsp.size < 2 then return none
-  let hdr := rbsp.get! 0
+  if rbsp.data.size < 2 then return none
+  let hdr := byteAtPure rbsp 0
   if (hdr &&& 0x80) != 0 || (hdr &&& 0x1F) != 8 then return none
   let nalRefIdc := (hdr >>> 5) &&& 0x03
   let some payloadBits := rbspPayloadBitLen rbsp | return none
-  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.size }, bitOffset := 8 }
+  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.data.size }, bitOffset := 8 }
   let some (ppsId64, r1) := r0.readUE | return none
   let some (spsId64, r2) := r1.readUE | return none
   if ppsId64 > 255 || spsId64 > 31 then return none
@@ -1426,34 +1426,35 @@ def parseRefPicListModLoop (r0 : BitReader) : Option (Array RefPicListModOp × B
   return none
 
 /-- Parse one `pred_weight_table` reference list (`ISO/IEC 14496-10` §7.3.3.2). -/
-def parsePredWeightList (r0 : BitReader) (count : Nat) (chromaArrayType : Nat) : Option (Array PredWeightEntry × BitReader) := Id.run do
-  let mut r := r0
-  let mut arr : Array PredWeightEntry := #[]
-  for _ in [:count] do
-    let some (lwBit, r1) := r.readBit | return none
-    r := r1
-    let mut e : PredWeightEntry := { lumaWeightFlag := lwBit == 1 }
-    if e.lumaWeightFlag then
-      let some (lw, r2) := r.readSE | return none
-      let some (lo, r3) := r2.readSE | return none
-      if lw.toInt < -128 || lw.toInt > 127 || lo.toInt < -128 || lo.toInt > 127 then return none
-      e := { e with lumaWeight := lw, lumaOffset := lo }
-      r := r3
-    if chromaArrayType != 0 then
-      let some (cwBit, r4) := r.readBit | return none
-      r := r4
-      e := { e with chromaWeightFlag := cwBit == 1 }
-      if e.chromaWeightFlag then
-        let some (cbW, r5) := r.readSE | return none
-        let some (cbO, r6) := r5.readSE | return none
-        let some (crW, r7) := r6.readSE | return none
-        let some (crO, r8) := r7.readSE | return none
-        if cbW.toInt < -128 || cbW.toInt > 127 || cbO.toInt < -128 || cbO.toInt > 127 ||
-           crW.toInt < -128 || crW.toInt > 127 || crO.toInt < -128 || crO.toInt > 127 then return none
-        e := { e with cbWeight := cbW, cbOffset := cbO, crWeight := crW, crOffset := crO }
-        r := r8
-    arr := arr.push e
-  return some (arr, r)
+def parsePredWeightList (r0 : BitReader) (count : Nat) (chromaArrayType : Nat) : Option (Array PredWeightEntry × BitReader) :=
+  let rec loop (rem : Nat) (r : BitReader) (arr : Array PredWeightEntry) : Option (Array PredWeightEntry × BitReader) :=
+    match rem with
+    | 0 => some (arr, r)
+    | rem' + 1 => Id.run do
+      let some (lwBit, r1) := r.readBit | return none
+      let mut rCur := r1
+      let mut e : PredWeightEntry := { lumaWeightFlag := lwBit == 1 }
+      if e.lumaWeightFlag then
+        let some (lw, r2) := rCur.readSE | return none
+        let some (lo, r3) := r2.readSE | return none
+        if lw.toInt < -128 || lw.toInt > 127 || lo.toInt < -128 || lo.toInt > 127 then return none
+        e := { e with lumaWeight := lw, lumaOffset := lo }
+        rCur := r3
+      if chromaArrayType != 0 then
+        let some (cwBit, r4) := rCur.readBit | return none
+        rCur := r4
+        e := { e with chromaWeightFlag := cwBit == 1 }
+        if e.chromaWeightFlag then
+          let some (cbW, r5) := rCur.readSE | return none
+          let some (cbO, r6) := r5.readSE | return none
+          let some (crW, r7) := r6.readSE | return none
+          let some (crO, r8) := r7.readSE | return none
+          if cbW.toInt < -128 || cbW.toInt > 127 || cbO.toInt < -128 || cbO.toInt > 127 ||
+             crW.toInt < -128 || crW.toInt > 127 || crO.toInt < -128 || crO.toInt > 127 then return none
+          e := { e with cbWeight := cbW, cbOffset := cbO, crWeight := crW, crOffset := crO }
+          rCur := r8
+      return loop rem' rCur (arr.push e)
+  loop count r0 #[]
 
 /-- Parse `pred_weight_table()` (`ISO/IEC 14496-10` §7.3.3.2). -/
 def parsePredWeightTable (r0 : BitReader) (isBSlice : Bool) (numRefL0M1 numRefL1M1 : UInt8) (chromaArrayType : Nat)
@@ -1502,18 +1503,30 @@ def parseMmcoOpsLoop (r0 : BitReader) : Option (Array MmcoOp × BitReader) := Id
       r := r1
   return none
 
+/-- Consume `cabac_alignment_one_bit` (`1` bits, `ISO/IEC 14496-10` §7.3.3) up to byte alignment. -/
+def alignCabacReaderLoop : Nat → BitReader → Option BitReader
+  | 0, r => if r.bitOffset % 8 == 0 then some r else none
+  | k + 1, r =>
+    if r.bitOffset % 8 == 0 then some r
+    else
+      match r.readBit with
+      | none => none
+      | some (b, rNext) =>
+        if b != 1 then none
+        else alignCabacReaderLoop k rNext
+
 /-- Parse a complete H.264 Slice Header (`nal_unit_type ∈ {1, 5}`, `ISO/IEC 14496-10` §7.3.3) from an EBSP NALU slice. -/
 def parseH264SliceHeaderFull (nalPayload : ByteSlice) (sps : H264SpsFull) (pps : H264PpsFull) : Option H264SliceHeaderFull := Id.run do
   if pps.spsId != sps.spsId then return none
   let rbsp := stripRbspEmulationBytesH264 nalPayload true
-  if rbsp.size < 2 then return none
-  let hdr := rbsp.get! 0
+  if rbsp.data.size < 2 then return none
+  let hdr := byteAtPure rbsp 0
   if (hdr &&& 0x80) != 0 then return none
   let nalRefIdc := (hdr >>> 5) &&& 0x03
   let nalUnitType := hdr &&& 0x1F
   if nalUnitType != 1 && nalUnitType != 5 then return none
   if nalUnitType == 5 && nalRefIdc == 0 then return none
-  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.size }, bitOffset := 8 }
+  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.data.size }, bitOffset := 8 }
   let some (firstMb, r1) := r0.readUE | return none
   let some (st64, r2) := r1.readUE | return none
   let some (ppsId64, r3) := r2.readUE | return none
@@ -1683,11 +1696,8 @@ def parseH264SliceHeaderFull (nalPayload : ByteSlice) (sps : H264SpsFull) (pps :
       betaDiv2 := be
       r := rBe
   if pps.entropyCodingModeFlag then
-    for _ in [:8] do
-      if r.bitOffset % 8 != 0 then
-        let some (alignBit, rAln) := r.readBit | return none
-        if alignBit != 1 then return none
-        r := rAln
+    let some rAln := alignCabacReaderLoop 8 r | return none
+    r := rAln
   return some {
     nalRefIdc, nalUnitType, firstMbInSlice := firstMb.toUInt32,
     sliceType := st64.toUInt8, sliceKind := kind, ppsId := pps.ppsId,
@@ -1720,24 +1730,26 @@ def writeRefPicListModLoop (w0 : BitWriter) (ops : Array RefPicListModOp) : Opti
   return some (w.writeUE 3)
 
 /-- Serialize one `pred_weight_table` reference list (`ISO/IEC 14496-10` §7.3.3.2). -/
-def writePredWeightList (w0 : BitWriter) (arr : Array PredWeightEntry) (chromaArrayType : Nat) : Option BitWriter := Id.run do
-  let mut w := w0
-  for e in arr do
-    w := w.writeBit (if e.lumaWeightFlag then 1 else 0)
-    if e.lumaWeightFlag then
-      if e.lumaWeight.toInt < -128 || e.lumaWeight.toInt > 127 || e.lumaOffset.toInt < -128 || e.lumaOffset.toInt > 127 then return none
-      w := w.writeSE e.lumaWeight
-      w := w.writeSE e.lumaOffset
-    if chromaArrayType != 0 then
-      w := w.writeBit (if e.chromaWeightFlag then 1 else 0)
-      if e.chromaWeightFlag then
-        if e.cbWeight.toInt < -128 || e.cbWeight.toInt > 127 || e.cbOffset.toInt < -128 || e.cbOffset.toInt > 127 ||
-           e.crWeight.toInt < -128 || e.crWeight.toInt > 127 || e.crOffset.toInt < -128 || e.crOffset.toInt > 127 then return none
-        w := w.writeSE e.cbWeight
-        w := w.writeSE e.cbOffset
-        w := w.writeSE e.crWeight
-        w := w.writeSE e.crOffset
-  return some w
+def writePredWeightList (w0 : BitWriter) (arr : Array PredWeightEntry) (chromaArrayType : Nat) : Option BitWriter :=
+  let rec loop : List PredWeightEntry → BitWriter → Option BitWriter
+    | [], w => some w
+    | e :: rest, wIn => Id.run do
+      let mut w := wIn.writeBit (if e.lumaWeightFlag then 1 else 0)
+      if e.lumaWeightFlag then
+        if e.lumaWeight.toInt < -128 || e.lumaWeight.toInt > 127 || e.lumaOffset.toInt < -128 || e.lumaOffset.toInt > 127 then return none
+        w := w.writeSE e.lumaWeight
+        w := w.writeSE e.lumaOffset
+      if chromaArrayType != 0 then
+        w := w.writeBit (if e.chromaWeightFlag then 1 else 0)
+        if e.chromaWeightFlag then
+          if e.cbWeight.toInt < -128 || e.cbWeight.toInt > 127 || e.cbOffset.toInt < -128 || e.cbOffset.toInt > 127 ||
+             e.crWeight.toInt < -128 || e.crWeight.toInt > 127 || e.crOffset.toInt < -128 || e.crOffset.toInt > 127 then return none
+          w := w.writeSE e.cbWeight
+          w := w.writeSE e.cbOffset
+          w := w.writeSE e.crWeight
+          w := w.writeSE e.crOffset
+      return loop rest w
+  loop arr.toList w0
 
 /-- Serialize `pred_weight_table()` (`ISO/IEC 14496-10` §7.3.3.2). -/
 def writePredWeightTable (w0 : BitWriter) (pwt : PredWeightTable) (isBSlice : Bool) (numRefL0M1 numRefL1M1 : UInt8) (chromaArrayType : Nat)
@@ -1768,9 +1780,16 @@ def writeMmcoOpsLoop (w0 : BitWriter) (ops : Array MmcoOp) : Option BitWriter :=
       w := w.writeUE op.arg1.toUInt64
   return some (w.writeUE 0)
 
-/-- Deterministically serialize an `H264SliceHeaderFull` into an H.264 Slice Header EBSP NALU
-    (with `cabac_alignment_one_bit` when CABAC, or `rbsp_trailing_bits()` when CAVLC header-only). -/
-def serializeH264SliceHeaderFull (sh : H264SliceHeaderFull) (sps : H264SpsFull) (pps : H264PpsFull) : Option ByteArray := Id.run do
+/-- Pad `BitWriter` with `cabac_alignment_one_bit` (`1` bits) up to byte alignment (`bitsUsed = 0`). -/
+def alignCabacWriterLoop : Nat → BitWriter → BitWriter
+  | 0, w => w
+  | k + 1, w =>
+    if w.bitsUsed == 0 then w
+    else alignCabacWriterLoop k (w.writeBit 1)
+
+/-- Write the 1-byte NAL header + `slice_header()` fields + (when CABAC) `cabac_alignment_one_bit`
+    into a `BitWriter`, with NO `rbsp_trailing_bits()` or `0x80` stop-bit appended. -/
+def writeH264SliceHeaderBits (sh : H264SliceHeaderFull) (sps : H264SpsFull) (pps : H264PpsFull) : Option BitWriter := Id.run do
   if pps.spsId != sps.spsId || sh.ppsId != pps.ppsId then return none
   if sh.nalRefIdc > 3 || (sh.nalUnitType != 1 && sh.nalUnitType != 5) then return none
   if sh.nalUnitType == 5 && sh.nalRefIdc == 0 then return none
@@ -1870,14 +1889,38 @@ def serializeH264SliceHeaderFull (sh : H264SliceHeaderFull) (sps : H264SpsFull) 
       w := w.writeSE sh.sliceAlphaC0OffsetDiv2
       w := w.writeSE sh.sliceBetaOffsetDiv2
   if pps.entropyCodingModeFlag then
-    for _ in [:8] do
-      if w.bitsUsed != 0 then
-        w := w.writeBit 1
-    w := w.writeBitsMSB 0x80 8
-    return some (insertRbspEmulationBytes w.toByteArray true)
+    w := alignCabacWriterLoop 8 w
+  return some w
+
+/-- Emit the exact CABAC slice-header EBSP prefix (`pps.entropyCodingModeFlag == true`)
+    with `cabac_alignment_one_bit` and ZERO trailing `0x80` / `rbsp_trailing_bits()`. -/
+def serializeH264SliceHeaderCabacPrefix (sh : H264SliceHeaderFull) (sps : H264SpsFull) (pps : H264PpsFull) : Option ByteArray := do
+  if !pps.entropyCodingModeFlag then none
   else
-    let rbsp := finalizeRbspWriter w
-    return some (insertRbspEmulationBytes rbsp true)
+    let w ← writeH264SliceHeaderBits sh sps pps
+    some (insertRbspEmulationBytes w.toByteArray true)
+
+/-- Compose a complete H.264 Slice EBSP NALU by writing `slice_header()`, running `writeSliceData`
+    to emit `slice_data()`, appending `rbsp_trailing_bits()` when `appendTrailingRbsp == true`,
+    and applying `0x000003` emulation prevention after byte 0. -/
+def serializeH264SliceNal (sh : H264SliceHeaderFull) (sps : H264SpsFull) (pps : H264PpsFull)
+    (writeSliceData : BitWriter → BitWriter) (appendTrailingRbsp : Bool := true) : Option ByteArray := do
+  let wHdr ← writeH264SliceHeaderBits sh sps pps
+  let wBody := writeSliceData wHdr
+  let rbsp := if appendTrailingRbsp then finalizeRbspWriter wBody else wBody.toByteArray
+  some (insertRbspEmulationBytes rbsp true)
+
+/-- Serialize an `H264SliceHeaderFull` into an H.264 EBSP slice-header NALU:
+    - For CABAC (`pps.entropyCodingModeFlag == true`), emits the exact byte-aligned header prefix
+      (ending at `cabac_alignment_one_bit`, with NO spurious `0x80` stop-bit byte).
+    - For CAVLC (`pps.entropyCodingModeFlag == false`), closes any partial trailing byte with
+      `finalizeRbspWriter` (`rbsp_trailing_bits()`) for standalone header parsing; use
+      `writeH264SliceHeaderBits` / `serializeH264SliceNal` when splicing CAVLC `slice_data()`. -/
+def serializeH264SliceHeaderFull (sh : H264SliceHeaderFull) (sps : H264SpsFull) (pps : H264PpsFull) : Option ByteArray :=
+  if pps.entropyCodingModeFlag then
+    serializeH264SliceHeaderCabacPrefix sh sps pps
+  else
+    serializeH264SliceNal sh sps pps id true
 
 /-! ## 7. Picture Order Count (`POC` Type 0 & Type 2, `ISO/IEC 14496-10` §8.2.1.1 & §8.2.1.3) -/
 
@@ -2042,14 +2085,30 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
   let mut poc0St : PocType0State := {}
   let mut poc2St : PocType2State := {}
   let mut sliceHeaderRoundtripOk := true
+  let mut sliceHeaderBitOffsetOk := true
+  let mut cabacPrefixRbspExactOk := true
   let mut sliceJsons : Array String := #[]
   for nal in vclNalus do
     let some sh := parseH264SliceHeaderFull (ByteSlice.ofByteArray nal) sps0 pps0 | return none
+    if let some wHdr := writeH264SliceHeaderBits sh sps0 pps0 then
+      if wHdr.totalBitsWritten != sh.sliceDataBitOffset then
+        sliceHeaderBitOffsetOk := false
+      if pps0.entropyCodingModeFlag && wHdr.bitsUsed != 0 then
+        sliceHeaderBitOffsetOk := false
+    else
+      sliceHeaderBitOffsetOk := false
     if let some shRe := serializeH264SliceHeaderFull sh sps0 pps0 then
       if parseH264SliceHeaderFull (ByteSlice.ofByteArray shRe) sps0 pps0 != some sh then
         sliceHeaderRoundtripOk := false
+      if pps0.entropyCodingModeFlag then
+        let origRbsp := stripRbspEmulationBytesH264 (ByteSlice.ofByteArray nal) true
+        let reRbsp := stripRbspEmulationBytesH264 (ByteSlice.ofByteArray shRe) true
+        let hdrByteLen := sh.sliceDataBitOffset / 8
+        if sh.sliceDataBitOffset % 8 != 0 || reRbsp != extractBytesPure origRbsp 0 hdrByteLen then
+          cabacPrefixRbspExactOk := false
     else
       sliceHeaderRoundtripOk := false
+      if pps0.entropyCodingModeFlag then cabacPrefixRbspExactOk := false
     let hasMmco5 := sh.mmcoOps.any (fun m => m.opcode == 5)
     let isIdr := sh.nalUnitType == 5
     let mut pocVal : Int := 0
@@ -2084,14 +2143,16 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
   let s4b := s!"\"num_units_in_tick\":{sps0.vui.numUnitsInTick},\"time_scale\":{sps0.vui.timeScale},"
   let s5 := s!"\"cabac\":{pps0.entropyCodingModeFlag},\"transform_8x8\":{pps0.transform8x8ModeFlag},\"pic_init_qp\":{initQp},"
   let s6 := s!"\"avcc_roundtrip_ok\":{avccRoundtripOk},\"framing_roundtrip_ok\":{framingRoundtripOk},"
-  let s6b := s!"\"slice_header_roundtrip_ok\":{sliceHeaderRoundtripOk},\"frames\":[{slicesStr}]}"
-  return some (s0 ++ s0b ++ s1 ++ s2 ++ s2b ++ s2c ++ s3 ++ s3b ++ s4 ++ s4b ++ s5 ++ s6 ++ s6b)
+  let s6b := s!"\"slice_header_roundtrip_ok\":{sliceHeaderRoundtripOk},\"slice_header_bit_offset_ok\":{sliceHeaderBitOffsetOk},"
+  let s6c := s!"\"cabac_prefix_rbsp_exact_ok\":{cabacPrefixRbspExactOk},\"frames\":[{slicesStr}]}"
+  return some (s0 ++ s0b ++ s1 ++ s2 ++ s2b ++ s2c ++ s3 ++ s3b ++ s4 ++ s4b ++ s5 ++ s6 ++ s6b ++ s6c)
 
 /-- Self-test check exercising RBSP/EBSP, `avcC`, full SPS/PPS (`1280x720` real FFmpeg bytes),
-    Slice Header, and POC Type 0/2. -/
+    Slice Header (including exact CABAC IDR & P-slice prefixes with zero spurious `0x80` byte),
+    and POC Type 0/2 (including `delta_pic_order_cnt_bottom` and bottom-field derivation). -/
 def runH264SyntaxSelfCheck : Bool :=
-  let spsRealOpt := parseH264SpsFull (ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264SpsBytes))
-  let ppsRealOpt := parseH264PpsFull (ByteSlice.ofByteArray (ByteArray.mk realFfmpegH264PpsBytes)) spsRealOpt
+  let spsRealOpt := parseH264SpsFull (ByteSlice.ofByteArray { data := realFfmpegH264SpsBytes })
+  let ppsRealOpt := parseH264PpsFull (ByteSlice.ofByteArray { data := realFfmpegH264PpsBytes }) spsRealOpt
   let realOk := match spsRealOpt, ppsRealOpt with
     | some sps, some pps =>
       sps.profileIdc == 66 && sps.widthPx == 1280 && sps.heightPx == 720 &&
@@ -2099,12 +2160,35 @@ def runH264SyntaxSelfCheck : Bool :=
       (serializeH264PpsFull pps sps.chromaFormatIdc sps.bitDepthLumaMinus8).bind
         (fun b => parseH264PpsFull (ByteSlice.ofByteArray b) (some sps)) == some pps
     | _, _ => false
+  let cabacSpsArr : Array UInt8 := #[
+    0x67, 0x4D, 0x40, 0x0A, 0xF2, 0x04, 0x1B, 0x60, 0x22, 0x00, 0x00, 0x03,
+    0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x1E, 0x24, 0x4A, 0x24
+  ]
+  let cabacPpsArr : Array UInt8 := #[0x68, 0xEB, 0xE3, 0xCB, 0x20]
+  let cabacIdrArr : Array UInt8 := #[0x65, 0x88, 0x84, 0x00, 0xBF, 0xFE, 0xF6, 0xAE]
+  let cabacNonIdrArr : Array UInt8 := #[0x41, 0x9A, 0x25, 0xB1, 0x0B, 0xFF, 0xFE, 0x8C]
+  let cabacOk := match parseH264SpsFull (ByteSlice.ofByteArray { data := cabacSpsArr }) with
+    | some cSps =>
+      match parseH264PpsFull (ByteSlice.ofByteArray { data := cabacPpsArr }) (some cSps) with
+      | some cPps =>
+        match parseH264SliceHeaderFull (ByteSlice.ofByteArray { data := cabacIdrArr }) cSps cPps,
+              parseH264SliceHeaderFull (ByteSlice.ofByteArray { data := cabacNonIdrArr }) cSps cPps with
+        | some shIdr, some shP =>
+          (serializeH264SliceHeaderFull shIdr cSps cPps).map (fun b => b.data) == some #[0x65, 0x88, 0x84, 0x00, 0xBF] &&
+          (serializeH264SliceHeaderFull shP cSps cPps).map (fun b => b.data) == some #[0x41, 0x9A, 0x25, 0xB1, 0x0B, 0xFF] &&
+          shIdr.sliceDataBitOffset == 40 && shP.sliceDataBitOffset == 48
+        | _, _ => false
+      | none => false
+    | none => false
   let rawRbsp : List UInt8 := [0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x03, 0x04]
   let ebsp := insertRbspEmulationList rawRbsp
   let rbspOk := stripRbspEmulationList ebsp == rawRbsp && ebsp.length > rawRbsp.length
   let (_, _, pocIdr, st1) := derivePicOrderCntType0 {} 0 true 3 false false false false 0 0
   let (_, _, pocP, st2)   := derivePicOrderCntType0 st1 0 false 2 false false false false 4 0
   let (_, _, pocB, _)     := derivePicOrderCntType0 st2 0 false 0 false false false false 2 0
-  realOk && rbspOk && pocIdr == 0 && pocP == 4 && pocB == 2
+  let (topFrm, botFrm, picFrm, _) := derivePicOrderCntType0 st1 0 false 2 false false false true 4 (-1)
+  let (_, botFld, picFld, _)      := derivePicOrderCntType0 st1 0 false 2 false true true true 5 99
+  realOk && cabacOk && rbspOk && pocIdr == 0 && pocP == 4 && pocB == 2 &&
+  topFrm == 4 && botFrm == 3 && picFrm == 3 && botFld == 5 && picFld == 5
 
 end LeanAV.H264Syntax
