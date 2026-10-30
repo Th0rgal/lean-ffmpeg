@@ -22,3 +22,5 @@ import LeanAV.NativeKernels
 import LeanAV.PlanIR
 import LeanAV.Ffv1Pipeline
 import LeanAV.Ffv1Proofs
+import LeanAV.AacLc
+import LeanAV.AacLcProofs

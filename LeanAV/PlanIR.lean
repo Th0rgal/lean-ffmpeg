@@ -1830,16 +1830,93 @@ def promoteNativeFfv1Plan (args : List String) (cfg : CliConfig) (plan : MediaPl
         } }
     | none => plan
 
+def resolveStandaloneAacAdtsPlan (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : Option String :=
+  if !plan.errors.isEmpty || plan.backend.tier == .unsupported ||
+     plan.inputs.length != 1 || plan.outputs.length != 1 then none
+  else
+    match plan.inputs.head?, plan.outputs.head? with
+    | some inSpec, some outSpec =>
+      if !inSpec.safePath || inSpec.path == "-" || (inSpec.path.toList.contains '%') ||
+         !isSafeLocalMediaPath outSpec.path || outSpec.path == "-" || (outSpec.path.toList.contains '%') ||
+         args.contains "-lavfi" || args.contains "-filter_complex" || args.contains "-/filter_complex" ||
+         args.contains "-map" || args.contains "-metadata" || args.contains "-map_metadata" ||
+         args.contains "-map_chapters" || args.contains "-bsf:v" || args.contains "-bsf:a" ||
+         args.contains "-bsf" || args.contains "-c:s" || args.contains "-scodec" ||
+         args.contains "-to" || args.contains "-sn" || args.contains "-dn" ||
+         args.contains "aac_fixed" ||
+         cfg.noAudio || cfg.videoCodec.isSome || cfg.videoFilter.isSome || cfg.audioFilter.isSome ||
+         cfg.startSec.isSome || cfg.durationSec.isSome || cfg.threads.isSome || cfg.bFrames.isSome ||
+         cfg.gopSize.isSome || cfg.movflags.isSome || cfg.preset.isSome || cfg.crf.isSome ||
+         cfg.videoBitrate.isSome || cfg.frameRate.isSome || cfg.videoSize.isSome ||
+         cfg.videoFrames.isSome || cfg.pixelFormat.isSome then none
+      else
+        match splitAtFirstInput args [] with
+        | none => none
+        | some (preArgs, _, postArgs) =>
+          let allowedPostFlag (tok : String) : Bool :=
+            !strStartsWithFast tok "-" ||
+            ["-y", "-n", "-nostdin", "-hide_banner", "-stats", "-nostats", "-vn",
+             "-json", "--json", "-dump-plan", "--dump-plan", "-v", "-loglevel",
+             "-f", "-c:a", "-acodec", "-codec:a", "-b:a", "-ab", "-ar", "-ac"].contains tok
+          if preArgs.contains "-f" || preArgs.contains "-c" || preArgs.contains "-codec" ||
+             preArgs.contains "-c:a" || preArgs.contains "-acodec" || preArgs.contains "-codec:a" ||
+             preArgs.contains "-ar" || preArgs.contains "-ac" || preArgs.contains "-ss" || preArgs.contains "-t" ||
+             !(postArgs.all allowedPostFlag) then none
+          else
+            let lowerIn := strToLowerAscii inSpec.path
+            let lowerOut := strToLowerAscii outSpec.path
+            let outFmtLower := cfg.format.map strToLowerAscii
+            let isAdtsIn := strEndsWithFast lowerIn ".aac" || strEndsWithFast lowerIn ".adts"
+            let isWavOrFlacIn := strEndsWithFast lowerIn ".wav" || strEndsWithFast lowerIn ".flac"
+            let isAdtsOut :=
+              ((strEndsWithFast lowerOut ".aac" || strEndsWithFast lowerOut ".adts") &&
+               (outFmtLower == none || outFmtLower == some "adts" || outFmtLower == some "aac")) ||
+              outFmtLower == some "adts"
+            let isWavOut :=
+              (strEndsWithFast lowerOut ".wav" && (outFmtLower == none || outFmtLower == some "wav")) ||
+              outFmtLower == some "wav"
+            let isFlacOut :=
+              (strEndsWithFast lowerOut ".flac" && (outFmtLower == none || outFmtLower == some "flac")) ||
+              outFmtLower == some "flac"
+            let outRawPcmCodec :=
+              postArgs.contains "pcm_u8" || postArgs.contains "pcm_s16le" ||
+              postArgs.contains "pcm_s24le" || postArgs.contains "pcm_s32le"
+            if isWavOrFlacIn && isAdtsOut && (cfg.audioCodec == none || cfg.audioCodec == some .aac) then
+              some "adts"
+            else if isAdtsIn && isFlacOut && cfg.audioBitrate.isNone &&
+                    (cfg.audioCodec == none || cfg.audioCodec == some .flac) then
+              some "flac"
+            else if isAdtsIn && isWavOut && cfg.audioBitrate.isNone &&
+                    (cfg.audioCodec == none || cfg.audioCodec == some .pcmS16le || outRawPcmCodec) then
+              some "wav"
+            else none
+    | _, _ => none
+
+def promoteStandaloneAacAdtsPlan (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : MediaPlanIR :=
+  if plan.backend.tier == .independentVerified then plan
+  else
+    match resolveStandaloneAacAdtsPlan args cfg plan with
+    | some effOutFmt =>
+      { plan with
+        outputs := plan.outputs.map fun o => { o with format := effOutFmt }
+        backend := {
+          tier := .independentVerified
+          delegatedContainer := false
+          fallbackAllowed := true
+          reasons := ["standalone_aac_lc_adts_codec"]
+        } }
+    | none => plan
+
 /-- Single-pass parse and lowering returning `(CliConfig, ExtendedPlanFlags, MediaPlanIR)` with FFV1 promotion. -/
 def parseArgsWithPlanIR (args : List String) : CliConfig × ExtendedPlanFlags × MediaPlanIR :=
   let (cfg, ext, plan0) := parseArgsWithPlanIRBase args
-  (cfg, ext, promoteNativeFfv1Plan args cfg plan0)
+  (cfg, ext, promoteStandaloneAacAdtsPlan args cfg (promoteNativeFfv1Plan args cfg plan0))
 
 /-- Parse raw FFmpeg CLI arguments (including Phase 3/4 flags) directly into a typed `MediaPlanIR`. -/
 def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
   let ext0 := extractExtendedPlanFlagsLoop args {}
   let cfg := parseFFmpegArgs ext0.baseArgs
-  promoteNativeFfv1Plan args cfg (lowerCliWithExtToPlanIR cfg ext0)
+  promoteStandaloneAacAdtsPlan args cfg (promoteNativeFfv1Plan args cfg (lowerCliWithExtToPlanIR cfg ext0))
 
 def streamKindToNativeKind : StreamKind → NativeStreamKind
   | .video    => .video
@@ -2429,6 +2506,62 @@ def standaloneLosslessPlanGateSpec : AVGateSpec MediaPlanIR StandaloneLosslessPl
 theorem standaloneLosslessPlanGateSpec_iff (plan : MediaPlanIR) :
     standaloneLosslessPlanGateSpec.gate plan = true ↔ StandaloneLosslessPlanSafe plan :=
   standaloneLosslessPlanGateSpec.iff_safe plan
+
+def parseBitrateBpsSpec (s : String) : Option Nat :=
+  let chars := s.toList
+  match chars.reverse with
+  | [] => none
+  | last :: revInit =>
+    let body := revInit.reverse
+    if last == 'k' || last == 'K' then
+      match parseNatCharsLoop body 0 false with
+      | some n => if n > 0 then some (n * 1000) else none
+      | none =>
+        match parseDecimalSecondsChars body with
+        | some sec => if sec.num > 0 && sec.den > 0 then some ((sec.num * 1000) / sec.den) else none
+        | none => none
+    else if last == 'm' || last == 'M' then
+      match parseNatCharsLoop body 0 false with
+      | some n => if n > 0 then some (n * 1000000) else none
+      | none =>
+        match parseDecimalSecondsChars body with
+        | some sec => if sec.num > 0 && sec.den > 0 then some ((sec.num * 1000000) / sec.den) else none
+        | none => none
+    else
+      match parseNatCharsLoop chars 0 false with
+      | some n => if n > 0 then some n else none
+      | none => none
+
+def isStandaloneAacAdtsPlanValid (plan : MediaPlanIR) : Bool :=
+  plan.errors.isEmpty &&
+  (plan.backend.tier == .independentVerified) &&
+  !plan.backend.delegatedContainer &&
+  plan.backend.reasons.contains "standalone_aac_lc_adts_codec"
+
+def StandaloneAacAdtsPlanSafe (plan : MediaPlanIR) : Prop :=
+  plan.errors.isEmpty = true ∧ plan.backend.tier = .independentVerified ∧
+    plan.backend.delegatedContainer = false ∧
+    plan.backend.reasons.contains "standalone_aac_lc_adts_codec" = true
+
+def standaloneAacAdtsPlanGateSpec : AVGateSpec MediaPlanIR StandaloneAacAdtsPlanSafe where
+  gate := isStandaloneAacAdtsPlanValid
+  sound plan h := by
+    unfold isStandaloneAacAdtsPlanValid StandaloneAacAdtsPlanSafe at *
+    simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true'] at h
+    exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+  complete plan h := by
+    unfold isStandaloneAacAdtsPlanValid StandaloneAacAdtsPlanSafe at *
+    rcases h with ⟨h1, h2, h3, h4⟩
+    simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true']
+    exact ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩
+  posWitness := parseArgsToPlanIR ["-y", "-i", "in.wav", "out.aac"]
+  negWitness := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-c", "copy", "out.mp4"]
+  nonVacuous := by decide
+  tight := by decide
+
+theorem standaloneAacAdtsPlanGateSpec_iff (plan : MediaPlanIR) :
+    standaloneAacAdtsPlanGateSpec.gate plan = true ↔ StandaloneAacAdtsPlanSafe plan :=
+  standaloneAacAdtsPlanGateSpec.iff_safe plan
 
 /-! ## 6. Formal Soundness, Round-Trip & Fallback Theorems (Phases 3, 4, 5 & 6) -/
 
