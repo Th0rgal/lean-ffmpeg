@@ -1,5 +1,22 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-30 M2-A1 H.264 / AVC bitstream syntax qualification
+(`campaign/m2-a1-h264-syntax-20261030` over `a39d5516`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**13,105 declarations with zero sorryAx/custom axioms** (`40,576` LOC across 22
+formal `LeanAV/*.lean` modules) and **446/446 `non_vacuous_and_tight`
+specifications** (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`: 23,
+`PlanIR`: 20, `H264SyntaxProofs`: 18, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`:
+6, `Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4
+H.264 / AVC Annex-B + ISO 14496-15 `avcC` / length-prefixed (`1`/`2`/`4`-byte)
+NALU framing, RBSP `0x000003` emulation-prevention strip/insert with EBSP-safety
+and roundtrip proofs, SPS/PPS/slice-header parsing & serialization across
+Baseline, Main, High, High 10, High 4:2:2, and High 4:4:4 Predictive profiles,
+POC Type 0 / Type 2 derivation, `lffmpeg h264-probe` zero-exec CLI inspection,
+and differential `ffprobe` / `ffmpeg` parity tests (`121` unit suite entries and
+`113` differential suite entries).
+
 The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,
 combining M1-A2 `c0a811f4`, M1-B2 `f619a6ab`, M1-C1 v4 `64028fe3`, and M1-C2 v2
 `5d32bf26` over base `367be082`) under Lean v4.35.0 and `turbo-lean`
