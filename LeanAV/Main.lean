@@ -1285,8 +1285,13 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
   let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
   let copyVideo := out.videoCodec == some .copy
   let copyAudio := out.audioCodec == some .copy
+  let copySubtitle := match out.subtitleCodec with
+    | some sc => sc == .copy
+    | none => out.globalCopy
+  let copyData := out.copyData
   match nativeRemuxBytes inFmt outFmt bytes (plan.timeline.startMs.getD 0).toNat
-      (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps copyVideo copyAudio with
+      (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps
+      copyVideo copyAudio copySubtitle copyData with
   | .fallback => return demoteNativePlan plan
   | _ => return plan
 
@@ -1296,8 +1301,9 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let some outFmt := containerFormatOfName out.format | return none
   let some inFmt := nativeInputContainerFormat inPath | return none
   let isDevNull := out.path == "/dev/null"
-  if !cfg.overwrite && !isDevNull && (← System.FilePath.pathExists out.path) then
-    if cfg.jsonOutput || args.contains "-n" then
+  let explicitNoOverwrite := args.contains "-n"
+  if !cfg.overwrite && (!isDevNull || explicitNoOverwrite) && (← System.FilePath.pathExists out.path) then
+    if cfg.jsonOutput || explicitNoOverwrite then
       return some (← reportCliError cfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists")
     if !cliQuiet cfg.logLevel then
@@ -1311,7 +1317,12 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
   let copyVideo := out.videoCodec == some .copy
   let copyAudio := out.audioCodec == some .copy
-  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps copyVideo copyAudio with
+  let copySubtitle := match out.subtitleCodec with
+    | some sc => sc == .copy
+    | none => out.globalCopy
+  let copyData := out.copyData
+  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps
+      copyVideo copyAudio copySubtitle copyData with
   | .fallback => return none
   | .invalid reason =>
     return some (← reportCliError cfg
@@ -2210,6 +2221,8 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_short_universal
 #print axioms LeanAV.PlanIR.demuxMpegTsIndependentOrFallback_rejects_bad_sync_universal
 #print axioms LeanAV.Format.isExplicitSdrCodePoint_accepts_sdr_and_rejects_unspecified_or_hdr
+#print axioms LeanAV.Format.nativeCoalescableMp4Pcm_audio_only_universal
+#print axioms LeanAV.Format.nativeSelectedStreamsCopiedOk_single_universal
 
 
 

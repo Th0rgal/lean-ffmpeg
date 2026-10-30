@@ -7749,24 +7749,27 @@ def rebuildMkvBlockPayload (s : ByteSlice) (blkOff blkEnd oldVintLen newTrackNum
 
 /-- Selectors and copy-stream constraints extracted from `MediaPlanIR` for native remuxing. -/
 def nativeSelectedStreamsCopiedOk (trackKinds : Array NativeStreamKind) (selected : Array Nat)
-    (copyVideo copyAudio : Bool) : Bool := Id.run do
+    (copyVideo copyAudio : Bool) (copySubtitle : Bool := true) (copyData : Bool := true) : Bool := Id.run do
   for idx in selected do
     if h : idx < trackKinds.size then
       let k := trackKinds[idx]
       if k == .video && !copyVideo then return false
       if k == .audio && !copyAudio then return false
+      if k == .subtitle && !copySubtitle then return false
+      if k == .data && !copyData then return false
   return true
 
 def remuxNativeMkv (s : ByteSlice) (wantWebm : Bool) (startMs durMs : Nat)
     (selectors : List NativeStreamSelector) (explicitMaps : Bool)
-    (copyVideo : Bool := true) (copyAudio : Bool := true) : NativeRemuxResult := Id.run do
+    (copyVideo : Bool := true) (copyAudio : Bool := true)
+    (copySubtitle : Bool := true) (copyData : Bool := true) : NativeRemuxResult := Id.run do
   let some mkv := parseNativeMkvContainer s (some wantWebm)
     | return .invalid "invalid_or_truncated_matroska"
   if mkv.hasEncrypted then return .fallback
   let trackKinds := mkv.tracks.map (fun t => t.kind)
   let some selectedIndices := resolveNativeStreamSelection trackKinds selectors explicitMaps
     | return .invalid "matroska_stream_selection_empty_or_out_of_range"
-  if !nativeSelectedStreamsCopiedOk trackKinds selectedIndices copyVideo copyAudio then
+  if !nativeSelectedStreamsCopiedOk trackKinds selectedIndices copyVideo copyAudio copySubtitle copyData then
     return .fallback
   let identityTracks : Bool := Id.run do
     if selectedIndices.size != mkv.tracks.size then return false
@@ -8082,8 +8085,14 @@ def mp4SubBoxesExact (s : ByteSlice) : Option (Array Mp4BoxView) := Id.run do
     pos := pos + boxLen
   return if pos == s.len then some out else none
 
+def nativePcmMaxSampleBytes : Nat := 1024
+
 def isNativeUncompressedPcmFourcc (fcc : String) : Bool :=
-  ["sowt", "twos", "in24", "in32", "fl32", "fl64", "raw ", "lpcm"].contains fcc
+  ["sowt", "twos", "in24", "in32", "fl32", "fl64", "raw ", "lpcm", "ipcm", "fpcm", "ulaw", "alaw"].contains fcc
+
+def isNativeCoalescableMp4Pcm (kind : NativeStreamKind) (fcc : String) (bytesPerSample : Nat) : Bool :=
+  kind == .audio && isNativeUncompressedPcmFourcc fcc &&
+  bytesPerSample > 0 && bytesPerSample ≤ nativePcmMaxSampleBytes
 
 structure NativeMp4Sample where
   fileOff   : Nat
@@ -8374,7 +8383,8 @@ def parseNativeMp4Track (fileSlice : ByteSlice) (trakSlice : ByteSlice) (mvhdTim
     let spc := (stscRuns[stscPos]!).2
     let mut byteCursor := chunkOffs[chunkIdx0]!
     if byteCursor > fileSlice.len then return none
-    if stszFixed > 0 && sampleIdx + spc ≤ stszCount && cttsRuns.isEmpty && stssArr?.isNone &&
+    if isNativeCoalescableMp4Pcm kind stsdFourcc stszFixed &&
+       sampleIdx + spc ≤ stszCount && cttsRuns.isEmpty && stssArr?.isNone &&
        sttsIdx < sttsRuns.size && sttsRem ≥ spc && (sttsRuns[sttsIdx]!).2 == 1 then
       let totalChunkBytes := spc * stszFixed
       if byteCursor + totalChunkBytes > fileSlice.len then return none
@@ -8521,14 +8531,19 @@ def buildMp4CttsBoxRle (ver : UInt8) (samples : Array NativeMp4Sample) : ByteArr
 
 def detectMp4PcmFixedSize (trk : NativeMp4Track) : Option Nat := Id.run do
   if trk.kind != .audio || !isNativeUncompressedPcmFourcc trk.stsdFourcc then return none
-  if trk.samples.any (fun smp => smp.dur > 1 && smp.byteLen % smp.dur == 0 && smp.byteLen / smp.dur ≤ 64) then
+  if trk.samples.any (fun smp =>
+      smp.dur > 1 && smp.byteLen % smp.dur == 0 &&
+      isNativeCoalescableMp4Pcm trk.kind trk.stsdFourcc (smp.byteLen / smp.dur)) then
     let smp0 := trk.samples[0]!
     if smp0.dur > 0 && smp0.byteLen % smp0.dur == 0 then
-      return some (smp0.byteLen / smp0.dur)
+      let fsz := smp0.byteLen / smp0.dur
+      if isNativeCoalescableMp4Pcm trk.kind trk.stsdFourcc fsz then
+        return some fsz
   return none
 
 /-- Rescale `elst` `segment_duration` entries inside an `edts` box from `srcTimescale` to `dstTimescale`,
-    returning the rewritten `edts` box and the total presentation duration in `dstTimescale` units. -/
+    promoting v0 `elst` to v1 (64-bit) whenever any rescaled `segment_duration ≥ 2^32`,
+    and returning the rewritten `edts` box and the total presentation duration in `dstTimescale` units. -/
 def rescaleMp4EdtsElst (edtsBox : ByteArray) (srcTimescale dstTimescale : Nat) : Option (ByteArray × Nat) := Id.run do
   if srcTimescale == 0 || dstTimescale == 0 then return none
   let topSlice := ByteSlice.ofByteArray edtsBox
@@ -8546,8 +8561,19 @@ def rescaleMp4EdtsElst (edtsBox : ByteArray) (srcTimescale dstTimescale : Nat) :
       let entrySz := if ver == 1 then 20 else 12
       if ver > 1 || b.bodySlice.len != 8 + cnt * entrySz then return none
       sawElst := true
-      let mut elstBody := ByteArray.emptyWithCapacity b.bodySlice.len
-      for k in [:8] do elstBody := elstBody.push (b.bodySlice.getByteD k 0)
+      let mut outVer := ver
+      if ver == 0 then
+        for i in [:cnt] do
+          let eOff := 8 + i * 12
+          let sd := (readU32BE b.bodySlice eOff).toNat
+          let newSd :=
+            if srcTimescale == dstTimescale then sd
+            else (sd * dstTimescale + srcTimescale / 2) / srcTimescale
+          if newSd ≥ 4294967296 then outVer := 1
+      let outEntrySz := if outVer == 1 then 20 else 12
+      let mut elstBody := ByteArray.emptyWithCapacity (8 + cnt * outEntrySz)
+      elstBody := elstBody.push outVer
+      for k in [1:8] do elstBody := elstBody.push (b.bodySlice.getByteD k 0)
       for i in [:cnt] do
         let eOff := 8 + i * entrySz
         if ver == 1 then
@@ -8555,6 +8581,7 @@ def rescaleMp4EdtsElst (edtsBox : ByteArray) (srcTimescale dstTimescale : Nat) :
           let newSd :=
             if srcTimescale == dstTimescale then sd
             else (sd * dstTimescale + srcTimescale / 2) / srcTimescale
+          if newSd ≥ 18446744073709551616 then return none
           totalSegDur := totalSegDur + newSd
           elstBody := pushU64BE elstBody newSd.toUInt64
           for k in [8:20] do elstBody := elstBody.push (b.bodySlice.getByteD (eOff + k) 0)
@@ -8563,10 +8590,19 @@ def rescaleMp4EdtsElst (edtsBox : ByteArray) (srcTimescale dstTimescale : Nat) :
           let newSd :=
             if srcTimescale == dstTimescale then sd
             else (sd * dstTimescale + srcTimescale / 2) / srcTimescale
-          if newSd ≥ 4294967296 then return none
+          if newSd ≥ 18446744073709551616 then return none
           totalSegDur := totalSegDur + newSd
-          elstBody := pushU32BE elstBody newSd.toUInt32
-          for k in [4:12] do elstBody := elstBody.push (b.bodySlice.getByteD (eOff + k) 0)
+          if outVer == 1 then
+            elstBody := pushU64BE elstBody newSd.toUInt64
+            let mtRaw := readU32BE b.bodySlice (eOff + 4)
+            let mt64 : UInt64 :=
+              if mtRaw ≥ 0x80000000 then (0xFFFFFFFF00000000 : UInt64) ||| mtRaw.toUInt64
+              else mtRaw.toUInt64
+            elstBody := pushU64BE elstBody mt64
+            for k in [8:12] do elstBody := elstBody.push (b.bodySlice.getByteD (eOff + k) 0)
+          else
+            elstBody := pushU32BE elstBody newSd.toUInt32
+            for k in [4:12] do elstBody := elstBody.push (b.bodySlice.getByteD (eOff + k) 0)
       newEdtsBody := newEdtsBody ++ wrapMp4Box 'e' 'l' 's' 't' elstBody
     else
       newEdtsBody := newEdtsBody ++ b.boxSlice.toByteArray
@@ -8808,6 +8844,11 @@ def prepareNativeMp4Track (trk : NativeMp4Track) (origMvhdTimescale : Nat) (hasT
       let effSegMs := Nat.max 1 (if trk.kind == .video && endUs > startUs && reqMovieMs ≤ trackVisMs then reqMovieMs else segDurMs)
       if preRollTicksNat == 0 && endUs == 0 then
         (ByteArray.empty, effSegMs)
+      else if effSegMs ≥ 4294967296 || preRollTicksNat ≥ 4294967296 then
+        let elst0 := pushU32BE (pushU32BE ByteArray.empty 0x01000000) 1
+        let elst1 := pushU64BE (pushU64BE elst0 effSegMs.toUInt64) preRollTicksNat.toUInt64
+        let elst := pushU32BE elst1 0x00010000
+        (wrapMp4Box 'e' 'd' 't' 's' (wrapMp4Box 'e' 'l' 's' 't' elst), effSegMs)
       else
         let elst0 := pushU32BE (pushU32BE ByteArray.empty 0) 1
         let elst1 := pushU32BE (pushU32BE elst0 effSegMs.toUInt32) preRollTicksNat.toUInt32
@@ -8834,35 +8875,62 @@ def assembleNativeMp4Trak (prep : NativePreparedMp4Track) (trackId : Nat) (chunk
   let stblBox := wrapMp4Box 's' 't' 'b' 'l' (prep.stblWithoutCo ++ coBox)
   let minfBox := wrapMp4Box 'm' 'i' 'n' 'f' (trk.mediaHdrBox ++ trk.dinfBox ++ stblBox)
   let mdhdBox := Id.run do
-    let mut b := ByteArray.emptyWithCapacity 24
-    b := pushU32BE b 0
-    b := pushU32BE b 0
-    b := pushU32BE b 0
-    b := pushU32BE b trk.timescale.toUInt32
-    b := pushU32BE b prep.totalTrackDur.toUInt32
-    b := pushU32BE b trk.langFlags
-    return wrapMp4Box 'm' 'd' 'h' 'd' b
+    if prep.totalTrackDur ≥ 4294967296 then
+      let mut b := ByteArray.emptyWithCapacity 36
+      b := pushU32BE b 0x01000000
+      b := pushU64BE b 0
+      b := pushU64BE b 0
+      b := pushU32BE b trk.timescale.toUInt32
+      b := pushU64BE b prep.totalTrackDur.toUInt64
+      b := pushU32BE b trk.langFlags
+      return wrapMp4Box 'm' 'd' 'h' 'd' b
+    else
+      let mut b := ByteArray.emptyWithCapacity 24
+      b := pushU32BE b 0
+      b := pushU32BE b 0
+      b := pushU32BE b 0
+      b := pushU32BE b trk.timescale.toUInt32
+      b := pushU32BE b prep.totalTrackDur.toUInt32
+      b := pushU32BE b trk.langFlags
+      return wrapMp4Box 'm' 'd' 'h' 'd' b
   let mdiaBox := wrapMp4Box 'm' 'd' 'i' 'a' (mdhdBox ++ trk.hdlrBox ++ minfBox)
   let tkhdBox := Id.run do
-    let mut b := ByteArray.emptyWithCapacity 84
-    b := pushU32BE b 3
-    b := pushU32BE b 0
-    b := pushU32BE b 0
-    b := pushU32BE b trackId.toUInt32
-    b := pushU32BE b 0
-    b := pushU32BE b prep.movieDurMs.toUInt32
-    b := pushZeros b 12
-    b := pushU16BE b trk.tkhdVolume
-    b := pushU16BE b 0
-    b := b ++ trk.tkhdMatrix
-    b := pushU32BE b trk.tkhdWidth16
-    b := pushU32BE b trk.tkhdHeight16
-    return wrapMp4Box 't' 'k' 'h' 'd' b
+    if prep.movieDurMs ≥ 4294967296 then
+      let mut b := ByteArray.emptyWithCapacity 96
+      b := pushU32BE b 0x01000003
+      b := pushU64BE b 0
+      b := pushU64BE b 0
+      b := pushU32BE b trackId.toUInt32
+      b := pushU32BE b 0
+      b := pushU64BE b prep.movieDurMs.toUInt64
+      b := pushZeros b 12
+      b := pushU16BE b trk.tkhdVolume
+      b := pushU16BE b 0
+      b := b ++ trk.tkhdMatrix
+      b := pushU32BE b trk.tkhdWidth16
+      b := pushU32BE b trk.tkhdHeight16
+      return wrapMp4Box 't' 'k' 'h' 'd' b
+    else
+      let mut b := ByteArray.emptyWithCapacity 84
+      b := pushU32BE b 3
+      b := pushU32BE b 0
+      b := pushU32BE b 0
+      b := pushU32BE b trackId.toUInt32
+      b := pushU32BE b 0
+      b := pushU32BE b prep.movieDurMs.toUInt32
+      b := pushZeros b 12
+      b := pushU16BE b trk.tkhdVolume
+      b := pushU16BE b 0
+      b := b ++ trk.tkhdMatrix
+      b := pushU32BE b trk.tkhdWidth16
+      b := pushU32BE b trk.tkhdHeight16
+      return wrapMp4Box 't' 'k' 'h' 'd' b
   wrapMp4Box 't' 'r' 'a' 'k' (tkhdBox ++ prep.edtsBox ++ mdiaBox)
 
 def remuxNativeMp4Container (s : ByteSlice) (startMs durMs : Nat)
     (metadata : List (String × String)) (selectors : List NativeStreamSelector)
-    (explicitMaps : Bool) (copyVideo : Bool := true) (copyAudio : Bool := true) : NativeRemuxResult := Id.run do
+    (explicitMaps : Bool) (copyVideo : Bool := true) (copyAudio : Bool := true)
+    (copySubtitle : Bool := true) (copyData : Bool := true) : NativeRemuxResult := Id.run do
   if !validNativeMp4Container s then return .invalid "invalid_or_truncated_mp4"
   if !nativeMp4MetadataSupported metadata then return .fallback
   let some topBoxes := mp4SubBoxesExact s | return .invalid "invalid_or_truncated_mp4"
@@ -8902,7 +8970,7 @@ def remuxNativeMp4Container (s : ByteSlice) (startMs durMs : Nat)
   let trackKinds := parsedTracks.map (fun t => t.kind)
   let some selectedIndices := resolveNativeStreamSelection trackKinds selectors explicitMaps
     | return .invalid "mp4_stream_selection_empty_or_out_of_range"
-  if !nativeSelectedStreamsCopiedOk trackKinds selectedIndices copyVideo copyAudio then
+  if !nativeSelectedStreamsCopiedOk trackKinds selectedIndices copyVideo copyAudio copySubtitle copyData then
     return .fallback
   let hasTrim := startMs > 0 || durMs > 0
   let startUs := startMs * 1000
@@ -8946,23 +9014,42 @@ def remuxNativeMp4Container (s : ByteSlice) (startMs durMs : Nat)
     if !metadata.isEmpty then buildNativeMp4Metadata metadata
     else origUdta?.getD ByteArray.empty
   let mvhdBox := Id.run do
-    let mut b := ByteArray.emptyWithCapacity 100
-    b := pushU32BE b 0
-    b := pushU32BE b 0
-    b := pushU32BE b 0
-    b := pushU32BE b 1000
-    b := pushU32BE b maxMovieDurMs.toUInt32
-    b := pushU32BE b 0x00010000
-    b := pushU16BE b 0x0100
-    b := pushZeros b 10
-    b := pushU32BE b 0x00010000
-    b := pushZeros b 12
-    b := pushU32BE b 0x00010000
-    b := pushZeros b 12
-    b := pushU32BE b 0x40000000
-    b := pushZeros b 24
-    b := pushU32BE b (prepared.size + 1).toUInt32
-    return wrapMp4Box 'm' 'v' 'h' 'd' b
+    if maxMovieDurMs ≥ 4294967296 then
+      let mut b := ByteArray.emptyWithCapacity 112
+      b := pushU32BE b 0x01000000
+      b := pushU64BE b 0
+      b := pushU64BE b 0
+      b := pushU32BE b 1000
+      b := pushU64BE b maxMovieDurMs.toUInt64
+      b := pushU32BE b 0x00010000
+      b := pushU16BE b 0x0100
+      b := pushZeros b 10
+      b := pushU32BE b 0x00010000
+      b := pushZeros b 12
+      b := pushU32BE b 0x00010000
+      b := pushZeros b 12
+      b := pushU32BE b 0x40000000
+      b := pushZeros b 24
+      b := pushU32BE b (prepared.size + 1).toUInt32
+      return wrapMp4Box 'm' 'v' 'h' 'd' b
+    else
+      let mut b := ByteArray.emptyWithCapacity 100
+      b := pushU32BE b 0
+      b := pushU32BE b 0
+      b := pushU32BE b 0
+      b := pushU32BE b 1000
+      b := pushU32BE b maxMovieDurMs.toUInt32
+      b := pushU32BE b 0x00010000
+      b := pushU16BE b 0x0100
+      b := pushZeros b 10
+      b := pushU32BE b 0x00010000
+      b := pushZeros b 12
+      b := pushU32BE b 0x00010000
+      b := pushZeros b 12
+      b := pushU32BE b 0x40000000
+      b := pushZeros b 24
+      b := pushU32BE b (prepared.size + 1).toUInt32
+      return wrapMp4Box 'm' 'v' 'h' 'd' b
   let dummyTraksSize : Nat := Id.run do
     let mut sum := 0
     for i in [:prepared.size] do
@@ -9199,14 +9286,16 @@ def nativeSingleStreamAllowsSelection (kind : NativeStreamKind)
 def nativeRemuxBytes (inFmt outFmt : ContainerFormat) (bytes : ByteArray)
     (startMs durMs : Nat) (metadata : List (String × String))
     (selectors : List NativeStreamSelector := defaultNativeStreamSelectors)
-    (explicitMaps : Bool := false) (copyVideo : Bool := true) (copyAudio : Bool := true) :
+    (explicitMaps : Bool := false) (copyVideo : Bool := true) (copyAudio : Bool := true)
+    (copySubtitle : Bool := true) (copyData : Bool := true) :
     NativeRemuxResult := Id.run do
   if inFmt != outFmt then return .fallback
   if !metadata.isEmpty && inFmt != .mp4 then return .fallback
   let s := ByteSlice.ofByteArray bytes
   match inFmt with
   | .mp4 =>
-    return remuxNativeMp4Container s startMs durMs metadata selectors explicitMaps copyVideo copyAudio
+    return remuxNativeMp4Container s startMs durMs metadata selectors explicitMaps
+      copyVideo copyAudio copySubtitle copyData
   | .ivf =>
     if !nativeSingleStreamAllowsSelection .video selectors explicitMaps then
       return .invalid "ivf_stream_selection_empty_or_out_of_range"
@@ -9233,9 +9322,11 @@ def nativeRemuxBytes (inFmt outFmt : ContainerFormat) (bytes : ByteArray)
     | some out => return .remuxed out
     | none => return .invalid "flac_trim_outside_stream"
   | .mkv =>
-    return remuxNativeMkv s false startMs durMs selectors explicitMaps copyVideo copyAudio
+    return remuxNativeMkv s false startMs durMs selectors explicitMaps
+      copyVideo copyAudio copySubtitle copyData
   | .webm =>
-    return remuxNativeMkv s true startMs durMs selectors explicitMaps copyVideo copyAudio
+    return remuxNativeMkv s true startMs durMs selectors explicitMaps
+      copyVideo copyAudio copySubtitle copyData
   | _ => return .fallback
 
 theorem nativeRemux_wav_passthrough (s : ByteSlice) (h : validateNativeWavStream s = true) :
@@ -9254,5 +9345,23 @@ theorem nativeRemux_window_gate_roundtrip :
     nativeWavSliceGateSpec.gate (40, 20, 50, 4, 200) = false ∧
     nativePacketInWindow 0 0 0 = true := by
   decide
+
+theorem nativeCoalescableMp4Pcm_audio_only_universal (k : NativeStreamKind) (fcc : String) (sz : Nat)
+    (h : isNativeCoalescableMp4Pcm k fcc sz = true) :
+    k = .audio ∧ isNativeUncompressedPcmFourcc fcc = true ∧ sz > 0 ∧ sz ≤ nativePcmMaxSampleBytes := by
+  unfold isNativeCoalescableMp4Pcm at h
+  simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at h
+  exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+
+theorem nativeSelectedStreamsCopiedOk_single_universal (k : NativeStreamKind)
+    (cv ca cs cd : Bool) :
+    nativeSelectedStreamsCopiedOk #[k] #[0] cv ca cs cd =
+      match k with
+      | .video => cv
+      | .audio => ca
+      | .subtitle => cs
+      | .data => cd
+      | .all => true := by
+  cases k <;> cases cv <;> cases ca <;> cases cs <;> cases cd <;> decide
 
 end LeanAV.Format

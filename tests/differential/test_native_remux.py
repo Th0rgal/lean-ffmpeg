@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -606,6 +607,11 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertFalse(executed)
         self.assertEqual(json.loads(res.stdout)["tier"], "independent_verified")
 
+        # Explicit -n on /dev/null is respected (rejects existing path)
+        res_n, executed_n = self.native("-json", "-n", "-i", "in.mp4", "-f", "mp4", "-c", "copy", "/dev/null")
+        self.assertNotEqual(res_n.returncode, 0)
+        self.assertFalse(executed_n)
+
         # OS-level strace -f -e trace=execve check if strace is installed
         strace_bin = shutil.which("strace")
         if strace_bin:
@@ -618,6 +624,218 @@ class NativeRemuxTests(unittest.TestCase):
             self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
             exec_lines = [ln for ln in st.stderr.splitlines() if "execve(" in ln]
             self.assertEqual(len(exec_lines), 1, f"Unexpected child execve calls: {exec_lines}")
+
+    def test_mp4_pcm_coalescing_ipcm_ulaw_and_non_audio_safety(self):
+        # 1. PCM S16LE in MP4 ('ipcm') trimmed natively without chunk-level drift
+        ipcm_in = self.tmp / "ipcm_in.mp4"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                     "-c:a", "pcm_s16le", ipcm_in).returncode, 0)
+        ipcm_out = self.tmp / "ipcm_trim.mp4"
+        res, executed = self.native("-json", "-y", "-ss", "0.25", "-t", "0.5", "-i", ipcm_in, "-c", "copy", ipcm_out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertAlmostEqual(float(self.probe(ipcm_out, "-show_format")["format"]["duration"]), 0.5, delta=0.02)
+
+        # 2. G.711 mulaw in MOV ('ulaw', 1 byte/sample) trimmed natively with sub-chunk precision
+        ulaw_in = self.tmp / "ulaw_in.mov"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=2",
+                     "-c:a", "pcm_mulaw", ulaw_in).returncode, 0)
+        ulaw_out = self.tmp / "ulaw_trim.mov"
+        res, executed = self.native("-json", "-y", "-ss", "0.25", "-t", "0.5", "-i", ulaw_in, "-c", "copy", ulaw_out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertAlmostEqual(float(self.probe(ulaw_out, "-show_format")["format"]["duration"]), 0.5, delta=0.02)
+
+        # 3. 24-channel float64 PCM in MOV ('fl64', 192 bytes/sample > 64) still sub-slices accurately
+        hi_ch_in = self.tmp / "fl64_24ch.mov"
+        r24 = self.ref("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=2",
+                       "-ac", "24", "-c:a", "pcm_f64be", hi_ch_in)
+        if r24.returncode == 0:
+            hi_ch_out = self.tmp / "fl64_24ch_trim.mov"
+            res, executed = self.native("-json", "-y", "-ss", "0.25", "-t", "0.5", "-i", hi_ch_in, "-c", "copy", hi_ch_out)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertFalse(executed)
+            self.assertAlmostEqual(float(self.probe(hi_ch_out, "-show_format")["format"]["duration"]), 0.5, delta=0.02)
+
+    def test_subtitle_and_data_stream_copy_vs_transcode_routing(self):
+        srt = self.tmp / "cues.srt"
+        vs_mkv = self.tmp / "vs_only.mkv"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "color=c=red:s=64x64:d=2:r=10", "-i", srt,
+                     "-c:v", "libx264", "-g", "10", "-c:s", "srt", vs_mkv).returncode, 0)
+        # -c:v copy WITHOUT -c:s copy on MKV with subtitles must delegate (ffmpeg transcodes subrip -> ass)
+        plan_res, executed = self.native("-dump-plan", "-i", vs_mkv, "-c:v", "copy", self.tmp / "vs_cv.mkv")
+        self.assertEqual(plan_res.returncode, 0)
+        self.assertFalse(executed)
+        self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+
+        vs_cv_out = self.tmp / "vs_cv_real.mkv"
+        r_del = subprocess.run([str(BINARY), "-json", "-y", "-i", str(vs_mkv), "-c:v", "copy", str(vs_cv_out)],
+                               capture_output=True, text=True)
+        self.assertEqual(r_del.returncode, 0, r_del.stdout + r_del.stderr)
+        self.assertEqual(json.loads(r_del.stdout)["tier"], "delegated_faithful")
+        sub_codecs = [s["codec_name"] for s in self.probe(vs_cv_out, "-show_streams")["streams"] if s["codec_type"] == "subtitle"]
+        self.assertEqual(sub_codecs, ["ass"])
+
+        # -c copy on MKV with subtitles copies both streams natively
+        vs_cc_out = self.tmp / "vs_cc.mkv"
+        res, executed = self.native("-json", "-y", "-i", vs_mkv, "-c", "copy", vs_cc_out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual([s["codec_name"] for s in self.probe(vs_cc_out, "-show_streams")["streams"]], ["h264", "subrip"])
+
+        # MP4 with mov_text subtitle: default -c copy drops subtitle (matching ffmpeg MP4 default selection),
+        # while -c copy -c:s copy or -map 0 -c copy preserves both natively, and -map 0 -c:v copy delegates!
+        vs_mp4 = self.tmp / "vs_only.mp4"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2:r=10", "-i", srt,
+                     "-c:v", "libx264", "-g", "10", "-c:s", "mov_text", vs_mp4).returncode, 0)
+        mp4_default = self.tmp / "vs_default.mp4"
+        res, executed = self.native("-json", "-y", "-i", vs_mp4, "-c", "copy", mp4_default)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual([s["codec_type"] for s in self.probe(mp4_default, "-show_streams")["streams"]], ["video"])
+
+        mp4_cs = self.tmp / "vs_cs.mp4"
+        res, executed = self.native("-json", "-y", "-i", vs_mp4, "-c", "copy", "-c:s", "copy", mp4_cs)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual([s["codec_type"] for s in self.probe(mp4_cs, "-show_streams")["streams"]], ["video", "subtitle"])
+
+        mp4_map0 = self.tmp / "vs_map0_cc.mp4"
+        res, executed = self.native("-json", "-y", "-i", vs_mp4, "-map", "0", "-c", "copy", mp4_map0)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual([s["codec_type"] for s in self.probe(mp4_map0, "-show_streams")["streams"]], ["video", "subtitle"])
+
+        plan_map0_cv, executed = self.native("-dump-plan", "-i", vs_mp4, "-map", "0", "-c:v", "copy", self.tmp / "vs_map0_cv.mp4")
+        self.assertEqual(plan_map0_cv.returncode, 0)
+        self.assertFalse(executed)
+        self.assertEqual(json.loads(plan_map0_cv.stdout)["backend"]["tier"], "delegated_faithful")
+
+        # MOV with tmcd data track: -map 0 -c:v copy delegates; -map 0 -c copy copies natively
+        tmcd_mov = self.tmp / "tmcd.mov"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "color=c=green:s=64x64:d=1:r=10",
+                     "-metadata:s:v:0", "timecode=00:00:00:00", "-c:v", "libx264", tmcd_mov).returncode, 0)
+        plan_tmcd_cv, executed = self.native("-dump-plan", "-i", tmcd_mov, "-map", "0", "-c:v", "copy", self.tmp / "tmcd_cv.mov")
+        self.assertEqual(plan_tmcd_cv.returncode, 0)
+        self.assertFalse(executed)
+        self.assertEqual(json.loads(plan_tmcd_cv.stdout)["backend"]["tier"], "delegated_faithful")
+
+        tmcd_cc = self.tmp / "tmcd_cc.mov"
+        res, executed = self.native("-json", "-y", "-i", tmcd_mov, "-map", "0", "-c", "copy", tmcd_cc)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        self.assertEqual([s["codec_type"] for s in self.probe(tmcd_cc, "-show_streams")["streams"]], ["video", "data"])
+
+    def test_combined_pre_and_post_ss_or_duplicate_t_delegates_faithfully(self):
+        # Combined pre-input -ss 0.5 and post-input -ss 0.5 with -to 1.0 must delegate and match reference ffmpeg!
+        combo_native = self.tmp / "combo_ss_lffmpeg.wav"
+        combo_ref = self.tmp / "combo_ss_ref.wav"
+        plan_res, executed = self.native("-dump-plan", "-ss", "0.5", "-i", "in.wav", "-ss", "0.5", "-to", "1.0", "-c", "copy", combo_native)
+        self.assertEqual(plan_res.returncode, 0)
+        self.assertFalse(executed)
+        self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+
+        r_lff = subprocess.run(
+            [str(BINARY), "-json", "-y", "-ss", "0.5", "-i", str(self.tmp / "in.wav"),
+             "-ss", "0.5", "-to", "1.0", "-c", "copy", str(combo_native)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r_lff.returncode, 0, r_lff.stdout + r_lff.stderr)
+        self.assertEqual(json.loads(r_lff.stdout)["tier"], "delegated_faithful")
+        self.assertEqual(
+            self.ref("-ss", "0.5", "-i", self.tmp / "in.wav", "-ss", "0.5", "-to", "1.0", "-c", "copy", combo_ref).returncode, 0)
+        self.assertEqual(self.framemd5(combo_native), self.framemd5(combo_ref))
+
+        # Combined pre-input -t and post-input -t also delegates faithfully and matches reference ffmpeg
+        dup_t_lff = self.tmp / "dup_t_lff.wav"
+        dup_t_ref = self.tmp / "dup_t_ref.wav"
+        r_dup = subprocess.run(
+            [str(BINARY), "-json", "-y", "-t", "1.5", "-i", str(self.tmp / "in.wav"),
+             "-t", "0.75", "-c", "copy", str(dup_t_lff)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r_dup.returncode, 0, r_dup.stdout + r_dup.stderr)
+        self.assertEqual(json.loads(r_dup.stdout)["tier"], "delegated_faithful")
+        self.assertEqual(
+            self.ref("-t", "1.5", "-i", self.tmp / "in.wav", "-t", "0.75", "-c", "copy", dup_t_ref).returncode, 0)
+        self.assertEqual(self.framemd5(dup_t_lff), self.framemd5(dup_t_ref))
+
+    def test_mp4_elst_v0_promotes_to_v1_on_64bit_rescaled_duration(self):
+        # Craft a valid MP4 from in.mp4 whose mvhd timescale is 1 and v0 elst segment_duration is 5,000,000
+        # (~57.8 days -> 5,000,000,000 ms >= 2^32 when rescaled to 1000 Hz output mvhd timescale).
+        raw = bytearray((self.tmp / "in.mp4").read_bytes())
+        # Patch mvhd v0 timescale (at offset +12 in mvhd body) to 1 and inject an edts/elst v0 box if needed
+        def patch_boxes(buf):
+            pos = 0
+            out = bytearray()
+            while pos + 8 <= len(buf):
+                sz = struct.unpack(">I", buf[pos:pos + 4])[0]
+                fcc = bytes(buf[pos + 4:pos + 8])
+                body = bytearray(buf[pos + 8:pos + sz])
+                if fcc == b"moov":
+                    cpos = 0
+                    new_moov = bytearray()
+                    while cpos + 8 <= len(body):
+                        csz = struct.unpack(">I", body[cpos:cpos + 4])[0]
+                        cfcc = bytes(body[cpos + 4:cpos + 8])
+                        cbody = bytearray(body[cpos + 8:cpos + csz])
+                        if cfcc == b"mvhd" and cbody[0] == 0:
+                            struct.pack_into(">II", cbody, 12, 1, 5000000)
+                            new_moov += struct.pack(">I4s", 8 + len(cbody), cfcc) + cbody
+                        elif cfcc == b"trak":
+                            tpos = 0
+                            new_trak = bytearray()
+                            saw_edts = False
+                            elst_body = struct.pack(">BBBBIIiHH", 0, 0, 0, 0, 1, 5000000, 0, 1, 0)
+                            edts_box = struct.pack(">I4s", 8 + 8 + len(elst_body), b"edts") + struct.pack(">I4s", 8 + len(elst_body), b"elst") + elst_body
+                            while tpos + 8 <= len(cbody):
+                                tsz = struct.unpack(">I", cbody[tpos:tpos + 4])[0]
+                                tfcc = bytes(cbody[tpos + 4:tpos + 8])
+                                tbody = bytearray(cbody[tpos + 8:tpos + tsz])
+                                if tfcc == b"tkhd":
+                                    new_trak += struct.pack(">I4s", 8 + len(tbody), tfcc) + tbody + edts_box
+                                    saw_edts = True
+                                elif tfcc == b"edts":
+                                    pass
+                                else:
+                                    new_trak += struct.pack(">I4s", 8 + len(tbody), tfcc) + tbody
+                                tpos += tsz
+                            if not saw_edts:
+                                new_trak = edts_box + new_trak
+                            new_moov += struct.pack(">I4s", 8 + len(new_trak), b"trak") + new_trak
+                        else:
+                            new_moov += struct.pack(">I4s", 8 + len(cbody), cfcc) + cbody
+                        cpos += csz
+                    delta = (8 + len(new_moov)) - sz
+                    # Shift stco offsets inside new_moov if moov precedes mdat
+                    # Simpler: move mdat before moov or adjust stco
+                    out += struct.pack(">I4s", 8 + len(new_moov), b"moov") + new_moov
+                else:
+                    out += buf[pos:pos + sz]
+                pos += sz
+            return out
+        # Build a clean mdat-before-moov input via ffmpeg default (no +faststart -> mdat precedes moov, so stco offsets are unaffected by moov growth!)
+        base_mp4 = self.tmp / "elst64_base.mp4"
+        self.assertEqual(
+            self.ref("-f", "lavfi", "-i", "color=c=black:s=32x32:d=1:r=5", "-c:v", "libx264", base_mp4).returncode, 0)
+        patched_mp4 = self.tmp / "elst64_in.mp4"
+        patched_mp4.write_bytes(patch_boxes(base_mp4.read_bytes()))
+
+        elst64_out = self.tmp / "elst64_out.mp4"
+        res, executed = self.native("-json", "-y", "-i", patched_mp4, "-c", "copy", elst64_out)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(executed)
+        out_bytes = elst64_out.read_bytes()
+        elst_idx = out_bytes.find(b"elst")
+        self.assertGreater(elst_idx, 0)
+        self.assertEqual(out_bytes[elst_idx + 4], 1)  # promoted to version 1 (64-bit)
+        seg_dur_64 = struct.unpack(">Q", out_bytes[elst_idx + 12:elst_idx + 20])[0]
+        self.assertEqual(seg_dur_64, 5000000000)
 
 
 if __name__ == "__main__":
