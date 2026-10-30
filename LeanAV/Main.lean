@@ -18,6 +18,8 @@ open LeanAV.Cli
 open LeanAV.NativeKernels
 open LeanAV.PlanIR
 open LeanAV.Ffv1Pipeline
+open LeanAV.H264InterDeblockDpb
+open LeanAV.H264InterDeblockDpbProofs
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -936,9 +938,42 @@ def runSelfTest : IO UInt32 := do
     | .fallbackDelegated _ => false
   let m1cLosslessOk := m1cZlibOk && m1cPngOk && m1cFlacOk
 
+  let m2b2QpelOk :=
+    h264LumaFracCoordsValidSpec.gate h264LumaFracCoordsValidSpec.posWitness &&
+    !(h264LumaFracCoordsValidSpec.gate h264LumaFracCoordsValidSpec.negWitness) &&
+    h264ChromaFracCoordsValidSpec.gate h264ChromaFracCoordsValidSpec.posWitness &&
+    !(h264ChromaFracCoordsValidSpec.gate h264ChromaFracCoordsValidSpec.negWitness) &&
+    implicitBiWeightValidSpec.gate implicitBiWeightValidSpec.posWitness &&
+    !(implicitBiWeightValidSpec.gate implicitBiWeightValidSpec.negWitness) &&
+    h264LumaFrac (Plane2D.alloc 8 8 8 137) 3 3 3 3 == 137 &&
+    h264ChromaFrac (Plane2D.alloc 4 4 4 173) 1 1 5 7 == 173
+  let m2b2DeblockOk :=
+    disableDeblockIdcValidSpec.gate disableDeblockIdcValidSpec.posWitness &&
+    !(disableDeblockIdcValidSpec.gate disableDeblockIdcValidSpec.negWitness) &&
+    deblockEdgeActiveSpec.gate deblockEdgeActiveSpec.posWitness &&
+    !(deblockEdgeActiveSpec.gate deblockEdgeActiveSpec.negWitness) &&
+    (filterLumaSamples8 ⟨100, 100, 100, 100, 108, 108, 108, 108⟩ 4 30 0 0).p0.toNat > 100
+  let m2b2DpbInit : H264Dpb := { maxRefFrames := 4, maxDpbCapacity := 4, maxFrameNum := 16 }
+  let m2b2DpbFinal := flushDpb (
+    insertDecodedPicture
+      (insertDecodedPicture
+        (insertDecodedPicture m2b2DpbInit true false false true 0 0 false [])
+        false false false true 1 4 false [])
+      false false false false 2 2 false [])
+  let m2b2DpbOk :=
+    dpbCapacityValidSpec.gate dpbCapacityValidSpec.posWitness &&
+    !(dpbCapacityValidSpec.gate dpbCapacityValidSpec.negWitness) &&
+    annexBSpsValidSpec.gate annexBSpsValidSpec.posWitness &&
+    !(annexBSpsValidSpec.gate annexBSpsValidSpec.negWitness) &&
+    annexBPpsValidSpec.gate annexBPpsValidSpec.posWitness &&
+    !(annexBPpsValidSpec.gate annexBPpsValidSpec.negWitness) &&
+    m2b2DpbFinal.outputPocLog == [0, 2, 4] &&
+    m2b2DpbFinal.priorCvsMonitor
+  let m2b2H264InterOk := m2b2QpelOk && m2b2DeblockOk && m2b2DpbOk
+
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
-                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk
+                graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk && m2b2H264InterOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
@@ -953,7 +988,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -2363,6 +2398,14 @@ def main (args : List String) : IO UInt32 := do
     let b6 := s!"\"in_bytes\": {rawBytes.size}, \"out_bytes\": {rep8.outputMp4Bytes.size}, \"dpb_poc_monotone\": {rep8.dpbPocMonotone}, \"iso_mp4_roundtrip_ok\": {roundtripIsoOk} }"
     IO.println (b0 ++ b1 ++ b2 ++ b3 ++ b4 ++ b5 ++ b6)
     return 0
+  | ["h264-inter-dpb-probe", annexBPath] => do
+    let rawBytes ← IO.FS.readBinFile annexBPath
+    let rep := simulateAnnexBDpbStream (LeanSys.Posix.ByteSlice.ofByteArray rawBytes)
+    IO.println (h264DpbReportToJson rep)
+    return if rep.pocMonotone && rep.capacityAllOk && rep.framesDecoded > 0 then 0 else 1
+  | ["h264-inter-dpb-vectors"] => do
+    IO.println h264KernelVectorsJson
+    return 0
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
     if a.startsWith "-" then runFFmpegCli args
@@ -2627,6 +2670,34 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Ffv1Proofs.ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p
 #print axioms LeanAV.Ffv1Proofs.ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation
 #print axioms LeanAV.Ffv1Proofs.ffv1MkvSar_roundtrip_unknown_square_and_anamorphic
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Tap6_dc_gain_32
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Tap6_palindromic_symm
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Round5_dc_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Round6_dc_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264CenterJ1_eq_vert
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFracCoordsValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFrac_dc_all_16_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFracCoordsValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaBilinear_weights_sum_64
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFrac_dc_all_64_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.implicitBiWeightValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.implicitBiWeightScaleFactor_sum_64
+#print axioms LeanAV.H264InterDeblockDpbProofs.mvpMedian_directional_16x8_and_8x16
+#print axioms LeanAV.H264InterDeblockDpbProofs.bDirectTemporal_mv_diff_conserves_collocated
+#print axioms LeanAV.H264InterDeblockDpbProofs.refineMotionSubpel_recovers_qpel_shift
+#print axioms LeanAV.H264InterDeblockDpbProofs.disableDeblockIdcValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.deblockEdgeActiveSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8_preserves_p3_q3
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8_normal_preserves_p2_q2
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8_reduces_step_discontinuity
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpbCapacityValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_b_slice_swaps_identical_l1_when_all_past
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_sliding_window_wraparound_evicts_oldest
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_rplm_and_mmco_all_ops_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_b_pyramid_bumping_monotone_poc
+#print axioms LeanAV.H264InterDeblockDpbProofs.annexBSpsValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.annexBPpsValidSpec
+
 
 
 
