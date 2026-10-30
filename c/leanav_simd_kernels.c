@@ -291,6 +291,7 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_binary_ba(
         case 8u: (void)luma_acceptance_accum_simd(ba0, (void *)ba1); break;
         case 9u: (void)down2x2_fused_brightness_simd(ba0, (void *)ba1); break;
         case 10u: (void)yuv420p_studio_range_simd(ba0, (void *)ba1); break;
+        case 11u: (void)bt2020_to_bt709_uv_simd(ba0, (void *)ba1); break;
         default: break;
     }
     s0->m_size = n_lanes << 3;

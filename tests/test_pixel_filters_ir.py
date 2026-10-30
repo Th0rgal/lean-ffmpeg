@@ -19,6 +19,8 @@ class PixelFiltersIR(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(dir=ROOT / ".lake")
         directory = Path(cls.tmp.name)
         kernels = []
+        callees = []
+        callee_names = ("lnir_px_y_studio_clamp_u8", "lnir_px_bt2020_to_bt709_uv_u8")
         for arch in ("x86_64", "arm64"):
             text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
             matches = re.findall(
@@ -26,18 +28,33 @@ class PixelFiltersIR(unittest.TestCase):
                 text, re.M | re.S)
             if len(matches) != 1:
                 raise AssertionError("exactly one packed filter definition required")
+            for cname in callee_names:
+                if f"@{cname}(" not in matches[0]:
+                    raise AssertionError(f"{arch}: filter shell must call @{cname}")
             kernels.append(matches[0])
+            cdefs = []
+            for cname in callee_names:
+                cm = re.findall(r"^define dso_local i64 @" + cname + r"\([^\n]*\n.*?^}", text, re.M | re.S)
+                if len(cm) != 1:
+                    raise AssertionError(f"{arch}: missing @{cname}")
+                cdefs.append(cm[0])
+            callees.append("\n\n".join(cdefs))
         if kernels[0] != kernels[1]:
             raise AssertionError("architecture filter implementations differ")
+        if callees[0] != callees[1]:
+            raise AssertionError("architecture filter @lnir_px_* callees differ")
         ir = directory / "filters.ll"
-        ir.write_text("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n"
-                      "declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)\n"
-                      "declare <16 x i8> @llvm.umin.v16i8(<16 x i8>, <16 x i8>)\n"
-                      + kernels[0].replace(" #0 {", " {"))
+        host = subprocess.check_output([clang, "-dumpmachine"], text=True).strip()
+        body = re.sub(r" #[0-9]+ \{", " {", kernels[0] + "\n\n" + callees[0])
+        ir.write_text(f'target triple = "{host}"\n'
+                      "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n\n"
+                      + body + "\n")
         so = directory / "filters.so"
-        subprocess.run([clang, "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
+        subprocess.run([clang, "-Werror", "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
                        check=True, capture_output=True)
-        subprocess.run([clang, "-target", "aarch64-linux-gnu", "-O3", "-c", str(ir),
+        arm_ir = directory / "filters-arm.ll"
+        arm_ir.write_text(ir.read_text().replace(host, "aarch64-unknown-linux-gnu"))
+        subprocess.run([clang, "-Werror", "-target", "aarch64-unknown-linux-gnu", "-O3", "-c", str(arm_ir),
                         "-o", str(directory / "filters-arm.o")], check=True, capture_output=True)
         cls.lib = ctypes.CDLL(str(so))
         cls.kernel = cls.lib.lean_native_apply_filters_yuv420p_u8

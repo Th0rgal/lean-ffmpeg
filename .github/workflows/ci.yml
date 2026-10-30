@@ -45,9 +45,11 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 278 or total_tight != 278:
+          if total_audited != 300 or total_tight != 300:
               sys.exit(1)
           PY
+      - name: LNIR wire & outer-shell zero-drift check
+        run: ./scripts/regen_lnir_c_kernels.sh --check-ir
       - name: Self-test & C-ABI / LNIR Kernel Verification
         run: |
           .lake/build/bin/lffmpeg self-test
@@ -92,6 +94,8 @@ jobs:
           "$HOME/.elan/bin/lean" --version
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: lake build
+      - name: LNIR wire & outer-shell zero-drift check
+        run: ./scripts/regen_lnir_c_kernels.sh --check-ir
       - run: .lake/build/bin/lffmpeg self-test
       - run: .lake/build/bin/lffmpeg verify-ffi
       - run: .lake/build/bin/lffmpeg verify-kernels

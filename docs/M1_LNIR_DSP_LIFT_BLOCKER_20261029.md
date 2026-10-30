@@ -76,13 +76,23 @@ them is infeasible at the pinned `turbo-lean@dc1656d`, for three reasons:
 
 Consequences:
 
-- The acceptance criterion "no unverified DSP routine remains" is **not met**. The 14
-  routines remain in the TCB (`README.md` "Unverified TCB" row) and are covered by
-  IR-structural tests (`tests/test_u16le_kernels_ir.py`, `tests/test_pixel_filters_ir.py`),
-  differential tests and `verify-kernels`.
-- The lifted cores are validated, but the shipped strided routines do not yet *call*
-  them. Their inlined arithmetic is still the template's. Equivalence of the two is checked
-  only by testing.
+- The acceptance criterion "no unverified DSP routine remains" is **partially closed
+  (M1-A2, 2026-10-30)**: all per-pixel arithmetic has been removed from the 14 outer
+  routines and wired via direct LLVM `call i64 @lnir_px_*` calls to **17 compiled scalar
+  `LNIR_WIRE_V1` pixel-core declarations** (decls 30–46 in `LeanAV/NativeKernels.lean`,
+  plus SIMD decl 29 `bt2020_to_bt709_uv_simd`, bringing `c/leanav_lnir_kernels.lnir` to
+  **46/46** `SymbolicTV`-validated and `verify-certs`-certified declarations and
+  `turbo-lean audit-spec` to **300/300** `non_vacuous_and_tight` specs across **9,065**
+  Lean declarations).
+- **§6.8 Explicit TCB Disclosure**: the 14 thin outer shells (`1,454` lines in
+  `c/leanav_lnir_{x86_64,arm64}.ll`, deterministically emitted by
+  `scripts/gen_lnir_outer_shells.py` and checked for zero drift by
+  `./scripts/regen_lnir_c_kernels.sh --check-ir`) remain in the unverified TCB solely for
+  2D row-stride/coordinate loops, narrow `i8`/`i16` GEP + `zext`/`trunc` loads and stores,
+  16x16 macroblock tiling, and scalar loop-carried accumulators (`sum`, `sumSq`, `maxSad`,
+  `totalSse`). Every pixel-level formula executes inside a verified `@lnir_px_*` core,
+  verified structurally and at runtime by `tests/test_u16le_kernels_ir.py`,
+  `tests/test_pixel_filters_ir.py`, and `lffmpeg verify-kernels`.
 
 ## Required upstream work (turbo-lean / lean-native-core)
 

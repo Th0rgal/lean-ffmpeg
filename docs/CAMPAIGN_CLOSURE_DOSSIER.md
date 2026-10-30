@@ -1,5 +1,23 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-30 M1-A2 LNIR Pixel-Core Outer-Loop Wiring & TCB Disclosure update
+under Lean v4.35.0 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`,
+`audit-spec` v2.1) audited **9,065 declarations with zero sorryAx/custom axioms**
+and **300/300 tight specifications** (`NativeKernels`: 59, `Format`: 56, `Video`: 31,
+`Encoder`: 30, `Scale`: 28, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with **`46/46` `LNIR_WIRE_V1`
+kernels** (29 data-parallel SIMD + 17 scalar `@lnir_px_*` pixel cores) passing
+`SymbolicTV` (`validate-tv --samples 64`) and certificate verification
+(`verify-certs`: `verified: true`, `37 VerifiedKernelProof`,
+`8 TranslationValidated`, `1 Tested`, all `chainValid: true` and
+`theoremsValid: true`), a `1,179`-line C-ABI/POSIX/SIMD bridge
+(`c/leanav_simd_kernels.c`), and **14 thin 2D strided/tiling/narrow-memory LLVM 18
+outer-loop shells** (`1,454` lines in `c/leanav_lnir_{x86_64,arm64}.ll` generated
+deterministically by `scripts/gen_lnir_outer_shells.py` and gated by
+`./scripts/regen_lnir_c_kernels.sh --check-ir`) that call the verified `@lnir_px_*`
+cores directly and are explicitly disclosed in the §6.8 Unverified TCB boundary
+(`docs/M1_LNIR_DSP_LIFT_BLOCKER_20261029.md`).
+
 The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
 **8,916 declarations with zero sorryAx/custom axioms** and **266/266 tight
