@@ -4,12 +4,14 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-START = "define weak_odr dso_local void @lean_native_swscale_bilinear_q8_u16le"
+sys.path.insert(0, str(ROOT / "scripts"))
+import gen_lnir_outer_shells as outer_gen
 
 
 class U16LeKernelsIR(unittest.TestCase):
@@ -21,25 +23,34 @@ class U16LeKernelsIR(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(dir=ROOT / ".lake")
         directory = Path(cls.tmp.name)
         kernels = []
+        px_cores = []
+        shell_names = tuple(outer_gen.EXPECTED_SHELL_CALLS.keys())
         for arch in ("x86_64", "arm64"):
             text = (ROOT / "c" / f"leanav_lnir_{arch}.ll").read_text()
-            names = ("lean_native_swscale_bilinear_q8_u16le", "lean_native_luma_stats_u16le", "lean_native_luma_stats_u8",
-                     "lean_native_swscale_down2x2_u8", "lean_native_swscale_down2x2_fused_eq_u8",
-                     "lean_native_extract_u16le_msb8", "lean_native_luma_acceptance_16x16_u8",
-                     "lean_native_luma_acceptance_16x16_u16le", "lean_native_stencil2d_box3x3_u8", "lean_native_av1_cdef_filter_u8")
-            kernels.append("\n".join(re.search(
-                r"define weak_odr dso_local [^\n]*@" + name + r"\([^\n]*\n.*?\n}",
-                text, re.S).group() for name in names))
+            outer_gen.verify_spliced_module(text, arch)
+            kernels.append("\n\n".join(re.search(
+                r"^define weak_odr dso_local [^\n]*@" + re.escape(name) + r"\([^\n]*\n.*?^}",
+                text, re.M | re.S).group() for name in shell_names))
+            pxs = re.findall(
+                r"^define dso_local i64 @lnir_px_[a-z0-9_]+\([^\n]*\n.*?^}",
+                text, re.M | re.S)
+            if len(pxs) != 17:
+                raise AssertionError(f"{arch}: expected 17 @lnir_px_* definitions, found {len(pxs)}")
+            px_cores.append("\n\n".join(pxs))
         if kernels[0] != kernels[1]:
-            raise AssertionError("architecture U16LE implementations differ")
+            raise AssertionError("architecture outer-shell implementations differ")
+        if px_cores[0] != px_cores[1]:
+            raise AssertionError("architecture @lnir_px_* implementations differ")
+        cls.extracted_shells = kernels[0]
         ir = directory / "u16.ll"
         host = subprocess.check_output([clang, "-dumpmachine"], text=True).strip()
+        body = re.sub(r" #[0-9]+ \{", " {", kernels[0] + "\n\n" + px_cores[0])
+        body = re.sub(r", !llvm\.loop ![0-9]+", "", body)
         ir.write_text(f'target triple = "{host}"\n' +
-                      "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n" +
-                      "declare i32 @llvm.vector.reduce.add.v16i32(<16 x i32>)\n" +
-                      "declare <4 x i32> @llvm.umin.v4i32(<4 x i32>, <4 x i32>)\n" +
-                      "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n" +
-                      re.sub(r", !llvm.loop ![0-9]+", "", kernels[0].replace(" #0 {", " {")))
+                      "declare noalias ptr @malloc(i64 noundef)\n" +
+                      "declare void @free(ptr noundef)\n" +
+                      "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n\n" +
+                      body + "\n")
         so = directory / "u16.so"
         subprocess.run([clang, "-Werror", "-O3", "-shared", "-fPIC", str(ir), "-o", str(so)],
                        check=True, capture_output=True)
@@ -73,6 +84,39 @@ class U16LeKernelsIR(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+    def test_all_14_outer_shells_wired_to_verified_lnir_px_cores(self):
+        self.assertEqual(self.extracted_shells.strip(), outer_gen.gen_all_outer_shells().strip())
+        self.assertNotIn("@llvm.vector.reduce", self.extracted_shells)
+        for shell_name, callees in outer_gen.EXPECTED_SHELL_CALLS.items():
+            m = re.search(
+                r"^define weak_odr dso_local [^\n]*@" + re.escape(shell_name) + r"\([^\n]*\n.*?^}",
+                self.extracted_shells, re.M | re.S)
+            self.assertIsNotNone(m, shell_name)
+            for callee in callees:
+                self.assertIn(f"@{callee}(", m.group(0))
+        # Also exercise the remaining U8 down3x3 / down3to2 / bilinear_q8_u8 shells directly.
+        d3 = self.lib.lean_native_swscale_down3x3_u8
+        d3.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 3
+        d3.restype = None
+        src9 = ctypes.create_string_buffer(bytes([90] * 36))
+        dst4 = ctypes.create_string_buffer(4)
+        d3(dst4, src9, 6, 2, 2)
+        self.assertEqual(dst4.raw, bytes([90] * 4))
+
+        d32 = self.lib.lean_native_swscale_down3to2_u8
+        d32.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 3
+        d32.restype = None
+        dst16 = ctypes.create_string_buffer(16)
+        d32(dst16, src9, 6, 4, 4)
+        self.assertEqual(dst16.raw, bytes([90] * 16))
+
+        bq8 = self.lib.lean_native_swscale_bilinear_q8_u8
+        bq8.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_uint64] * 5
+        bq8.restype = None
+        dst25 = ctypes.create_string_buffer(25)
+        bq8(dst25, src9, 6, 6, 6, 5, 5)
+        self.assertEqual(dst25.raw, bytes([90] * 25))
 
     def test_box3x3_interior_vectors_and_tails(self):
         stencil = self.lib.lean_native_stencil2d_box3x3_u8

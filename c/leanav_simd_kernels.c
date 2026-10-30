@@ -8,8 +8,8 @@
  *   2. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
  *      `leanav_c_ffi_probe_mp4_contract` with borrowed `lean_inc`).
- *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 16
- *      `LNIR_WIRE_V1` kernels and 7 2D/reduction LLVM 18 routines (`leanav_c_exec_lnir_*_ba`).
+ *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 46
+ *      `LNIR_WIRE_V1` kernels and 14 thin 2D/reduction/filter/16-bit outer shells (`leanav_c_exec_lnir_*_ba`).
  */
 #include <lean/lean.h>
 #include <stdint.h>
@@ -252,6 +252,9 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_unary_ba(
         case 1u: (void)prores_qscale_map_simd(ba0); break;
         case 2u: (void)boxblur_div9_recip_shift_simd(ba0); break;
         case 3u: (void)pq10_studio_clamp_select_simd(ba0); break;
+        case 4u: (void)extract_u16le_msb8_simd(ba0); break;
+        case 5u: (void)luma_stats_moments_simd(ba0); break;
+        case 6u: (void)bilinear_q8_clamp10_simd(ba0); break;
         default: break;
     }
     s0->m_size = byte_sz;
@@ -284,6 +287,11 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_binary_ba(
         case 4u: (void)aac_imdct_window_mul_gpu(ba0, (void *)ba1); break;
         case 5u: (void)swscale_down2x2_box_simd(ba0, (void *)ba1); break;
         case 6u: (void)swscale_down3to2_bilinear_simd(ba0, (void *)ba1); break;
+        case 7u: (void)luma_stats_pack_simd(ba0, (void *)ba1); break;
+        case 8u: (void)luma_acceptance_accum_simd(ba0, (void *)ba1); break;
+        case 9u: (void)down2x2_fused_brightness_simd(ba0, (void *)ba1); break;
+        case 10u: (void)yuv420p_studio_range_simd(ba0, (void *)ba1); break;
+        case 11u: (void)bt2020_to_bt709_uv_simd(ba0, (void *)ba1); break;
         default: break;
     }
     s0->m_size = n_lanes << 3;
@@ -324,6 +332,11 @@ LEAN_EXPORT lean_obj_res leanav_c_exec_lnir_ternary_ba(
         case 1u: (void)av1_cdef_fma_blend_gpu(ba0, (void *)ba1, (void *)ba2_eff); break;
         case 2u: (void)swscale_down3x3_box_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
         case 3u: (void)av1_cdef_dir_filter_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 4u: (void)luma_acceptance_gate_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 5u: (void)bilinear_q8_blend_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 6u: (void)bilinear_q8_pack_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 7u: (void)av1_cdef_tap_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
+        case 8u: (void)down2x2_fused_eq_simd(ba0, (void *)ba1, (void *)ba2_eff); break;
         default: break;
     }
     s0->m_size = n_lanes << 3;
