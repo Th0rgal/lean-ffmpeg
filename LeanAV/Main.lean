@@ -1349,11 +1349,12 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
     let outFmtPcmBps := outFmtLower.bind isStandalonePcmFmtBps
     let outBytesOpt : Option (ByteArray × String) :=
       if isFlacOut then
-        let targetBps := if bpsIn == 8 then 8 else if bpsIn == 24 || bpsIn == 32 then 24 else 16
+        let targetBps := if bpsIn >= 4 && bpsIn <= 32 then bpsIn else 16
         let scaled := scaleChannelsBps chansIn bpsIn targetBps
         (flacEncodeStream scaled srIn targetBps 4096 true).map (fun b => (b, "flac"))
       else if isWavOut then
-        let targetBps := outCodecBps.getD (if bpsIn == 8 || bpsIn == 16 || bpsIn == 24 || bpsIn == 32 then bpsIn else 16)
+        let defaultWavBps := if bpsIn >= 4 && bpsIn <= 32 then bpsIn else 16
+        let targetBps := outCodecBps.getD defaultWavBps
         let scaled := scaleChannelsBps chansIn bpsIn targetBps
         some (muxWavPcmLE scaled srIn targetBps, "wav")
       else
@@ -2362,6 +2363,9 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Video.pngEncodeWith_decode_all_filters_roundtrip
 #print axioms LeanAV.Audio.flacFrameSyncGateSpec_iff
 #print axioms LeanAV.Audio.flacChannelAssignGateSpec_iff
+#print axioms LeanAV.Audio.flacMidSide64_roundtrip
+#print axioms LeanAV.Audio.flacStereoPair64_all_modes_roundtrip
+#print axioms LeanAV.Audio.flacFixedList_roundtrip
 #print axioms LeanAV.Audio.flacStream_and_stereo_modes_roundtrip
 #print axioms LeanAV.PlanIR.standaloneLosslessPlanGateSpec_iff
 #print axioms LeanAV.PlanIR.standaloneLossless_routing_and_kernels_verified

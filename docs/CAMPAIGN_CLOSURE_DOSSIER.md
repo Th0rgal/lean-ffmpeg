@@ -2,18 +2,20 @@
 
 The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
-audited **9,789 declarations with zero sorryAx/custom axioms** and **301/301
-tight specifications** (`Format`: 56, `Video`: 41, `Encoder`: 30, `Scale`: 28,
-`Bitstream`: 25, `NativeKernels`: 25, `Audio`: 23, `Spec`: 23, `PlanIR`: 19,
+audited **10,092 declarations with zero sorryAx/custom axioms** and **308/308
+tight specifications** (`Format`: 56, `Video`: 44, `Encoder`: 30, `Scale`: 28,
+`Bitstream`: 27, `Audio`: 25, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 19,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
 shadowed), adding pure Lean 4 `independent_verified` Zlib/DEFLATE (RFC 1950 /
 RFC 1951 stored, fixed, and dynamic canonical Huffman + LZ77 + Adler-32), PNG
-(filters `0..4`, Adam7 interlace, `PLTE`/`tRNS`, 8/16-bit rawvideo CLI
-roundtrip), and FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC subframes, 4
-stereo modes, STREAMINFO MD5 + CRC-8/CRC-16, 8/16/24/32-bit WAV & raw PCM CLI
-roundtrip) decode and encode with zero `ffmpeg` subprocesses (verified under
+(filters `0..4`, Adam7 interlace, strict RFC 2083 chunk ordering/multiplicity,
+`PLTE`/`tRNS` including 16-bit RGB keys, 8/16-bit rawvideo CLI roundtrip), and
+FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC subframes, 64-bit signed Rice
+residuals, wasted bits, 4 stereo modes, STREAMINFO MD5 + CRC-8/CRC-16,
+`WAVE_FORMAT_EXTENSIBLE` 8/12/16/20/24/32-bit WAV & raw PCM CLI roundtrip)
+decode and encode with zero `ffmpeg` subprocesses (verified under
 `PATH=/nonexistent` and `strace -f -e trace=execve`), passing `136/136` unit
-tests and `70/70` differential tests (`66` passed, `4` harness-CLI skips).
+tests and `73/73` differential suite entries (`69` passed, `4` skipped).
 
 The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited

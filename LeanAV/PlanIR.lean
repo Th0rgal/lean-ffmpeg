@@ -631,7 +631,9 @@ def isExtendedMapSpec (s : String) : Bool :=
     let rest := String.ofList (s.toList.drop 1)
     (parseStreamMapSpec rest).isSome || isDelegatedGroupMapSpec rest || rest == "0:t" || rest == "0:t:0"
   else if strStartsWithFast s "[" && strEndsWithFast s "]" then
-    s.toList.length > 2
+    match s.toList with
+    | _ :: _ :: _ :: _ => true
+    | _ => false
   else
     isDelegatedGroupMapSpec s || s == "0:t" || s == "0:t?" || s == "0:t:0" || s == "0:t:0?"
 
@@ -2025,17 +2027,26 @@ def encodeFlacIndependentOrFallback (channelsData : Array (Array Int32)) (sample
   | some bytes => .independentVerified bytes
   | none => .fallbackDelegated "invalid_flac_audio_parameters"
 
+def isStandaloneLosslessPlanValid (plan : MediaPlanIR) : Bool :=
+  plan.errors.isEmpty &&
+  (plan.backend.tier == .independentVerified) &&
+  !plan.backend.delegatedContainer
+
 def StandaloneLosslessPlanSafe (plan : MediaPlanIR) : Prop :=
   plan.errors.isEmpty = true ∧ plan.backend.tier = .independentVerified ∧
     plan.backend.delegatedContainer = false
 
-instance (plan : MediaPlanIR) : Decidable (StandaloneLosslessPlanSafe plan) :=
-  inferInstanceAs (Decidable (_ ∧ _ ∧ _))
-
 def standaloneLosslessPlanGateSpec : AVGateSpec MediaPlanIR StandaloneLosslessPlanSafe where
-  gate := fun plan => decide (StandaloneLosslessPlanSafe plan)
-  sound _ h := of_decide_eq_true h
-  complete _ h := decide_eq_true h
+  gate := isStandaloneLosslessPlanValid
+  sound plan h := by
+    unfold isStandaloneLosslessPlanValid StandaloneLosslessPlanSafe at *
+    simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true'] at h
+    exact ⟨h.1.1, h.1.2, h.2⟩
+  complete plan h := by
+    unfold isStandaloneLosslessPlanValid StandaloneLosslessPlanSafe at *
+    rcases h with ⟨h1, h2, h3⟩
+    simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true']
+    exact ⟨⟨h1, h2⟩, h3⟩
   posWitness := parseArgsToPlanIR ["-y", "-i", "in.png", "out.png"]
   negWitness := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-c", "copy", "out.mp4"]
   nonVacuous := by decide

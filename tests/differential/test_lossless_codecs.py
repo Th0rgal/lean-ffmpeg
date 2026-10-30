@@ -383,6 +383,167 @@ class LosslessCodecTests(unittest.TestCase):
                 self.assertEqual(len(exec_lines), 1, f"Expected exactly 1 execve (lffmpeg itself), got: {exec_lines}")
                 self.assertIn("lffmpeg", exec_lines[0])
 
+    def test_zlib_flevels_and_oversubscribed_huffman_rejection(self):
+        payload = bytes((i * 53 + (i >> 3) * 17) & 255 for i in range(8192))
+        for level in (0, 1, 5, 9):
+            z_ref = self.write(f"lvl{level}.z", zlib.compress(payload, level))
+            dec = self.dir / f"lvl{level}.raw"
+            run(LFFMPEG, "lossless-codec", "zlib-decode", z_ref, dec)
+            self.assertEqual(dec.read_bytes(), payload)
+
+        # Oversubscribed dynamic Huffman stream (corrupted code-length header) must fail closed
+        bad_dyn = bytearray(zlib.compress(b"abcd" * 512, 9))
+        bad_dyn[2] = 0x05  # final=1, btype=2 (dynamic), all header bits mangled
+        bad_dyn[3] = 0xFF
+        bad_dyn[4] = 0xFF
+        bad_dyn[5] = 0xFF
+        res = subprocess.run(
+            [str(LFFMPEG), "lossless-codec", "zlib-decode", str(self.write("oversub.z", bytes(bad_dyn))), str(self.dir / "bad_out")],
+            capture_output=True,
+        )
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_png_strict_chunk_ordering_multiplicity_and_trns_rgb(self):
+        w, h = 4, 3
+        rgb8 = bytes([
+            10, 20, 30,  40, 50, 60,  10, 20, 30,  255, 0, 128,
+            0, 0, 0,     10, 20, 30,  7, 8, 9,     11, 22, 33,
+            99, 88, 77,  10, 20, 30,  1, 2, 3,     4, 5, 6,
+        ])
+        trns8 = struct.pack(">HHH", 10, 20, 30)
+        png8 = self.write("trns8.png", png_bytes(w, h, 8, 2, filtered_rows(rgb8, w, h, 3, [0]), trns=trns8))
+        rgba8_out = self.dir / "trns8.rgba"
+        run(LFFMPEG, "-y", "-i", png8, "-f", "rawvideo", "-pix_fmt", "rgba", rgba8_out)
+        got8 = rgba8_out.read_bytes()
+        for idx in range(w * h):
+            r, g, b = rgb8[idx * 3:idx * 3 + 3]
+            expected_a = 0 if (r, g, b) == (10, 20, 30) else 255
+            self.assertEqual(got8[idx * 4:idx * 4 + 4], bytes([r, g, b, expected_a]))
+
+        # 16-bit RGB tRNS must compare full 16-bit key before downscaling to 8-bit RGBA:
+        # pixel 0 matches (0x1234, 0x5678, 0x9ABC) -> alpha 0;
+        # pixel 1 has same high bytes (0x1200, 0x5600, 0x9A00) -> alpha 255!
+        rgb16_pixels = struct.pack(
+            ">6H",
+            0x1234, 0x5678, 0x9ABC,
+            0x1200, 0x5600, 0x9A00,
+        )
+        trns16 = struct.pack(">HHH", 0x1234, 0x5678, 0x9ABC)
+        png16 = self.write("trns16.png", png_bytes(2, 1, 16, 2, b"\x00" + rgb16_pixels, trns=trns16))
+        rgba16_out = self.dir / "trns16.rgba"
+        run(LFFMPEG, "-y", "-i", png16, "-f", "rawvideo", "-pix_fmt", "rgba", rgba16_out)
+        self.assertEqual(
+            rgba16_out.read_bytes(),
+            bytes([0x12, 0x56, 0x9A, 0x00, 0x12, 0x56, 0x9A, 0xFF]),
+        )
+
+        # Malformed PNG chunk sequences that RFC 2083 forbids:
+        ihdr_rgb = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 2, 0, 0, 0))
+        ihdr_gray = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 0, 0, 0, 0))
+        ihdr_idx = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 3, 0, 0, 0))
+        idat_rgb = png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03\x04\x05\x06"))
+        idat_rgb_part1 = png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03\x04\x05\x06")[:4])
+        idat_rgb_part2 = png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03\x04\x05\x06")[4:])
+        plte = png_chunk(b"PLTE", bytes(range(12)))
+        ancillary = png_chunk(b"tEXt", b"k\x00v")
+        iend = png_chunk(b"IEND", b"")
+        sig = b"\x89PNG\r\n\x1a\n"
+
+        invalid_pngs = [
+            ("non_contiguous_idat.png", sig + ihdr_rgb + idat_rgb_part1 + ancillary + idat_rgb_part2 + iend),
+            ("plte_on_gray.png", sig + ihdr_gray + plte + png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02")) + iend),
+            ("dup_plte.png", sig + ihdr_idx + plte + plte + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x01")) + iend),
+            ("trns_before_plte.png", sig + ihdr_idx + png_chunk(b"tRNS", b"\x80") + plte + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x01")) + iend),
+            ("plte_after_idat.png", sig + ihdr_rgb + idat_rgb + plte + iend),
+            ("missing_plte_idx.png", sig + ihdr_idx + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x01")) + iend),
+            ("bad_trns_len_rgb.png", sig + ihdr_rgb + png_chunk(b"tRNS", b"\x00\x01\x02\x03") + idat_rgb + iend),
+            ("nonzero_iend.png", sig + ihdr_rgb + idat_rgb + png_chunk(b"IEND", b"\x00")),
+        ]
+        for fname, bad_bytes in invalid_pngs:
+            bad_path = self.write(fname, bad_bytes)
+            res = subprocess.run(
+                [str(LFFMPEG), "lossless-codec", "png-decode", str(bad_path), str(self.dir / f"out_{fname}")],
+                capture_output=True,
+            )
+            self.assertNotEqual(res.returncode, 0, f"Expected fail-closed rejection for {fname}")
+
+    @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
+    def test_flac_32bit_extremes_wasted_bits_and_wav_extensible_depths(self):
+        # 1. Full 32-bit signed stereo with extreme opposite-rail samples (triggers 33-bit side channel & 64-bit Rice residuals)
+        s32_pairs = [
+            (-2147483648, 2147483647),
+            (2147483647, -2147483648),
+            (-2147483648, -2147483648),
+            (2147483647, 2147483647),
+            (0, 0),
+            (1234567890, -1234567890),
+        ] * 900
+        pcm32_bytes = bytearray()
+        for l_s, r_s in s32_pairs:
+            pcm32_bytes += struct.pack("<ii", l_s, r_s)
+        pcm32_in = self.write("extreme32.pcm", bytes(pcm32_bytes))
+
+        lean_flac32 = self.dir / "lean32.flac"
+        run(LFFMPEG, "-y", "-f", "s32le", "-ar", "48000", "-ac", "2", "-i", pcm32_in, lean_flac32)
+        ff_pcm32 = self.dir / "ff32.pcm"
+        run(FFMPEG, "-y", "-v", "error", "-i", lean_flac32, "-f", "s32le", ff_pcm32)
+        self.assertEqual(ff_pcm32.read_bytes(), bytes(pcm32_bytes))
+
+        # Roundtrip 32-bit FLAC -> WAV (WAVE_FORMAT_EXTENSIBLE) -> FLAC -> s32le without 24-bit truncation
+        wav32 = self.dir / "lean32.wav"
+        run(LFFMPEG, "-y", "-i", lean_flac32, wav32)
+        ff_wav32_pcm = self.dir / "ff_wav32.pcm"
+        run(FFMPEG, "-y", "-v", "error", "-i", wav32, "-f", "s32le", ff_wav32_pcm)
+        self.assertEqual(ff_wav32_pcm.read_bytes(), bytes(pcm32_bytes))
+
+        re_flac32 = self.dir / "re32.flac"
+        run(LFFMPEG, "-y", "-i", wav32, re_flac32)
+        lean_pcm32 = self.dir / "lean32_out.pcm"
+        run(LFFMPEG, "-y", "-i", re_flac32, "-f", "s32le", lean_pcm32)
+        self.assertEqual(lean_pcm32.read_bytes(), bytes(pcm32_bytes))
+
+        # Also decode FFmpeg-encoded 32-bit FLAC (including wasted-bits blocks via LSB-shifted samples)
+        wasted_pairs = [((i * 1024) - 524288, ((i * 512) - 262144)) for i in range(2048)]
+        wasted32 = bytearray()
+        for l_s, r_s in wasted_pairs:
+            wasted32 += struct.pack("<ii", l_s << 8, r_s << 8)
+        wasted_in = self.write("wasted32.pcm", bytes(wasted32))
+        ff_wasted_flac = self.dir / "ff_wasted32.flac"
+        run(FFMPEG, "-y", "-v", "error", "-f", "s32le", "-ar", "44100", "-ac", "2", "-i", wasted_in, ff_wasted_flac)
+        lean_wasted_out = self.dir / "lean_wasted32.pcm"
+        run(LFFMPEG, "-y", "-i", ff_wasted_flac, "-f", "s32le", lean_wasted_out)
+        self.assertEqual(lean_wasted_out.read_bytes(), bytes(wasted32))
+
+        # 2. 24-bit WAV WAVE_FORMAT_EXTENSIBLE interoperability with FFmpeg
+        samples24 = [int(4_000_000 * math.sin(i * 0.09)) for i in range(1024)]
+        pcm24 = pack_s24le(samples24)
+        pcm24_in = self.write("mono24.pcm", pcm24)
+        ff_wav24 = self.dir / "ff24.wav"
+        run(FFMPEG, "-y", "-v", "error", "-f", "s24le", "-ar", "48000", "-ac", "1", "-i", pcm24_in, "-c:a", "pcm_s24le", ff_wav24)
+        lean_from_ff_wav24 = self.dir / "lean_from_ff24.flac"
+        run(LFFMPEG, "-y", "-i", ff_wav24, lean_from_ff_wav24)
+        lean_wav24 = self.dir / "lean24.wav"
+        run(LFFMPEG, "-y", "-i", lean_from_ff_wav24, lean_wav24)
+        ff_check24 = self.dir / "ff_check24.pcm"
+        run(FFMPEG, "-y", "-v", "error", "-i", lean_wav24, "-f", "s24le", ff_check24)
+        self.assertEqual(ff_check24.read_bytes(), pcm24)
+
+        # 3. 12-bit FLAC (via FFmpeg -bits_per_raw_sample 12) -> Lean WAV (MSB-aligned 16-bit extensible) -> FFmpeg s16le
+        vals12 = [((i * 73) % 4096) - 2048 for i in range(1024)]
+        msb16 = struct.pack(f"<{len(vals12)}h", *[v << 4 for v in vals12])
+        msb16_in = self.write("in12_msb16.pcm", msb16)
+        ff_flac12 = self.dir / "ff12.flac"
+        run(
+            FFMPEG, "-y", "-v", "error",
+            "-f", "s16le", "-ar", "32000", "-ac", "1", "-i", msb16_in,
+            "-bits_per_raw_sample", "12", ff_flac12,
+        )
+        lean_wav12 = self.dir / "lean12.wav"
+        run(LFFMPEG, "-y", "-i", ff_flac12, lean_wav12)
+        ff_out12_s16 = self.dir / "ff12_out.pcm"
+        run(FFMPEG, "-y", "-v", "error", "-i", lean_wav12, "-f", "s16le", ff_out12_s16)
+        self.assertEqual(ff_out12_s16.read_bytes(), msb16)
+
 
 if __name__ == "__main__":
     unittest.main()

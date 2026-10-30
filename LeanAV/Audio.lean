@@ -44,7 +44,21 @@ inductive FlacFixedOrder where
   | order4 -- p[n] = 4*s[n-1] - 6*s[n-2] + 4*s[n-3] - s[n-4]
   deriving Repr, DecidableEq, Inhabited
 
-/-- Compute the FLAC Fixed Predictor value at index `i` from previously reconstructed samples `out`. -/
+@[inline]
+def flacFixedPredict64 (ord : FlacFixedOrder) (out : Array Int64) (i : Nat) : Int64 :=
+  match ord with
+  | .order0 => 0
+  | .order1 =>
+    if i ≥ 1 then out.getD (i - 1) 0 else 0
+  | .order2 =>
+    if i ≥ 2 then 2 * out.getD (i - 1) 0 - out.getD (i - 2) 0 else 0
+  | .order3 =>
+    if i ≥ 3 then 3 * out.getD (i - 1) 0 - 3 * out.getD (i - 2) 0 + out.getD (i - 3) 0 else 0
+  | .order4 =>
+    if i ≥ 4 then
+      4 * out.getD (i - 1) 0 - 6 * out.getD (i - 2) 0 + 4 * out.getD (i - 3) 0 - out.getD (i - 4) 0
+    else 0
+
 @[inline]
 def flacFixedPredict (ord : FlacFixedOrder) (out : Array Int32) (i : Nat) : Int32 :=
   let ds := out.toList
@@ -61,19 +75,17 @@ def flacFixedPredict (ord : FlacFixedOrder) (out : Array Int32) (i : Nat) : Int3
       4 * ds.getD (i - 1) 0 - 6 * ds.getD (i - 2) 0 + 4 * ds.getD (i - 3) 0 - ds.getD (i - 4) 0
     else 0
 
-/-- Structural helper for `flacEncodeFixedResiduals`. -/
-def flacEncodeFixedResidualsLoop (ord : FlacFixedOrder) (samples : Array Int32) (i : Nat) : Nat → List Int32 → List Int32
+def flacEncodeFixedResidualsLoop (ord : FlacFixedOrder) (samples : Array Int32) (i : Nat) :
+    Nat → List Int32 → List Int32
   | 0, acc => acc.reverse
   | rem + 1, acc =>
-    let s := samples.toList.getD i 0
+    let s := samples.getD i 0
     let p := flacFixedPredict ord samples i
     flacEncodeFixedResidualsLoop ord samples (i + 1) rem ((s - p) :: acc)
 
-/-- Encode a channel's samples into FLAC Fixed-LPC residuals (`r[i] = s[i] - predict(i)`). -/
 def flacEncodeFixedResiduals (ord : FlacFixedOrder) (samples : Array Int32) : Array Int32 :=
-  (flacEncodeFixedResidualsLoop ord samples 0 samples.toList.length []).toArray
+  (flacEncodeFixedResidualsLoop ord samples 0 samples.size []).toArray
 
-/-- Structural helper for `flacDecodeFixedResiduals`. -/
 def flacDecodeFixedResidualsLoop (ord : FlacFixedOrder) : List Int32 → List Int32 → List Int32
   | [], outRev => outRev.reverse
   | r :: rest, outRev =>
@@ -81,11 +93,31 @@ def flacDecodeFixedResidualsLoop (ord : FlacFixedOrder) : List Int32 → List In
     let p := flacFixedPredict ord curOut outRev.length
     flacDecodeFixedResidualsLoop ord rest ((r + p) :: outRev)
 
-/-- Reconstruct a channel's samples bit-exactly (`R0`) from FLAC Fixed-LPC residuals (`s[i] = r[i] + predict(i)`). -/
 def flacDecodeFixedResiduals (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 :=
   (flacDecodeFixedResidualsLoop ord residuals.toList []).toArray
 
-/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC predictor (`flacFixedPredictFast`) without `.toList` conversions. -/
+def flacEncodeFixedResiduals64Loop (ord : FlacFixedOrder) (samples : Array Int64) (i : Nat)
+    (acc : Array Int64) : Nat → Array Int64
+  | 0 => acc
+  | rem + 1 =>
+    let s := samples.getD i 0
+    let p := flacFixedPredict64 ord samples i
+    flacEncodeFixedResiduals64Loop ord samples (i + 1) (acc.push (s - p)) rem
+
+def flacEncodeFixedResiduals64 (ord : FlacFixedOrder) (samples : Array Int64) : Array Int64 :=
+  flacEncodeFixedResiduals64Loop ord samples 0 #[] samples.size
+
+def flacDecodeFixedResiduals64Loop (ord : FlacFixedOrder) (residuals : Array Int64) (i : Nat)
+    (out : Array Int64) : Nat → Array Int64
+  | 0 => out
+  | rem + 1 =>
+    let r := residuals.getD i 0
+    let p := flacFixedPredict64 ord out out.size
+    flacDecodeFixedResiduals64Loop ord residuals (i + 1) (out.push (r + p)) rem
+
+def flacDecodeFixedResiduals64 (ord : FlacFixedOrder) (warmup residuals : Array Int64) : Array Int64 :=
+  flacDecodeFixedResiduals64Loop ord residuals 0 warmup residuals.size
+
 @[inline]
 def flacFixedPredictFast (ord : FlacFixedOrder) (arr : Array Int32) (i : Nat) : Int32 :=
   match ord with
@@ -101,7 +133,6 @@ def flacFixedPredictFast (ord : FlacFixedOrder) (arr : Array Int32) (i : Nat) : 
       4 * arr.getD (i - 1) 0 - 6 * arr.getD (i - 2) 0 + 4 * arr.getD (i - 3) 0 - arr.getD (i - 4) 0
     else 0
 
-/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC residual encoder (`flacEncodeFixedResidualsFast`). -/
 def flacEncodeFixedResidualsFast (ord : FlacFixedOrder) (samples : Array Int32) : Array Int32 := Id.run do
   let n := samples.size
   let mut out := Array.mkEmpty n
@@ -111,7 +142,6 @@ def flacEncodeFixedResidualsFast (ord : FlacFixedOrder) (samples : Array Int32) 
     out := out.push (s - p)
   return out
 
-/-- Fast `O(N)` flat-`Array` FLAC Fixed-LPC residual decoder (`flacDecodeFixedResidualsFast`). -/
 def flacDecodeFixedResidualsFast (ord : FlacFixedOrder) (residuals : Array Int32) : Array Int32 := Id.run do
   let n := residuals.size
   let mut out := Array.mkEmpty n
@@ -121,8 +151,29 @@ def flacDecodeFixedResidualsFast (ord : FlacFixedOrder) (residuals : Array Int32
     out := out.push (r + p)
   return out
 
-/-- Structural FIR inner dot-product helper for `flacDecodeLpcFir`. -/
-def flacLpcFirDot (outList : List Int32) (curIdx : Nat) (coeffs : List Int32) (k : Nat) (acc : Int64) : List Int32 → Int64
+def flacLpcFirDot64 (outArr : Array Int64) (curIdx : Nat) (coeffs : Array Int64)
+    (k : Nat) (acc : Int64) : Nat → Int64
+  | 0 => acc
+  | rem + 1 =>
+    let nextAcc :=
+      if curIdx > k then acc + coeffs.getD k 0 * outArr.getD (curIdx - 1 - k) 0
+      else acc
+    flacLpcFirDot64 outArr curIdx coeffs (k + 1) nextAcc rem
+
+def flacDecodeLpcFir64Loop (coeffs : Array Int64) (qShift : UInt32) (residuals : Array Int64)
+    (i : Nat) (outArr : Array Int64) : Nat → Array Int64
+  | 0 => outArr
+  | rem + 1 =>
+    let acc := flacLpcFirDot64 outArr outArr.size coeffs 0 0 coeffs.size
+    let pred : Int64 := acc >>> qShift.toUInt64.toInt64
+    flacDecodeLpcFir64Loop coeffs qShift residuals (i + 1) (outArr.push (residuals.getD i 0 + pred)) rem
+
+def flacDecodeLpcFir64 (warmup coeffs : Array Int64) (qShift : UInt32)
+    (residuals : Array Int64) : Array Int64 :=
+  flacDecodeLpcFir64Loop coeffs qShift residuals 0 warmup residuals.size
+
+def flacLpcFirDot (outList : List Int32) (curIdx : Nat) (coeffs : List Int32) (k : Nat) (acc : Int64) :
+    List Int32 → Int64
   | [] => acc
   | c :: cs =>
     let nextAcc :=
@@ -132,7 +183,6 @@ def flacLpcFirDot (outList : List Int32) (curIdx : Nat) (coeffs : List Int32) (k
       else acc
     flacLpcFirDot outList curIdx coeffs (k + 1) nextAcc cs
 
-/-- Structural outer recursion helper for `flacDecodeLpcFir`. -/
 def flacDecodeLpcFirList (coeffs : List Int32) (qShift : UInt32) : List Int32 → List Int32 → List Int32
   | outList, [] => outList
   | outList, r :: rs =>
@@ -140,25 +190,32 @@ def flacDecodeLpcFirList (coeffs : List Int32) (qShift : UInt32) : List Int32 �
     let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
     flacDecodeLpcFirList coeffs qShift (outList ++ [r + pred]) rs
 
-/-- General quantized FIR LPC synthesis filter (`s[n] = r[n] + (∑_{k=0}^{L-1} coeffs[k] * s[n-1-k]) >> qShift`). -/
 def flacDecodeLpcFir (warmup : Array Int32) (coeffs : Array Int32) (qShift : UInt32)
     (residuals : Array Int32) : Array Int32 :=
   (flacDecodeLpcFirList coeffs.toList qShift warmup.toList residuals.toList).toArray
 
-/-- FLAC Reversible Mid-Side Stereo Decorrelation (`mid = (L + R) >> 1`, `side = L - R`). -/
 @[inline]
-def flacStereoToMidSide (left right : Int32) : Int32 × Int32 :=
+def flacStereoToMidSide64 (left right : Int64) : Int64 × Int64 :=
   let side := left - right
   let mid := (left + right) >>> 1
   (mid, side)
 
-/-- FLAC Exact Reversible Mid-Side Reconstruction (`L = mid + ((side + (side & 1)) >> 1)`, `R = L - side`). -/
 @[inline]
-def flacMidSideToStereo (mid side : Int32) : Int32 × Int32 :=
+def flacMidSideToStereo64 (mid side : Int64) : Int64 × Int64 :=
   let sum2 := (mid <<< 1) + (side &&& 1)
   let left := (sum2 + side) >>> 1
   let right := (sum2 - side) >>> 1
   (left, right)
+
+@[inline]
+def flacStereoToMidSide (left right : Int32) : Int32 × Int32 :=
+  let (m, s) := flacStereoToMidSide64 left.toInt64 right.toInt64
+  (m.toInt32, s.toInt32)
+
+@[inline]
+def flacMidSideToStereo (mid side : Int32) : Int32 × Int32 :=
+  let (l, r) := flacMidSideToStereo64 mid.toInt64 side.toInt64
+  (l.toInt32, r.toInt32)
 
 /-! ## 2. Opus (`RFC 6716`: SILK + CELT Hybrid Audio Codec) -/
 
@@ -353,54 +410,60 @@ structure FlacStreamInfo where
   totalSamples  : UInt64
   deriving Repr, DecidableEq, Inhabited
 
-/--
-  Parse a FLAC `STREAMINFO` block from a `ByteSlice` starting either at `"fLaC"` magic
-  (`0x66 0x4C 0x61 0x43`) or directly at the 34-byte payload.
--/
 def parseFlacStreamInfo (s : ByteSlice) : Option FlacStreamInfo :=
-  let baseOff : Nat :=
-    if s.len ≥ 42 &&
-       sliceByteD s 0 == 0x66 && sliceByteD s 1 == 0x4C &&
-       sliceByteD s 2 == 0x61 && sliceByteD s 3 == 0x43 then 8
-    else if s.len ≥ 34 then 0
-    else 999999
-  if baseOff + 18 > s.len then none
-  else
-    let minBlk : UInt16 := ((sliceByteD s baseOff).toUInt16 <<< 8) ||| (sliceByteD s (baseOff + 1)).toUInt16
-    let maxBlk : UInt16 := ((sliceByteD s (baseOff + 2)).toUInt16 <<< 8) ||| (sliceByteD s (baseOff + 3)).toUInt16
-    let minFrm : UInt32 :=
-      ((sliceByteD s (baseOff + 4)).toUInt32 <<< 16) |||
-      ((sliceByteD s (baseOff + 5)).toUInt32 <<< 8)  |||
-      (sliceByteD s (baseOff + 6)).toUInt32
-    let maxFrm : UInt32 :=
-      ((sliceByteD s (baseOff + 7)).toUInt32 <<< 16) |||
-      ((sliceByteD s (baseOff + 8)).toUInt32 <<< 8)  |||
-      (sliceByteD s (baseOff + 9)).toUInt32
-    let b10 := (sliceByteD s (baseOff + 10)).toUInt32
-    let b11 := (sliceByteD s (baseOff + 11)).toUInt32
-    let b12 := (sliceByteD s (baseOff + 12)).toUInt32
-    let b13 := (sliceByteD s (baseOff + 13)).toUInt32
-    let sr : UInt32 := (b10 <<< 12) ||| (b11 <<< 4) ||| (b12 >>> 4)
-    let ch : UInt8 := (((b12 >>> 1) &&& 0x07) + 1).toUInt8
-    let bps : UInt8 := ((((b12 &&& 1) <<< 4) ||| (b13 >>> 4)) + 1).toUInt8
-    let totHi : UInt64 := (b13 &&& 0x0F).toUInt64
-    let totLo : UInt64 :=
-      ((sliceByteD s (baseOff + 14)).toUInt64 <<< 24) |||
-      ((sliceByteD s (baseOff + 15)).toUInt64 <<< 16) |||
-      ((sliceByteD s (baseOff + 16)).toUInt64 <<< 8)  |||
-      (sliceByteD s (baseOff + 17)).toUInt64
-    let totSamples : UInt64 := (totHi <<< 32) ||| totLo
-    if sr == 0 || minBlk < 16 then none
-    else some {
-      minBlockSize := minBlk
-      maxBlockSize := maxBlk
-      minFrameSize := minFrm
-      maxFrameSize := maxFrm
-      sampleRate := sr
-      channels := ch
-      bitsPerSample := bps
-      totalSamples := totSamples
-    }
+  let hasFlacMagic :=
+    s.len ≥ 4 &&
+    sliceByteD s 0 == 0x66 && sliceByteD s 1 == 0x4C &&
+    sliceByteD s 2 == 0x61 && sliceByteD s 3 == 0x43
+  let baseOffOpt : Option Nat :=
+    if hasFlacMagic then
+      if s.len ≥ 42 &&
+         ((sliceByteD s 4 &&& 0x7F) == 0) &&
+         sliceByteD s 5 == 0x00 && sliceByteD s 6 == 0x00 && sliceByteD s 7 == 0x22 then
+        some 8
+      else none
+    else if s.len == 34 then some 0
+    else none
+  match baseOffOpt with
+  | none => none
+  | some baseOff =>
+    if baseOff + 34 > s.len then none
+    else
+      let minBlk : UInt16 := ((sliceByteD s baseOff).toUInt16 <<< 8) ||| (sliceByteD s (baseOff + 1)).toUInt16
+      let maxBlk : UInt16 := ((sliceByteD s (baseOff + 2)).toUInt16 <<< 8) ||| (sliceByteD s (baseOff + 3)).toUInt16
+      let minFrm : UInt32 :=
+        ((sliceByteD s (baseOff + 4)).toUInt32 <<< 16) |||
+        ((sliceByteD s (baseOff + 5)).toUInt32 <<< 8)  |||
+        (sliceByteD s (baseOff + 6)).toUInt32
+      let maxFrm : UInt32 :=
+        ((sliceByteD s (baseOff + 7)).toUInt32 <<< 16) |||
+        ((sliceByteD s (baseOff + 8)).toUInt32 <<< 8)  |||
+        (sliceByteD s (baseOff + 9)).toUInt32
+      let b10 := (sliceByteD s (baseOff + 10)).toUInt32
+      let b11 := (sliceByteD s (baseOff + 11)).toUInt32
+      let b12 := (sliceByteD s (baseOff + 12)).toUInt32
+      let b13 := (sliceByteD s (baseOff + 13)).toUInt32
+      let sr : UInt32 := (b10 <<< 12) ||| (b11 <<< 4) ||| (b12 >>> 4)
+      let ch : UInt8 := (((b12 >>> 1) &&& 0x07) + 1).toUInt8
+      let bps : UInt8 := ((((b12 &&& 1) <<< 4) ||| (b13 >>> 4)) + 1).toUInt8
+      let totHi : UInt64 := (b13 &&& 0x0F).toUInt64
+      let totLo : UInt64 :=
+        ((sliceByteD s (baseOff + 14)).toUInt64 <<< 24) |||
+        ((sliceByteD s (baseOff + 15)).toUInt64 <<< 16) |||
+        ((sliceByteD s (baseOff + 16)).toUInt64 <<< 8)  |||
+        (sliceByteD s (baseOff + 17)).toUInt64
+      let totSamples : UInt64 := (totHi <<< 32) ||| totLo
+      if sr == 0 || sr > (655350 : UInt32) || minBlk < 16 || maxBlk < minBlk || bps < 4 then none
+      else some {
+        minBlockSize := minBlk
+        maxBlockSize := maxBlk
+        minFrameSize := minFrm
+        maxFrameSize := maxFrm
+        sampleRate := sr
+        channels := ch
+        bitsPerSample := bps
+        totalSamples := totSamples
+      }
 
 /-- Serialize a `FlacStreamInfo` into a canonical 42-byte `fLaC` + `STREAMINFO` header (`isLastBlock` defaults to `false`). -/
 def serializeFlacStreamInfo (si : FlacStreamInfo) (md5Bytes16 : Array UInt8 := #[]) (isLastBlock : Bool := false) : ByteArray :=
@@ -462,53 +525,64 @@ theorem flacStreamInfo_parse_serialize_roundtrip :
 
 /-! ### T2: Standard RFC 9639 FLAC Subframe Decoder & Encoder (Constant, Verbatim, Fixed 0..4, LPC, Rice 4/5-bit + Escape) -/
 
-/-- Sign-extend an unsigned `n`-bit word (`1 ≤ n ≤ 32`) into `Int32`. -/
 @[inline]
-def signExtendBits32 (u : UInt64) (n : Nat) : Int32 :=
-  if n == 0 || n > 32 then 0
+def signExtendBits64 (u : UInt64) (n : Nat) : Int64 :=
+  if n == 0 || n > 63 then 0
   else
     let signBit : UInt64 := (1 : UInt64) <<< (n - 1).toUInt64
     if (u &&& signBit) != 0 then
-      let full : UInt64 := (1 : UInt64) <<< n.toUInt64
-      Int32.ofInt ((u.toNat : Int) - (full.toNat : Int))
+      let mask : UInt64 := ((1 : UInt64) <<< n.toUInt64) - 1
+      let ext : UInt64 := u ||| (0xFFFFFFFFFFFFFFFF ^^^ mask)
+      ext.toInt64
     else
-      Int32.ofInt (u.toNat : Int)
+      u.toInt64
 
-/-- Read a signed `n`-bit two's-complement integer (`1 ≤ n ≤ 32`) MSB-first from `BitReader`. -/
+@[inline]
+def signExtendBits32 (u : UInt64) (n : Nat) : Int32 :=
+  (signExtendBits64 u n).toInt32
+
+@[inline]
+def readSignedBitsMSB64 (r : BitReader) (n : Nat) : Option (Int64 × BitReader) := do
+  if n > 63 then none
+  let (u, r') ← r.readBitsMSB n
+  some (signExtendBits64 u n, r')
+
 @[inline]
 def readSignedBitsMSB (r : BitReader) (n : Nat) : Option (Int32 × BitReader) := do
-  let (u, r') ← r.readBitsMSB n
-  some (signExtendBits32 u n, r')
+  let (v, r') ← readSignedBitsMSB64 r n
+  some (v.toInt32, r')
 
-/-- Write a signed `n`-bit two's-complement integer (`1 ≤ n ≤ 32`) MSB-first to `BitWriter`. -/
+@[inline]
+def writeSignedBitsMSB64 (w : BitWriter) (v : Int64) (n : Nat) : BitWriter :=
+  if n == 0 then w
+  else
+    let mask : UInt64 := if n ≥ 64 then 0xFFFFFFFFFFFFFFFF else ((1 : UInt64) <<< n.toUInt64) - 1
+    let u : UInt64 := v.toUInt64 &&& mask
+    w.writeBitsMSB u n
+
 @[inline]
 def writeSignedBitsMSB (w : BitWriter) (v : Int32) (n : Nat) : BitWriter :=
-  let mask : UInt64 := ((1 : UInt64) <<< n.toUInt64) - 1
-  let u : UInt64 := v.toUInt32.toUInt64 &&& mask
-  w.writeBitsMSB u n
+  writeSignedBitsMSB64 w v.toInt64 n
 
-/-- Structural helper: read `n` signed `rawBps`-bit integers MSB-first from `BitReader`. -/
-def readSignedSamplesLoop (rawBps : Nat) (cur : BitReader) : Nat → List Int32 → Option (List Int32 × BitReader)
+def readSignedSamplesLoop64 (rawBps : Nat) (cur : BitReader) : Nat → List Int64 → Option (List Int64 × BitReader)
   | 0, acc => some (acc.reverse, cur)
   | rem + 1, acc =>
     if rawBps == 0 then
-      readSignedSamplesLoop 0 cur rem (0 :: acc)
+      readSignedSamplesLoop64 0 cur rem (0 :: acc)
     else
-      match readSignedBitsMSB cur rawBps with
+      match readSignedBitsMSB64 cur rawBps with
       | none => none
-      | some (sv, rNext) => readSignedSamplesLoop rawBps rNext rem (sv :: acc)
+      | some (sv, rNext) => readSignedSamplesLoop64 rawBps rNext rem (sv :: acc)
 
-/-- Structural helper: read `n` signed Rice-Golomb (`k`-bit) integers from `BitReader`. -/
-def readRiceSamplesLoop (k : Nat) (cur : BitReader) : Nat → List Int32 → Option (List Int32 × BitReader)
+def readRiceSamplesLoop64 (k : Nat) (cur : BitReader) : Nat → List Int64 → Option (List Int64 × BitReader)
   | 0, acc => some (acc.reverse, cur)
   | rem + 1, acc =>
     match cur.readRiceSigned k with
     | none => none
-    | some (sv, rNext) => readRiceSamplesLoop k rNext rem (sv :: acc)
+    | some (sv, rNext) => readRiceSamplesLoop64 k rNext rem (sv :: acc)
 
-/-- Structural helper: decode `numParts` FLAC Rice partitions starting at partition `p`. -/
-def decodeFlacRicePartitionsLoop (blockSize predOrder partOrder numParts paramBits : Nat) (escapeParam : UInt64)
-    (cur : BitReader) (p : Nat) : Nat → List Int32 → Option (List Int32 × BitReader)
+def decodeFlacRicePartitionsLoop64 (blockSize predOrder partOrder numParts paramBits : Nat) (escapeParam : UInt64)
+    (cur : BitReader) (p : Nat) : Nat → List Int64 → Option (List Int64 × BitReader)
   | 0, accRev => some (accRev.reverse, cur)
   | remParts + 1, accRev =>
     match cur.readBitsMSB paramBits with
@@ -523,20 +597,19 @@ def decodeFlacRicePartitionsLoop (blockSize predOrder partOrder numParts paramBi
         match rP.readBitsMSB 5 with
         | none => none
         | some (rawBpsBits, rEsc) =>
-          match readSignedSamplesLoop rawBpsBits.toNat rEsc nSamplesInPart [] with
+          match readSignedSamplesLoop64 rawBpsBits.toNat rEsc nSamplesInPart [] with
           | none => none
           | some (partSamples, rNext) =>
-            decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam
+            decodeFlacRicePartitionsLoop64 blockSize predOrder partOrder numParts paramBits escapeParam
               rNext (p + 1) remParts (partSamples.reverse ++ accRev)
       else
-        match readRiceSamplesLoop param.toNat rP nSamplesInPart [] with
+        match readRiceSamplesLoop64 param.toNat rP nSamplesInPart [] with
         | none => none
         | some (partSamples, rNext) =>
-          decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam
+          decodeFlacRicePartitionsLoop64 blockSize predOrder partOrder numParts paramBits escapeParam
             rNext (p + 1) remParts (partSamples.reverse ++ accRev)
 
-/-- Decode FLAC partitioned Rice residuals (`codingMethod = 0` for 4-bit param, `1` for 5-bit param, plus escape `15`/`31`). -/
-def decodeFlacRicePartitions (r0 : BitReader) (blockSize predOrder : Nat) : Option (Array Int32 × BitReader) :=
+def decodeFlacRicePartitions64 (r0 : BitReader) (blockSize predOrder : Nat) : Option (Array Int64 × BitReader) :=
   match r0.readBitsMSB 2 with
   | none => none
   | some (codingMethod, r1) =>
@@ -551,177 +624,171 @@ def decodeFlacRicePartitions (r0 : BitReader) (blockSize predOrder : Nat) : Opti
         let escapeParam : UInt64 := if codingMethod == 0 then 15 else 31
         if blockSize < predOrder || (partOrder > 0 && blockSize % numParts != 0) then none
         else
-          match decodeFlacRicePartitionsLoop blockSize predOrder partOrder numParts paramBits escapeParam r2 0 numParts [] with
+          match decodeFlacRicePartitionsLoop64 blockSize predOrder partOrder numParts paramBits
+            escapeParam r2 0 numParts [] with
           | none => none
           | some (resList, curEnd) => some (resList.toArray, curEnd)
 
-/--
-  Decode any RFC 9639 / FFmpeg `libavcodec/flacdec.c` FLAC subframe:
-  - `stype == 0`: `SUBFRAME_CONSTANT`
-  - `stype == 1`: `SUBFRAME_VERBATIM`
-  - `8 ≤ stype ≤ 12`: `SUBFRAME_FIXED` (orders `0..4`)
-  - `32 ≤ stype ≤ 63`: `SUBFRAME_LPC` (orders `1..32`, with `qlp_coeff_prec`, `qlp_shift`, and FIR coeffs)
-  Supports `wasted_bits` and both 4-bit (`RICE`) and 5-bit (`RICE2`) partitions + escape raw partitions.
--/
-def decodeFlacSubframeSpec (s : ByteSlice) (blockSize bps : Nat) : Option (Array Int32) :=
-  if blockSize == 0 || bps == 0 || bps > 32 then none
-  else
-    let r0 := BitReader.ofSlice s
-    match r0.readBit with
-    | none => none
-    | some (zeroBit, r1) =>
-      if zeroBit != 0 then none
-      else
-        match r1.readBitsMSB 6 with
-        | none => none
-        | some (stypeBits, r2) =>
-          let stype := stypeBits.toNat
-          match r2.readBit with
-          | none => none
-          | some (wastedFlag, r3) =>
-            let (wastedBits, r4) : Nat × BitReader :=
-              if wastedFlag == 1 then
-                match r3.readUnary0 31 with
-                | some (kMinus1, rW) => (kMinus1 + 1, rW)
-                | none => (999, r3)
-              else (0, r3)
-            if wastedBits ≥ bps then none
-            else
-              let effBps := bps - wastedBits
-              let applyWasted (arr : Array Int32) : Array Int32 :=
-                if wastedBits == 0 then arr
-                else (arr.toList.map (fun x => x <<< Int32.ofNat wastedBits)).toArray
-              if stype == 0 then
-                -- SUBFRAME_CONSTANT
-                match readSignedBitsMSB r4 effBps with
-                | none => none
-                | some (cVal, _) => some (applyWasted (List.replicate blockSize cVal).toArray)
-              else if stype == 1 then
-                -- SUBFRAME_VERBATIM
-                match readSignedSamplesLoop effBps r4 blockSize [] with
-                | none => none
-                | some (outList, _) => some (applyWasted outList.toArray)
-              else if stype ≥ 8 && stype ≤ 12 then
-                -- SUBFRAME_FIXED (order = stype - 8)
-                let predOrder := stype - 8
-                if blockSize < predOrder then none
-                else
-                  match readSignedSamplesLoop effBps r4 predOrder [] with
-                  | none => none
-                  | some (warmList, cur) =>
-                    match decodeFlacRicePartitions cur blockSize predOrder with
-                    | none => none
-                    | some (residuals, _) =>
-                      let ord : FlacFixedOrder := match predOrder with
-                        | 0 => .order0
-                        | 1 => .order1
-                        | 2 => .order2
-                        | 3 => .order3
-                        | _ => .order4
-                      let fullList := flacDecodeFixedResidualsLoop ord residuals.toList warmList.reverse
-                      some (applyWasted fullList.toArray)
-              else if stype ≥ 32 && stype ≤ 63 then
-                -- SUBFRAME_LPC (order = stype - 32 + 1)
-                let predOrder := stype - 32 + 1
-                if blockSize < predOrder then none
-                else
-                  match readSignedSamplesLoop effBps r4 predOrder [] with
-                  | none => none
-                  | some (warmList, cur) =>
-                    match cur.readBitsMSB 4 with
-                    | none => none
-                    | some (precMinus1Bits, r5) =>
-                      if precMinus1Bits == 15 then none
-                      else
-                        let coeffPrec := precMinus1Bits.toNat + 1
-                        match readSignedBitsMSB r5 5 with
-                        | none => none
-                        | some (qShiftSigned, r6) =>
-                          if qShiftSigned < 0 then none
-                          else
-                            let qShift : UInt32 := qShiftSigned.toInt.toNat.toUInt32
-                            match readSignedSamplesLoop coeffPrec r6 predOrder [] with
-                            | none => none
-                            | some (coeffList, curC) =>
-                              match decodeFlacRicePartitions curC blockSize predOrder with
-                              | none => none
-                              | some (residuals, _) =>
-                                let out := flacDecodeLpcFir warmList.toArray coeffList.toArray qShift residuals
-                                some (applyWasted out)
-              else
-                none
+def flacApplyWasted64Loop (arr : Array Int64) (wb : Int64) (i : Nat) (acc : Array Int64) : Nat → Array Int64
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ arr.size then acc
+    else flacApplyWasted64Loop arr wb (i + 1) (acc.push (arr.getD i 0 <<< wb)) k
 
-/-- Subframe encoding mode for `encodeFlacSubframeSpec`. -/
+def flacApplyWasted64 (arr : Array Int64) (wastedBits : Nat) : Array Int64 :=
+  if wastedBits == 0 then arr
+  else flacApplyWasted64Loop arr wastedBits.toUInt64.toInt64 0 #[] arr.size
+
+def flacArray64To32Loop (arr : Array Int64) (i : Nat) (acc : Array Int32) : Nat → Array Int32
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ arr.size then acc
+    else flacArray64To32Loop arr (i + 1) (acc.push (arr.getD i 0).toInt32) k
+
+def flacArray64To32 (arr : Array Int64) : Array Int32 :=
+  flacArray64To32Loop arr 0 #[] arr.size
+
+def flacArray32To64Loop (arr : Array Int32) (i : Nat) (acc : Array Int64) : Nat → Array Int64
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ arr.size then acc
+    else flacArray32To64Loop arr (i + 1) (acc.push (arr.getD i 0).toInt64) k
+
+def flacArray32To64 (arr : Array Int32) : Array Int64 :=
+  flacArray32To64Loop arr 0 #[] arr.size
+
+def flacDecodeSubframeCore64 (r0 : BitReader) (blockSize bps : Nat) : Option (Array Int64 × BitReader) := do
+  if blockSize == 0 || bps == 0 || bps > 33 then none
+  let (zeroBit, r1) ← r0.readBit
+  if zeroBit != 0 then none
+  let (stypeBits, r2) ← r1.readBitsMSB 6
+  let stype := stypeBits.toNat
+  let (wastedFlag, r3) ← r2.readBit
+  let (wastedBits, r4) ←
+    if wastedFlag == 1 then do
+      let (km1, rw) ← r3.readUnary0 33
+      some (km1 + 1, rw)
+    else some (0, r3)
+  if wastedBits ≥ bps then none
+  let effBps := bps - wastedBits
+  if stype == 0 then
+    let (cVal, rEnd) ← readSignedBitsMSB64 r4 effBps
+    some (flacApplyWasted64 (List.replicate blockSize cVal).toArray wastedBits, rEnd)
+  else if stype == 1 then
+    let (outList, rEnd) ← readSignedSamplesLoop64 effBps r4 blockSize []
+    some (flacApplyWasted64 outList.toArray wastedBits, rEnd)
+  else if stype ≥ 8 && stype ≤ 12 then
+    let predOrder := stype - 8
+    if blockSize < predOrder then none
+    else do
+      let (warmList, cur) ← readSignedSamplesLoop64 effBps r4 predOrder []
+      let (residuals, rEnd) ← decodeFlacRicePartitions64 cur blockSize predOrder
+      let ord : FlacFixedOrder := match predOrder with
+        | 0 => .order0 | 1 => .order1 | 2 => .order2 | 3 => .order3 | _ => .order4
+      let out := flacDecodeFixedResiduals64 ord warmList.toArray residuals
+      some (flacApplyWasted64 out wastedBits, rEnd)
+  else if stype ≥ 32 && stype ≤ 63 then
+    let predOrder := stype - 32 + 1
+    if blockSize < predOrder then none
+    else do
+      let (warmList, cur) ← readSignedSamplesLoop64 effBps r4 predOrder []
+      let (precMinus1Bits, r5) ← cur.readBitsMSB 4
+      if precMinus1Bits == 15 then none
+      else do
+        let coeffPrec := precMinus1Bits.toNat + 1
+        let (qShiftSigned, r6) ← readSignedBitsMSB64 r5 5
+        if qShiftSigned < 0 then none
+        else do
+          let qShift : UInt32 := qShiftSigned.toUInt64.toUInt32
+          let (coeffList, curC) ← readSignedSamplesLoop64 coeffPrec r6 predOrder []
+          let (residuals, rEnd) ← decodeFlacRicePartitions64 curC blockSize predOrder
+          let out := flacDecodeLpcFir64 warmList.toArray coeffList.toArray qShift residuals
+          some (flacApplyWasted64 out wastedBits, rEnd)
+  else none
+
+def decodeFlacSubframeSpec (s : ByteSlice) (blockSize bps : Nat) : Option (Array Int32) := do
+  if bps > 32 then none
+  let (arr64, _) ← flacDecodeSubframeCore64 (BitReader.ofSlice s) blockSize bps
+  some (flacArray64To32 arr64)
+
 inductive FlacSubframeSpecMode where
-  | constant (val : Int32)
+  | constant (val : Int64)
   | verbatim
-  | fixed (ord : FlacFixedOrder) (codingMethod : UInt8 := 0) (riceK : Nat := 3) (escaped : Bool := false) (rawBps : Nat := 16)
-  | lpc (coeffs : Array Int32) (coeffPrec : Nat) (qShift : UInt32) (codingMethod : UInt8 := 0) (riceK : Nat := 3)
+  | fixed (ord : FlacFixedOrder) (codingMethod : UInt8 := 0) (riceK : Nat := 3)
+      (escaped : Bool := false) (rawBps : Nat := 16)
+  | lpc (coeffs : Array Int32) (coeffPrec : Nat) (qShift : UInt32)
+      (codingMethod : UInt8 := 0) (riceK : Nat := 3)
   deriving Repr, DecidableEq, Inhabited
 
-/-- Structural helper: write a list of signed `n`-bit integers MSB-first to `BitWriter`. -/
+def writeSignedListMSB64 (n : Nat) (w : BitWriter) : List Int64 → BitWriter
+  | [] => w
+  | s :: rest => writeSignedListMSB64 n (writeSignedBitsMSB64 w s n) rest
+
 def writeSignedListMSB (n : Nat) (w : BitWriter) : List Int32 → BitWriter
   | [] => w
   | s :: rest => writeSignedListMSB n (writeSignedBitsMSB w s n) rest
 
-/-- Structural helper: write a list of signed Rice-Golomb (`k`-bit) integers to `BitWriter`. -/
+def writeRiceListSigned64 (k : Nat) (w : BitWriter) : List Int64 → BitWriter
+  | [] => w
+  | r :: rest => writeRiceListSigned64 k (w.writeRiceSigned k r) rest
+
 def writeRiceListSigned (k : Nat) (w : BitWriter) : List Int32 → BitWriter
   | [] => w
-  | r :: rest => writeRiceListSigned k (w.writeRiceSigned k r) rest
+  | r :: rest => writeRiceListSigned k (w.writeRiceSigned k r.toInt64) rest
 
-/-- Structural helper: encode LPC FIR residuals starting at index `i` into `BitWriter`. -/
-def encodeFlacLpcResidualsLoop (sampleList coeffList : List Int32) (qShift : UInt32) (riceK : Nat)
-    (i : Nat) (w : BitWriter) : Nat → BitWriter
+def encodeFlacLpcResidualsLoop64 (samples : Array Int64) (coeffs : Array Int64) (qShift : UInt32)
+    (riceK : Nat) (i : Nat) (w : BitWriter) : Nat → BitWriter
   | 0 => w
   | rem + 1 =>
-    let acc := flacLpcFirDot sampleList i coeffList 0 0 coeffList
-    let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
-    let res : Int32 := sampleList.getD i 0 - pred
-    encodeFlacLpcResidualsLoop sampleList coeffList qShift riceK (i + 1) (w.writeRiceSigned riceK res) rem
+    let acc := flacLpcFirDot64 samples i coeffs 0 0 coeffs.size
+    let pred : Int64 := acc >>> qShift.toUInt64.toInt64
+    let res : Int64 := samples.getD i 0 - pred
+    encodeFlacLpcResidualsLoop64 samples coeffs qShift riceK (i + 1) (w.writeRiceSigned riceK res) rem
 
-/-- Encode a FLAC subframe according to RFC 9639 (`Constant`, `Verbatim`, `Fixed 0..4`, or `LPC` with 4/5-bit Rice or Escape). -/
-def encodeFlacSubframeSpec (mode : FlacSubframeSpecMode) (bps : Nat) (samples : Array Int32) : ByteArray :=
+def flacWriteSubframeBits64 (w0 : BitWriter) (mode : FlacSubframeSpecMode) (bps : Nat)
+    (samples : Array Int64) : BitWriter :=
   let sampleList := samples.toList
-  let w0 := (BitWriter.empty (sampleList.length * 2 + 16)).writeBit 0 -- zero bit
+  let wHeader := w0.writeBit 0
   match mode with
   | .constant val =>
-    let w1 := (w0.writeBitsMSB 0 6).writeBit 0
-    (writeSignedBitsMSB w1 val bps).toByteArray
+    let w1 := (wHeader.writeBitsMSB 0 6).writeBit 0
+    writeSignedBitsMSB64 w1 val bps
   | .verbatim =>
-    let w1 := (w0.writeBitsMSB 1 6).writeBit 0
-    (writeSignedListMSB bps w1 sampleList).toByteArray
+    let w1 := (wHeader.writeBitsMSB 1 6).writeBit 0
+    writeSignedListMSB64 bps w1 sampleList
   | .fixed ord codingMethod riceK escaped rawBps =>
     let predOrder : Nat := match ord with
-      | .order0 => 0
-      | .order1 => 1
-      | .order2 => 2
-      | .order3 => 3
-      | .order4 => 4
-    let w1 := (w0.writeBitsMSB (8 + predOrder).toUInt64 6).writeBit 0
-    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
+      | .order0 => 0 | .order1 => 1 | .order2 => 2 | .order3 => 3 | .order4 => 4
+    let w1 := (wHeader.writeBitsMSB (8 + predOrder).toUInt64 6).writeBit 0
+    let w2 := writeSignedListMSB64 bps w1 (sampleList.take predOrder)
     let cm : UInt64 := if codingMethod == 0 then 0 else 1
     let paramBits : Nat := if codingMethod == 0 then 4 else 5
     let escCode : UInt64 := if codingMethod == 0 then 15 else 31
     let w3 := (w2.writeBitsMSB cm 2).writeBitsMSB 0 4
-    let allResList := (flacEncodeFixedResiduals ord samples).toList.drop predOrder
+    let allResList := (flacEncodeFixedResiduals64 ord samples).toList.drop predOrder
     if escaped then
       let w4 := (w3.writeBitsMSB escCode paramBits).writeBitsMSB rawBps.toUInt64 5
-      (writeSignedListMSB rawBps w4 allResList).toByteArray
+      writeSignedListMSB64 rawBps w4 allResList
     else
       let w4 := w3.writeBitsMSB riceK.toUInt64 paramBits
-      (writeRiceListSigned riceK w4 allResList).toByteArray
+      writeRiceListSigned64 riceK w4 allResList
   | .lpc coeffs coeffPrec qShift codingMethod riceK =>
-    let coeffList := coeffs.toList
-    let predOrder := coeffList.length
-    let w1 := (w0.writeBitsMSB (32 + predOrder - 1).toUInt64 6).writeBit 0
-    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
-    let w3 := writeSignedBitsMSB (w2.writeBitsMSB (coeffPrec - 1).toUInt64 4) (Int32.ofNat qShift.toNat) 5
-    let w4 := writeSignedListMSB coeffPrec w3 coeffList
+    let coeffs64 := flacArray32To64 coeffs
+    let coeffList64 := coeffs64.toList
+    let predOrder := coeffList64.length
+    let w1 := (wHeader.writeBitsMSB (32 + predOrder - 1).toUInt64 6).writeBit 0
+    let w2 := writeSignedListMSB64 bps w1 (sampleList.take predOrder)
+    let w3 := writeSignedBitsMSB64 (w2.writeBitsMSB (coeffPrec - 1).toUInt64 4) qShift.toUInt64.toInt64 5
+    let w4 := writeSignedListMSB64 coeffPrec w3 coeffList64
     let cm : UInt64 := if codingMethod == 0 then 0 else 1
     let paramBits : Nat := if codingMethod == 0 then 4 else 5
     let w5 := ((w4.writeBitsMSB cm 2).writeBitsMSB 0 4).writeBitsMSB riceK.toUInt64 paramBits
-    let w6 := encodeFlacLpcResidualsLoop sampleList coeffList qShift riceK predOrder w5 (sampleList.length - predOrder)
-    w6.toByteArray
+    encodeFlacLpcResidualsLoop64 samples coeffs64 qShift riceK predOrder w5 (samples.size - predOrder)
+
+def encodeFlacSubframeSpec (mode : FlacSubframeSpecMode) (bps : Nat) (samples : Array Int32) : ByteArray :=
+  let samples64 := flacArray32To64 samples
+  let w0 := BitWriter.empty (samples.size * 2 + 16)
+  (flacWriteSubframeBits64 w0 mode bps samples64).toByteArray
 
 /-- Real 48-byte FLAC Fixed Order-2 subframe extracted from `flac_fixed.flac` (frame 0, offset 8295). -/
 def realFfmpegFlacFixedSubframeBytes : Array UInt8 := #[
@@ -788,7 +855,7 @@ def flacEncodeSubframeRiceR0 (ord : FlacFixedOrder) (riceK : Nat) (samples : Arr
   w := w.writeBitsMSB kClamped.toUInt64 4
   w := w.writeBitsMSB samples.size.toUInt64 16
   for r in residuals do
-    w := w.writeRiceSigned kClamped r
+    w := w.writeRiceSigned kClamped r.toInt64
   return w.toByteArray
 
 /-- Decode a FLAC Fixed-LPC Subframe encoded by `flacEncodeSubframeRiceR0` back into exact `Int32` samples (`Regime R0`, `maxErr = 0`). -/
@@ -810,7 +877,7 @@ def flacDecodeSubframeRiceR0 (s : ByteSlice) : Option (Array Int32) := Id.run do
   for _ in [:count] do
     match curR.readRiceSigned riceK with
     | some (val, nextR) =>
-      residuals := residuals.push val
+      residuals := residuals.push val.toInt32
       curR := nextR
     | none => return none
   return some (flacDecodeFixedResiduals ord residuals)
@@ -1634,15 +1701,22 @@ structure FlacFrameHeaderView where
   headerLen : Nat
   deriving Repr, DecidableEq, Inhabited
 
+@[inline]
+def isFlacFrameSyncWord (w16 : Nat) : Bool :=
+  w16 == 0xFFF8 || w16 == 0xFFF9
+
 def FlacFrameSyncSafe (w16 : Nat) : Prop :=
   (w16 >>> 1) = 0x7FFC
 
-instance (w16 : Nat) : Decidable (FlacFrameSyncSafe w16) := inferInstanceAs (Decidable (_ = _))
-
 def flacFrameSyncGateSpec : AVGateSpec Nat FlacFrameSyncSafe where
-  gate := fun w16 => decide (FlacFrameSyncSafe w16)
-  sound _ h := of_decide_eq_true h
-  complete _ h := decide_eq_true h
+  gate := isFlacFrameSyncWord
+  sound w16 h := by
+    simp only [isFlacFrameSyncWord, Bool.or_eq_true, beq_iff_eq] at h
+    rcases h with rfl | rfl <;> rfl
+  complete w16 h := by
+    simp only [FlacFrameSyncSafe] at h
+    simp only [isFlacFrameSyncWord, Bool.or_eq_true, beq_iff_eq]
+    omega
   posWitness := 0xFFF8
   negWitness := 0xFFFA
   nonVacuous := by decide
@@ -1652,14 +1726,22 @@ theorem flacFrameSyncGateSpec_iff (w16 : Nat) :
     flacFrameSyncGateSpec.gate w16 = true ↔ FlacFrameSyncSafe w16 :=
   flacFrameSyncGateSpec.iff_safe w16
 
+@[inline]
+def isFlacChannelAssignValid (ca : Nat) : Bool :=
+  ca < 8 || ca == 8 || ca == 9 || ca == 10
+
 def FlacChannelAssignSafe (ca : Nat) : Prop := ca ≤ 10
 
-instance (ca : Nat) : Decidable (FlacChannelAssignSafe ca) := inferInstanceAs (Decidable (_ ≤ _))
-
 def flacChannelAssignGateSpec : AVGateSpec Nat FlacChannelAssignSafe where
-  gate := fun ca => decide (FlacChannelAssignSafe ca)
-  sound _ h := of_decide_eq_true h
-  complete _ h := decide_eq_true h
+  gate := isFlacChannelAssignValid
+  sound ca h := by
+    simp only [isFlacChannelAssignValid, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq] at h
+    simp only [FlacChannelAssignSafe]
+    omega
+  complete ca h := by
+    simp only [FlacChannelAssignSafe] at h
+    simp only [isFlacChannelAssignValid, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq]
+    omega
   posWitness := 10
   negWitness := 11
   nonVacuous := by decide
@@ -1676,45 +1758,121 @@ inductive FlacStereoMode where
   | midSide
   deriving Repr, DecidableEq, Inhabited
 
-def flacStereoEncodePair (mode : FlacStereoMode) (l r : Int32) : Int32 × Int32 :=
+def flacStereoEncodePair64 (mode : FlacStereoMode) (l r : Int64) : Int64 × Int64 :=
   match mode with
   | .independent => (l, r)
   | .leftSide => (l, l - r)
   | .rightSide => (l - r, r)
-  | .midSide => flacStereoToMidSide l r
+  | .midSide => flacStereoToMidSide64 l r
 
-def flacStereoDecodePair (mode : FlacStereoMode) (c0 c1 : Int32) : Int32 × Int32 :=
+def flacStereoDecodePair64 (mode : FlacStereoMode) (c0 c1 : Int64) : Int64 × Int64 :=
   match mode with
   | .independent => (c0, c1)
   | .leftSide => (c0, c0 - c1)
   | .rightSide => (c0 + c1, c1)
-  | .midSide => flacMidSideToStereo c0 c1
+  | .midSide => flacMidSideToStereo64 c0 c1
 
-theorem flacLeftSide_roundtrip (l r : Int32) :
-    flacStereoDecodePair .leftSide (flacStereoEncodePair .leftSide l r).1
-      (flacStereoEncodePair .leftSide l r).2 = (l, r) := by
-  simp only [flacStereoEncodePair, flacStereoDecodePair]
+def flacStereoEncodePair (mode : FlacStereoMode) (l r : Int32) : Int32 × Int32 :=
+  let (c0, c1) := flacStereoEncodePair64 mode l.toInt64 r.toInt64
+  (c0.toInt32, c1.toInt32)
+
+def flacStereoDecodePair (mode : FlacStereoMode) (c0 c1 : Int32) : Int32 × Int32 :=
+  let (l, r) := flacStereoDecodePair64 mode c0.toInt64 c1.toInt64
+  (l.toInt32, r.toInt32)
+
+theorem flacLeftSide64_roundtrip (l r : Int32) :
+    flacStereoDecodePair64 .leftSide (flacStereoEncodePair64 .leftSide l.toInt64 r.toInt64).1
+      (flacStereoEncodePair64 .leftSide l.toInt64 r.toInt64).2 = (l.toInt64, r.toInt64) := by
+  simp only [flacStereoEncodePair64, flacStereoDecodePair64]
   congr 1
   cases l with | ofUInt32 lu =>
   cases r with | ofUInt32 ru =>
   cases lu with | ofBitVec lb =>
   cases ru with | ofBitVec rb =>
-  show Int32.ofUInt32 (UInt32.ofBitVec (lb - (lb - rb))) = Int32.ofUInt32 (UInt32.ofBitVec rb)
+  change Int64.ofUInt64 (UInt64.ofBitVec (lb.signExtend 64 - (lb.signExtend 64 - rb.signExtend 64))) =
+    Int64.ofUInt64 (UInt64.ofBitVec (rb.signExtend 64))
   congr 2
   bv_omega
 
-theorem flacRightSide_roundtrip (l r : Int32) :
-    flacStereoDecodePair .rightSide (flacStereoEncodePair .rightSide l r).1
-      (flacStereoEncodePair .rightSide l r).2 = (l, r) := by
-  simp only [flacStereoEncodePair, flacStereoDecodePair]
+theorem flacRightSide64_roundtrip (l r : Int32) :
+    flacStereoDecodePair64 .rightSide (flacStereoEncodePair64 .rightSide l.toInt64 r.toInt64).1
+      (flacStereoEncodePair64 .rightSide l.toInt64 r.toInt64).2 = (l.toInt64, r.toInt64) := by
+  simp only [flacStereoEncodePair64, flacStereoDecodePair64]
   congr 1
   cases l with | ofUInt32 lu =>
   cases r with | ofUInt32 ru =>
   cases lu with | ofBitVec lb =>
   cases ru with | ofBitVec rb =>
-  show Int32.ofUInt32 (UInt32.ofBitVec (lb - rb + rb)) = Int32.ofUInt32 (UInt32.ofBitVec lb)
+  change Int64.ofUInt64 (UInt64.ofBitVec (lb.signExtend 64 - rb.signExtend 64 + rb.signExtend 64)) =
+    Int64.ofUInt64 (UInt64.ofBitVec (lb.signExtend 64))
   congr 2
   bv_omega
+
+theorem flacMidSide64_roundtrip (l r : Int32) :
+    flacStereoDecodePair64 .midSide (flacStereoEncodePair64 .midSide l.toInt64 r.toInt64).1
+      (flacStereoEncodePair64 .midSide l.toInt64 r.toInt64).2 = (l.toInt64, r.toInt64) := by
+  simp only [flacStereoEncodePair64, flacStereoDecodePair64, flacStereoToMidSide64, flacMidSideToStereo64]
+  cases l with | ofUInt32 lu =>
+  cases r with | ofUInt32 ru =>
+  cases lu with | ofBitVec lb =>
+  cases ru with | ofBitVec rb =>
+  have hl_lo : -2147483648 ≤ lb.toInt := BitVec.le_toInt lb
+  have hl_hi : lb.toInt < 2147483648 := BitVec.toInt_lt
+  have hr_lo : -2147483648 ≤ rb.toInt := BitVec.le_toInt rb
+  have hr_hi : rb.toInt < 2147483648 := BitVec.toInt_lt
+  let l64 := lb.signExtend 64
+  let r64 := rb.signExtend 64
+  let mid := (l64 + r64).sshiftRight 1
+  let side := l64 - r64
+  let m := (mid <<< (1 : BitVec 64)) + (side &&& (1 : BitVec 64))
+  have hl64 : l64.toInt = lb.toInt := BitVec.toInt_signExtend_of_le (by omega)
+  have hr64 : r64.toInt = rb.toInt := BitVec.toInt_signExtend_of_le (by omega)
+  have hsum_int : (l64 + r64).toInt = lb.toInt + rb.toInt := by
+    rw [BitVec.toInt_add, hl64, hr64, Int.bmod_eq_of_le] <;> omega
+  have hside_int : side.toInt = lb.toInt - rb.toInt := by
+    rw [BitVec.toInt_sub, hl64, hr64, Int.bmod_eq_of_le] <;> omega
+  have hmid_int : mid.toInt = (lb.toInt + rb.toInt) / 2 := by
+    change ((l64 + r64).sshiftRight 1).toInt = _
+    rw [BitVec.toInt_sshiftRight, hsum_int, Int.shiftRight_eq_div_pow]
+    rfl
+  have hmid_shl : (mid <<< (1 : BitVec 64)).toInt = 2 * ((lb.toInt + rb.toInt) / 2) := by
+    have heq2 : mid <<< (1 : BitVec 64) = mid + mid := by
+      apply BitVec.eq_of_toNat_eq
+      change (mid.toNat <<< 1) % 2^64 = (mid.toNat + mid.toNat) % 2^64
+      congr 1; simp [Nat.shiftLeft_eq]; omega
+    rw [heq2, BitVec.toInt_add, hmid_int, Int.bmod_eq_of_le] <;> omega
+  have hlsb : (side &&& (1 : BitVec 64)).toInt = (lb.toInt - rb.toInt) % 2 := by
+    rw [BitVec.toInt_and]
+    have hmod1 : side.toNat &&& (1 : BitVec 64).toNat = side.toNat % 2 :=
+      Nat.and_one_is_mod side.toNat
+    rw [hmod1]
+    have hs_cond := BitVec.toInt_eq_toNat_cond side
+    rw [Int.bmod_eq_of_le] <;> omega
+  have hm_int : m.toInt = lb.toInt + rb.toInt := by
+    change ((mid <<< (1 : BitVec 64)) + (side &&& (1 : BitVec 64))).toInt = _
+    rw [BitVec.toInt_add, hmid_shl, hlsb, Int.bmod_eq_of_le] <;> omega
+  apply Prod.ext
+  · change Int64.ofUInt64 (UInt64.ofBitVec ((m + side).sshiftRight 1)) =
+      Int64.ofUInt64 (UInt64.ofBitVec l64)
+    congr 2
+    apply BitVec.eq_of_toInt_eq
+    rw [BitVec.toInt_sshiftRight, BitVec.toInt_add, hm_int, hside_int, hl64, Int.shiftRight_eq_div_pow]
+    rw [Int.bmod_eq_of_le] <;> omega
+  · change Int64.ofUInt64 (UInt64.ofBitVec ((m - side).sshiftRight 1)) =
+      Int64.ofUInt64 (UInt64.ofBitVec r64)
+    congr 2
+    apply BitVec.eq_of_toInt_eq
+    rw [BitVec.toInt_sshiftRight, BitVec.toInt_sub, hm_int, hside_int, hr64, Int.shiftRight_eq_div_pow]
+    rw [Int.bmod_eq_of_le] <;> omega
+
+theorem flacStereoPair64_all_modes_roundtrip (m : FlacStereoMode) (l r : Int32) :
+    flacStereoDecodePair64 m (flacStereoEncodePair64 m l.toInt64 r.toInt64).1
+      (flacStereoEncodePair64 m l.toInt64 r.toInt64).2 = (l.toInt64, r.toInt64) := by
+  cases m
+  · rfl
+  · exact flacLeftSide64_roundtrip l r
+  · exact flacRightSide64_roundtrip l r
+  · exact flacMidSide64_roundtrip l r
 
 def flacFixedPredictList (ord : FlacFixedOrder) (xs : List Int32) (i : Nat) : Int32 :=
   match ord with
@@ -1791,30 +1949,27 @@ theorem flacFixedList_roundtrip (ord : FlacFixedOrder) (xs : List Int32) :
     flacDecodeFixedListGo ord [] (flacEncodeFixedListGo ord xs 0 xs.length) = xs := by
   simpa using flacDecodeFixedListGo_roundtrip ord xs xs.length 0 (by omega)
 
+def flacUtf8ContByte (v s : UInt64) : UInt8 :=
+  (0x80 : UInt8) ||| ((v >>> s).toUInt8 &&& (0x3F : UInt8))
+
 def flacUtf8Encode (v : UInt64) : Option ByteArray :=
-  let n := v.toNat
-  if n < 0x80 then some { data := #[n.toUInt8] }
-  else if n < 0x800 then
-    some { data := #[(0xC0 ||| (n >>> 6)).toUInt8, (0x80 ||| (n &&& 0x3F)).toUInt8] }
-  else if n < 0x10000 then
-    some { data := #[(0xE0 ||| (n >>> 12)).toUInt8, (0x80 ||| ((n >>> 6) &&& 0x3F)).toUInt8,
-      (0x80 ||| (n &&& 0x3F)).toUInt8] }
-  else if n < 0x200000 then
-    some { data := #[(0xF0 ||| (n >>> 18)).toUInt8, (0x80 ||| ((n >>> 12) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 6) &&& 0x3F)).toUInt8, (0x80 ||| (n &&& 0x3F)).toUInt8] }
-  else if n < 0x4000000 then
-    some { data := #[(0xF8 ||| (n >>> 24)).toUInt8, (0x80 ||| ((n >>> 18) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 12) &&& 0x3F)).toUInt8, (0x80 ||| ((n >>> 6) &&& 0x3F)).toUInt8,
-      (0x80 ||| (n &&& 0x3F)).toUInt8] }
-  else if n < 0x80000000 then
-    some { data := #[(0xFC ||| (n >>> 30)).toUInt8, (0x80 ||| ((n >>> 24) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 18) &&& 0x3F)).toUInt8, (0x80 ||| ((n >>> 12) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 6) &&& 0x3F)).toUInt8, (0x80 ||| (n &&& 0x3F)).toUInt8] }
-  else if n < 0x1000000000 then
-    some { data := #[0xFE, (0x80 ||| ((n >>> 30) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 24) &&& 0x3F)).toUInt8, (0x80 ||| ((n >>> 18) &&& 0x3F)).toUInt8,
-      (0x80 ||| ((n >>> 12) &&& 0x3F)).toUInt8, (0x80 ||| ((n >>> 6) &&& 0x3F)).toUInt8,
-      (0x80 ||| (n &&& 0x3F)).toUInt8] }
+  if v < 0x80 then some { data := #[v.toUInt8] }
+  else if v < 0x800 then
+    some { data := #[(0xC0 : UInt8) ||| (v >>> 6).toUInt8, flacUtf8ContByte v 0] }
+  else if v < 0x10000 then
+    some { data := #[(0xE0 : UInt8) ||| (v >>> 12).toUInt8, flacUtf8ContByte v 6, flacUtf8ContByte v 0] }
+  else if v < 0x200000 then
+    some { data := #[(0xF0 : UInt8) ||| (v >>> 18).toUInt8, flacUtf8ContByte v 12,
+      flacUtf8ContByte v 6, flacUtf8ContByte v 0] }
+  else if v < 0x4000000 then
+    some { data := #[(0xF8 : UInt8) ||| (v >>> 24).toUInt8, flacUtf8ContByte v 18,
+      flacUtf8ContByte v 12, flacUtf8ContByte v 6, flacUtf8ContByte v 0] }
+  else if v < 0x80000000 then
+    some { data := #[(0xFC : UInt8) ||| (v >>> 30).toUInt8, flacUtf8ContByte v 24,
+      flacUtf8ContByte v 18, flacUtf8ContByte v 12, flacUtf8ContByte v 6, flacUtf8ContByte v 0] }
+  else if v < 0x1000000000 then
+    some { data := #[0xFE, flacUtf8ContByte v 30, flacUtf8ContByte v 24,
+      flacUtf8ContByte v 18, flacUtf8ContByte v 12, flacUtf8ContByte v 6, flacUtf8ContByte v 0] }
   else none
 
 def flacUtf8DecodeCont (s : ByteSlice) (pos : Nat) : Nat → UInt64 → Option (UInt64 × Nat)
@@ -1822,13 +1977,13 @@ def flacUtf8DecodeCont (s : ByteSlice) (pos : Nat) : Nat → UInt64 → Option (
   | k + 1, acc =>
     if pos ≥ s.len then none
     else
-      let b := s.getByteD pos 0
+      let b := sliceByteD s pos
       if (b &&& 0xC0) != 0x80 then none
       else flacUtf8DecodeCont s (pos + 1) k ((acc <<< 6) ||| (b &&& 0x3F).toUInt64)
 
 def flacUtf8Decode (s : ByteSlice) (off : Nat) : Option (UInt64 × Nat) := do
   if off ≥ s.len then none
-  let b0 := s.getByteD off 0
+  let b0 := sliceByteD s off
   if (b0 &&& 0x80) == 0 then some (b0.toUInt64, off + 1)
   else if (b0 &&& 0xE0) == 0xC0 then
     let (v, p) ← flacUtf8DecodeCont s (off + 1) 1 (b0 &&& 0x1F).toUInt64
@@ -1853,8 +2008,8 @@ def flacUtf8Decode (s : ByteSlice) (off : Nat) : Option (UInt64 × Nat) := do
 def flacUtf8Check (n : UInt64) : Bool :=
   match flacUtf8Encode n with
   | some enc =>
-    flacUtf8Decode { ba := enc, off := 0, len := enc.data.toList.length } 0 ==
-      some (n, enc.data.toList.length)
+    flacUtf8Decode { ba := enc, off := 0, len := enc.data.size } 0 ==
+      some (n, enc.data.size)
   | none => false
 
 theorem flacUtf8_encode_decode_roundtrip :
@@ -1862,29 +2017,36 @@ theorem flacUtf8_encode_decode_roundtrip :
       flacUtf8Check = true := by
   decide
 
-def flacCrc8Slice (s : ByteSlice) (off len : Nat) : UInt8 := Id.run do
-  let mut c : UInt8 := 0
-  for i in [0:len] do
-    c := flacCrc8StepByteFast c (s.getByteD (off + i) 0)
-  return c
+def flacCrc8SliceLoop (s : ByteSlice) (off i : Nat) (c : UInt8) : Nat → UInt8
+  | 0 => c
+  | k + 1 => flacCrc8SliceLoop s off (i + 1) (flacCrc8StepByteFast c (sliceByteD s (off + i))) k
 
-def flacCrc16Slice (s : ByteSlice) (off len : Nat) : UInt16 := Id.run do
-  let mut c : UInt16 := 0
-  for i in [0:len] do
-    c := flacCrc16StepByteSpec c (s.getByteD (off + i) 0)
-  return c
+def flacCrc8Slice (s : ByteSlice) (off len : Nat) : UInt8 :=
+  flacCrc8SliceLoop s off 0 0 len
+
+def flacCrc16SliceLoop (s : ByteSlice) (off i : Nat) (c : UInt16) : Nat → UInt16
+  | 0 => c
+  | k + 1 => flacCrc16SliceLoop s off (i + 1) (flacCrc16StepByteSpec c (sliceByteD s (off + i))) k
+
+def flacCrc16Slice (s : ByteSlice) (off len : Nat) : UInt16 :=
+  flacCrc16SliceLoop s off 0 0 len
+
+def flacSliceBytesLoop (b : ByteArray) (i : Nat) (acc : Array UInt8) : Nat → Array UInt8
+  | 0 => acc
+  | k + 1 => flacSliceBytesLoop b (i + 1) (acc.push (b.data.getD i 0)) k
 
 def flacSliceBytes (b : ByteArray) (off len : Nat) : ByteArray :=
-  if b.data.toList.length ≤ 1024 then
-    { data := ((b.data.toList.drop off).take len).toArray }
-  else
-    b.extract off (off + len)
+  { data := flacSliceBytesLoop b off #[] len }
+
+def flacPushArrayLoop {α : Type} (src : Array α) (i : Nat) (acc : Array α) : Nat → Array α
+  | 0 => acc
+  | k + 1 =>
+    match src[i]? with
+    | some v => flacPushArrayLoop src (i + 1) (acc.push v) k
+    | none => acc
 
 def flacAppendBytes (a b : ByteArray) : ByteArray :=
-  if a.data.toList.length + b.data.toList.length ≤ 1024 then
-    { data := (a.data.toList ++ b.data.toList).toArray }
-  else
-    a ++ b
+  { data := flacPushArrayLoop b.data 0 a.data b.data.size }
 
 def flacResolveBlockSize (code : Nat) (s : ByteSlice) (pos : Nat) : Option (Nat × Nat) :=
   match code with
@@ -1894,10 +2056,10 @@ def flacResolveBlockSize (code : Nat) (s : ByteSlice) (pos : Nat) : Option (Nat 
   | 3 => some (1152, pos)
   | 4 => some (2304, pos)
   | 5 => some (4608, pos)
-  | 6 => if pos < s.len then some ((s.getByteD pos 0).toNat + 1, pos + 1) else none
+  | 6 => if pos < s.len then some ((sliceByteD s pos).toNat + 1, pos + 1) else none
   | 7 =>
     if pos + 1 < s.len then
-      some ((s.getByteD pos 0).toNat * 256 + (s.getByteD (pos + 1) 0).toNat + 1, pos + 2)
+      some ((sliceByteD s pos).toNat * 256 + (sliceByteD s (pos + 1)).toNat + 1, pos + 2)
     else none
   | _ => if code ≤ 15 then some (256 <<< (code - 8), pos) else none
 
@@ -1915,14 +2077,14 @@ def flacResolveSampleRate (code : Nat) (si : FlacStreamInfo) (s : ByteSlice) (po
   | 9 => some (44100, pos)
   | 10 => some (48000, pos)
   | 11 => some (96000, pos)
-  | 12 => if pos < s.len then some (((s.getByteD pos 0).toUInt32) * 1000, pos + 1) else none
+  | 12 => if pos < s.len then some (((sliceByteD s pos).toUInt32) * 1000, pos + 1) else none
   | 13 =>
     if pos + 1 < s.len then
-      some (((s.getByteD pos 0).toUInt32 <<< 8) ||| (s.getByteD (pos + 1) 0).toUInt32, pos + 2)
+      some (((sliceByteD s pos).toUInt32 <<< 8) ||| (sliceByteD s (pos + 1)).toUInt32, pos + 2)
     else none
   | 14 =>
     if pos + 1 < s.len then
-      some ((((s.getByteD pos 0).toUInt32 <<< 8) ||| (s.getByteD (pos + 1) 0).toUInt32) * 10, pos + 2)
+      some ((((sliceByteD s pos).toUInt32 <<< 8) ||| (sliceByteD s (pos + 1)).toUInt32) * 10, pos + 2)
     else none
   | _ => none
 
@@ -1939,28 +2101,27 @@ def flacResolveBps (code : Nat) (si : FlacStreamInfo) : Option Nat :=
 
 def flacParseFrameHeader (s : ByteSlice) (frameOff : Nat) (si : FlacStreamInfo) : Option FlacFrameHeaderView := do
   if frameOff + 6 > s.len then none
-  let b0 := (s.getByteD frameOff 0).toNat
-  let b1 := (s.getByteD (frameOff + 1) 0).toNat
+  let b0 := (sliceByteD s frameOff).toNat
+  let b1 := (sliceByteD s (frameOff + 1)).toNat
   let w16 := (b0 <<< 8) ||| b1
-  if !decide (FlacFrameSyncSafe w16) then none
+  if !flacFrameSyncGateSpec.gate w16 then none
   let varBlk := (b1 &&& 1) == 1
-  let b2 := (s.getByteD (frameOff + 2) 0).toNat
-  let b3 := (s.getByteD (frameOff + 3) 0).toNat
+  let b2 := (sliceByteD s (frameOff + 2)).toNat
+  let b3 := (sliceByteD s (frameOff + 3)).toNat
   let bsCode := (b2 >>> 4) &&& 0x0F
   let srCode := b2 &&& 0x0F
   let chAssign := (b3 >>> 4) &&& 0x0F
   let bpsCode := (b3 >>> 1) &&& 0x07
   let resBit := b3 &&& 1
-  if resBit != 0 || !decide (FlacChannelAssignSafe chAssign) then none
+  if resBit != 0 || !flacChannelAssignGateSpec.gate chAssign then none
   let (utf8Val, pos1) ← flacUtf8Decode s (frameOff + 4)
   let (blkSz, pos2) ← flacResolveBlockSize bsCode s pos1
   let (sr, pos3) ← flacResolveSampleRate srCode si s pos2
   let bps ← flacResolveBps bpsCode si
   if sr == 0 || blkSz == 0 || pos3 ≥ s.len then none
   let hdrLen := pos3 - frameOff
-  let crcExpected := s.getByteD pos3 0
-  let hdrBytes := (flacSliceBytes s.ba (s.off + frameOff) hdrLen).data.toList
-  let crcActual := if hdrLen ≤ 32 then flacCrc8List hdrBytes else flacCrc8Slice s frameOff hdrLen
+  let crcExpected := sliceByteD s pos3
+  let crcActual := flacCrc8Slice s frameOff hdrLen
   if crcActual != crcExpected then none
   let numCh := if chAssign < 8 then chAssign + 1 else 2
   some {
@@ -1977,84 +2138,11 @@ def flacParseFrameHeader (s : ByteSlice) (frameOff : Nat) (si : FlacStreamInfo) 
     headerLen := hdrLen + 1
   }
 
-def flacDecodeSubframeWithReader (r0 : BitReader) (blockSize bps : Nat) : Option (Array Int32 × BitReader) := do
-  if blockSize == 0 || bps == 0 || bps > 33 then none
-  let (zeroBit, r1) ← r0.readBit
-  if zeroBit != 0 then none
-  let (stypeBits, r2) ← r1.readBitsMSB 6
-  let stype := stypeBits.toNat
-  let (wastedFlag, r3) ← r2.readBit
-  let (wastedBits, r4) ←
-    if wastedFlag == 1 then do
-      let (km1, rw) ← r3.readUnary0 32
-      some (km1 + 1, rw)
-    else some (0, r3)
-  if wastedBits ≥ bps then none
-  let effBps := bps - wastedBits
-  let applyWasted (arr : Array Int32) : Array Int32 :=
-    if wastedBits == 0 then arr
-    else (arr.toList.map (fun x => x <<< Int32.ofNat wastedBits)).toArray
-  if stype == 0 then
-    let (cVal, rEnd) ← readSignedBitsMSB r4 effBps
-    some (applyWasted (List.replicate blockSize cVal).toArray, rEnd)
-  else if stype == 1 then
-    let (outList, rEnd) ← readSignedSamplesLoop effBps r4 blockSize []
-    some (applyWasted outList.toArray, rEnd)
-  else if stype ≥ 8 && stype ≤ 12 then
-    let predOrder := stype - 8
-    if blockSize < predOrder then none
-    else do
-      let (warmList, cur) ← readSignedSamplesLoop effBps r4 predOrder []
-      let (residuals, rEnd) ← decodeFlacRicePartitions cur blockSize predOrder
-      let ord : FlacFixedOrder := match predOrder with
-        | 0 => .order0 | 1 => .order1 | 2 => .order2 | 3 => .order3 | _ => .order4
-      let fullList :=
-        if blockSize ≤ 64 then
-          flacDecodeFixedListGo ord warmList residuals.toList
-        else Id.run do
-          let mut out := Array.mkEmpty blockSize
-          for w in warmList do out := out.push w
-          for i in [0:residuals.size] do
-            let idx := predOrder + i
-            let p := flacFixedPredictFast ord out idx
-            out := out.push (residuals.getD i 0 + p)
-          return out.toList
-      some (applyWasted fullList.toArray, rEnd)
-  else if stype ≥ 32 && stype ≤ 63 then
-    let predOrder := stype - 32 + 1
-    if blockSize < predOrder then none
-    else do
-      let (warmList, cur) ← readSignedSamplesLoop effBps r4 predOrder []
-      let (precMinus1Bits, r5) ← cur.readBitsMSB 4
-      if precMinus1Bits == 15 then none
-      else do
-        let coeffPrec := precMinus1Bits.toNat + 1
-        let (qShiftSigned, r6) ← readSignedBitsMSB r5 5
-        if qShiftSigned < 0 then none
-        else do
-          let qShift : UInt32 := qShiftSigned.toInt.toNat.toUInt32
-          let (coeffList, curC) ← readSignedSamplesLoop coeffPrec r6 predOrder []
-          let (residuals, rEnd) ← decodeFlacRicePartitions curC blockSize predOrder
-          let out :=
-            if blockSize ≤ 64 then
-              flacDecodeLpcFir warmList.toArray coeffList.toArray qShift residuals
-            else Id.run do
-              let coeffsA := coeffList.toArray
-              let mut accA := Array.mkEmpty blockSize
-              for w in warmList do accA := accA.push w
-              for i in [0:residuals.size] do
-                let curIdx := predOrder + i
-                let mut dot : Int64 := 0
-                for k in [0:predOrder] do
-                  dot := dot + (coeffsA.getD k 0).toInt64 * (accA.getD (curIdx - 1 - k) 0).toInt64
-                let pred : Int32 := (dot >>> Int64.ofInt (qShift.toNat : Int)).toInt32
-                accA := accA.push (residuals.getD i 0 + pred)
-              return accA
-          some (applyWasted out, rEnd)
-  else none
+def flacDecodeSubframeWithReader (r0 : BitReader) (blockSize bps : Nat) : Option (Array Int64 × BitReader) :=
+  flacDecodeSubframeCore64 r0 blockSize bps
 
 def flacDecodeSubframesLoop (r : BitReader) (hdr : FlacFrameHeaderView) (chIdx : Nat) :
-    Nat → List (Array Int32) → Option (List (Array Int32) × BitReader)
+    Nat → List (Array Int64) → Option (List (Array Int64) × BitReader)
   | 0, acc => some (acc.reverse, r)
   | rem + 1, acc => do
     let subBps :=
@@ -2062,11 +2150,18 @@ def flacDecodeSubframesLoop (r : BitReader) (hdr : FlacFrameHeaderView) (chIdx :
          (hdr.channelAssign == 9 && chIdx == 0) ||
          (hdr.channelAssign == 10 && chIdx == 1) then hdr.bitsPerSample + 1
       else hdr.bitsPerSample
-    let (chSamples, rNext) ← flacDecodeSubframeWithReader r hdr.blockSize subBps
+    let (chSamples, rNext) ← flacDecodeSubframeCore64 r hdr.blockSize subBps
     flacDecodeSubframesLoop rNext hdr (chIdx + 1) rem (chSamples :: acc)
 
-def flacReconstructStereoChannels (chAssign : Nat) (chans : List (Array Int32)) (n : Nat) : Array (Array Int32) :=
-  if chAssign < 8 then chans.toArray
+def flacReconstructStereoLoop (mode : FlacStereoMode) (c0 c1 : Array Int64) (i : Nat)
+    (outL outR : Array Int32) : Nat → Array (Array Int32)
+  | 0 => #[outL, outR]
+  | k + 1 =>
+    let (l, r) := flacStereoDecodePair64 mode (c0.getD i 0) (c1.getD i 0)
+    flacReconstructStereoLoop mode c0 c1 (i + 1) (outL.push l.toInt32) (outR.push r.toInt32) k
+
+def flacReconstructStereoChannels (chAssign : Nat) (chans : List (Array Int64)) (n : Nat) : Array (Array Int32) :=
+  if chAssign < 8 then (chans.map flacArray64To32).toArray
   else
     let c0 := chans.getD 0 #[]
     let c1 := chans.getD 1 #[]
@@ -2074,22 +2169,14 @@ def flacReconstructStereoChannels (chAssign : Nat) (chans : List (Array Int32)) 
       if chAssign == 8 then .leftSide
       else if chAssign == 9 then .rightSide
       else .midSide
-    if n ≤ 64 then
-      let pairs := (List.range n).map (fun i => flacStereoDecodePair mode (c0.toList.getD i 0) (c1.toList.getD i 0))
-      #[(pairs.map Prod.fst).toArray, (pairs.map Prod.snd).toArray]
-    else Id.run do
-      let mut outL := Array.mkEmpty n
-      let mut outR := Array.mkEmpty n
-      for i in [0:n] do
-        let (l, r) := flacStereoDecodePair mode (c0.getD i 0) (c1.getD i 0)
-        outL := outL.push l
-        outR := outR.push r
-      return #[outL, outR]
+    flacReconstructStereoLoop mode c0 c1 0 #[] #[] n
 
 def flacDecodeFrameAt (s : ByteSlice) (frameOff : Nat) (si : FlacStreamInfo) :
     Option (FlacFrameHeaderView × Array (Array Int32) × Nat) := do
   let hdr ← flacParseFrameHeader s frameOff si
-  let subSlice : ByteSlice := { ba := s.ba, off := s.off + frameOff + hdr.headerLen, len := s.len - (frameOff + hdr.headerLen) }
+  let subSlice : ByteSlice := {
+    ba := s.ba, off := s.off + frameOff + hdr.headerLen, len := s.len - (frameOff + hdr.headerLen)
+  }
   let (rawChans, rAfter) ← flacDecodeSubframesLoop (BitReader.ofSlice subSlice) hdr 0 hdr.channels []
   let padBits := (8 - (rAfter.bitOffset % 8)) % 8
   let (padVal, rAligned) ← if padBits == 0 then some (0, rAfter) else rAfter.readBitsMSB padBits
@@ -2097,13 +2184,10 @@ def flacDecodeFrameAt (s : ByteSlice) (frameOff : Nat) (si : FlacStreamInfo) :
   let bodySubBytes := rAligned.bitOffset / 8
   let crcPos := frameOff + hdr.headerLen + bodySubBytes
   if crcPos + 2 > s.len then none
-  let crcExpected : UInt16 := ((s.getByteD crcPos 0).toUInt16 <<< 8) ||| (s.getByteD (crcPos + 1) 0).toUInt16
+  let crcExpected : UInt16 :=
+    ((sliceByteD s crcPos).toUInt16 <<< 8) ||| (sliceByteD s (crcPos + 1)).toUInt16
   let frameLenNoCrc := hdr.headerLen + bodySubBytes
-  let crcActual :=
-    if frameLenNoCrc ≤ 256 then
-      flacCrc16List (flacSliceBytes s.ba (s.off + frameOff) frameLenNoCrc).data.toList
-    else
-      flacCrc16Slice s frameOff frameLenNoCrc
+  let crcActual := flacCrc16Slice s frameOff frameLenNoCrc
   if crcActual != crcExpected then none
   some (hdr, flacReconstructStereoChannels hdr.channelAssign rawChans hdr.blockSize, crcPos + 2)
 
@@ -2112,11 +2196,11 @@ def flacParseMetadataLoop (s : ByteSlice) (pos : Nat) (siOpt : Option FlacStream
   | 0 => none
   | fuel + 1 => do
     if pos + 4 > s.len then none
-    let hdrByte := s.getByteD pos 0
+    let hdrByte := sliceByteD s pos
     let isLast := (hdrByte &&& 0x80) != 0
     let btype := (hdrByte &&& 0x7F).toNat
-    let blen := ((s.getByteD (pos + 1) 0).toNat <<< 16) |||
-      ((s.getByteD (pos + 2) 0).toNat <<< 8) ||| (s.getByteD (pos + 3) 0).toNat
+    let blen := ((sliceByteD s (pos + 1)).toNat <<< 16) |||
+      ((sliceByteD s (pos + 2)).toNat <<< 8) ||| (sliceByteD s (pos + 3)).toNat
     if btype == 127 || pos + 4 + blen > s.len then none
     let nextPos := pos + 4 + blen
     let (siNext, md5Next) ←
@@ -2135,19 +2219,43 @@ def flacParseMetadataLoop (s : ByteSlice) (pos : Nat) (siOpt : Option FlacStream
     else
       flacParseMetadataLoop s nextPos siNext md5Next fuel
 
-def flacPcmMd5Bytes (channelsData : Array (Array Int32)) (bps : Nat) : ByteArray := Id.run do
+def flacPushSampleLeLoop (u : UInt32) (b : Nat) (raw : Array UInt8) : Nat → Array UInt8
+  | 0 => raw
+  | k + 1 =>
+    flacPushSampleLeLoop u (b + 1) (raw.push (((u >>> (8 * b).toUInt32) &&& 0xFF).toUInt8)) k
+
+def flacPcmMd5ChansLoop (channelsData : Array (Array Int32)) (i bytesPerSample ch : Nat)
+    (raw : Array UInt8) : Nat → Array UInt8
+  | 0 => raw
+  | k + 1 =>
+    let v := (channelsData.getD ch #[]).getD i 0
+    let raw' := flacPushSampleLeLoop v.toUInt32 0 raw bytesPerSample
+    flacPcmMd5ChansLoop channelsData i bytesPerSample (ch + 1) raw' k
+
+def flacPcmMd5SamplesLoop (channelsData : Array (Array Int32)) (nCh bytesPerSample i : Nat)
+    (raw : Array UInt8) : Nat → Array UInt8
+  | 0 => raw
+  | k + 1 =>
+    let raw' := flacPcmMd5ChansLoop channelsData i bytesPerSample 0 raw nCh
+    flacPcmMd5SamplesLoop channelsData nCh bytesPerSample (i + 1) raw' k
+
+def flacPcmMd5Bytes (channelsData : Array (Array Int32)) (bps : Nat) : ByteArray :=
   let nCh := channelsData.size
-  if nCh == 0 then return md5 { data := #[] }
-  let nSamples := (channelsData.getD 0 #[]).size
-  let bytesPerSample := (bps + 7) / 8
-  let mut raw := ByteArray.emptyWithCapacity (nSamples * nCh * bytesPerSample)
-  for i in [0:nSamples] do
-    for ch in [0:nCh] do
-      let v := (channelsData.getD ch #[]).getD i 0
-      let u : UInt32 := v.toUInt32
-      for b in [0:bytesPerSample] do
-        raw := raw.push ((u >>> (8 * b).toUInt32) &&& 0xFF).toUInt8
-  return md5 raw
+  if nCh == 0 then md5 { data := #[] }
+  else
+    let nSamples := (channelsData.getD 0 #[]).size
+    let bytesPerSample := (bps + 7) / 8
+    let raw := flacPcmMd5SamplesLoop channelsData nCh bytesPerSample 0
+      (Array.mkEmpty (nSamples * nCh * bytesPerSample)) nSamples
+    md5 { data := raw }
+
+def flacMergeFrameChansLoop (acc frameChans : Array (Array Int32)) (c : Nat)
+    (out : Array (Array Int32)) : Nat → Array (Array Int32)
+  | 0 => out
+  | k + 1 =>
+    let src := frameChans.getD c #[]
+    let merged := flacPushArrayLoop src 0 (acc.getD c #[]) src.size
+    flacMergeFrameChansLoop acc frameChans (c + 1) (out.push merged) k
 
 def flacDecodeFramesLoop (s : ByteSlice) (pos : Nat) (si : FlacStreamInfo)
     (acc : Array (Array Int32)) : Nat → Option (Array (Array Int32))
@@ -2158,21 +2266,13 @@ def flacDecodeFramesLoop (s : ByteSlice) (pos : Nat) (si : FlacStreamInfo)
     else do
       let (hdr, frameChans, nextPos) ← flacDecodeFrameAt s pos si
       if nextPos ≤ pos || hdr.channels != si.channels.toNat then none
-      let acc' :=
-        if s.len ≤ 512 then
-          ((List.range hdr.channels).map (fun c =>
-            ((acc.toList.getD c #[]).toList ++ (frameChans.toList.getD c #[]).toList).toArray)).toArray
-        else Id.run do
-          let mut merged := acc
-          for c in [0:hdr.channels] do
-            merged := merged.set! c ((merged.getD c #[]) ++ (frameChans.getD c #[]))
-          return merged
+      let acc' := flacMergeFrameChansLoop acc frameChans 0 #[] hdr.channels
       flacDecodeFramesLoop s nextPos si acc' fuel
 
 def flacDecodeStream (s : ByteSlice) (verifyMd5 : Bool := true) : Option FlacDecodedStream := do
   if s.len < 42 then none
-  if s.getByteD 0 0 != 0x66 || s.getByteD 1 0 != 0x4C ||
-     s.getByteD 2 0 != 0x61 || s.getByteD 3 0 != 0x43 then none
+  if sliceByteD s 0 != 0x66 || sliceByteD s 1 != 0x4C ||
+     sliceByteD s 2 != 0x61 || sliceByteD s 3 != 0x43 then none
   let (si, md5Hdr, audioOff) ← flacParseMetadataLoop s 4 none { data := #[] } 128
   let initAcc := (List.replicate si.channels.toNat (#[] : Array Int32)).toArray
   let decoded ← flacDecodeFramesLoop s audioOff si initAcc (s.len + 1)
@@ -2183,154 +2283,133 @@ def flacDecodeStream (s : ByteSlice) (verifyMd5 : Bool := true) : Option FlacDec
   else
     some { info := si, md5 := md5Hdr, channelsData := decoded }
 
-def flacSampleAbs (x : Int32) : Nat :=
-  let v := x.toInt
-  if v < 0 then (-v).toNat else v.toNat
+def flacZigzag64 (x : Int64) : UInt64 :=
+  if x < 0 then
+    let m : UInt64 := (-1 - x).toUInt64
+    (m <<< 1) ||| 1
+  else
+    x.toUInt64 <<< 1
 
-def flacBestRiceK (res : List Int32) (maxK : Nat) : Nat :=
+def flacSampleAbs64 (x : Int64) : Nat :=
+  let mag : UInt64 := if x < 0 then (0 - x).toUInt64 else x.toUInt64
+  mag.toNat
+
+def flacSampleAbs (x : Int32) : Nat :=
+  flacSampleAbs64 x.toInt64
+
+def flacRiceFits64 (x : Int64) (k : Nat) : Bool :=
+  if k > 30 then false
+  else
+    let z : UInt64 := flacZigzag64 x
+    let q : UInt64 := z >>> k.toUInt64
+    z < ((1 : UInt64) <<< 63) && q < ((1 : UInt64) <<< (63 - k).toUInt64) && q < 1048576
+
+def flacBestRiceK64 (res : List Int64) (maxK : Nat) : Nat :=
   let cnt := res.length
   if cnt == 0 then 0
   else
-    let sumAbs := res.foldl (fun acc r => acc + flacSampleAbs r * 2) 0
-    let avg := sumAbs / cnt
+    let sumAbs : UInt64 := res.foldl (fun acc r => acc + flacZigzag64 r) 0
+    let avg : UInt64 := sumAbs / cnt.toUInt64
     let rec findK (k : Nat) : Nat → Nat
       | 0 => k
       | fuel + 1 =>
-        if k ≥ maxK || (1 <<< k) ≥ avg then k
+        if k ≥ maxK || ((1 : UInt64) <<< k.toUInt64) ≥ avg then k
         else findK (k + 1) fuel
     findK 0 maxK
 
-def flacEstimateRiceBits (res : List Int32) (k : Nat) : Nat :=
-  res.foldl (fun acc r =>
-    let z : Nat :=
-      let v := r.toInt
-      if v ≥ 0 then (2 * v).toNat else (-2 * v - 1).toNat
-    acc + (z >>> k) + 1 + k) 0
-
-def flacSolveLpcOrder2 (samples : Array Int32) : Option (Array Int32 × Nat × UInt32) := Id.run do
-  let n := samples.size
-  if n < 16 then return none
-  let mut r0 : Int := 0
-  let mut r1 : Int := 0
-  let mut r2 : Int := 0
-  for i in [0:n] do
-    let s0 := (samples.getD i 0).toInt
-    r0 := r0 + s0 * s0
-    if i ≥ 1 then r1 := r1 + s0 * (samples.getD (i - 1) 0).toInt
-    if i ≥ 2 then r2 := r2 + s0 * (samples.getD (i - 2) 0).toInt
-  if r0 ≤ 0 then return none
-  let denom := r0 * r0 - r1 * r1
-  if denom ≤ 0 then return none
-  let scale : Int := 256
-  let a1Num := r1 * (r0 - r2) * scale
-  let a2Num := (r0 * r2 - r1 * r1) * scale
-  let q1 := a1Num / denom
-  let q2 := a2Num / denom
-  if q1 < -511 || q1 > 511 || q2 < -511 || q2 > 511 then return none
-  if q1 == 0 && q2 == 0 then return none
-  return some (#[Int32.ofInt q1, Int32.ofInt q2], 10, 8)
-
-def flacWriteSubframeBits (w0 : BitWriter) (mode : FlacSubframeSpecMode) (bps : Nat) (samples : Array Int32) : BitWriter :=
-  let sampleList := samples.toList
-  let wHeader := w0.writeBit 0
-  match mode with
-  | .constant val =>
-    let w1 := (wHeader.writeBitsMSB 0 6).writeBit 0
-    writeSignedBitsMSB w1 val bps
-  | .verbatim =>
-    let w1 := (wHeader.writeBitsMSB 1 6).writeBit 0
-    writeSignedListMSB bps w1 sampleList
-  | .fixed ord codingMethod riceK escaped rawBps =>
-    let predOrder : Nat := match ord with
-      | .order0 => 0 | .order1 => 1 | .order2 => 2 | .order3 => 3 | .order4 => 4
-    let w1 := (wHeader.writeBitsMSB (8 + predOrder).toUInt64 6).writeBit 0
-    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
-    let cm : UInt64 := if codingMethod == 0 then 0 else 1
-    let paramBits : Nat := if codingMethod == 0 then 4 else 5
-    let escCode : UInt64 := if codingMethod == 0 then 15 else 31
-    let w3 := (w2.writeBitsMSB cm 2).writeBitsMSB 0 4
-    let allResList :=
-      if sampleList.length ≤ 64 then
-        (flacEncodeFixedListGo ord sampleList 0 sampleList.length).drop predOrder
+def flacEstimateRiceBits64 (res : List Int64) (k : Nat) : Option UInt64 :=
+  let rec go (acc : UInt64) : List Int64 → Option UInt64
+    | [] => some acc
+    | r :: rs =>
+      if !flacRiceFits64 r k then none
       else
-        ((flacEncodeFixedResidualsFast ord samples).extract predOrder samples.size).toList
-    if escaped then
-      let w4 := (w3.writeBitsMSB escCode paramBits).writeBitsMSB rawBps.toUInt64 5
-      writeSignedListMSB rawBps w4 allResList
-    else
-      let w4 := w3.writeBitsMSB riceK.toUInt64 paramBits
-      writeRiceListSigned riceK w4 allResList
-  | .lpc coeffs coeffPrec qShift codingMethod riceK =>
-    let coeffList := coeffs.toList
-    let predOrder := coeffList.length
-    let w1 := (wHeader.writeBitsMSB (32 + predOrder - 1).toUInt64 6).writeBit 0
-    let w2 := writeSignedListMSB bps w1 (sampleList.take predOrder)
-    let w3 := writeSignedBitsMSB (w2.writeBitsMSB (coeffPrec - 1).toUInt64 4) (Int32.ofNat qShift.toNat) 5
-    let w4 := writeSignedListMSB coeffPrec w3 coeffList
-    let cm : UInt64 := if codingMethod == 0 then 0 else 1
-    let paramBits : Nat := if codingMethod == 0 then 4 else 5
-    let w5 := ((w4.writeBitsMSB cm 2).writeBitsMSB 0 4).writeBitsMSB riceK.toUInt64 paramBits
-    encodeFlacLpcResidualsLoop sampleList coeffList qShift riceK predOrder w5 (sampleList.length - predOrder)
+        let q : UInt64 := (flacZigzag64 r) >>> k.toUInt64
+        go (acc + q + 1 + k.toUInt64) rs
+  go 0 res
 
-def flacChooseSubframeMode (samples : Array Int32) (bps : Nat) (allowLpc : Bool := true) : FlacSubframeSpecMode :=
+def flacSolveLpcOrder2Loop (samples : Array Int64) (i : Nat) (r0 r1 r2 : Int) : Nat → Int × Int × Int
+  | 0 => (r0, r1, r2)
+  | k + 1 =>
+    let s0 := (samples.getD i 0).toInt
+    let r0' := r0 + s0 * s0
+    let r1' := if i ≥ 1 then r1 + s0 * (samples.getD (i - 1) 0).toInt else r1
+    let r2' := if i ≥ 2 then r2 + s0 * (samples.getD (i - 2) 0).toInt else r2
+    flacSolveLpcOrder2Loop samples (i + 1) r0' r1' r2' k
+
+def flacSolveLpcOrder2_64 (samples : Array Int64) : Option (Array Int32 × Nat × UInt32) :=
+  let n := samples.size
+  if n < 16 then none
+  else
+    let (r0, r1, r2) := flacSolveLpcOrder2Loop samples 0 0 0 0 n
+    if r0 ≤ 0 then none
+    else
+      let denom := r0 * r0 - r1 * r1
+      if denom ≤ 0 then none
+      else
+        let scale : Int := 256
+        let a1Num := r1 * (r0 - r2) * scale
+        let a2Num := (r0 * r2 - r1 * r1) * scale
+        let q1 := a1Num / denom
+        let q2 := a2Num / denom
+        if q1 < -511 || q1 > 511 || q2 < -511 || q2 > 511 then none
+        else if q1 == 0 && q2 == 0 then none
+        else some (#[Int32.ofInt q1, Int32.ofInt q2], 10, 8)
+
+def flacWriteSubframeBits (w0 : BitWriter) (mode : FlacSubframeSpecMode) (bps : Nat)
+    (samples : Array Int32) : BitWriter :=
+  flacWriteSubframeBits64 w0 mode bps (flacArray32To64 samples)
+
+def flacChooseSubframeMode64 (samples : Array Int64) (bps : Nat)
+    (allowLpc : Bool := true) : FlacSubframeSpecMode :=
   let xs := samples.toList
   match xs with
   | [] => .verbatim
   | s0 :: rest =>
     if rest.all (· == s0) then .constant s0
-    else if xs.length < 5 then .verbatim
+    else if samples.size < 5 then .verbatim
     else
-      let maxK4 := 14
-      let maxK5 := 30
-      let evalFixed (ord : FlacFixedOrder) : FlacSubframeSpecMode × Nat :=
+      let verbCost : UInt64 := (samples.size * bps + 8).toUInt64
+      let evalFixed (ord : FlacFixedOrder) : FlacSubframeSpecMode × UInt64 :=
         let pOrd := match ord with | .order0 => 0 | .order1 => 1 | .order2 => 2 | .order3 => 3 | .order4 => 4
-        let res :=
-          if xs.length ≤ 64 then (flacEncodeFixedListGo ord xs 0 xs.length).drop pOrd
-          else ((flacEncodeFixedResidualsFast ord samples).extract pOrd samples.size).toList
-        let k5 := flacBestRiceK res maxK5
-        let cm : UInt8 := if k5 ≤ maxK4 then 0 else 1
-        let kUse := if cm == 0 then Nat.min k5 maxK4 else k5
-        let cost := pOrd * bps + flacEstimateRiceBits res kUse + 16
-        (.fixed ord cm kUse false bps, cost)
+        let res := (flacEncodeFixedResiduals64 ord samples).toList.drop pOrd
+        let k := flacBestRiceK64 res 30
+        match flacEstimateRiceBits64 res k with
+        | none => (.verbatim, verbCost)
+        | some bits => (.fixed ord (if k ≤ 14 then 0 else 1) k false bps, (pOrd * bps + 16).toUInt64 + bits)
       let cands := [FlacFixedOrder.order0, .order1, .order2, .order3, .order4].map evalFixed
-      let verbCost := xs.length * bps + 8
-      let bestFixed := cands.foldl (fun b c => if c.2 < b.2 then c else b) (.verbatim, verbCost)
-      if !allowLpc then bestFixed.1
+      let best := cands.foldl (fun b c => if c.2 < b.2 then c else b) (.verbatim, verbCost)
+      if !allowLpc then best.1
       else
-        match flacSolveLpcOrder2 samples with
-        | none => bestFixed.1
+        match flacSolveLpcOrder2_64 samples with
+        | none => best.1
         | some (coeffs, prec, qShift) =>
-          let cList := coeffs.toList
-          let lpcRes := (List.range (xs.length - 2)).map fun j =>
+          let coeffs64 := flacArray32To64 coeffs
+          let lpcRes := (List.range (samples.size - 2)).map fun j =>
             let idx := j + 2
-            let acc := flacLpcFirDot xs idx cList 0 0 cList
-            let pred : Int32 := (acc >>> Int64.ofInt (qShift.toNat : Int)).toInt32
-            xs.getD idx 0 - pred
-          let kLpc := flacBestRiceK lpcRes maxK5
-          let cmLpc : UInt8 := if kLpc ≤ maxK4 then 0 else 1
-          let lpcCost := 2 * bps + 9 + 2 * prec + flacEstimateRiceBits lpcRes kLpc + 16
-          if lpcCost < bestFixed.2 then .lpc coeffs prec qShift cmLpc kLpc else bestFixed.1
+            let acc := flacLpcFirDot64 samples idx coeffs64 0 0 coeffs64.size
+            samples.getD idx 0 - (acc >>> qShift.toUInt64.toInt64)
+          let k := flacBestRiceK64 lpcRes 30
+          match flacEstimateRiceBits64 lpcRes k with
+          | none => best.1
+          | some bits =>
+            let cost : UInt64 := (2 * bps + 9 + 2 * prec + 16).toUInt64 + bits
+            if cost < best.2 then .lpc coeffs prec qShift (if k ≤ 14 then 0 else 1) k else best.1
 
-def flacChooseStereoMode (ch0 ch1 : Array Int32) : FlacStereoMode × Array Int32 × Array Int32 :=
-  let n := ch0.toList.length
-  let mkPairs (m : FlacStereoMode) : Array Int32 × Array Int32 × Nat :=
-    if n ≤ 64 then
-      let ps := (List.range n).map (fun i => flacStereoEncodePair m (ch0.toList.getD i 0) (ch1.toList.getD i 0))
-      let a0 := ps.map Prod.fst
-      let a1 := ps.map Prod.snd
-      let energy := a0.foldl (fun s x => s + flacSampleAbs x) 0 + a1.foldl (fun s x => s + flacSampleAbs x) 0
-      (a0.toArray, a1.toArray, energy)
-    else Id.run do
-      let nFast := ch0.size
-      let mut a0 := Array.mkEmpty nFast
-      let mut a1 := Array.mkEmpty nFast
-      let mut energy : Nat := 0
-      for i in [0:nFast] do
-        let (x0, x1) := flacStereoEncodePair m (ch0.getD i 0) (ch1.getD i 0)
-        a0 := a0.push x0
-        a1 := a1.push x1
-        energy := energy + flacSampleAbs x0 + flacSampleAbs x1
-      return (a0, a1, energy)
+def flacChooseSubframeMode (samples : Array Int32) (bps : Nat)
+    (allowLpc : Bool := true) : FlacSubframeSpecMode :=
+  flacChooseSubframeMode64 (flacArray32To64 samples) bps allowLpc
+
+def flacStereoPairsLoop64 (m : FlacStereoMode) (ch0 ch1 : Array Int32) (i : Nat)
+    (a0 a1 : Array Int64) (energy : UInt64) : Nat → Array Int64 × Array Int64 × UInt64
+  | 0 => (a0, a1, energy)
+  | k + 1 =>
+    let (x0, x1) := flacStereoEncodePair64 m (ch0.getD i 0).toInt64 (ch1.getD i 0).toInt64
+    let m0 : UInt64 := if x0 < 0 then (0 - x0).toUInt64 else x0.toUInt64
+    let m1 : UInt64 := if x1 < 0 then (0 - x1).toUInt64 else x1.toUInt64
+    flacStereoPairsLoop64 m ch0 ch1 (i + 1) (a0.push x0) (a1.push x1) (energy + m0 + m1) k
+
+def flacChooseStereoMode (ch0 ch1 : Array Int32) : FlacStereoMode × Array Int64 × Array Int64 :=
+  let mkPairs (m : FlacStereoMode) := flacStereoPairsLoop64 m ch0 ch1 0 #[] #[] 0 ch0.size
   let (i0, i1, eI) := mkPairs .independent
   let (l0, l1, eL) := mkPairs .leftSide
   let (r0, r1, eR) := mkPairs .rightSide
@@ -2346,24 +2425,23 @@ def flacBpsHeaderCode (bps : Nat) : UInt8 :=
   | 8 => 1 | 12 => 2 | 16 => 4 | 20 => 5 | 24 => 6 | 32 => 7 | _ => 0
 
 def flacSampleRateHeaderCode (sr : UInt32) : UInt8 × List UInt8 :=
-  match sr.toNat with
-  | 88200 => (1, [])
-  | 176400 => (2, [])
-  | 192000 => (3, [])
-  | 8000 => (4, [])
-  | 16000 => (5, [])
-  | 22050 => (6, [])
-  | 24000 => (7, [])
-  | 32000 => (8, [])
-  | 44100 => (9, [])
-  | 48000 => (10, [])
-  | 96000 => (11, [])
-  | v =>
-    if v ≤ 65535 then (13, [((v >>> 8) &&& 0xFF).toUInt8, (v &&& 0xFF).toUInt8])
-    else if v % 10 == 0 && v / 10 ≤ 65535 then
-      let u := v / 10
-      (14, [((u >>> 8) &&& 0xFF).toUInt8, (u &&& 0xFF).toUInt8])
-    else (0, [])
+  if sr == 88200 then (1, [])
+  else if sr == 176400 then (2, [])
+  else if sr == 192000 then (3, [])
+  else if sr == 8000 then (4, [])
+  else if sr == 16000 then (5, [])
+  else if sr == 22050 then (6, [])
+  else if sr == 24000 then (7, [])
+  else if sr == 32000 then (8, [])
+  else if sr == 44100 then (9, [])
+  else if sr == 48000 then (10, [])
+  else if sr == 96000 then (11, [])
+  else if sr ≤ 65535 then
+    (13, [((sr >>> 8) &&& 0xFF).toUInt8, (sr &&& 0xFF).toUInt8])
+  else if sr % 10 == 0 && sr / 10 ≤ 65535 then
+    let u := sr / 10
+    (14, [((u >>> 8) &&& 0xFF).toUInt8, (u &&& 0xFF).toUInt8])
+  else (0, [])
 
 def flacBlockSizeHeaderCode (blkSz : Nat) : UInt8 × List UInt8 :=
   match blkSz with
@@ -2387,25 +2465,25 @@ def flacBlockSizeHeaderCode (blkSz : Nat) : UInt8 × List UInt8 :=
 def flacEncodeFrame (blockChannels : Array (Array Int32)) (sampleRate : UInt32) (bps : Nat)
     (frameIdx : UInt64) (stereoOpt : Option FlacStereoMode := none)
     (modeOpt : Option FlacSubframeSpecMode := none) : Option ByteArray := do
-  let nCh := blockChannels.toList.length
+  let nCh := blockChannels.size
   if nCh == 0 || nCh > 8 || bps == 0 || bps > 32 then none
-  let blkSz := (blockChannels.toList.getD 0 #[]).toList.length
+  let blkSz := (blockChannels.getD 0 #[]).size
   if blkSz == 0 || blkSz > 65535 then none
-  let (chAssign, encChans) : Nat × List (Array Int32) :=
+  let (chAssign, encChans) : Nat × List (Array Int64) :=
     if nCh == 2 then
-      let c0 := blockChannels.toList.getD 0 #[]
-      let c1 := blockChannels.toList.getD 1 #[]
+      let c0 := blockChannels.getD 0 #[]
+      let c1 := blockChannels.getD 1 #[]
       let (stMode, s0, s1) :=
         match stereoOpt with
         | some sm =>
-          let ps := (List.range blkSz).map (fun i => flacStereoEncodePair sm (c0.toList.getD i 0) (c1.toList.getD i 0))
-          (sm, (ps.map Prod.fst).toArray, (ps.map Prod.snd).toArray)
+          let (a0, a1, _) := flacStereoPairsLoop64 sm c0 c1 0 #[] #[] 0 blkSz
+          (sm, a0, a1)
         | none => flacChooseStereoMode c0 c1
       let ca := match stMode with
         | .independent => 1 | .leftSide => 8 | .rightSide => 9 | .midSide => 10
       (ca, [s0, s1])
     else
-      (nCh - 1, blockChannels.toList)
+      (nCh - 1, blockChannels.toList.map flacArray32To64)
   let (bsCode, bsTail) := flacBlockSizeHeaderCode blkSz
   let (srCode, srTail) := flacSampleRateHeaderCode sampleRate
   let bpsCode := flacBpsHeaderCode bps
@@ -2415,44 +2493,41 @@ def flacEncodeFrame (blockChannels : Array (Array Int32)) (sampleRate : UInt32) 
   let hdrCore : List UInt8 := [0xFF, 0xF8, b2, b3] ++ utf8.data.toList ++ bsTail ++ srTail
   let crc8 := flacCrc8List hdrCore
   let hdrFull : ByteArray := { data := (hdrCore ++ [crc8]).toArray }
-  let rec writeSubs (w : BitWriter) (idx : Nat) : List (Array Int32) → BitWriter
+  let rec writeSubs (w : BitWriter) (idx : Nat) : List (Array Int64) → BitWriter
     | [] => w
     | chArr :: rest =>
       let subBps :=
         if (chAssign == 8 && idx == 1) || (chAssign == 9 && idx == 0) || (chAssign == 10 && idx == 1) then
           bps + 1
         else bps
-      let subMode := modeOpt.getD (flacChooseSubframeMode chArr subBps (blkSz > 64))
-      writeSubs (flacWriteSubframeBits w subMode subBps chArr) (idx + 1) rest
+      let subMode := modeOpt.getD (flacChooseSubframeMode64 chArr subBps (blkSz > 64))
+      writeSubs (flacWriteSubframeBits64 w subMode subBps chArr) (idx + 1) rest
   let w0 : BitWriter := { bytes := { data := #[] }, curByte := 0, bitsUsed := 0 }
   let subBytes := (writeSubs w0 0 encChans).toByteArray
   let bodyNoCrc := flacAppendBytes hdrFull subBytes
-  let crc16 :=
-    if bodyNoCrc.data.toList.length ≤ 256 then
-      flacCrc16List bodyNoCrc.data.toList
-    else
-      flacCrc16Slice { ba := bodyNoCrc, off := 0, len := bodyNoCrc.size } 0 bodyNoCrc.size
+  let crc16 := flacCrc16Slice { ba := bodyNoCrc, off := 0, len := bodyNoCrc.data.size } 0 bodyNoCrc.data.size
   let footer : ByteArray := { data := #[((crc16 >>> 8) &&& 0xFF).toUInt8, (crc16 &&& 0xFF).toUInt8] }
   some (flacAppendBytes bodyNoCrc footer)
 
+def flacSliceChannelLoop (ch : Array Int32) (i : Nat) (acc : Array Int32) : Nat → Array Int32
+  | 0 => acc
+  | k + 1 => flacSliceChannelLoop ch (i + 1) (acc.push (ch.getD i 0)) k
+
 def flacSliceChannelRange (ch : Array Int32) (off len : Nat) : Array Int32 :=
-  if ch.toList.length ≤ 256 then
-    ((ch.toList.drop off).take len).toArray
-  else
-    ch.extract off (off + len)
+  flacSliceChannelLoop ch off #[] len
 
 def flacEncodeFramesLoop (channelsData : Array (Array Int32)) (sampleRate : UInt32) (bps blockSize : Nat)
     (sampleOff : Nat) (frameIdx : UInt64) (minFrm maxFrm : Nat) (acc : ByteArray) :
     Nat → Option (ByteArray × Nat × Nat)
   | 0 => some (acc, minFrm, maxFrm)
   | fuel + 1 =>
-    let total := (channelsData.toList.getD 0 #[]).toList.length
+    let total := (channelsData.getD 0 #[]).size
     if sampleOff ≥ total then some (acc, minFrm, maxFrm)
     else do
       let curBlk := Nat.min blockSize (total - sampleOff)
       let blkChans := (channelsData.toList.map (fun ch => flacSliceChannelRange ch sampleOff curBlk)).toArray
       let frm ← flacEncodeFrame blkChans sampleRate bps frameIdx
-      let fLen := frm.data.toList.length
+      let fLen := frm.data.size
       let min' := if minFrm == 0 || fLen < minFrm then fLen else minFrm
       let max' := if fLen > maxFrm then fLen else maxFrm
       flacEncodeFramesLoop channelsData sampleRate bps blockSize (sampleOff + curBlk) (frameIdx + 1)
@@ -2460,14 +2535,16 @@ def flacEncodeFramesLoop (channelsData : Array (Array Int32)) (sampleRate : UInt
 
 def flacEncodeStream (channelsData : Array (Array Int32)) (sampleRate : UInt32) (bps : Nat := 16)
     (blockSize : Nat := 4096) (computeMd5 : Bool := true) : Option ByteArray := do
-  let nCh := channelsData.toList.length
-  if nCh == 0 || nCh > 8 || sampleRate == 0 || bps < 4 || bps > 32 || blockSize < 16 then none
-  let total := (channelsData.toList.getD 0 #[]).toList.length
-  if channelsData.toList.any (fun c => c.toList.length != total) then none
+  let nCh := channelsData.size
+  if nCh == 0 || nCh > 8 || sampleRate == 0 || sampleRate > (655350 : UInt32) ||
+     bps < 4 || bps > 32 || blockSize < 16 || blockSize > 65535 then none
+  let total := (channelsData.getD 0 #[]).size
+  if channelsData.toList.any (fun c => c.size != total) then none
   let numFrames := if total == 0 then 0 else (total + blockSize - 1) / blockSize
   let (framesBytes, minFrm, maxFrm) ←
     flacEncodeFramesLoop channelsData sampleRate bps blockSize 0 0 0 0 { data := #[] } (numFrames + 1)
-  let minBlk : UInt16 := (if total == 0 then blockSize else Nat.min blockSize (if total < 16 then 16 else total)).toUInt16
+  let minBlkNat := if total == 0 then blockSize else Nat.min blockSize (if total < 16 then 16 else total)
+  let minBlk : UInt16 := minBlkNat.toUInt16
   let maxBlk : UInt16 := blockSize.toUInt16
   let si : FlacStreamInfo := {
     minBlockSize := if minBlk < 16 then 16 else minBlk
@@ -2498,15 +2575,14 @@ def flacDecodedToAudioFrame (dec : FlacDecodedStream) : AudioFrame := Id.run do
   let nCh := dec.info.channels.toNat
   let nS := if nCh == 0 then 0 else (dec.channelsData.getD 0 #[]).size
   let bps := dec.info.bitsPerSample.toNat
-  let shiftTo16 (v : Int32) : Int32 :=
-    if bps == 16 then v
-    else if bps > 16 then v >>> Int32.ofNat (bps - 16)
+  let normSample (v : Int32) : Int32 :=
+    if bps > 16 || bps == 16 then v
     else v <<< Int32.ofNat (16 - bps)
   let mut samples := Array.mkEmpty (nCh * nS)
   for ch in [0:nCh] do
     let cArr := dec.channelsData.getD ch #[]
     for i in [0:nS] do
-      samples := samples.push (shiftTo16 (cArr.getD i 0))
+      samples := samples.push (normSample (cArr.getD i 0))
   return {
     sampleFmt := if bps > 16 then .s32p else .s16p
     sampleRate := dec.info.sampleRate
@@ -2524,16 +2600,19 @@ def flacEncodeAudioFrame (af : AudioFrame) (bps : Nat := 16) (blockSize : Nat :=
 def flacRoundtripChannels (chans : Array (Array Int32)) (sr : UInt32) (bps blkSz : Nat) :
     Option (List (List Int32)) := do
   let bytes ← flacEncodeStream chans sr bps blkSz false
-  let dec ← flacDecodeStream { ba := bytes, off := 0, len := bytes.data.toList.length } false
+  let dec ← flacDecodeStream { ba := bytes, off := 0, len := bytes.data.size } false
   if dec.info.sampleRate == sr && dec.info.bitsPerSample.toNat == bps then
     some (dec.channelsData.toList.map Array.toList)
   else none
 
-def flacRoundtripStereoMode (ch0 ch1 : Array Int32) (sm : FlacStereoMode) : Option (List (List Int32)) := do
-  let frm ← flacEncodeFrame #[ch0, ch1] 48000 16 0 (some sm) (some (.fixed .order2 0 4 false 16))
-  let si : FlacStreamInfo := ⟨16, 16, 0, 0, 48000, 2, 16, 16⟩
-  let (_, chans, used) ← flacDecodeFrameAt { ba := frm, off := 0, len := frm.data.toList.length } 0 si
-  if used == frm.data.toList.length then some (chans.toList.map Array.toList) else none
+def flacRoundtripStereoMode (ch0 ch1 : Array Int32) (sm : FlacStereoMode) (bps : Nat := 16)
+    (modeOpt : Option FlacSubframeSpecMode := some (.fixed .order2 0 4 false 16)) :
+    Option (List (List Int32)) := do
+  let blkSz := ch0.size
+  let frm ← flacEncodeFrame #[ch0, ch1] 48000 bps 0 (some sm) modeOpt
+  let si : FlacStreamInfo := ⟨blkSz.toUInt16, blkSz.toUInt16, 0, 0, 48000, 2, bps.toUInt8, blkSz.toUInt64⟩
+  let (_, chans, used) ← flacDecodeFrameAt { ba := frm, off := 0, len := frm.data.size } 0 si
+  if used == frm.data.size then some (chans.toList.map Array.toList) else none
 
 set_option maxHeartbeats 800000 in
 set_option maxRecDepth 200000 in
@@ -2541,11 +2620,16 @@ theorem flacStream_and_stereo_modes_roundtrip :
     let c0 : Array Int32 := #[0, 120, 240, 350, 440, 510, 550, 560, 540, 490, 410, 300, 170, 20, -130, -270]
     let c1 : Array Int32 := #[10, 110, 220, 310, 390, 450, 490, 500, 480, 430, 360, 260, 150, 30, -100, -220]
     let exp := [c0.toList, c1.toList]
+    let c32L : Array Int32 := #[2147483647, -2147483648, 1500000000, -1500000000]
+    let c32R : Array Int32 := #[-2147483648, 2147483647, -1500000000, 1500000000]
+    let exp32 := [c32L.toList, c32R.toList]
     flacRoundtripChannels #[c0, c1] 48000 16 16 = some exp ∧
     flacRoundtripStereoMode c0 c1 .independent = some exp ∧
     flacRoundtripStereoMode c0 c1 .leftSide = some exp ∧
     flacRoundtripStereoMode c0 c1 .rightSide = some exp ∧
-    flacRoundtripStereoMode c0 c1 .midSide = some exp := by
+    flacRoundtripStereoMode c0 c1 .midSide = some exp ∧
+    flacRoundtripStereoMode c32L c32R .midSide 32 (some .verbatim) = some exp32 ∧
+    flacRoundtripStereoMode c32L c32R .leftSide 32 (some (.fixed .order1 1 30 false 33)) = some exp32 := by
   decide
 
 end LeanAV.Audio
