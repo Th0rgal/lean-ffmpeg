@@ -1874,15 +1874,17 @@ def adler32Step (s1 s2 : UInt32) (b : UInt8) : UInt32 × UInt32 :=
   let a := (s1 + b.toUInt32) % 65521
   (a, (s2 + a) % 65521)
 
-def adler32List (bytes : List UInt8) : UInt32 :=
-  let sums := bytes.foldl (fun (a : UInt32 × UInt32) b =>
-    let s1 := (a.1 + b.toUInt32) % 65521
-    (s1, (a.2 + s1) % 65521)) (1, 0)
+def adler32 (data : ByteArray) : UInt32 :=
+  let sums := data.data.toList.foldl (fun (a : UInt32 × UInt32) b => adler32Step a.1 a.2 b) (1, 0)
   (sums.2 <<< 16) ||| sums.1
 
-def adler32 (data : ByteArray) : UInt32 := adler32List data.data.toList
-
-theorem adler32List_eq (data : ByteArray) : adler32List data.data.toList = adler32 data := rfl
+theorem adler32Step_bounds (s1 s2 : UInt32) (b : UInt8) :
+    (adler32Step s1 s2 b).1 < 65521 ∧ (adler32Step s1 s2 b).2 < 65521 ∧
+    adler32 ByteArray.empty = 1 ∧
+    adler32 (ByteArray.mk #[0x57, 0x69, 0x6B, 0x69, 0x70, 0x65, 0x64, 0x69, 0x61]) = 0x11E60398 := by
+  refine ⟨UInt32.mod_lt _ (by decide), UInt32.mod_lt _ (by decide), ?_, ?_⟩
+  · decide
+  · decide
 
 def pushU32BEDeflate (ba : ByteArray) (v : UInt32) : ByteArray :=
   ((((ba.push ((v >>> 24) &&& 0xFF).toUInt8).push ((v >>> 16) &&& 0xFF).toUInt8).push

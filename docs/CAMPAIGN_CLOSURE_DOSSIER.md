@@ -2,7 +2,7 @@
 
 The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
-audited **9,790 declarations with zero sorryAx/custom axioms** and **301/301
+audited **9,789 declarations with zero sorryAx/custom axioms** and **301/301
 tight specifications** (`Format`: 56, `Video`: 41, `Encoder`: 30, `Scale`: 28,
 `Bitstream`: 25, `NativeKernels`: 25, `Audio`: 23, `Spec`: 23, `PlanIR`: 19,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
