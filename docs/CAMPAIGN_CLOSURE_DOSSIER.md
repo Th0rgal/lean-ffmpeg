@@ -1,5 +1,31 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
+and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
+audited **10,309 declarations with zero sorryAx/custom axioms** and **320/320
+tight specifications** (`Format`: 56, `Video`: 46, `Audio`: 34, `Encoder`: 30,
+`Scale`: 28, `Bitstream`: 27, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 20,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
+shadowed), adding pure Lean 4 `independent_verified` Zlib/DEFLATE (RFC 1950 /
+RFC 1951 stored, fixed, and dynamic canonical Huffman + LZ77 + Adler-32), PNG
+(filters `0..4`, Adam7 interlace, strict RFC 2083 chunk ordering/multiplicity,
+`PLTE`/`tRNS` including 16-bit RGB and sub-8-bit keys, 1-bit grayscale `tRNS`
+with low-`bitDepth` high-bit masking, exact `(v + 128) / 257`
+16->8 downscaling and `-c:v copy`/`-c copy` chunk-exact stream copy, 8/16-bit
+rawvideo CLI roundtrip), and FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC
+subframes, 33-bit stereo side-channel samples with RFC 9639 §9.2.7.3
+`[-2147483647, 2147483647]` signed Rice residuals and adaptive
+partition order selection, fail-closed rejection of residual values outside
+`[-2147483647, 2147483647]` with verbatim fallback, `AudioFrame` 8..32-bit
+sign-extension/denormalization roundtrip, wasted bits, 4 stereo modes,
+STREAMINFO MD5 + CRC-8/CRC-16, `-c:a copy`/`-c copy` metadata-preserving stream
+copy, 3-way `independentVerified` / out-of-domain `fallbackDelegated` / corrupt
+fail-closed dispatch, and `WAVE_FORMAT_EXTENSIBLE` 8/12/16/20/24/32-bit WAV &
+raw PCM CLI roundtrip) decode and encode with zero `ffmpeg` subprocesses
+(verified under `PATH=/nonexistent` and `LEANAV_FFMPEG_BIN=/nonexistent`),
+passing `121` unit suite entries (`119` passed, `2` skipped without `clang-18`)
+and `78` differential suite entries (`74` passed, `4` skipped).
+
 The 2026-10-30 M1-A2 LNIR Pixel-Core Outer-Loop Wiring & TCB Disclosure update
 under Lean v4.35.0 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`,
 `audit-spec` v2.1) audited **9,065 declarations with zero sorryAx/custom axioms**
@@ -160,7 +186,8 @@ Every capability in the registry and in [`LeanAV.PlanIR.BackendTier`](../LeanAV/
   1. `LeanAV.PlanIR.rescalePtsIndependentOrFallback` (exact rational timestamp conversion with explicit out-of-domain fallback).
   2. `LeanAV.PlanIR.scalePlane2x2IndependentOrFallback` (verified 2x2 downscaler with bounds and parity guards).
   3. `LeanAV.PlanIR.demuxIvfIndependentOrFallback`, `LeanAV.PlanIR.demuxMatroskaIndependentOrFallback`, and `LeanAV.PlanIR.demuxMpegTsIndependentOrFallback` (IVF, Matroska `SimpleBlock`, and 188-byte MPEG-TS container demuxers with explicit out-of-domain fallback).
-  4. **16 Compiled `LNIR_WIRE_V1` DSP & Stencil Kernels** in [`LeanAV/NativeKernels.lean`](../LeanAV/NativeKernels.lean) (`swscale_luma_gain_bias_simd`, `flac_lpc_autocorr_dot_simd`, `opus_celt_pvq_mix_saxpy_gpu`, `av1_wiener_3tap_sym_gpu`, `av1_cdef_fma_blend_gpu`, `h264_idct_tuple_accum_sroa`, `bframe_bipred_blend_gpu`, `hevc_sao_band_offset_add_gpu`, `aac_imdct_window_mul_gpu`, `prores_qscale_map_simd`, `boxblur_div9_recip_shift_simd`, `pq10_studio_clamp_select_simd`, `swscale_down2x2_box_simd`, `swscale_down3x3_box_simd`, `swscale_down3to2_bilinear_simd`, `av1_cdef_dir_filter_simd`), validated with `lean-native-core validate-tv` (`16/16`, 64 samples) and `lean-native-core verify-certs` (`16/16 VerifiedKernelProof`), lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, including 7 vectorized 2D strided/reduction runtime routines) and NVIDIA PTX 8.0 (`sm_90`), linked into `libleanav_dsp.a`, and verified at runtime against `evalLnirKernel`.
+  4. `LeanAV.PlanIR.decodePngIndependentOrFallback`, `LeanAV.PlanIR.encodePngIndependentOrFallback`, `LeanAV.PlanIR.decodeFlacIndependentOrFallback`, and `LeanAV.PlanIR.encodeFlacIndependentOrFallback` (standalone PNG + Zlib/DEFLATE and FLAC lossless codecs gated by `standaloneLosslessPlanGateSpec` with zero `ffmpeg` subprocesses).
+  5. **16 Compiled `LNIR_WIRE_V1` DSP & Stencil Kernels** in [`LeanAV/NativeKernels.lean`](../LeanAV/NativeKernels.lean) (`swscale_luma_gain_bias_simd`, `flac_lpc_autocorr_dot_simd`, `opus_celt_pvq_mix_saxpy_gpu`, `av1_wiener_3tap_sym_gpu`, `av1_cdef_fma_blend_gpu`, `h264_idct_tuple_accum_sroa`, `bframe_bipred_blend_gpu`, `hevc_sao_band_offset_add_gpu`, `aac_imdct_window_mul_gpu`, `prores_qscale_map_simd`, `boxblur_div9_recip_shift_simd`, `pq10_studio_clamp_select_simd`, `swscale_down2x2_box_simd`, `swscale_down3x3_box_simd`, `swscale_down3to2_bilinear_simd`, `av1_cdef_dir_filter_simd`), validated with `lean-native-core validate-tv` (`16/16`, 64 samples) and `lean-native-core verify-certs` (`16/16 VerifiedKernelProof`), lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, including 7 vectorized 2D strided/reduction runtime routines) and NVIDIA PTX 8.0 (`sm_90`), linked into `libleanav_dsp.a`, and verified at runtime against `evalLnirKernel`.
 - **Completeness & Fallback Theorem**: `LeanAV.PlanIR.independentKernel_fallback_complete_and_sound`.
 - **CLI Verification**: `lffmpeg verify-kernels`.
 

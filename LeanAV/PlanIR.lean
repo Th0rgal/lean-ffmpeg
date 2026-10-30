@@ -14,6 +14,8 @@ import LeanAV.Spec
 import LeanAV.Core
 import LeanAV.Format
 import LeanAV.Scale
+import LeanAV.Audio
+import LeanAV.Video
 import LeanAV.Cli
 
 namespace LeanAV.PlanIR
@@ -23,6 +25,8 @@ open LeanAV.Spec
 open LeanAV.Core
 open LeanAV.Format
 open LeanAV.Scale
+open LeanAV.Audio
+open LeanAV.Video
 open LeanAV.Cli
 
 /-! ## 1. Contract Classification & Backend Tiers (§1 of Maxwell Plan) -/
@@ -630,7 +634,9 @@ def isExtendedMapSpec (s : String) : Bool :=
     let rest := String.ofList (s.toList.drop 1)
     (parseStreamMapSpec rest).isSome || isDelegatedGroupMapSpec rest || rest == "0:t" || rest == "0:t:0"
   else if strStartsWithFast s "[" && strEndsWithFast s "]" then
-    s.toList.length > 2
+    match s.toList with
+    | _ :: _ :: _ :: _ => true
+    | _ => false
   else
     isDelegatedGroupMapSpec s || s == "0:t" || s == "0:t?" || s == "0:t:0" || s == "0:t:0?"
 
@@ -905,6 +911,12 @@ structure ExtendedPlanFlags where
   seenFirstOutput        : Bool := false
   pendingOutputFmt       : Option String := none
   extraOutputs           : List (String × Option String) := []
+  inputFmt               : Option String := none
+  inputVideoSize         : Option (Nat × Nat) := none
+  inputPixFmt            : Option String := none
+  inputAudioRate         : Option Nat := none
+  inputAudioChannels     : Option Nat := none
+  outputAudioCodecRaw    : Option String := none
   deriving Repr, DecidableEq, Inhabited
 
 def parseSignedMapIndex : String → Option Int
@@ -950,6 +962,26 @@ def hasLavfiSourceFilter (graph : String) : Bool :=
    "mandelbrot", "life=", "cellauto", "gradients", "allrgb", "allyuv", "haldclutsrc",
    "pal75bars", "pal100bars", "rgbtestsrc", "sierpinski", "hilbert", "afirsrc",
    "anoisesrc", "movie=", "amovie="].any (fun src => strStartsWithFast graph src)
+
+def isStandaloneInputFmt (fmt : String) : Bool :=
+  ["rawvideo", "png_pipe", "image2", "flac", "wav", "s16le", "s24le", "s32le", "u8"].contains
+    (strToLowerAscii fmt)
+
+def isStandalonePcmFmtBps (fmt : String) : Option Nat :=
+  match strToLowerAscii fmt with
+  | "u8"    => some 8
+  | "s16le" => some 16
+  | "s24le" => some 24
+  | "s32le" => some 32
+  | _       => none
+
+def isStandalonePcmCodecBps (codec : String) : Option Nat :=
+  match strToLowerAscii codec with
+  | "pcm_u8"    => some 8
+  | "pcm_s16le" => some 16
+  | "pcm_s24le" => some 24
+  | "pcm_s32le" => some 32
+  | _           => none
 
 def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : ExtendedPlanFlags) : ExtendedPlanFlags :=
   if tok == "-i" then
@@ -1022,7 +1054,11 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
   else if tok == "-f" then
     if rest.contains "-i" then
       if supportedFormat value then
-        { acc with hasExtraDelegatedFlags := true, hasLavfiFmt := acc.hasLavfiFmt || value == "lavfi" }
+        let keepClean := !acc.seenInput && isStandaloneInputFmt value && acc.inputFmt.isNone
+        { acc with
+          inputFmt := if !acc.seenInput then some value else acc.inputFmt
+          hasExtraDelegatedFlags := if keepClean then acc.hasExtraDelegatedFlags else true
+          hasLavfiFmt := acc.hasLavfiFmt || value == "lavfi" }
       else
         { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-f " ++ value)] }
     else if !acc.seenFirstOutput then
@@ -1042,6 +1078,7 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
       { acc with
           globalCopy := value == "copy",
           copyData := value == "copy",
+          outputAudioCodecRaw := some value,
           baseArgs := acc.baseArgs ++ [tok, value] }
   else if tok == "-c:v" || tok == "-vcodec" || tok == "-codec:v" then
     if rest.contains "-i" || acc.seenFirstOutput then
@@ -1054,11 +1091,16 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
       if (parseCliCodec value).isSome then { acc with hasExtraDelegatedFlags := true }
       else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-c:a " ++ value)] }
     else
-      { acc with baseArgs := acc.baseArgs ++ ["-c:a", value] }
+      { acc with outputAudioCodecRaw := some value, baseArgs := acc.baseArgs ++ ["-c:a", value] }
   else if tok == "-s" || tok == "-video_size" then
     if rest.contains "-i" || acc.seenFirstOutput then
-      if (parseVideoSizeSpec value).isSome then { acc with hasExtraDelegatedFlags := true }
-      else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-s " ++ value)] }
+      match parseVideoSizeSpec value with
+      | some wh =>
+        let keepClean := !acc.seenInput && !acc.seenFirstOutput && acc.inputVideoSize.isNone
+        { acc with
+          inputVideoSize := if !acc.seenInput then some wh else acc.inputVideoSize
+          hasExtraDelegatedFlags := if keepClean then acc.hasExtraDelegatedFlags else true }
+      | none => { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-s " ++ value)] }
     else
       { acc with baseArgs := acc.baseArgs ++ ["-s", value] }
   else if tok == "-r" || tok == "-framerate" then
@@ -1069,19 +1111,34 @@ def applyExtendedFlagValue (tok value : String) (rest : List String) (acc : Exte
       { acc with baseArgs := acc.baseArgs ++ ["-r", value] }
   else if tok == "-ar" then
     if rest.contains "-i" || acc.seenFirstOutput then
-      if (parsePosNatSpec value).isSome then { acc with hasExtraDelegatedFlags := true }
-      else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ar " ++ value)] }
+      match parsePosNatSpec value with
+      | some sr =>
+        let keepClean := !acc.seenInput && !acc.seenFirstOutput && acc.inputAudioRate.isNone
+        { acc with
+          inputAudioRate := if !acc.seenInput then some sr else acc.inputAudioRate
+          hasExtraDelegatedFlags := if keepClean then acc.hasExtraDelegatedFlags else true }
+      | none => { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ar " ++ value)] }
     else
       { acc with baseArgs := acc.baseArgs ++ ["-ar", value] }
   else if tok == "-ac" then
     if rest.contains "-i" || acc.seenFirstOutput then
-      if (parsePosNatSpec value).isSome then { acc with hasExtraDelegatedFlags := true }
-      else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ac " ++ value)] }
+      match parsePosNatSpec value with
+      | some ch =>
+        let keepClean := !acc.seenInput && !acc.seenFirstOutput && acc.inputAudioChannels.isNone
+        { acc with
+          inputAudioChannels := if !acc.seenInput then some ch else acc.inputAudioChannels
+          hasExtraDelegatedFlags := if keepClean then acc.hasExtraDelegatedFlags else true }
+      | none => { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-ac " ++ value)] }
     else
       { acc with baseArgs := acc.baseArgs ++ ["-ac", value] }
   else if tok == "-pix_fmt" || tok == "-pixel_format" then
     if rest.contains "-i" || acc.seenFirstOutput then
-      if supportedPixFmt value then { acc with hasExtraDelegatedFlags := true }
+      if supportedPixFmt value then
+        let keepClean := !acc.seenInput && !acc.seenFirstOutput && acc.inputPixFmt.isNone &&
+          (pngPixFmtInfo value).isSome
+        { acc with
+          inputPixFmt := if !acc.seenInput then some value else acc.inputPixFmt
+          hasExtraDelegatedFlags := if keepClean then acc.hasExtraDelegatedFlags else true }
       else { acc with extraErrors := acc.extraErrors ++ [.unsupportedCodecOrFlag ("-pix_fmt " ++ value)] }
     else
       { acc with baseArgs := acc.baseArgs ++ ["-pix_fmt", value] }
@@ -1210,7 +1267,9 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extNoData
       extGlobalCopy extCopyData extBsfs extDumpPlan _extSeenInput _extSeenStartSec _extSeenDurSec
       extHasPostInputSeek extToIsInputOpt extToSec extHasLavfiFmt extHasLavfiInput
-      extHasExtraDelegatedFlags extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs =>
+      extHasExtraDelegatedFlags extExtraErrors extMpegOptions _extSeenFirstOut _extPendingFmt extExtraOutputs
+      extInputFmt extInputVideoSize extInputPixFmt extInputAudioRate extInputAudioChannels
+      extOutputAudioCodecRaw =>
   let toSubtractsStart : Bool := extToIsInputOpt || extHasPostInputSeek
   let toRangeErr : List CliError :=
     match extToSec with
@@ -1350,38 +1409,166 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     | none => false
     | some pf => !nativeMp4PixFmt pf
 
+  let isStandaloneOutCandidate : Bool :=
+    inferredFmt == "image2" || inferredFmt == "png_pipe" || inferredFmt == "rawvideo" ||
+    inferredFmt == "flac" || inferredFmt == "wav" ||
+    inferredFmt == "u8" || inferredFmt == "s16le" || inferredFmt == "s24le" || inferredFmt == "s32le"
+
+  let isStandaloneCommonClean : Bool :=
+    isStandaloneOutCandidate &&
+    match inputSpecs with
+    | [i] =>
+      !anyConcatInput &&
+      i.safePath &&
+      i.path != "-" &&
+      !(i.path.toList.contains '%') &&
+      isSafeLocalMediaPath outPath &&
+      outPath != "-" &&
+      !(outPath.toList.contains '%') &&
+      extExtraOutputs.isEmpty &&
+      !extHasExtraDelegatedFlags &&
+      extMpegOptions.isEmpty &&
+      !extNoSubtitle &&
+      !extNoData &&
+      (!extCopyData || extGlobalCopy) &&
+      extToSec.isNone &&
+      !extHasPostInputSeek &&
+      extMaps.isEmpty &&
+      extMetadataEntries.isEmpty &&
+      extMapMetadataSource == -1 &&
+      extMapChaptersSource == -1 &&
+      extSubtitleCodec.isNone &&
+      extBsfs.isEmpty &&
+      cfgVideoFilter.isNone &&
+      cfgAudioFilter.isNone &&
+      cfgStartSec.isNone &&
+      cfgDurationSec.isNone &&
+      cfgThreads.isNone &&
+      cfgBFrames.isNone &&
+      cfgGopSize.isNone &&
+      cfgMovflags.isNone &&
+      cfgPreset.isNone &&
+      cfgCrf.isNone &&
+      cfgVideoBitrate.isNone &&
+      cfgAudioBitrate.isNone &&
+      cfgFrameRate.isNone
+    | _ => false
+
+  let isStandalonePngRoute : Bool :=
+    isStandaloneCommonClean &&
+    !cfgNoVideo &&
+    (cfgAudioCodec.isNone || (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy)) &&
+    cfgAudioRate.isNone &&
+    cfgAudioChannels.isNone &&
+    extInputAudioRate.isNone &&
+    extInputAudioChannels.isNone &&
+    cfgVideoSize.isNone &&
+    (cfgVideoFrames == none || cfgVideoFrames == some 1) &&
+    (match cfgPixelFormat with | none => true | some pf => (pngPixFmtInfo pf).isSome) &&
+    (let lowerInPath := match inputSpecs with | [i] => strToLowerAscii i.path | _ => ""
+     let lowerOutPath := strToLowerAscii outPath
+     let inFmtLower := extInputFmt.map strToLowerAscii
+     let outFmtLower := cfgFormat.map strToLowerAscii
+     let isPngInput :=
+       strEndsWithFast lowerInPath ".png" &&
+       (inFmtLower == none || inFmtLower == some "png_pipe" || inFmtLower == some "image2") &&
+       extInputVideoSize.isNone && extInputPixFmt.isNone
+     let isRawVideoForPngInput :=
+       inFmtLower == some "rawvideo" && extInputVideoSize.isSome &&
+       (match extInputPixFmt with | some pf => (pngPixFmtInfo pf).isSome | none => false)
+     let isPngOutput :=
+       strEndsWithFast lowerOutPath ".png" &&
+       (outFmtLower == none || outFmtLower == some "png_pipe" || outFmtLower == some "image2")
+     let isRawVideoFromPngOutput :=
+       outFmtLower == some "rawvideo" ||
+       (outFmtLower == none && inferredFmt == "rawvideo" && cfgVideoCodec == some .rawvideo)
+     (isPngInput && isPngOutput &&
+      (cfgVideoCodec == none || cfgVideoCodec == some .png ||
+       (cfgVideoCodec == some .copy && cfgPixelFormat.isNone))) ||
+     (isPngInput && isRawVideoFromPngOutput &&
+      (cfgVideoCodec == none || cfgVideoCodec == some .rawvideo)) ||
+     (isRawVideoForPngInput && isPngOutput &&
+      (cfgVideoCodec == none || cfgVideoCodec == some .png)))
+
+  let isStandaloneFlacRoute : Bool :=
+    isStandaloneCommonClean &&
+    !cfgNoAudio &&
+    (cfgVideoCodec.isNone || (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy)) &&
+    cfgVideoSize.isNone &&
+    cfgVideoFrames.isNone &&
+    cfgPixelFormat.isNone &&
+    extInputVideoSize.isNone &&
+    extInputPixFmt.isNone &&
+    (let lowerInPath := match inputSpecs with | [i] => strToLowerAscii i.path | _ => ""
+     let lowerOutPath := strToLowerAscii outPath
+     let inFmtLower := extInputFmt.map strToLowerAscii
+     let outFmtLower := cfgFormat.map strToLowerAscii
+     let isFlacInput :=
+       strEndsWithFast lowerInPath ".flac" &&
+       (inFmtLower == none || inFmtLower == some "flac") &&
+       extInputAudioRate.isNone && extInputAudioChannels.isNone
+     let isWavForFlacInput :=
+       strEndsWithFast lowerInPath ".wav" &&
+       (inFmtLower == none || inFmtLower == some "wav") &&
+       extInputAudioRate.isNone && extInputAudioChannels.isNone
+     let isRawPcmForFlacInput :=
+       match inFmtLower.bind isStandalonePcmFmtBps, extInputAudioRate, extInputAudioChannels with
+       | some _, some sr, some ch => sr > 0 && ch > 0 && ch ≤ 8
+       | _, _, _ => false
+     let isFlacOutput :=
+       (strEndsWithFast lowerOutPath ".flac" && (outFmtLower == none || outFmtLower == some "flac")) ||
+       outFmtLower == some "flac"
+     let isWavFromFlacOutput :=
+       (strEndsWithFast lowerOutPath ".wav" && (outFmtLower == none || outFmtLower == some "wav")) ||
+       outFmtLower == some "wav"
+     let outRawPcmBps := outFmtLower.bind isStandalonePcmFmtBps
+     let outCodecPcmBps := extOutputAudioCodecRaw.bind isStandalonePcmCodecBps
+     let isPcmOutputCodecConsistent :=
+       if isWavFromFlacOutput then cfgAudioCodec == none || outCodecPcmBps.isSome
+       else
+         match outRawPcmBps with
+         | some fmtBps => cfgAudioCodec == none || outCodecPcmBps == some fmtBps
+         | none => false
+     (isFlacInput && isFlacOutput &&
+      (cfgAudioCodec == none || cfgAudioCodec == some .flac ||
+       (cfgAudioCodec == some .copy && cfgAudioRate.isNone && cfgAudioChannels.isNone))) ||
+     (isFlacInput && (isWavFromFlacOutput || outRawPcmBps.isSome) && isPcmOutputCodecConsistent) ||
+     ((isWavForFlacInput || isRawPcmForFlacInput) && isFlacOutput &&
+      (cfgAudioCodec == none || cfgAudioCodec == some .flac)))
+
   let isDelegatedContainerOrOption : Bool :=
-    inferredFmt != "mp4" ||
-    !extExtraOutputs.isEmpty ||
-    anyConcatInput ||
-    !isSingleMp4Input ||
-    extHasExtraDelegatedFlags ||
-    extHasPostInputSeek ||
-    extToSec.isSome ||
-    !extMpegOptions.isEmpty ||
-    extNoSubtitle ||
-    extNoData ||
-    extCopyData ||
-    !extMaps.isEmpty ||
-    !extMetadataEntries.isEmpty ||
-    extMapMetadataSource != -1 ||
-    extMapChaptersSource != -1 ||
-    extSubtitleCodec.isSome ||
-    !extBsfs.isEmpty ||
-    cfgAudioFilter.isSome ||
-    cfgNoVideo ||
-    cfgVideoFrames.isSome ||
-    cfgAudioRate.isSome ||
-    (cfgAudioChannels.isSome && cfgAudioChannels != some 2) ||
-    cfgThreads.isSome ||
-    cfgBFrames.isSome ||
-    cfgGopSize.isSome ||
-    cfgMovflags.isSome ||
-    isMixedCopyTranscode ||
-    isDelegatedVideoFilter ||
-    isDelegatedPixFmt ||
-    (cfgAudioCodec.isSome && cfgAudioCodec != some .copy && cfgAudioCodec != some .aac) ||
-    isDelegatedVideoCodec
+    !(isStandalonePngRoute || isStandaloneFlacRoute) &&
+    (inferredFmt != "mp4" ||
+     !extExtraOutputs.isEmpty ||
+     anyConcatInput ||
+     !isSingleMp4Input ||
+     extHasExtraDelegatedFlags ||
+     extHasPostInputSeek ||
+     extToSec.isSome ||
+     !extMpegOptions.isEmpty ||
+     extNoSubtitle ||
+     extNoData ||
+     extCopyData ||
+     !extMaps.isEmpty ||
+     !extMetadataEntries.isEmpty ||
+     extMapMetadataSource != -1 ||
+     extMapChaptersSource != -1 ||
+     extSubtitleCodec.isSome ||
+     !extBsfs.isEmpty ||
+     cfgAudioFilter.isSome ||
+     cfgNoVideo ||
+     cfgVideoFrames.isSome ||
+     cfgAudioRate.isSome ||
+     (cfgAudioChannels.isSome && cfgAudioChannels != some 2) ||
+     cfgThreads.isSome ||
+     cfgBFrames.isSome ||
+     cfgGopSize.isSome ||
+     cfgMovflags.isSome ||
+     isMixedCopyTranscode ||
+     isDelegatedVideoFilter ||
+     isDelegatedPixFmt ||
+     (cfgAudioCodec.isSome && cfgAudioCodec != some .copy && cfgAudioCodec != some .aac) ||
+     isDelegatedVideoCodec)
 
   let nativeCopyFormat := ["mp4", "mov", "ivf", "wav", "flac", "matroska", "mkv", "webm"].contains inferredFmt
   let nativeMetadataOk := extMetadataEntries.isEmpty ||
@@ -1433,6 +1620,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       (.unsupported, ["at_least_one_input_and_one_output_required"])
     else if isNativeStreamCopy then
       (.independentVerified, ["native_stream_copy"])
+    else if isStandalonePngRoute then
+      (.independentVerified, ["standalone_png_zlib_lossless_codec"])
+    else if isStandaloneFlacRoute then
+      (.independentVerified, ["standalone_flac_lossless_codec"])
     else if isDelegatedContainerOrOption then
       (.delegatedFaithful, ["phase4_structured_argv_delegation"])
     else if cfgStartSec.isSome || cfgDurationSec.isSome || cfgVideoCodec != some .copy then
@@ -1988,6 +2179,107 @@ def demuxMpegTsIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (Ar
     else
       .fallbackDelegated "mpegts_missing_sync_byte_or_empty_packets"
 
+inductive LosslessDecodeDispatch (α : Type) where
+  | independentVerified (value : α)
+  | fallbackDelegated (reason : String)
+  | invalidCorrupt (reason : String)
+  deriving Repr, DecidableEq, Inhabited
+
+def LosslessDecodeDispatch.tag {α : Type} : LosslessDecodeDispatch α → String × String
+  | .independentVerified _ => ("independentVerified", "")
+  | .fallbackDelegated r => ("fallbackDelegated", r)
+  | .invalidCorrupt r => ("invalidCorrupt", r)
+
+def classifyPngDecode3Way (s : ByteSlice) : LosslessDecodeDispatch PngImage :=
+  if pngHasOutOfDomainAncillaryChunks s then
+    .fallbackDelegated "out_of_domain_apng_animation_stream"
+  else
+    match pngDecode s with
+    | some img =>
+      if img.width > 0 && img.height > 0 then .independentVerified img
+      else .invalidCorrupt "invalid_or_corrupt_png_stream"
+    | none => .invalidCorrupt "invalid_or_corrupt_png_stream"
+
+def decodePngIndependentOrFallback (s : ByteSlice) : KernelExecutionResult PngImage :=
+  match classifyPngDecode3Way s with
+  | .independentVerified img => .independentVerified img
+  | .fallbackDelegated reason => .fallbackDelegated reason
+  | .invalidCorrupt reason => .fallbackDelegated reason
+
+def encodePngIndependentOrFallback (img : PngImage) : KernelExecutionResult ByteArray :=
+  match pngEncode img with
+  | some bytes => .independentVerified bytes
+  | none => .fallbackDelegated "invalid_png_image_geometry_or_pixels"
+
+def classifyFlacDecode3Way (s : ByteSlice) (verifyMd5 : Bool := true) :
+    LosslessDecodeDispatch FlacDecodedStream :=
+  match flacDecodeStream s verifyMd5 with
+  | some dec =>
+    if dec.info.sampleRate > 0 && dec.info.channels > 0 then .independentVerified dec
+    else .invalidCorrupt "invalid_or_corrupt_flac_stream"
+  | none =>
+    if flacHasValidOutOfDomainEnvelope s then
+      .fallbackDelegated "out_of_domain_flac_envelope_or_metadata"
+    else
+      .invalidCorrupt "invalid_or_corrupt_flac_stream"
+
+def decodeFlacIndependentOrFallback (s : ByteSlice) (verifyMd5 : Bool := true) :
+    KernelExecutionResult FlacDecodedStream :=
+  match classifyFlacDecode3Way s verifyMd5 with
+  | .independentVerified dec => .independentVerified dec
+  | .fallbackDelegated reason => .fallbackDelegated reason
+  | .invalidCorrupt reason => .fallbackDelegated reason
+
+def classifyWavDemux3Way (s : ByteSlice) :
+    LosslessDecodeDispatch (Array (Array Int32) × UInt32 × Nat) :=
+  match demuxWavPcmLE s with
+  | some res => .independentVerified res
+  | none =>
+    if wavHasValidOutOfDomainEnvelope s then
+      .fallbackDelegated "out_of_domain_wav_format_or_channel_count"
+    else
+      .invalidCorrupt "invalid_or_corrupt_wav_stream"
+
+def encodeFlacIndependentOrFallback (channelsData : Array (Array Int32)) (sampleRate : UInt32)
+    (bps : Nat := 16) (blockSize : Nat := 4096) (computeMd5 : Bool := true) :
+    KernelExecutionResult ByteArray :=
+  match flacEncodeStream channelsData sampleRate bps blockSize computeMd5 with
+  | some bytes => .independentVerified bytes
+  | none => .fallbackDelegated "invalid_flac_audio_parameters"
+
+def isStandaloneLosslessPlanValid (plan : MediaPlanIR) : Bool :=
+  plan.errors.isEmpty &&
+  (plan.backend.tier == .independentVerified) &&
+  !plan.backend.delegatedContainer &&
+  (plan.backend.reasons.contains "standalone_png_zlib_lossless_codec" ||
+   plan.backend.reasons.contains "standalone_flac_lossless_codec")
+
+def StandaloneLosslessPlanSafe (plan : MediaPlanIR) : Prop :=
+  plan.errors.isEmpty = true ∧ plan.backend.tier = .independentVerified ∧
+    plan.backend.delegatedContainer = false ∧
+    (plan.backend.reasons.contains "standalone_png_zlib_lossless_codec" = true ∨
+     plan.backend.reasons.contains "standalone_flac_lossless_codec" = true)
+
+def standaloneLosslessPlanGateSpec : AVGateSpec MediaPlanIR StandaloneLosslessPlanSafe where
+  gate := isStandaloneLosslessPlanValid
+  sound plan h := by
+    unfold isStandaloneLosslessPlanValid StandaloneLosslessPlanSafe at *
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, Bool.not_eq_true'] at h
+    exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+  complete plan h := by
+    unfold isStandaloneLosslessPlanValid StandaloneLosslessPlanSafe at *
+    rcases h with ⟨h1, h2, h3, h4⟩
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, Bool.not_eq_true']
+    exact ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩
+  posWitness := parseArgsToPlanIR ["-y", "-i", "in.png", "out.png"]
+  negWitness := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-c", "copy", "out.mp4"]
+  nonVacuous := by decide
+  tight := by decide
+
+theorem standaloneLosslessPlanGateSpec_iff (plan : MediaPlanIR) :
+    standaloneLosslessPlanGateSpec.gate plan = true ↔ StandaloneLosslessPlanSafe plan :=
+  standaloneLosslessPlanGateSpec.iff_safe plan
+
 /-! ## 6. Formal Soundness, Round-Trip & Fallback Theorems (Phases 3, 4, 5 & 6) -/
 
 set_option maxRecDepth 200000
@@ -2209,6 +2501,50 @@ theorem isNoFileOutputFormat_non_vacuous :
     isNoFileOutputFormat "mp4" "out.mp4" = false ∧
     isNoFileOutputFormat "image2" "frame.png" = false ∧
     isNoFileOutputFormat "image2" "frame-%03d.png" = true := by
+  decide
+
+theorem standaloneLossless_routing_and_kernels_verified :
+    let pPng := parseArgsToPlanIR ["-y", "-i", "in.png", "out.png"]
+    let pPngCopyV := parseArgsToPlanIR ["-y", "-i", "in.png", "-c:v", "copy", "out.png"]
+    let pPngCopyAll := parseArgsToPlanIR ["-y", "-i", "in.png", "-c", "copy", "out.png"]
+    let pRawPng := parseArgsToPlanIR ["-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "8x8", "-i", "in.rgb", "out.png"]
+    let pPngRaw := parseArgsToPlanIR ["-y", "-i", "in.png", "-f", "rawvideo", "-pix_fmt", "rgba", "out.raw"]
+    let pFlac := parseArgsToPlanIR ["-y", "-i", "in.flac", "out.flac"]
+    let pFlacCopyA := parseArgsToPlanIR ["-y", "-i", "in.flac", "-c:a", "copy", "out.flac"]
+    let pFlacCopyAll := parseArgsToPlanIR ["-y", "-i", "in.flac", "-c", "copy", "out.flac"]
+    let pFlacWav := parseArgsToPlanIR ["-y", "-i", "in.flac", "out.wav"]
+    let pFlacS24 := parseArgsToPlanIR ["-y", "-i", "in.flac", "-f", "s24le", "out.pcm"]
+    let pFlacAf := parseArgsToPlanIR ["-y", "-i", "in.flac", "-af", "hdcd", "-f", "s24le", "out.pcm"]
+    let badImg : PngImage := ⟨0, 0, 8, 2, { data := #[] }, { data := #[] }, { data := #[] }⟩
+    pPng.backend.tier = .independentVerified ∧
+    pPngCopyV.backend.tier = .independentVerified ∧
+    pPngCopyAll.backend.tier = .independentVerified ∧
+    pRawPng.backend.tier = .independentVerified ∧
+    pPngRaw.backend.tier = .independentVerified ∧
+    pFlac.backend.tier = .independentVerified ∧
+    pFlacCopyA.backend.tier = .independentVerified ∧
+    pFlacCopyAll.backend.tier = .independentVerified ∧
+    pFlacWav.backend.tier = .independentVerified ∧
+    pFlacS24.backend.tier = .independentVerified ∧
+    pFlacAf.backend.tier = .delegatedFaithful ∧
+    encodePngIndependentOrFallback badImg = .fallbackDelegated "invalid_png_image_geometry_or_pixels" ∧
+    encodeFlacIndependentOrFallback #[] 48000 = .fallbackDelegated "invalid_flac_audio_parameters" := by
+  decide
+
+theorem losslessDecode3Way_trichotomy_verified :
+    let oggHdr : ByteSlice :=
+      { ba := { data := #[0x4F, 0x67, 0x67, 0x53, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }
+        off := 0, len := 32 }
+    let rf64Hdr : ByteSlice :=
+      { ba := { data := #[0x52, 0x46, 0x36, 0x34, 0xFF, 0xFF, 0xFF, 0xFF, 0x57, 0x41, 0x56, 0x45,
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }
+        off := 0, len := 44 }
+    let corrupt : ByteSlice := { ba := { data := #[0x00, 0x01, 0x02, 0x03] }, off := 0, len := 4 }
+    (classifyFlacDecode3Way oggHdr true).tag = ("fallbackDelegated", "out_of_domain_flac_envelope_or_metadata") ∧
+    (classifyFlacDecode3Way corrupt true).tag = ("invalidCorrupt", "invalid_or_corrupt_flac_stream") ∧
+    (classifyWavDemux3Way rf64Hdr).tag = ("fallbackDelegated", "out_of_domain_wav_format_or_channel_count") ∧
+    (classifyWavDemux3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_wav_stream") ∧
+    (classifyPngDecode3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_png_stream") := by
   decide
 
 end LeanAV.PlanIR
