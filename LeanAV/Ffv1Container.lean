@@ -47,6 +47,30 @@ private def slice (b : ByteArray) (p n : Nat) : Except String ByteArray :=
 private def ratio (n d : Nat) : Nat × Nat :=
   let g := Nat.gcd n d
   (n / g, d / g)
+
+/-- Resolve Matroska video track `(sarNum, sarDen)` from `(width, height)`, optional
+    `DisplayWidth`/`DisplayHeight` (`0x54B0`/`0x54BA`), and `DisplayUnit` (`0x54B2`, default `0`). -/
+def resolveMkvSar (width height : Nat) (dwOpt dhOpt : Option Nat) (unit : Nat) :
+    Except String (Nat × Nat) := do
+  if unit > 4 then throw "Invalid Matroska display unit"
+  let dw := dwOpt.getD (if unit == 0 then width else 0)
+  let dh := dhOpt.getD (if unit == 0 then height else 0)
+  if (dwOpt.isSome || dhOpt.isSome) && (dw == 0 || dh == 0) then
+    throw "Invalid Matroska display dimensions"
+  if dwOpt.isNone && dhOpt.isNone then
+    return if unit == 4 then (0, 1) else (1, 1)
+  else if dw > 0 && dh > 0 && width > 0 && height > 0 then
+    return ratio (dw * height) (dh * width)
+  else
+    return if unit == 4 then (0, 1) else (1, 1)
+
+/-- Compute `(dwOpt, dhOpt, unitOpt)` emitted by `muxMkv` for `(width, height, sarNum, sarDen)`. -/
+def encodeMkvDisplay (width height sarNum sarDen : Nat) : Option Nat × Option Nat × Option Nat :=
+  if sarNum == 0 then (none, none, some 4)
+  else if ratio sarNum sarDen == (1, 1) then (none, none, none)
+  else
+    let (dw, dh) := ratio (width * sarNum) (height * sarDen)
+    (some dw, some dh, some 3)
 private def validate (s : Stream) : Except String Unit := do
   if s.width == 0 || s.height == 0 || s.width > 65535 || s.height > 65535 then
     throw "Invalid container dimensions"
@@ -211,14 +235,14 @@ def demuxMkv (b : ByteArray) : Except String Stream := do
           let vs ← ebmlNodes b video.pos video.stop
           let width ← optUInt b vs 0xB0 0
           let height ← optUInt b vs 0xBA 0
-          let hasDisplay := (vs.find? (·.id == 0x54B0)).isSome || (vs.find? (·.id == 0x54BA)).isSome
-          let dw ← optUInt b vs 0x54B0 width
-          let dh ← optUInt b vs 0x54BA height
+          let dwOpt ← match vs.find? (·.id == 0x54B0) with
+            | some n => some <$> nodeUInt b n
+            | none => pure none
+          let dhOpt ← match vs.find? (·.id == 0x54BA) with
+            | some n => some <$> nodeUInt b n
+            | none => pure none
           let unit ← optUInt b vs 0x54B2 0
-          if unit > 4 || (unit != 4 && (dw == 0 || dh == 0)) then throw "Invalid Matroska display dimensions"
-          let (sn, sd) :=
-            if !hasDisplay || unit == 4 then (0, 1)
-            else ratio (dw * height) (dh * width)
+          let (sn, sd) ← resolveMkvSar width height dwOpt dhOpt unit
           let duration ← optUInt b es 0x23E383 40000000
           if duration == 0 then throw "Invalid Matroska DefaultDuration"
           let (tn, td) := durationRatio duration
@@ -262,10 +286,10 @@ def muxMkv (s : Stream) : Except String ByteArray := do
   let info := ebml 0x1549A966 (eu 0x2AD7B1 1000000 ++
     ebml 0x4D80 (bytes "LeanAV") ++ ebml 0x5741 (bytes "LeanAV"))
   let dispFields :=
-    if s.sarNum == 0 then ByteArray.empty
-    else
-      let (dw, dh) := ratio (s.width * s.sarNum) (s.height * s.sarDen)
-      eu 0x54B0 dw ++ eu 0x54BA dh ++ eu 0x54B2 3
+    match encodeMkvDisplay s.width s.height s.sarNum s.sarDen with
+    | (none, none, some u) => eu 0x54B2 u
+    | (some dw, some dh, some u) => eu 0x54B0 dw ++ eu 0x54BA dh ++ eu 0x54B2 u
+    | _ => ByteArray.empty
   let video := ebml 0xE0 (eu 0xB0 s.width ++ eu 0xBA s.height ++ dispFields)
   let duration := (1000000000 * s.timeNum + s.timeDen / 2) / s.timeDen
   if duration == 0 then throw "Matroska frame duration below one nanosecond"

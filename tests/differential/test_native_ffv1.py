@@ -36,6 +36,18 @@ def _make_packed_or_gray(size_per_frame: int, frames: int) -> bytes:
     return bytes(out)
 
 
+def _normalize_framemd5(raw: bytes) -> tuple[bool, list[str]]:
+    lines = raw.decode("utf-8").splitlines()
+    has_sw = False
+    kept: list[str] = []
+    for ln in lines:
+        if ln.startswith("#software:"):
+            has_sw = True
+        else:
+            kept.append(ln)
+    return has_sw, kept
+
+
 class NativeFfv1Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -202,7 +214,14 @@ class NativeFfv1Tests(unittest.TestCase):
                     lean_out = self.run_isolated("-i", str(mkv_d), "-f", fmt, "-")
                     self.assertEqual(ref_out.returncode, 0, ref_out.stderr.decode(errors="replace"))
                     self.assertEqual(lean_out.returncode, 0, lean_out.stderr.decode(errors="replace"))
-                    self.assertEqual(lean_out.stdout, ref_out.stdout)
+                    if fmt == "framemd5":
+                        ref_sw, ref_lines = _normalize_framemd5(ref_out.stdout)
+                        lean_sw, lean_lines = _normalize_framemd5(lean_out.stdout)
+                        self.assertTrue(ref_sw)
+                        self.assertTrue(lean_sw)
+                        self.assertEqual(lean_lines, ref_lines)
+                    else:
+                        self.assertEqual(lean_out.stdout, ref_out.stdout)
 
             expected_md5 = f"MD5={hashlib.md5(self.run_ref('-i', str(y4m_src), '-f', 'rawvideo', '-').stdout).hexdigest()}\n".encode()
             lean_md5 = self.run_isolated("-i", str(mkv_a), "-f", "md5", "-")
@@ -274,6 +293,151 @@ class NativeFfv1Tests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(del_res.returncode, 0, del_res.stderr.decode(errors="replace"))
+
+    def test_two_pass_coder2_custom_transition_table_decode_parity(self):
+        with tempfile.TemporaryDirectory(prefix="native-ffv1-2pass-") as tmp:
+            root = Path(tmp)
+            w, h, frames = 32, 24, 4
+            raw_bytes = _make_yuv420p(w, h, frames)
+            raw_in = root / "src.yuv"
+            raw_in.write_bytes(raw_bytes)
+            passlog = root / "ffv1_2pass"
+            out_mkv = root / "twopass.mkv"
+            p1 = self.run_ref(
+                "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+                "-video_size", f"{w}x{h}", "-framerate", "25",
+                "-i", str(raw_in), "-c:v", "ffv1", "-level", "3",
+                "-coder", "1", "-context", "1", "-slices", "4", "-slicecrc", "1", "-g", "2",
+                "-pass", "1", "-passlogfile", str(passlog),
+                "-f", "null", os.devnull,
+            )
+            self.assertEqual(p1.returncode, 0, p1.stderr.decode(errors="replace"))
+            p2 = self.run_ref(
+                "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+                "-video_size", f"{w}x{h}", "-framerate", "25",
+                "-i", str(raw_in), "-c:v", "ffv1", "-level", "3",
+                "-coder", "1", "-context", "1", "-slices", "4", "-slicecrc", "1", "-g", "2",
+                "-pass", "2", "-passlogfile", str(passlog),
+                str(out_mkv),
+            )
+            self.assertEqual(p2.returncode, 0, p2.stderr.decode(errors="replace"))
+
+            lean_raw = self.run_isolated("-i", str(out_mkv), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-")
+            self.assertEqual(lean_raw.returncode, 0, lean_raw.stderr.decode(errors="replace"))
+            self.assertEqual(lean_raw.stdout, raw_bytes)
+
+            ref_fmd5 = self.run_ref("-i", str(out_mkv), "-f", "framemd5", "-")
+            lean_fmd5 = self.run_isolated("-i", str(out_mkv), "-f", "framemd5", "-")
+            self.assertEqual(ref_fmd5.returncode, 0, ref_fmd5.stderr.decode(errors="replace"))
+            self.assertEqual(lean_fmd5.returncode, 0, lean_fmd5.stderr.decode(errors="replace"))
+            ref_sw, ref_lines = _normalize_framemd5(ref_fmd5.stdout)
+            lean_sw, lean_lines = _normalize_framemd5(lean_fmd5.stdout)
+            self.assertTrue(ref_sw and lean_sw)
+            self.assertEqual(lean_lines, ref_lines)
+
+    def test_unsupported_ffv1_pix_fmt_honors_nonexistent_ffmpeg_bin_fail_closed(self):
+        with tempfile.TemporaryDirectory(prefix="native-ffv1-noescape-") as tmp:
+            root = Path(tmp)
+            nv12_in = root / "src.nv12"
+            nv12_in.write_bytes(bytes(16 * 16 * 3 // 2))
+            out_mkv = root / "out_nv12.mkv"
+            env_nonexistent = {
+                "PATH": "/nonexistent",
+                "LEANAV_FFMPEG_BIN": "/nonexistent",
+                "LEANAV_FFPROBE_BIN": "/nonexistent",
+                "LANG": "C",
+                "LC_ALL": "C",
+            }
+            strace_bin = shutil.which("strace")
+            if strace_bin:
+                trace_log = root / "nv12_strace.log"
+                proc = subprocess.run(
+                    [
+                        strace_bin, "-f", "-e", "trace=execve", "-o", str(trace_log),
+                        str(BINARY), "-y", "-f", "rawvideo", "-pix_fmt", "nv12",
+                        "-video_size", "16x16", "-framerate", "25",
+                        "-i", str(nv12_in), "-c:v", "ffv1", str(out_mkv),
+                    ],
+                    env=env_nonexistent,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                trace_text = trace_log.read_text(encoding="utf-8")
+                self.assertNotIn('"/usr/bin/ffmpeg"', trace_text)
+                self.assertNotIn('"/usr/local/bin/ffmpeg"', trace_text)
+            else:
+                proc = subprocess.run(
+                    [
+                        str(BINARY), "-y", "-f", "rawvideo", "-pix_fmt", "nv12",
+                        "-video_size", "16x16", "-framerate", "25",
+                        "-i", str(nv12_in), "-c:v", "ffv1", str(out_mkv),
+                    ],
+                    env=env_nonexistent,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(out_mkv.exists())
+
+    def test_matroska_sar_display_unit_bidirectional_parity(self):
+        with tempfile.TemporaryDirectory(prefix="native-ffv1-sar-") as tmp:
+            root = Path(tmp)
+            w, h, frames = 16, 12, 2
+            raw_bytes = _make_yuv420p(w, h, frames)
+            raw_in = root / "src.yuv"
+            raw_in.write_bytes(raw_bytes)
+            cases = (
+                ("0_1", "0:0", [], "#sar 0: 0/1"),
+                ("1_1", "1:1", ["-vf", "setsar=1/1"], "#sar 0: 1/1"),
+                ("4_3", "4:3", ["-vf", "setsar=4/3"], "#sar 0: 4/3"),
+            )
+            for label, y4m_sar, vf_args, expected_sar_line in cases:
+                with self.subTest(sar=label):
+                    ff_mkv = root / f"ff_{label}.mkv"
+                    ff_enc = self.run_ref(
+                        "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+                        "-video_size", f"{w}x{h}", "-framerate", "25",
+                        "-i", str(raw_in), *vf_args,
+                        "-c:v", "ffv1", "-level", "3", "-coder", "1", "-slices", "4",
+                        str(ff_mkv),
+                    )
+                    self.assertEqual(ff_enc.returncode, 0, ff_enc.stderr.decode(errors="replace"))
+
+                    lean_mkv = root / f"lean_{label}.mkv"
+                    if label == "0_1":
+                        lean_enc = self.run_isolated(
+                            "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+                            "-video_size", f"{w}x{h}", "-framerate", "25",
+                            "-i", str(raw_in), "-c:v", "ffv1", "-level", "3",
+                            "-coder", "1", "-slices", "4", str(lean_mkv),
+                        )
+                    else:
+                        y4m_in = root / f"in_{label}.y4m"
+                        hdr = f"YUV4MPEG2 W{w} H{h} F25:1 Ip A{y4m_sar} C420jpeg\n".encode("ascii")
+                        frame_sz = w * h * 3 // 2
+                        body = bytearray(hdr)
+                        for idx in range(frames):
+                            body.extend(b"FRAME\n")
+                            body.extend(raw_bytes[idx * frame_sz : (idx + 1) * frame_sz])
+                        y4m_in.write_bytes(bytes(body))
+                        lean_enc = self.run_isolated(
+                            "-y", "-i", str(y4m_in), "-c:v", "ffv1", "-level", "3",
+                            "-coder", "1", "-slices", "4", str(lean_mkv),
+                        )
+                    self.assertEqual(lean_enc.returncode, 0, lean_enc.stderr.decode(errors="replace"))
+
+                    for tag, media_path in (("ff_mkv", ff_mkv), ("lean_mkv", lean_mkv)):
+                        with self.subTest(sar=label, producer=tag):
+                            ref_fmd5 = self.run_ref("-i", str(media_path), "-f", "framemd5", "-")
+                            lean_fmd5 = self.run_isolated("-i", str(media_path), "-f", "framemd5", "-")
+                            self.assertEqual(ref_fmd5.returncode, 0, ref_fmd5.stderr.decode(errors="replace"))
+                            self.assertEqual(lean_fmd5.returncode, 0, lean_fmd5.stderr.decode(errors="replace"))
+                            ref_sw, ref_lines = _normalize_framemd5(ref_fmd5.stdout)
+                            lean_sw, lean_lines = _normalize_framemd5(lean_fmd5.stdout)
+                            self.assertTrue(ref_sw and lean_sw)
+                            self.assertIn(expected_sar_line, ref_lines)
+                            self.assertEqual(lean_lines, ref_lines)
 
 
 if __name__ == "__main__":

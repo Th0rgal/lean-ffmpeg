@@ -567,4 +567,146 @@ theorem ffv1RangeDecoder_getBit_range_inv (r : RangeDecoder) (state : Nat)
   · exact ffv1RangeDecoder_refill_inv
       { r with low := r.low - (r.range - r.range * state / 256), range := r.range * state / 256 } hsplit.1
 
+theorem ffv1Transitions_fromOne_zero_size (one : Array Nat) :
+    (Transitions.fromOne one).zero.size = 256 := by
+  simp [Transitions.fromOne]
+
+theorem ffv1Transitions_fromOne_zero_at_zero (one : Array Nat) :
+    (Transitions.fromOne one).zero[0]! = 0 := by
+  simp [Transitions.fromOne]
+
+theorem ffv1Transitions_fromOne_preserves_state_bounds (one : Array Nat) (i : Nat)
+    (hi1 : 1 ≤ i) (hi255 : i ≤ 255)
+    (hone : 1 ≤ one.getD (256 - i) 0 ∧ one.getD (256 - i) 0 ≤ 255) :
+    1 ≤ (Transitions.fromOne one).zero.getD i 0 ∧ (Transitions.fromOne one).zero.getD i 0 ≤ 255 := by
+  have hilt : i < 256 := by omega
+  have hget : (Transitions.fromOne one).zero.getD i 0 =
+      (if i == 0 then 0 else (256 - one.getD (256 - i) 0) % 256) := by
+    simp [Transitions.fromOne, Array.getD, hilt]
+  rw [hget]
+  have hne : (i == 0) = false := beq_false_of_ne (by omega)
+  rw [hne]
+  change 1 ≤ (256 - one.getD (256 - i) 0) % 256 ∧ (256 - one.getD (256 - i) 0) % 256 ≤ 255
+  omega
+
+set_option maxRecDepth 400000 in
+theorem ffv1DefaultTransitions_interior_bounded_and_closure :
+    ((List.range 241).all fun k =>
+      let i := k + 8
+      8 ≤ defaultTransitions.one.getD i 0 && defaultTransitions.one.getD i 0 ≤ 248 &&
+      8 ≤ defaultTransitions.zero.getD i 0 && defaultTransitions.zero.getD i 0 ≤ 248) = true ∧
+    defaultTransitions.zero.getD 128 0 = 122 ∧
+    defaultTransitions.one.getD 128 0 = 134 := by
+  decide
+
+set_option maxRecDepth 400000 in
+theorem ffv1Version2Transitions_zero_and_one_bounded :
+    ((List.range 255).all fun k =>
+      let i := k + 1
+      1 ≤ version2Transitions.one.getD i 0 && version2Transitions.one.getD i 0 ≤ 255 &&
+      1 ≤ version2Transitions.zero.getD i 0 && version2Transitions.zero.getD i 0 ≤ 255) = true ∧
+    version2Transitions.zero.getD 255 0 = 246 := by
+  decide
+
+theorem ffv1AppendCrc_size_exact (b : ByteArray) :
+    (appendCrc b).size = b.size + 4 := by
+  unfold appendCrc
+  repeat rw [ByteArray.size_push]
+
+set_option maxRecDepth 400000 in
+theorem ffv1AppendCrc_verifies_and_detects_bitflip :
+    crc32 (appendCrc "FFV1-v3-header".toUTF8) = 0 ∧
+    crc32 ((appendCrc "FFV1-v3-header".toUTF8).set! 0 0xFF) ≠ 0 := by
+  decide
+
+theorem ffv1RangeEncoder_putBit_preserves_state_bounds (r : RangeEncoder) (state : Nat) (bit : Bool)
+    (htOne : 1 ≤ r.transitions.one[state]! ∧ r.transitions.one[state]! ≤ 255)
+    (htZero : 1 ≤ r.transitions.zero[state]! ∧ r.transitions.zero[state]! ≤ 255) :
+    1 ≤ (r.putBit state bit).2 ∧ (r.putBit state bit).2 ≤ 255 := by
+  unfold RangeEncoder.putBit
+  cases bit <;> simp [htOne, htZero]
+
+theorem ffv1RangeDecoder_getBit_preserves_state_bounds (r : RangeDecoder) (state : Nat)
+    (hr : 256 ≤ r.range) (hs1 : 1 ≤ state) (hs255 : state ≤ 255)
+    (htOne : 1 ≤ r.transitions.one[state]! ∧ r.transitions.one[state]! ≤ 255)
+    (htZero : 1 ≤ r.transitions.zero[state]! ∧ r.transitions.zero[state]! ≤ 255) :
+    let (_, nextState, nextRd) := r.getBit state
+    1 ≤ nextState ∧ nextState ≤ 255 ∧ 256 ≤ nextRd.range := by
+  have hinv := ffv1RangeDecoder_getBit_range_inv r state hr hs1 hs255
+  unfold RangeDecoder.getBit at hinv ⊢
+  dsimp only at hinv ⊢
+  split
+  · next hcond =>
+    simp only [hcond, ↓reduceIte] at hinv
+    exact ⟨htZero.1, htZero.2, hinv.1⟩
+  · next hcond =>
+    simp only [hcond, ↓reduceIte] at hinv
+    exact ⟨htOne.1, htOne.2, hinv.1⟩
+
+theorem ffv1SplitV3Slices_rejects_short_packets (pkt : ByteArray) (ec : Nat) :
+    (ec = 0 → pkt.size < 3 → splitV3Slices pkt ec = .error "FFV1 packet shorter than slice trailer") ∧
+    (ec ≠ 0 → pkt.size < 8 → splitV3Slices pkt ec = .error "FFV1 packet shorter than slice trailer") := by
+  refine ⟨?_, ?_⟩
+  · intro hec hsz
+    subst hec
+    unfold splitV3Slices
+    simp [hsz, Bind.bind, Except.bind, MonadExcept.throw, throwThe, MonadExceptOf.throw]
+  · intro hec hsz
+    unfold splitV3Slices
+    have hne : (ec != 0) = true := by simp [hec]
+    simp [hne, hsz, Bind.bind, Except.bind, MonadExcept.throw, throwThe, MonadExceptOf.throw]
+
+theorem ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p (cfg : Configuration)
+    (pkt : ByteArray) (w h : Nat) :
+    decodeFrameV3 cfg 0 h pkt = .error "Invalid FFV1 frame dimensions" ∧
+    decodeFrameV3 cfg w 0 pkt = .error "Invalid FFV1 frame dimensions" ∧
+    (cfg.colorspace = 0 → cfg.chroma = true → w = 3 → h = 4 →
+      decodeFrameV3 cfg w h pkt = .error "Odd dimensions for yuv420p FFV1 frame") := by
+  refine ⟨?_, ?_, ?_⟩
+  · unfold decodeFrameV3
+    simp [Bind.bind, Except.bind, MonadExcept.throw, throwThe, MonadExceptOf.throw]
+  · unfold decodeFrameV3
+    simp [Bind.bind, Except.bind, MonadExcept.throw, throwThe, MonadExceptOf.throw]
+  · intro hcs hch hw hh
+    subst hw hh
+    unfold decodeFrameV3
+    simp [hcs, hch, Bind.bind, Except.bind, MonadExcept.throw, throwThe, MonadExceptOf.throw]
+
+theorem ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation (cfg : Configuration)
+    (raw : ByteArray)
+    (hhs : cfg.horizontalSlices = 1) (hvs : cfg.verticalSlices = 1)
+    (hq : 1 ≤ cfg.quantization.size) :
+    (raw.size ≠ 24 →
+      encodeFrameV3 cfg 4 4 .yuv420p raw 0 true #[] =
+        .error "Raw frame byte length mismatch") ∧
+    (raw.size = 24 → cfg.intra = 1 →
+      encodeFrameV3 cfg 4 4 .yuv420p raw 0 false #[] =
+        .error "Cannot emit inter-frame in intra-only FFV1 configuration") := by
+  have hctx : ¬ (0 ≥ cfg.quantization.size) := by omega
+  refine ⟨?_, ?_⟩
+  · intro hsz
+    unfold encodeFrameV3 Ffv1PixelFormat.frameByteSize
+    simp [hhs, hvs, hctx, hsz, pure, Except.pure, Bind.bind, Except.bind,
+      MonadExcept.throw, throwThe, MonadExceptOf.throw]
+  · intro hsz hintra
+    unfold encodeFrameV3 Ffv1PixelFormat.frameByteSize
+    simp [hhs, hvs, hctx, hsz, hintra, pure, Except.pure, Bind.bind, Except.bind,
+      MonadExcept.throw, throwThe, MonadExceptOf.throw]
+
+theorem ffv1MkvSar_roundtrip_unknown_square_and_anamorphic :
+    let okEq (r : Except String (Nat × Nat)) (p : Nat × Nat) : Bool :=
+      match r with
+      | .ok q => q == p
+      | .error _ => false
+    let roundtrip (w h sn sd : Nat) :=
+      let (dwOpt, dhOpt, uOpt) := encodeMkvDisplay w h sn sd
+      resolveMkvSar w h dwOpt dhOpt (uOpt.getD 0)
+    okEq (roundtrip 16 12 0 1) (0, 1) = true ∧
+    okEq (roundtrip 16 12 1 1) (1, 1) = true ∧
+    okEq (roundtrip 16 12 4 3) (4, 3) = true ∧
+    okEq (resolveMkvSar 16 12 none none 0) (1, 1) = true ∧
+    okEq (resolveMkvSar 16 12 none none 4) (0, 1) = true ∧
+    (match resolveMkvSar 16 12 none none 5 with | .error _ => true | .ok _ => false) = true := by
+  decide
+
 end LeanAV.Ffv1Proofs

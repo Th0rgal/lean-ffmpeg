@@ -1645,7 +1645,7 @@ def verifyU16LeNative (_ : Unit) : Bool := Id.run do
 
 def resolveToolExecPathIO (envVar : String) (candidates : List String) (fallback : String) : IO String := do
   if let some p ← IO.getEnv envVar then
-    if p != "" && (← System.FilePath.pathExists p) then
+    if p != "" then
       return p
   for c in candidates do
     if (← System.FilePath.pathExists c) then

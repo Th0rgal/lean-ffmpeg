@@ -2,49 +2,62 @@ import LeanAV.Spec
 
 namespace LeanAV.Ffv1
 
-def crc32 (bytes : ByteArray) : UInt32 := Id.run do
-  let mut crc : UInt32 := 0
-  for b in bytes do
-    crc := crc ^^^ (b.toUInt32 <<< 24)
-    for _ in [:8] do
-      crc := if crc &&& 0x80000000 != 0 then
-        (crc <<< 1) ^^^ 0x04C11DB7 else crc <<< 1
-  return crc
+private def crc32ByteStep : Nat → UInt32 → UInt32
+  | 0, crc => crc
+  | k + 1, crc =>
+    let next := if crc &&& 0x80000000 != 0 then
+      (crc <<< 1) ^^^ 0x04C11DB7 else crc <<< 1
+    crc32ByteStep k next
+
+private def crc32ListLoop : List UInt8 → UInt32 → UInt32
+  | [], crc => crc
+  | b :: bs, crc => crc32ListLoop bs (crc32ByteStep 8 (crc ^^^ (b.toUInt32 <<< 24)))
+
+def crc32 (bytes : ByteArray) : UInt32 :=
+  crc32ListLoop bytes.data.toList 0
 
 def appendCrc (bytes : ByteArray) : ByteArray :=
   let crc := crc32 bytes
   (((bytes.push (crc >>> 24).toUInt8).push (crc >>> 16).toUInt8).push
     (crc >>> 8).toUInt8).push crc.toUInt8
 
-def defaultOneStates : Array Nat := Id.run do
-  let mut states := Array.replicate 256 0
-  let mut p : Nat := 0x80000000
-  let mut last : Nat := 0
-  for _ in [:128] do
+private def defaultOnePass1Loop : Nat → Nat → Nat → Array Nat → Array Nat
+  | 0, _, _, states => states
+  | rem + 1, p, last, states =>
     let p8 := (p + 0x800000) / 0x1000000
     let next := max (last + 1) p8
-    if 0 < last && last ≤ 255 && next ≤ 248 then
-      states := states.set! last next
-    p := p + ((0x100000000 - p) * 0x0CCCCCCC + 0x80000000) / 0x100000000
-    last := next
-  for i in [8:249] do
-    if states[i]! == 0 then
-      let probability := i * 0x1000000
-      let updated := probability +
-        ((0x100000000 - probability) * 0x0CCCCCCC + 0x80000000) / 0x100000000
-      states := states.set! i (min 248 (max (i + 1) ((updated + 0x800000) / 0x1000000)))
-  return states
+    let states1 :=
+      if 0 < last && last ≤ 255 && next ≤ 248 then
+        states.set! last next
+      else states
+    let pNext := p + ((0x100000000 - p) * 0x0CCCCCCC + 0x80000000) / 0x100000000
+    defaultOnePass1Loop rem pNext next states1
+
+private def defaultOnePass2Loop : Nat → Nat → Array Nat → Array Nat
+  | 0, _, states => states
+  | rem + 1, i, states =>
+    let states1 :=
+      if states.getD i 0 == 0 then
+        let probability := i * 0x1000000
+        let updated := probability +
+          ((0x100000000 - probability) * 0x0CCCCCCC + 0x80000000) / 0x100000000
+        states.set! i (min 248 (max (i + 1) ((updated + 0x800000) / 0x1000000)))
+      else states
+    defaultOnePass2Loop rem (i + 1) states1
+
+def defaultOneStates : Array Nat :=
+  let s1 := defaultOnePass1Loop 128 0x80000000 0 (Array.replicate 256 0)
+  defaultOnePass2Loop 241 8 s1
 
 structure Transitions where
   one : Array Nat
   zero : Array Nat
   deriving Inhabited
 
-def Transitions.fromOne (one : Array Nat) : Transitions := Id.run do
-  let mut zero := Array.replicate 256 0
-  for i in [1:255] do
-    zero := zero.set! i ((256 - one[256 - i]!) % 256)
-  return { one, zero }
+def Transitions.fromOne (one : Array Nat) : Transitions :=
+  let zero := Array.ofFn fun (i : Fin 256) =>
+    if i.val == 0 then 0 else (256 - one.getD (256 - i.val) 0) % 256
+  { one, zero }
 
 def defaultTransitions : Transitions := Transitions.fromOne defaultOneStates
 

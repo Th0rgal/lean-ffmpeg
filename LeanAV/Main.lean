@@ -2107,6 +2107,17 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Ffv1Proofs.ffv1RangeSplit_partition_and_bounds
 #print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_refill_terminates_one_step
 #print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_getBit_range_inv
+#print axioms LeanAV.Ffv1Proofs.ffv1Transitions_fromOne_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1DefaultTransitions_interior_bounded_and_closure
+#print axioms LeanAV.Ffv1Proofs.ffv1Version2Transitions_zero_and_one_bounded
+#print axioms LeanAV.Ffv1Proofs.ffv1AppendCrc_size_exact
+#print axioms LeanAV.Ffv1Proofs.ffv1AppendCrc_verifies_and_detects_bitflip
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeEncoder_putBit_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1RangeDecoder_getBit_preserves_state_bounds
+#print axioms LeanAV.Ffv1Proofs.ffv1SplitV3Slices_rejects_short_packets
+#print axioms LeanAV.Ffv1Proofs.ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p
+#print axioms LeanAV.Ffv1Proofs.ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation
+#print axioms LeanAV.Ffv1Proofs.ffv1MkvSar_roundtrip_unknown_square_and_anamorphic
 
 
 

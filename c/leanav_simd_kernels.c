@@ -36,7 +36,7 @@ static void leanav_init_glibc_malloc_arena(void) {
 
 static const char *leanav_resolve_ffmpeg_exec_path(void) {
     const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
-    if (env_bin && env_bin[0] != '\0' && access(env_bin, X_OK) == 0) return env_bin;
+    if (env_bin && env_bin[0] != '\0') return env_bin;
     if (access("/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg", X_OK) == 0) {
         return "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg";
     }
