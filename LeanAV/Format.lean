@@ -7004,6 +7004,38 @@ def demuxWavPcmLE (s : ByteSlice) : Option (Array (Array Int32) × UInt32 × Nat
       chans := chans.set! ch ((chans.getD ch #[]).push v)
   return some (chans, sampleRate, validBps)
 
+def wavEnvelopeScanLoop (s : ByteSlice) (pos : Nat) (seenFmt seenData : Bool)
+    (audioFmt channels : Nat) (sampleRate : UInt32) (containerBps chunksSeen : Nat) : Nat → Bool
+  | 0 => false
+  | fuel + 1 =>
+    if pos + 8 > s.len then
+      if !seenFmt || !seenData || channels == 0 || sampleRate == 0 then false
+      else audioFmt != 1 || channels > 8 || chunksSeen > 64 ||
+        (containerBps != 8 && containerBps != 16 && containerBps != 24 && containerBps != 32)
+    else
+      let cSize := (readU32LE s (pos + 4)).toNat
+      if pos + 8 + cSize > s.len then false
+      else
+        let chunksSeen' := chunksSeen + 1
+        let padded := cSize + (cSize % 2)
+        let pos' := pos + 8 + padded
+        if fourCCEq s pos 'f' 'm' 't' ' ' then
+          if cSize < 16 then false
+          else
+            wavEnvelopeScanLoop s pos' true seenData
+              (readU16LE s (pos + 8)).toNat (readU16LE s (pos + 10)).toNat
+              (readU32LE s (pos + 12)) (readU16LE s (pos + 22)).toNat chunksSeen' fuel
+        else if fourCCEq s pos 'd' 'a' 't' 'a' then
+          wavEnvelopeScanLoop s pos' seenFmt true audioFmt channels sampleRate containerBps chunksSeen' fuel
+        else
+          wavEnvelopeScanLoop s pos' seenFmt seenData audioFmt channels sampleRate containerBps chunksSeen' fuel
+
+def wavHasValidOutOfDomainEnvelope (s : ByteSlice) : Bool :=
+  if s.len < 44 then false
+  else if fourCCEq s 0 'R' 'F' '6' '4' && fourCCEq s 8 'W' 'A' 'V' 'E' then true
+  else if !fourCCEq s 0 'R' 'I' 'F' 'F' || !fourCCEq s 8 'W' 'A' 'V' 'E' then false
+  else wavEnvelopeScanLoop s 12 false false 0 0 0 0 0 (s.len + 1)
+
 def pcmRawLEToChannels (s : ByteSlice) (channels bps : Nat) : Option (Array (Array Int32)) := Id.run do
   if channels == 0 || channels > 8 then return none
   if bps < 4 || bps > 32 then return none

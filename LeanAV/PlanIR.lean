@@ -1359,7 +1359,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   let isStandalonePngRoute : Bool :=
     isStandaloneCommonClean &&
     !cfgNoVideo &&
-    cfgAudioCodec.isNone &&
+    (cfgAudioCodec.isNone || (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy)) &&
     cfgAudioRate.isNone &&
     cfgAudioChannels.isNone &&
     extInputAudioRate.isNone &&
@@ -1395,7 +1395,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   let isStandaloneFlacRoute : Bool :=
     isStandaloneCommonClean &&
     !cfgNoAudio &&
-    cfgVideoCodec.isNone &&
+    (cfgVideoCodec.isNone || (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy)) &&
     cfgVideoSize.isNone &&
     cfgVideoFrames.isNone &&
     cfgPixelFormat.isNone &&
@@ -2000,25 +2000,66 @@ def demuxMpegTsIndependentOrFallback (s : ByteSlice) : KernelExecutionResult (Ar
     else
       .fallbackDelegated "mpegts_missing_sync_byte_or_empty_packets"
 
+inductive LosslessDecodeDispatch (α : Type) where
+  | independentVerified (value : α)
+  | fallbackDelegated (reason : String)
+  | invalidCorrupt (reason : String)
+  deriving Repr, DecidableEq, Inhabited
+
+def LosslessDecodeDispatch.tag {α : Type} : LosslessDecodeDispatch α → String × String
+  | .independentVerified _ => ("independentVerified", "")
+  | .fallbackDelegated r => ("fallbackDelegated", r)
+  | .invalidCorrupt r => ("invalidCorrupt", r)
+
+def classifyPngDecode3Way (s : ByteSlice) : LosslessDecodeDispatch PngImage :=
+  if pngHasOutOfDomainAncillaryChunks s then
+    .fallbackDelegated "out_of_domain_apng_animation_stream"
+  else
+    match pngDecode s with
+    | some img =>
+      if img.width > 0 && img.height > 0 then .independentVerified img
+      else .invalidCorrupt "invalid_or_corrupt_png_stream"
+    | none => .invalidCorrupt "invalid_or_corrupt_png_stream"
+
 def decodePngIndependentOrFallback (s : ByteSlice) : KernelExecutionResult PngImage :=
-  match pngDecode s with
-  | some img =>
-    if img.width > 0 && img.height > 0 then .independentVerified img
-    else .fallbackDelegated "invalid_or_corrupt_png_stream"
-  | none => .fallbackDelegated "invalid_or_corrupt_png_stream"
+  match classifyPngDecode3Way s with
+  | .independentVerified img => .independentVerified img
+  | .fallbackDelegated reason => .fallbackDelegated reason
+  | .invalidCorrupt reason => .fallbackDelegated reason
 
 def encodePngIndependentOrFallback (img : PngImage) : KernelExecutionResult ByteArray :=
   match pngEncode img with
   | some bytes => .independentVerified bytes
   | none => .fallbackDelegated "invalid_png_image_geometry_or_pixels"
 
-def decodeFlacIndependentOrFallback (s : ByteSlice) (verifyMd5 : Bool := true) :
-    KernelExecutionResult FlacDecodedStream :=
+def classifyFlacDecode3Way (s : ByteSlice) (verifyMd5 : Bool := true) :
+    LosslessDecodeDispatch FlacDecodedStream :=
   match flacDecodeStream s verifyMd5 with
   | some dec =>
     if dec.info.sampleRate > 0 && dec.info.channels > 0 then .independentVerified dec
-    else .fallbackDelegated "invalid_or_corrupt_flac_stream"
-  | none => .fallbackDelegated "invalid_or_corrupt_flac_stream"
+    else .invalidCorrupt "invalid_or_corrupt_flac_stream"
+  | none =>
+    if flacHasValidOutOfDomainEnvelope s then
+      .fallbackDelegated "out_of_domain_flac_envelope_or_metadata"
+    else
+      .invalidCorrupt "invalid_or_corrupt_flac_stream"
+
+def decodeFlacIndependentOrFallback (s : ByteSlice) (verifyMd5 : Bool := true) :
+    KernelExecutionResult FlacDecodedStream :=
+  match classifyFlacDecode3Way s verifyMd5 with
+  | .independentVerified dec => .independentVerified dec
+  | .fallbackDelegated reason => .fallbackDelegated reason
+  | .invalidCorrupt reason => .fallbackDelegated reason
+
+def classifyWavDemux3Way (s : ByteSlice) :
+    LosslessDecodeDispatch (Array (Array Int32) × UInt32 × Nat) :=
+  match demuxWavPcmLE s with
+  | some res => .independentVerified res
+  | none =>
+    if wavHasValidOutOfDomainEnvelope s then
+      .fallbackDelegated "out_of_domain_wav_format_or_channel_count"
+    else
+      .invalidCorrupt "invalid_or_corrupt_wav_stream"
 
 def encodeFlacIndependentOrFallback (channelsData : Array (Array Int32)) (sampleRate : UInt32)
     (bps : Nat := 16) (blockSize : Nat := 4096) (computeMd5 : Bool := true) :
@@ -2280,22 +2321,46 @@ theorem isNoFileOutputFormat_non_vacuous :
 
 theorem standaloneLossless_routing_and_kernels_verified :
     let pPng := parseArgsToPlanIR ["-y", "-i", "in.png", "out.png"]
+    let pPngCopyV := parseArgsToPlanIR ["-y", "-i", "in.png", "-c:v", "copy", "out.png"]
+    let pPngCopyAll := parseArgsToPlanIR ["-y", "-i", "in.png", "-c", "copy", "out.png"]
     let pRawPng := parseArgsToPlanIR ["-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "8x8", "-i", "in.rgb", "out.png"]
     let pPngRaw := parseArgsToPlanIR ["-y", "-i", "in.png", "-f", "rawvideo", "-pix_fmt", "rgba", "out.raw"]
     let pFlac := parseArgsToPlanIR ["-y", "-i", "in.flac", "out.flac"]
+    let pFlacCopyA := parseArgsToPlanIR ["-y", "-i", "in.flac", "-c:a", "copy", "out.flac"]
+    let pFlacCopyAll := parseArgsToPlanIR ["-y", "-i", "in.flac", "-c", "copy", "out.flac"]
     let pFlacWav := parseArgsToPlanIR ["-y", "-i", "in.flac", "out.wav"]
     let pFlacS24 := parseArgsToPlanIR ["-y", "-i", "in.flac", "-f", "s24le", "out.pcm"]
     let pFlacAf := parseArgsToPlanIR ["-y", "-i", "in.flac", "-af", "hdcd", "-f", "s24le", "out.pcm"]
     let badImg : PngImage := ⟨0, 0, 8, 2, { data := #[] }, { data := #[] }, { data := #[] }⟩
     pPng.backend.tier = .independentVerified ∧
+    pPngCopyV.backend.tier = .independentVerified ∧
+    pPngCopyAll.backend.tier = .independentVerified ∧
     pRawPng.backend.tier = .independentVerified ∧
     pPngRaw.backend.tier = .independentVerified ∧
     pFlac.backend.tier = .independentVerified ∧
+    pFlacCopyA.backend.tier = .independentVerified ∧
+    pFlacCopyAll.backend.tier = .independentVerified ∧
     pFlacWav.backend.tier = .independentVerified ∧
     pFlacS24.backend.tier = .independentVerified ∧
     pFlacAf.backend.tier = .delegatedFaithful ∧
     encodePngIndependentOrFallback badImg = .fallbackDelegated "invalid_png_image_geometry_or_pixels" ∧
     encodeFlacIndependentOrFallback #[] 48000 = .fallbackDelegated "invalid_flac_audio_parameters" := by
+  decide
+
+theorem losslessDecode3Way_trichotomy_verified :
+    let oggHdr : ByteSlice :=
+      { ba := { data := #[0x4F, 0x67, 0x67, 0x53, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }
+        off := 0, len := 32 }
+    let rf64Hdr : ByteSlice :=
+      { ba := { data := #[0x52, 0x46, 0x36, 0x34, 0xFF, 0xFF, 0xFF, 0xFF, 0x57, 0x41, 0x56, 0x45,
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }
+        off := 0, len := 44 }
+    let corrupt : ByteSlice := { ba := { data := #[0x00, 0x01, 0x02, 0x03] }, off := 0, len := 4 }
+    (classifyFlacDecode3Way oggHdr true).tag = ("fallbackDelegated", "out_of_domain_flac_envelope_or_metadata") ∧
+    (classifyFlacDecode3Way corrupt true).tag = ("invalidCorrupt", "invalid_or_corrupt_flac_stream") ∧
+    (classifyWavDemux3Way rf64Hdr).tag = ("fallbackDelegated", "out_of_domain_wav_format_or_channel_count") ∧
+    (classifyWavDemux3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_wav_stream") ∧
+    (classifyPngDecode3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_png_stream") := by
   decide
 
 end LeanAV.PlanIR

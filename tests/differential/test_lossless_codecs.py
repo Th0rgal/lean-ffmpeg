@@ -347,7 +347,7 @@ class LosslessCodecTests(unittest.TestCase):
         self.assertNotEqual(res_bad.returncode, 0)
 
     def test_zero_subprocess_isolation_path_and_strace(self):
-        env_isolated = {"PATH": "/nonexistent"}
+        env_isolated = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
         width, height = 12, 8
         rgb = bytes((i * 29 + 11) & 255 for i in range(width * height * 3))
         raw_in = self.write("iso.rgb", rgb)
@@ -420,9 +420,11 @@ class LosslessCodecTests(unittest.TestCase):
             expected_a = 0 if (r, g, b) == (10, 20, 30) else 255
             self.assertEqual(got8[idx * 4:idx * 4 + 4], bytes([r, g, b, expected_a]))
 
-        # 16-bit RGB tRNS must compare full 16-bit key before downscaling to 8-bit RGBA:
-        # pixel 0 matches (0x1234, 0x5678, 0x9ABC) -> alpha 0;
-        # pixel 1 has same high bytes (0x1200, 0x5600, 0x9A00) -> alpha 255!
+        # 16-bit RGB tRNS must compare full 16-bit key before downscaling to 8-bit RGBA
+        # using exact ((v + 128) // 257) rounding:
+        # pixel 0 matches (0x1234, 0x5678, 0x9ABC) -> (0x12, 0x56, 0x9A, 0x00);
+        # pixel 1 has same high bytes (0x1200, 0x5600, 0x9A00) -> (0x12, 0x56, 0x99, 0xFF)
+        # (since (0x9ABC + 128) // 257 == 0x9A while (0x9A00 + 128) // 257 == 0x99).
         rgb16_pixels = struct.pack(
             ">6H",
             0x1234, 0x5678, 0x9ABC,
@@ -434,7 +436,7 @@ class LosslessCodecTests(unittest.TestCase):
         run(LFFMPEG, "-y", "-i", png16, "-f", "rawvideo", "-pix_fmt", "rgba", rgba16_out)
         self.assertEqual(
             rgba16_out.read_bytes(),
-            bytes([0x12, 0x56, 0x9A, 0x00, 0x12, 0x56, 0x9A, 0xFF]),
+            bytes([0x12, 0x56, 0x9A, 0x00, 0x12, 0x56, 0x99, 0xFF]),
         )
 
         # Malformed PNG chunk sequences that RFC 2083 forbids:
@@ -543,6 +545,131 @@ class LosslessCodecTests(unittest.TestCase):
         ff_out12_s16 = self.dir / "ff12_out.pcm"
         run(FFMPEG, "-y", "-v", "error", "-i", lean_wav12, "-f", "s16le", ff_out12_s16)
         self.assertEqual(ff_out12_s16.read_bytes(), msb16)
+
+    @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
+    def test_flac_fullscale_alternating_4099_and_audioframe_depths(self):
+        # Finding 1: 4,099 full-scale stereo s32le samples (+2147483647 / -2147483648)
+        alt_bytes = bytearray()
+        for i in range(4099):
+            l_s = 2147483647 if (i % 2 == 0) else -2147483648
+            r_s = -2147483648 if (i % 2 == 0) else 2147483647
+            alt_bytes += struct.pack("<ii", l_s, r_s)
+        alt_in = self.write("alt4099.pcm", bytes(alt_bytes))
+        alt_flac = self.dir / "alt4099.flac"
+        run(LFFMPEG, "-y", "-f", "s32le", "-ar", "48000", "-ac", "2", "-i", alt_in, alt_flac)
+        ff_alt_pcm = self.dir / "ff_alt4099.pcm"
+        run(FFMPEG, "-y", "-v", "error", "-i", alt_flac, "-f", "s32le", ff_alt_pcm)
+        self.assertEqual(ff_alt_pcm.read_bytes(), bytes(alt_bytes))
+
+        # Finding 2: flacDecodedToAudioFrame <-> flacEncodeAudioFrame roundtrip across 8, 12, 16, 24, 32-bit
+        u8_raw = bytes([0, 64, 128, 192, 255, 17, 240, 127] * 64)
+        flac8 = self.dir / "in8.flac"
+        run(LFFMPEG, "-y", "-f", "u8", "-ar", "32000", "-ac", "1", "-i", self.write("in8.pcm", u8_raw), flac8)
+        msb12 = struct.pack("<256h", *[(((i * 73) % 4096) - 2048) << 4 for i in range(256)])
+        flac12 = self.dir / "in12.flac"
+        run(FFMPEG, "-y", "-v", "error", "-f", "s16le", "-ar", "32000", "-ac", "1", "-i", self.write("in12.pcm", msb12), "-bits_per_raw_sample", "12", flac12)
+        s16_raw = struct.pack("<256h", *[((i * 131) % 65536) - 32768 for i in range(256)])
+        flac16 = self.dir / "in16.flac"
+        run(LFFMPEG, "-y", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", self.write("in16.pcm", s16_raw), flac16)
+        pcm24 = pack_s24le([int(3_000_000 * math.sin(i * 0.1)) for i in range(256)])
+        flac24 = self.dir / "in24.flac"
+        run(LFFMPEG, "-y", "-f", "s24le", "-ar", "48000", "-ac", "1", "-i", self.write("in24.pcm", pcm24), flac24)
+        for tag, src_flac, out_fmt in (
+            ("8", flac8, "u8"),
+            ("12", flac12, "s16le"),
+            ("16", flac16, "s16le"),
+            ("24", flac24, "s24le"),
+            ("32", alt_flac, "s32le"),
+        ):
+            rt_flac = self.dir / f"af_rt_{tag}.flac"
+            run(LFFMPEG, "lossless-codec", "flac-frame-roundtrip", src_flac, rt_flac)
+            ref_pcm = self.dir / f"af_ref_{tag}.pcm"
+            got_pcm = self.dir / f"af_got_{tag}.pcm"
+            run(FFMPEG, "-y", "-v", "error", "-i", src_flac, "-f", out_fmt, ref_pcm)
+            run(FFMPEG, "-y", "-v", "error", "-i", rt_flac, "-f", out_fmt, got_pcm)
+            self.assertEqual(got_pcm.read_bytes(), ref_pcm.read_bytes(), f"AudioFrame roundtrip mismatch for {tag}-bit")
+
+    @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
+    def test_out_of_domain_fallback_corrupt_fail_closed_and_strict_ffmpeg_bin(self):
+        # Valid IEEE float32 WAV (format tag 3) -> out-of-domain fallbackDelegated succeeds via FFmpeg
+        f32_samples = struct.pack("<64f", *[0.5 * math.sin(i * 0.2) for i in range(64)])
+        f32_in = self.write("f32.raw", f32_samples)
+        f32_wav = self.dir / "f32.wav"
+        run(FFMPEG, "-y", "-v", "error", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", f32_in, "-c:a", "pcm_f32le", f32_wav)
+        f32_flac = self.dir / "f32_delegated.flac"
+        run(LFFMPEG, "-y", "-i", f32_wav, f32_flac)
+        self.assertTrue(f32_flac.exists() and f32_flac.stat().st_size > 42)
+
+        # Strict LEANAV_FFMPEG_BIN=/nonexistent MUST fail on delegated fallback (never silently use /usr/bin/ffmpeg)
+        env_bad_bin = dict(os.environ)
+        env_bad_bin["LEANAV_FFMPEG_BIN"] = "/nonexistent/ffmpeg_missing_binary"
+        res_bad_bin = subprocess.run(
+            [str(LFFMPEG), "-y", "-i", str(f32_wav), str(self.dir / "should_fail.flac")],
+            env=env_bad_bin, capture_output=True,
+        )
+        self.assertNotEqual(res_bad_bin.returncode, 0)
+
+        # Valid ID3v2-prefixed FLAC -> out-of-domain fallbackDelegated succeeds via FFmpeg
+        id3_hdr = b"ID3\x03\x00\x00\x00\x00\x00\x04ABCD"
+        id3_flac = self.write("id3_tagged.flac", id3_hdr + f32_flac.read_bytes())
+        id3_wav = self.dir / "id3_out.wav"
+        run(LFFMPEG, "-y", "-i", id3_flac, id3_wav)
+        self.assertTrue(id3_wav.exists() and id3_wav.stat().st_size > 44)
+
+        # Corrupt WAV / PNG / FLAC bitstreams MUST fail closed (rc != 0)
+        for bad_name, bad_payload, out_ext in (
+            ("corrupt.wav", b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00", "flac"),
+            ("corrupt.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRbroken", "png"),
+            ("corrupt.flac", b"fLaC\x80\x00\x00\x22" + b"\x00" * 10, "wav"),
+        ):
+            bad_p = self.write(bad_name, bad_payload)
+            rc = subprocess.run([str(LFFMPEG), "-y", "-i", str(bad_p), str(self.dir / f"bad_out.{out_ext}")], capture_output=True)
+            self.assertNotEqual(rc.returncode, 0, f"Expected fail-closed rc!=0 for {bad_name}")
+
+    @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
+    def test_stream_copy_metadata_and_png_16to8_sub8_rounding(self):
+        # Finding 4a: PNG -c:v copy and -c copy preserve pal8 + PLTE + tRNS + gAMA + tEXt bit-identically
+        ihdr_pal = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, 3, 0, 0, 0))
+        gama = png_chunk(b"gAMA", struct.pack(">I", 45455))
+        plte = png_chunk(b"PLTE", bytes([10, 20, 30, 200, 210, 220]))
+        trns = png_chunk(b"tRNS", bytes([0, 255]))
+        idat = png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x01", 9))
+        text = png_chunk(b"tEXt", b"Comment\x00HelloPngCopy")
+        pal_png_bytes = b"\x89PNG\r\n\x1a\n" + ihdr_pal + gama + plte + trns + idat + text + png_chunk(b"IEND", b"")
+        pal_in = self.write("pal_gama_text.png", pal_png_bytes)
+        for copy_flags in (["-c:v", "copy"], ["-c", "copy"]):
+            pal_out = self.dir / f"pal_copy_{copy_flags[0][1:].replace(':', '')}.png"
+            run(LFFMPEG, "-y", "-i", pal_in, *copy_flags, pal_out, env={"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"})
+            self.assertEqual(pal_out.read_bytes(), pal_png_bytes)
+
+        # Finding 4b: FLAC -c:a copy and -c copy preserve Vorbis comment metadata bit-identically
+        s16_in = self.write("tag.pcm", struct.pack("<128h", *[i * 100 - 6400 for i in range(128)]))
+        tagged_flac = self.dir / "tagged.flac"
+        run(FFMPEG, "-y", "-v", "error", "-f", "s16le", "-ar", "44100", "-ac", "1", "-i", s16_in, "-metadata", "title=HelloFlacTest", tagged_flac)
+        tagged_bytes = tagged_flac.read_bytes()
+        self.assertIn(b"HelloFlacTest", tagged_bytes)
+        for copy_flags in (["-c:a", "copy"], ["-c", "copy"]):
+            flac_out = self.dir / f"flac_copy_{copy_flags[0][1:].replace(':', '')}.flac"
+            run(LFFMPEG, "-y", "-i", tagged_flac, *copy_flags, flac_out, env={"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"})
+            self.assertEqual(flac_out.read_bytes(), tagged_bytes)
+
+        # Finding 5: 16->8 exact /257 rounding and sub-8-bit tRNS + 16-bit replication
+        rgba16_px = struct.pack(">4H", 0x12FF, 0xFF00, 0x0080, 0x0081)
+        p_rgba16 = self.write("r16.png", png_bytes(1, 1, 16, 6, b"\x00" + rgba16_px))
+        o_rgba8 = self.dir / "r16.rgba"
+        run(LFFMPEG, "-y", "-i", p_rgba16, "-f", "rawvideo", "-pix_fmt", "rgba", o_rgba8)
+        self.assertEqual(o_rgba8.read_bytes(), bytes([0x13, 0xFE, 0x00, 0x01]))
+
+        p_g2_tr = self.write("g2_tr.png", png_bytes(4, 1, 2, 0, b"\x00\x1b", trns=b"\x00\x02"))
+        o_g2_rgba = self.dir / "g2_tr.rgba"
+        o_g2_rgba64 = self.dir / "g2_tr.rgba64be"
+        run(LFFMPEG, "-y", "-i", p_g2_tr, "-f", "rawvideo", "-pix_fmt", "rgba", o_g2_rgba)
+        run(LFFMPEG, "-y", "-i", p_g2_tr, "-f", "rawvideo", "-pix_fmt", "rgba64be", o_g2_rgba64)
+        self.assertEqual(o_g2_rgba.read_bytes(), bytes([0,0,0,255, 85,85,85,255, 170,170,170,0, 255,255,255,255]))
+        self.assertEqual(
+            o_g2_rgba64.read_bytes(),
+            bytes([0,0,0,0,0,0,255,255, 85,85,85,85,85,85,255,255, 170,170,170,170,170,170,0,0, 255,255,255,255,255,255,255,255]),
+        )
 
 
 if __name__ == "__main__":

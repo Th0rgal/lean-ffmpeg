@@ -2283,6 +2283,53 @@ def flacDecodeStream (s : ByteSlice) (verifyMd5 : Bool := true) : Option FlacDec
   else
     some { info := si, md5 := md5Hdr, channelsData := decoded }
 
+def flacMetadataCountLoop (s : ByteSlice) (pos blocks : Nat) (seenSi : Bool) : Nat → Bool
+  | 0 => false
+  | fuel + 1 =>
+    if pos + 4 > s.len then false
+    else
+      let hdr := sliceByteD s pos
+      let isLast := (hdr &&& 0x80) != 0
+      let btype := (hdr &&& 0x7F).toNat
+      let blen := ((sliceByteD s (pos + 1)).toNat <<< 16) |||
+        ((sliceByteD s (pos + 2)).toNat <<< 8) ||| (sliceByteD s (pos + 3)).toNat
+      if btype == 127 || pos + 4 + blen > s.len then false
+      else
+        let okSi := if btype == 0 then (!seenSi && blen == 34) else seenSi
+        if !okSi then false
+        else
+          let blocks' := blocks + 1
+          let pos' := pos + 4 + blen
+          if isLast then blocks' > 128 && pos' < s.len
+          else flacMetadataCountLoop s pos' blocks' true fuel
+
+def flacHasValidOutOfDomainEnvelope (s : ByteSlice) : Bool :=
+  let id3Ok :=
+    if s.len ≥ 14 &&
+       sliceByteD s 0 == 0x49 && sliceByteD s 1 == 0x44 && sliceByteD s 2 == 0x33 &&
+       sliceByteD s 3 < 0xFF && sliceByteD s 4 < 0xFF &&
+       sliceByteD s 6 < 0x80 && sliceByteD s 7 < 0x80 &&
+       sliceByteD s 8 < 0x80 && sliceByteD s 9 < 0x80 then
+      let sz := ((sliceByteD s 6).toNat <<< 21) ||| ((sliceByteD s 7).toNat <<< 14) |||
+        ((sliceByteD s 8).toNat <<< 7) ||| (sliceByteD s 9).toNat
+      let footer := if (sliceByteD s 5 &&& 0x10) != 0 then 10 else 0
+      let flacOff := 10 + sz + footer
+      flacOff + 42 ≤ s.len &&
+        sliceByteD s flacOff == 0x66 && sliceByteD s (flacOff + 1) == 0x4C &&
+        sliceByteD s (flacOff + 2) == 0x61 && sliceByteD s (flacOff + 3) == 0x43
+    else false
+  let oggOk :=
+    s.len ≥ 32 &&
+    sliceByteD s 0 == 0x4F && sliceByteD s 1 == 0x67 &&
+    sliceByteD s 2 == 0x67 && sliceByteD s 3 == 0x53
+  let manyBlocksOk :=
+    if s.len ≥ 42 &&
+       sliceByteD s 0 == 0x66 && sliceByteD s 1 == 0x4C &&
+       sliceByteD s 2 == 0x61 && sliceByteD s 3 == 0x43 then
+      flacMetadataCountLoop s 4 0 false (s.len + 1)
+    else false
+  id3Ok || oggOk || manyBlocksOk
+
 def flacZigzag64 (x : Int64) : UInt64 :=
   if x < 0 then
     let m : UInt64 := (-1 - x).toUInt64
@@ -2298,11 +2345,40 @@ def flacSampleAbs (x : Int32) : Nat :=
   flacSampleAbs64 x.toInt64
 
 def flacRiceFits64 (x : Int64) (k : Nat) : Bool :=
-  if k > 30 then false
-  else
-    let z : UInt64 := flacZigzag64 x
-    let q : UInt64 := z >>> k.toUInt64
-    z < ((1 : UInt64) <<< 63) && q < ((1 : UInt64) <<< (63 - k).toUInt64) && q < 1048576
+  decide ((-2147483648 : Int64) ≤ x) &&
+  decide (x ≤ (2147483647 : Int64)) &&
+  decide (k ≤ 30) &&
+  decide (((flacZigzag64 x) >>> k.toUInt64) < 1048576)
+
+def FlacRiceResidualSafe (p : Int64 × Nat) : Prop :=
+  (-2147483648 : Int64) ≤ p.1 ∧ p.1 ≤ (2147483647 : Int64) ∧
+  p.2 ≤ 30 ∧ ((flacZigzag64 p.1) >>> p.2.toUInt64) < 1048576
+
+def flacRiceResidualGateSpec : AVGateSpec (Int64 × Nat) FlacRiceResidualSafe where
+  gate := fun p => flacRiceFits64 p.1 p.2
+  sound p h := by
+    unfold flacRiceFits64 at h
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+    rcases h with ⟨⟨⟨hlo, hhi⟩, hk⟩, hq⟩
+    exact ⟨hlo, hhi, hk, hq⟩
+  complete p h := by
+    rcases h with ⟨hlo, hhi, hk, hq⟩
+    unfold flacRiceFits64
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨⟨⟨hlo, hhi⟩, hk⟩, hq⟩
+  posWitness := (2147483647, 30)
+  negWitness := (2147483648, 30)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem flacRiceResidualGateSpec_iff (p : Int64 × Nat) :
+    flacRiceResidualGateSpec.gate p = true ↔ FlacRiceResidualSafe p :=
+  flacRiceResidualGateSpec.iff_safe p
+
+theorem flacRiceFits64_bounds (x : Int64) (k : Nat) (h : flacRiceFits64 x k = true) :
+    (-2147483648 : Int64) ≤ x ∧ x ≤ (2147483647 : Int64) ∧
+      k ≤ 30 ∧ ((flacZigzag64 x) >>> k.toUInt64) < 1048576 :=
+  flacRiceResidualGateSpec.sound (x, k) h
 
 def flacBestRiceK64 (res : List Int64) (maxK : Nat) : Nat :=
   let cnt := res.length
@@ -2560,30 +2636,89 @@ def flacEncodeStream (channelsData : Array (Array Int32)) (sampleRate : UInt32) 
   let hdr := serializeFlacStreamInfo si md5Arr true
   some (flacAppendBytes hdr framesBytes)
 
-def flacAudioFrameToChannels (af : AudioFrame) : Array (Array Int32) := Id.run do
-  let nCh := af.channels.toNat
-  let nS := af.numSamples
-  let mut out := Array.mkEmpty nCh
-  for ch in [0:nCh] do
-    let mut cArr := Array.mkEmpty nS
-    for i in [0:nS] do
-      cArr := cArr.push (af.getSample ch i)
-    out := out.push cArr
-  return out
+def flacNormToAudioSample (bps : Nat) (v : Int32) : Int32 :=
+  if bps ≥ 16 then v
+  else v <<< Int32.ofNat (16 - bps)
 
-def flacDecodedToAudioFrame (dec : FlacDecodedStream) : AudioFrame := Id.run do
+def flacDenormFromAudioSample (sf : SampleFormat) (bps : Nat) (v : Int32) : Int32 :=
+  if bps < 16 && (sf == .s16p || sf == .s16le) then
+    v >>> Int32.ofNat (16 - bps)
+  else v
+
+def isFlacAudioFrameFormatValid (p : SampleFormat × Nat) : Bool :=
+  (decide (4 ≤ p.2) && decide (p.2 ≤ 16) && (p.1 == .s16p || p.1 == .s16le)) ||
+  (decide (16 < p.2) && decide (p.2 ≤ 32) && (p.1 == .s32p || p.1 == .s32le || p.1 == .s24le))
+
+def FlacAudioFrameFormatSafe (p : SampleFormat × Nat) : Prop :=
+  (4 ≤ p.2 ∧ p.2 ≤ 16 ∧ (p.1 = .s16p ∨ p.1 = .s16le)) ∨
+  (16 < p.2 ∧ p.2 ≤ 32 ∧ (p.1 = .s32p ∨ p.1 = .s32le ∨ p.1 = .s24le))
+
+def flacAudioFrameFormatGateSpec : AVGateSpec (SampleFormat × Nat) FlacAudioFrameFormatSafe where
+  gate := isFlacAudioFrameFormatValid
+  sound p h := by
+    unfold isFlacAudioFrameFormatValid FlacAudioFrameFormatSafe at *
+    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h
+    rcases h with ⟨⟨h1, h2⟩, h3⟩ | ⟨⟨h1, h2⟩, h3⟩
+    · exact Or.inl ⟨h1, h2, h3⟩
+    · exact Or.inr ⟨h1, h2, by rcases h3 with (h3 | h3) | h3 <;> simp [h3]⟩
+  complete p h := by
+    unfold isFlacAudioFrameFormatValid FlacAudioFrameFormatSafe at *
+    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
+    rcases h with ⟨h1, h2, h3⟩ | ⟨h1, h2, h3⟩
+    · exact Or.inl ⟨⟨h1, h2⟩, h3⟩
+    · exact Or.inr ⟨⟨h1, h2⟩, by rcases h3 with h3 | h3 | h3 <;> simp [h3]⟩
+  posWitness := (.s16p, 12)
+  negWitness := (.s16p, 24)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem flacAudioFrameFormatGateSpec_iff (p : SampleFormat × Nat) :
+    flacAudioFrameFormatGateSpec.gate p = true ↔ FlacAudioFrameFormatSafe p :=
+  flacAudioFrameFormatGateSpec.iff_safe p
+
+def flacAudioSampleAt (af : AudioFrame) (ch i : Nat) : Int32 :=
+  let nCh := af.channels.toNat
+  if af.sampleFmt == .s16le || af.sampleFmt == .s24le || af.sampleFmt == .s32le || af.sampleFmt == .f32le then
+    af.samples.getD (i * nCh + ch) 0
+  else
+    af.getSample ch i
+
+def flacAudioFrameChanLoop (af : AudioFrame) (bps ch i : Nat) (acc : Array Int32) : Nat → Array Int32
+  | 0 => acc
+  | k + 1 =>
+    flacAudioFrameChanLoop af bps ch (i + 1)
+      (acc.push (flacDenormFromAudioSample af.sampleFmt bps (flacAudioSampleAt af ch i))) k
+
+def flacAudioFrameChansLoop (af : AudioFrame) (bps ch : Nat) (acc : Array (Array Int32)) :
+    Nat → Array (Array Int32)
+  | 0 => acc
+  | k + 1 =>
+    let cArr := flacAudioFrameChanLoop af bps ch 0 (Array.mkEmpty af.numSamples) af.numSamples
+    flacAudioFrameChansLoop af bps (ch + 1) (acc.push cArr) k
+
+def flacAudioFrameToChannels (af : AudioFrame) (bps : Nat := 16) : Array (Array Int32) :=
+  let nCh := af.channels.toNat
+  flacAudioFrameChansLoop af bps 0 (Array.mkEmpty nCh) nCh
+
+def flacDecodedSamplesChanLoop (cArr : Array Int32) (bps i : Nat) (acc : Array Int32) : Nat → Array Int32
+  | 0 => acc
+  | k + 1 =>
+    flacDecodedSamplesChanLoop cArr bps (i + 1)
+      (acc.push (flacNormToAudioSample bps (cArr.getD i 0))) k
+
+def flacDecodedSamplesChansLoop (channelsData : Array (Array Int32)) (bps nS ch : Nat)
+    (acc : Array Int32) : Nat → Array Int32
+  | 0 => acc
+  | k + 1 =>
+    let acc' := flacDecodedSamplesChanLoop (channelsData.getD ch #[]) bps 0 acc nS
+    flacDecodedSamplesChansLoop channelsData bps nS (ch + 1) acc' k
+
+def flacDecodedToAudioFrame (dec : FlacDecodedStream) : AudioFrame :=
   let nCh := dec.info.channels.toNat
   let nS := if nCh == 0 then 0 else (dec.channelsData.getD 0 #[]).size
   let bps := dec.info.bitsPerSample.toNat
-  let normSample (v : Int32) : Int32 :=
-    if bps > 16 || bps == 16 then v
-    else v <<< Int32.ofNat (16 - bps)
-  let mut samples := Array.mkEmpty (nCh * nS)
-  for ch in [0:nCh] do
-    let cArr := dec.channelsData.getD ch #[]
-    for i in [0:nS] do
-      samples := samples.push (normSample (cArr.getD i 0))
-  return {
+  let samples := flacDecodedSamplesChansLoop dec.channelsData bps nS 0 (Array.mkEmpty (nCh * nS)) nCh
+  {
     sampleFmt := if bps > 16 then .s32p else .s16p
     sampleRate := dec.info.sampleRate
     channels := dec.info.channels.toUInt32
@@ -2594,8 +2729,10 @@ def flacDecodedToAudioFrame (dec : FlacDecodedStream) : AudioFrame := Id.run do
     samples := samples
   }
 
-def flacEncodeAudioFrame (af : AudioFrame) (bps : Nat := 16) (blockSize : Nat := 4096) : Option ByteArray :=
-  flacEncodeStream (flacAudioFrameToChannels af) af.sampleRate bps blockSize true
+def flacEncodeAudioFrame (af : AudioFrame) (bps : Nat := 16) (blockSize : Nat := 4096)
+    (computeMd5 : Bool := true) : Option ByteArray :=
+  if !flacAudioFrameFormatGateSpec.gate (af.sampleFmt, bps) then none
+  else flacEncodeStream (flacAudioFrameToChannels af bps) af.sampleRate bps blockSize computeMd5
 
 def flacRoundtripChannels (chans : Array (Array Int32)) (sr : UInt32) (bps blkSz : Nat) :
     Option (List (List Int32)) := do
@@ -2614,14 +2751,90 @@ def flacRoundtripStereoMode (ch0 ch1 : Array Int32) (sm : FlacStereoMode) (bps :
   let (_, chans, used) ← flacDecodeFrameAt { ba := frm, off := 0, len := frm.data.size } 0 si
   if used == frm.data.size then some (chans.toList.map Array.toList) else none
 
-set_option maxHeartbeats 800000 in
+def flacAudioFrameRoundtripChannels (chans : Array (Array Int32)) (sr : UInt32) (bps blkSz : Nat) :
+    Option (List (List Int32)) := do
+  let bytes0 ← flacEncodeStream chans sr bps blkSz false
+  let dec0 ← flacDecodeStream { ba := bytes0, off := 0, len := bytes0.data.size } false
+  let af := flacDecodedToAudioFrame dec0
+  let bytes1 ← flacEncodeAudioFrame af bps blkSz false
+  let dec1 ← flacDecodeStream { ba := bytes1, off := 0, len := bytes1.data.size } false
+  if dec1.info.sampleRate == sr && dec1.info.bitsPerSample.toNat == bps then
+    some (dec1.channelsData.toList.map Array.toList)
+  else none
+
+theorem flacBitVecShift_roundtrip (vb : BitVec 32) (s : Nat) (hs1 : 1 ≤ s) (hs2 : s ≤ 16)
+    (hLo : -(2 ^ (31 - s) : Int) ≤ vb.toInt) (hHi : vb.toInt < (2 ^ (31 - s) : Int)) :
+    BitVec.sshiftRight (vb <<< s) s = vb := by
+  apply BitVec.eq_of_toInt_eq
+  rw [BitVec.toInt_sshiftRight, BitVec.toInt_shiftLeft, Int.shiftRight_eq_div_pow, Nat.shiftLeft_eq]
+  have hvCond := BitVec.toInt_eq_toNat_cond vb
+  have hpow : (2 ^ s : Int) > 0 := by
+    have hSc : s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨ s = 7 ∨ s = 8 ∨
+        s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 ∨ s = 14 ∨ s = 15 ∨ s = 16 := by omega
+    rcases hSc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> omega
+  have hb : ((↑(vb.toNat * 2 ^ s) : Int)).bmod 4294967296 = vb.toInt * (2 ^ s : Int) := by
+    have hle : vb.toInt * (2 ^ s : Int) ≥ -2147483648 ∧ vb.toInt * (2 ^ s : Int) < 2147483648 := by
+      have hSc : s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨ s = 7 ∨ s = 8 ∨
+          s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 ∨ s = 14 ∨ s = 15 ∨ s = 16 := by omega
+      rcases hSc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> omega
+    split at hvCond
+    · have hcast : (↑(vb.toNat * 2 ^ s) : Int) = vb.toInt * (2 ^ s : Int) := by
+        rw [Int.natCast_mul, Int.natCast_pow]; simp [hvCond]
+      rw [hcast, Int.bmod_eq_of_le] <;> omega
+    · have hcast : (↑(vb.toNat * 2 ^ s) : Int) = vb.toInt * (2 ^ s : Int) + ↑(4294967296 : Nat) * (2 ^ s : Int) := by
+        rw [Int.natCast_mul, Int.natCast_pow]
+        have hv2 : (↑vb.toNat : Int) = vb.toInt + 4294967296 := by omega
+        rw [hv2, Int.add_mul]
+        simp
+      rw [hcast, Int.add_mul_bmod_self_left, Int.bmod_eq_of_le] <;> omega
+  rw [hb]
+  exact Int.mul_ediv_cancel vb.toInt (by omega)
+
+theorem flacInt32Smod_shift (s : Nat) (hs1 : 1 ≤ s) (hs2 : s ≤ 16) :
+    ((Int32.ofNat s).toBitVec.smod 32).toNat = s := by
+  have hSc : s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨ s = 7 ∨ s = 8 ∨
+      s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 ∨ s = 14 ∨ s = 15 ∨ s = 16 := by omega
+  rcases hSc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+
+theorem flacDenorm_norm_s16_sub16_roundtrip (sf : SampleFormat) (bps : Nat) (v : Int32)
+    (hSf : sf = .s16p ∨ sf = .s16le)
+    (hBpsLo : 4 ≤ bps) (hBpsHi : bps < 16)
+    (hLo : -(2 ^ (bps - 1) : Int) ≤ v.toInt) (hHi : v.toInt < (2 ^ (bps - 1) : Int)) :
+    flacDenormFromAudioSample sf bps (flacNormToAudioSample bps v) = v := by
+  have hNotGe : ¬ (bps ≥ 16) := by omega
+  have hSfB : (sf == .s16p || sf == .s16le) = true := by rcases hSf with rfl | rfl <;> rfl
+  simp only [flacNormToAudioSample, flacDenormFromAudioSample, hNotGe, ↓reduceIte, hBpsHi, decide_true, hSfB, Bool.and_self]
+  cases v with | ofUInt32 vu =>
+  cases vu with | ofBitVec vb =>
+  change _ ≤ vb.toInt at hLo
+  change vb.toInt < _ at hHi
+  change Int32.ofUInt32 (UInt32.ofBitVec
+    (BitVec.sshiftRight (vb <<< ((Int32.ofNat (16 - bps)).toBitVec.smod 32).toNat)
+      ((Int32.ofNat (16 - bps)).toBitVec.smod 32).toNat)) = Int32.ofUInt32 (UInt32.ofBitVec vb)
+  rw [flacInt32Smod_shift (16 - bps) (by omega) (by omega)]
+  congr 2
+  apply flacBitVecShift_roundtrip vb (16 - bps) (by omega) (by omega)
+  · have hCases : bps = 4 ∨ bps = 5 ∨ bps = 6 ∨ bps = 7 ∨ bps = 8 ∨ bps = 9 ∨ bps = 10 ∨
+        bps = 11 ∨ bps = 12 ∨ bps = 13 ∨ bps = 14 ∨ bps = 15 := by omega
+    rcases hCases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> omega
+  · have hCases : bps = 4 ∨ bps = 5 ∨ bps = 6 ∨ bps = 7 ∨ bps = 8 ∨ bps = 9 ∨ bps = 10 ∨
+        bps = 11 ∨ bps = 12 ∨ bps = 13 ∨ bps = 14 ∨ bps = 15 := by omega
+    rcases hCases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> omega
+
+theorem flacDenorm_norm_ge16_roundtrip (sf : SampleFormat) (bps : Nat) (v : Int32)
+    (hBps : 16 ≤ bps) :
+    flacDenormFromAudioSample sf bps (flacNormToAudioSample bps v) = v := by
+  have hNotLt : ¬ (bps < 16) := by omega
+  simp [flacNormToAudioSample, flacDenormFromAudioSample, hBps, hNotLt]
+
+set_option maxHeartbeats 1600000 in
 set_option maxRecDepth 200000 in
 theorem flacStream_and_stereo_modes_roundtrip :
     let c0 : Array Int32 := #[0, 120, 240, 350, 440, 510, 550, 560, 540, 490, 410, 300, 170, 20, -130, -270]
     let c1 : Array Int32 := #[10, 110, 220, 310, 390, 450, 490, 500, 480, 430, 360, 260, 150, 30, -100, -220]
     let exp := [c0.toList, c1.toList]
-    let c32L : Array Int32 := #[2147483647, -2147483648, 1500000000, -1500000000]
-    let c32R : Array Int32 := #[-2147483648, 2147483647, -1500000000, 1500000000]
+    let c32L : Array Int32 := #[2147483647, -2147483648, 2147483647, -2147483648, 1500000000, -1500000000]
+    let c32R : Array Int32 := #[-2147483648, 2147483647, -2147483648, 2147483647, -1500000000, 1500000000]
     let exp32 := [c32L.toList, c32R.toList]
     flacRoundtripChannels #[c0, c1] 48000 16 16 = some exp ∧
     flacRoundtripStereoMode c0 c1 .independent = some exp ∧
@@ -2629,7 +2842,23 @@ theorem flacStream_and_stereo_modes_roundtrip :
     flacRoundtripStereoMode c0 c1 .rightSide = some exp ∧
     flacRoundtripStereoMode c0 c1 .midSide = some exp ∧
     flacRoundtripStereoMode c32L c32R .midSide 32 (some .verbatim) = some exp32 ∧
-    flacRoundtripStereoMode c32L c32R .leftSide 32 (some (.fixed .order1 1 30 false 33)) = some exp32 := by
+    flacRoundtripStereoMode c32L c32R .leftSide 32 none = some exp32 ∧
+    flacChooseSubframeMode64 #[4294967295, -4294967295, 4294967295, -4294967295, 4294967295, -4294967295] 33 false = .verbatim := by
+  decide
+
+set_option maxHeartbeats 1600000 in
+set_option maxRecDepth 200000 in
+theorem flacAudioFrame_all_depths_roundtrip :
+    let c8 : Array Int32 := #[-128, -64, -1, 0, 1, 64, 127, -33]
+    let c12 : Array Int32 := #[-2048, -1024, -7, 0, 7, 1024, 2047, -513]
+    let c16 : Array Int32 := #[-32768, -12345, -1, 0, 1, 12345, 32767, -999]
+    let c24 : Array Int32 := #[-8388608, -1234567, -1, 0, 1, 1234567, 8388607, -424242]
+    let c32 : Array Int32 := #[-2147483648, -1500000000, -1, 0, 1, 1500000000, 2147483647, -123456789]
+    flacAudioFrameRoundtripChannels #[c8] 32000 8 16 = some [c8.toList] ∧
+    flacAudioFrameRoundtripChannels #[c12] 32000 12 16 = some [c12.toList] ∧
+    flacAudioFrameRoundtripChannels #[c16] 44100 16 16 = some [c16.toList] ∧
+    flacAudioFrameRoundtripChannels #[c24] 48000 24 16 = some [c24.toList] ∧
+    flacAudioFrameRoundtripChannels #[c32] 96000 32 16 = some [c32.toList] := by
   decide
 
 end LeanAV.Audio

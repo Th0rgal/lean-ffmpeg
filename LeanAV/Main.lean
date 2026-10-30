@@ -1223,6 +1223,28 @@ def isIntrospectionFlag (s : String) : Bool :=
    "-hwaccels", "-sources", "-sinks"].contains s
 
 /-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
+def runDelegatedLosslessFallback (validCfg : CliConfig) (plan : MediaPlanIR)
+    (inPath outPath : String) (t0 : Nat) : IO UInt32 := do
+  let argv := buildDelegatedFfmpegArgv plan []
+  let suppress : UInt32 := if validCfg.jsonOutput || cliQuiet validCfg.logLevel then 1 else 0
+  let rc ←
+    if verifyExecArgvHygiene argv.toList then
+      ffiExecDelegatedFfmpegC argv outPath suppress
+    else
+      pure 1
+  let t1 ← IO.monoNanosNow
+  if rc == 0 then
+    if validCfg.jsonOutput then
+      let inBytes ← getFileByteSizeOr inPath 0
+      let outBytes ← getFileByteSizeOr outPath 0
+      let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
+      IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-delegated-faithful\",\"tier\":\"delegated_faithful\",\"format\":\"{jsonEscape fmtStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\",\"in_bytes\":{inBytes},\"out_bytes\":{outBytes},\"total_us\":{(t1 - t0) / 1000}}"
+    return 0
+  else
+    return ← reportCliError validCfg
+      "{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"error\":\"delegated lossless fallback failed\"}"
+      (s!"Delegated conversion failed! ({inPath} -> {outPath})")
+
 def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
     (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
   if !validCfg.overwrite then
@@ -1245,34 +1267,43 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
   let isPngJob := plan.backend.reasons.contains "standalone_png_zlib_lossless_codec"
   if isPngJob then
     let inFmtLower := ext.inputFmt.map strToLowerAscii
-    let imgOpt : Option PngImage :=
+    let imgDisp : LosslessDecodeDispatch PngImage :=
       if inFmtLower == some "rawvideo" then
         match ext.inputVideoSize, ext.inputPixFmt with
-        | some (w, h), some pf => pngImageFromRaw rawIn w h pf
-        | _, _ => none
+        | some (w, h), some pf =>
+          match pngImageFromRaw rawIn w h pf with
+          | some img => .independentVerified img
+          | none => .invalidCorrupt "invalid_rawvideo_input"
+        | _, _ => .invalidCorrupt "invalid_rawvideo_input"
       else
-        match decodePngIndependentOrFallback inSlice with
-        | .independentVerified img => some img
-        | .fallbackDelegated _ => none
-    let some img := imgOpt | do
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid PNG or rawvideo input\"}"
-        (s!"Invalid PNG or rawvideo input: {inPath}")
+        classifyPngDecode3Way inSlice
+    let img ← match imgDisp with
+      | .independentVerified img => pure img
+      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .invalidCorrupt _ =>
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid PNG or rawvideo input\"}"
+          (s!"Invalid PNG or rawvideo input: {inPath}")
     let outFmtLower := validCfg.format.map strToLowerAscii
     let inferredOutFmt := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
     let isRawOut :=
       outFmtLower == some "rawvideo" ||
       (outFmtLower == none && inferredOutFmt == "rawvideo" && validCfg.videoCodec == some .rawvideo)
+    let isPngStreamCopy :=
+      !isRawOut && inFmtLower != some "rawvideo" && validCfg.videoCodec == some .copy && validCfg.pixelFormat.isNone
     let outBytesOpt : Option ByteArray :=
       if isRawOut then
         pngImageToRaw img validCfg.pixelFormat
+      else if isPngStreamCopy then
+        some rawIn
       else
         match validCfg.pixelFormat with
         | none =>
-          if img.colorType == 3 then
-            match pngImageToRaw img (some (pngDefaultPixFmt img)) with
+          if img.colorType == 3 || (img.transparency.size > 0 && !(img.colorType == 0 && img.bitDepth == 1)) then
+            let defPf := pngDefaultPixFmt img
+            match pngImageToRaw img (some defPf) with
             | some converted =>
-              match pngImageFromRaw converted img.width img.height (pngDefaultPixFmt img) with
+              match pngImageFromRaw converted img.width img.height defPf with
               | some img2 => pngEncode img2
               | none => none
             | none => none
@@ -1308,25 +1339,33 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
   else
     let inFmtLower := ext.inputFmt.map strToLowerAscii
     let lowerIn := strToLowerAscii inPath
-    let audioInOpt : Option (Array (Array Int32) × UInt32 × Nat) :=
+    let isWavIn := strEndsWithFast lowerIn ".wav" || inFmtLower == some "wav"
+    let isRawPcmIn := (inFmtLower.bind isStandalonePcmFmtBps).isSome
+    let audioDisp : LosslessDecodeDispatch (Array (Array Int32) × UInt32 × Nat) :=
       match inFmtLower.bind isStandalonePcmFmtBps with
       | some bps =>
         match ext.inputAudioRate, ext.inputAudioChannels with
         | some sr, some ch =>
-          (pcmRawLEToChannels inSlice ch bps).map (fun chans => (chans, sr.toUInt32, bps))
-        | _, _ => none
+          match pcmRawLEToChannels inSlice ch bps with
+          | some chans => .independentVerified (chans, sr.toUInt32, bps)
+          | none => .invalidCorrupt "invalid_raw_pcm_input"
+        | _, _ => .invalidCorrupt "invalid_raw_pcm_input"
       | none =>
-        if strEndsWithFast lowerIn ".wav" || inFmtLower == some "wav" then
-          demuxWavPcmLE inSlice
+        if isWavIn then
+          classifyWavDemux3Way inSlice
         else
-          match decodeFlacIndependentOrFallback inSlice true with
+          match classifyFlacDecode3Way inSlice true with
           | .independentVerified dec =>
-            some (dec.channelsData, dec.info.sampleRate, dec.info.bitsPerSample.toNat)
-          | .fallbackDelegated _ => none
-    let some (chansIn, srIn, bpsIn) := audioInOpt | do
-      return ← reportCliError validCfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid FLAC, WAV, or PCM input\"}"
-        (s!"Invalid FLAC, WAV, or PCM input: {inPath}")
+            .independentVerified (dec.channelsData, dec.info.sampleRate, dec.info.bitsPerSample.toNat)
+          | .fallbackDelegated r => .fallbackDelegated r
+          | .invalidCorrupt r => .invalidCorrupt r
+    let (chansIn, srIn, bpsIn) ← match audioDisp with
+      | .independentVerified triple => pure triple
+      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .invalidCorrupt _ =>
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid FLAC, WAV, or PCM input\"}"
+          (s!"Invalid FLAC, WAV, or PCM input: {inPath}")
     if let some reqSr := validCfg.audioRate then
       if reqSr != srIn.toNat then
         return ← reportCliError validCfg
@@ -1342,13 +1381,18 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
     let isFlacOut :=
       (strEndsWithFast lowerOut ".flac" && (outFmtLower == none || outFmtLower == some "flac")) ||
       outFmtLower == some "flac"
+    let isFlacStreamCopy :=
+      isFlacOut && !isWavIn && !isRawPcmIn &&
+      validCfg.audioCodec == some .copy && validCfg.audioRate.isNone && validCfg.audioChannels.isNone
     let isWavOut :=
       (strEndsWithFast lowerOut ".wav" && (outFmtLower == none || outFmtLower == some "wav")) ||
       outFmtLower == some "wav"
     let outCodecBps := ext.outputAudioCodecRaw.bind isStandalonePcmCodecBps
     let outFmtPcmBps := outFmtLower.bind isStandalonePcmFmtBps
     let outBytesOpt : Option (ByteArray × String) :=
-      if isFlacOut then
+      if isFlacStreamCopy then
+        some (rawIn, "flac")
+      else if isFlacOut then
         let targetBps := if bpsIn >= 4 && bpsIn <= 32 then bpsIn else 16
         let scaled := scaleChannelsBps chansIn bpsIn targetBps
         (flacEncodeStream scaled srIn targetBps 4096 true).map (fun b => (b, "flac"))
@@ -1843,8 +1887,17 @@ def runLosslessCodec (args : List String) : IO UInt32 := do
       | some bytes => IO.FS.writeBinFile output bytes; return 0
       | none => IO.eprintln "invalid flac parameters"; return 1
     | none => IO.eprintln "invalid pcm or wav input"; return 1
+  | "flac-frame-roundtrip" :: input :: output :: _ =>
+    let data ← IO.FS.readBinFile input
+    match flacDecodeStream (ByteSlice.ofByteArray data) true with
+    | some dec =>
+      let af := flacDecodedToAudioFrame dec
+      match flacEncodeAudioFrame af dec.info.bitsPerSample.toNat 4096 true with
+      | some bytes => IO.FS.writeBinFile output bytes; return 0
+      | none => IO.eprintln "flacEncodeAudioFrame failed"; return 1
+    | none => IO.eprintln "invalid flac stream"; return 1
   | _ =>
-    IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode|flac-encode|flac-decode ..."
+    IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode|flac-encode|flac-decode|flac-frame-roundtrip ..."
     return 2
 
 def main (args : List String) : IO UInt32 := do
@@ -2367,8 +2420,17 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Audio.flacStereoPair64_all_modes_roundtrip
 #print axioms LeanAV.Audio.flacFixedList_roundtrip
 #print axioms LeanAV.Audio.flacStream_and_stereo_modes_roundtrip
+#print axioms LeanAV.Audio.flacRiceResidualGateSpec_iff
+#print axioms LeanAV.Audio.flacRiceFits64_bounds
+#print axioms LeanAV.Audio.flacAudioFrameFormatGateSpec_iff
+#print axioms LeanAV.Audio.flacDenorm_norm_s16_sub16_roundtrip
+#print axioms LeanAV.Audio.flacDenorm_norm_ge16_roundtrip
+#print axioms LeanAV.Audio.flacAudioFrame_all_depths_roundtrip
+#print axioms LeanAV.Video.pngDownscale16To8_rep_exact
+#print axioms LeanAV.Video.pngDownscale16To8_and_trns_verified
 #print axioms LeanAV.PlanIR.standaloneLosslessPlanGateSpec_iff
 #print axioms LeanAV.PlanIR.standaloneLossless_routing_and_kernels_verified
+#print axioms LeanAV.PlanIR.losslessDecode3Way_trichotomy_verified
 
 
 
