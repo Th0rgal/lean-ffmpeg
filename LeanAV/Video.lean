@@ -3402,7 +3402,7 @@ def pngEncodeWith (image : PngImage) (filter : Nat := 5) (mode : DeflateMode := 
   let out := pngAppendBytes signature (pngChunk 0x49484452 ihdr)
   let out := if palLen == 0 then out else pngAppendBytes out (pngChunk 0x504C5445 image.palette)
   let out :=
-    if trnsLen == 0 || (image.colorType == 0 && image.bitDepth == 1) then out
+    if trnsLen == 0 then out
     else pngAppendBytes out (pngChunk 0x74524E53 image.transparency)
   let idat := pngChunk 0x49444154 (zlibEncodeMode raw mode)
   let iend := pngChunk 0x49454E44 { data := #[] }
@@ -3532,7 +3532,7 @@ def pngPixFmtInfo (pixFmt : String) : Option (Nat × Nat) :=
 def pngDefaultPixFmt (img : PngImage) : String :=
   match img.colorType, img.bitDepth with
   | 0, 16 => if img.transparency.size == 2 then "ya16be" else "gray16be"
-  | 0, 1 => "monob"
+  | 0, 1 => if img.transparency.size == 2 then "ya8" else "monob"
   | 0, _ => if img.transparency.size == 2 then "ya8" else "gray"
   | 2, 16 => if img.transparency.size == 6 then "rgba64be" else "rgb48be"
   | 2, _ => if img.transparency.size == 6 then "rgba" else "rgb24"
@@ -3541,6 +3541,11 @@ def pngDefaultPixFmt (img : PngImage) : String :=
   | 4, _ => "ya8"
   | 6, 16 => "rgba64be"
   | _, _ => "rgba"
+
+@[inline]
+def pngGrayTrnsSample (trns : ByteArray) (bd : Nat) : Nat :=
+  let raw := (trns.data.getD 0 0).toNat * 256 + (trns.data.getD 1 0).toNat
+  if bd < 16 then raw &&& ((1 <<< bd) - 1) else raw
 
 @[inline]
 def pngDownscale16To8 (hi lo : UInt8) : UInt8 :=
@@ -3649,8 +3654,8 @@ def pngImageToRgba8 (img : PngImage) : Option ByteArray := Id.run do
   if img.colorType == 0 then
     let rb := pngRowBytes img.width 1 img.bitDepth
     if img.pixels.data.size != img.height * rb then return none
-    let hasTr := img.transparency.data.size == 2 && img.bitDepth > 1
-    let t0 := (img.transparency.data.getD 0 0).toNat * 256 + (img.transparency.data.getD 1 0).toNat
+    let hasTr := img.transparency.data.size == 2
+    let t0 := pngGrayTrnsSample img.transparency img.bitDepth
     return some { data := pngGrayToRgba8YLoop img.pixels img.width rb img.bitDepth hasTr t0 0 out img.height }
   if img.colorType == 4 then
     let bpc := if img.bitDepth == 16 then 2 else 1
@@ -3722,8 +3727,8 @@ def pngImageToRgba16Be (img : PngImage) : Option ByteArray := Id.run do
   if img.colorType == 0 then
     let rb := pngRowBytes img.width 1 img.bitDepth
     if img.pixels.data.size != img.height * rb then return none
-    let hasTr := img.transparency.data.size == 2 && img.bitDepth > 1
-    let t0 := (img.transparency.data.getD 0 0).toNat * 256 + (img.transparency.data.getD 1 0).toNat
+    let hasTr := img.transparency.data.size == 2
+    let t0 := pngGrayTrnsSample img.transparency img.bitDepth
     return some { data := pngGrayToRgba16YLoop img.pixels img.width rb img.bitDepth hasTr t0 0 #[] img.height }
   if img.colorType == 4 && img.bitDepth == 16 then
     if img.pixels.data.size != count * 4 then return none
@@ -3746,7 +3751,7 @@ def pngImageToRaw (img : PngImage) (pixFmtOpt : Option String) : Option ByteArra
   let fmt := pngNormalizeFmtStr (pixFmtOpt.getD (pngDefaultPixFmt img))
   match pngPixFmtInfo fmt with
   | some (bd, ct) =>
-    if img.bitDepth == bd && img.colorType == ct && (img.transparency.size == 0 || (bd == 1 && ct == 0)) then
+    if img.bitDepth == bd && img.colorType == ct && img.transparency.size == 0 then
       some img.pixels
     else if fmt == "monob" then do
       let rgba ← pngImageToRgba8 img
@@ -3900,20 +3905,27 @@ theorem pngDownscale16To8_rep_exact (v : UInt8) :
   rw [hdiv]
   exact UInt8.ofNat_toNat
 
+set_option maxHeartbeats 800000 in
+set_option maxRecDepth 200000 in
 theorem pngDownscale16To8_and_trns_verified :
     pngDownscale16To8 0x12 0xFF = 0x13 ∧
     pngDownscale16To8 0xFF 0x00 = 0xFE ∧
     pngDownscale16To8 0x00 0x80 = 0x00 ∧
     pngDownscale16To8 0x00 0x81 = 0x01 ∧
     (pngImageToRgba8 ⟨4, 1, 1, 0, { data := #[0x50] }, { data := #[] }, { data := #[0x00, 0x01] }⟩).map (fun b => b.data.toList) =
-      some [0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255] ∧
-    (pngImageToRgba8 ⟨4, 1, 2, 0, { data := #[0x1B] }, { data := #[] }, { data := #[0x00, 0x02] }⟩).map (fun b => b.data.toList) =
+      some [0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0] ∧
+    (pngImageToRgba8 ⟨4, 1, 1, 0, { data := #[0x50] }, { data := #[] }, { data := #[0xFF, 0xFD] }⟩).map (fun b => b.data.toList) =
+      some [0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0] ∧
+    (pngImageToRgba8 ⟨4, 1, 2, 0, { data := #[0x1B] }, { data := #[] }, { data := #[0xFF, 0xFE] }⟩).map (fun b => b.data.toList) =
       some [0, 0, 0, 255, 85, 85, 85, 255, 170, 170, 170, 0, 255, 255, 255, 255] ∧
-    (pngImageToRgba16Be ⟨4, 1, 2, 0, { data := #[0x1B] }, { data := #[] }, { data := #[0x00, 0x02] }⟩).map (fun b => b.data.toList) =
+    (pngImageToRgba16Be ⟨4, 1, 2, 0, { data := #[0x1B] }, { data := #[] }, { data := #[0xFF, 0xFE] }⟩).map (fun b => b.data.toList) =
       some [0, 0, 0, 0, 0, 0, 255, 255,
             85, 85, 85, 85, 85, 85, 255, 255,
             170, 170, 170, 170, 170, 170, 0, 0,
-            255, 255, 255, 255, 255, 255, 255, 255] := by
+            255, 255, 255, 255, 255, 255, 255, 255] ∧
+    ((pngEncodeWith ⟨4, 1, 1, 0, { data := #[0x50] }, { data := #[] }, { data := #[0x00, 0x01] }⟩ 0 .stored).bind
+      (fun b => (pngDecode { ba := b, off := 0, len := b.data.size }).map (fun d => d.transparency.data.toList))) =
+      some [0, 1] := by
   decide
 
 end LeanAV.Video

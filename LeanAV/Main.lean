@@ -1299,7 +1299,7 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
       else
         match validCfg.pixelFormat with
         | none =>
-          if img.colorType == 3 || (img.transparency.size > 0 && !(img.colorType == 0 && img.bitDepth == 1)) then
+          if img.colorType == 3 then
             let defPf := pngDefaultPixFmt img
             match pngImageToRaw img (some defPf) with
             | some converted =>
@@ -1850,10 +1850,16 @@ def runLosslessCodec (args : List String) : IO UInt32 := do
     | none => IO.eprintln "invalid png"; return 1
   | "png-encode" :: w :: h :: depth :: color :: input :: output :: rest =>
     let pixels ← IO.FS.readBinFile input
-    let palette ← match rest with
-      | p :: _ => IO.FS.readBinFile p
-      | [] => pure ByteArray.empty
-    let img : PngImage := ⟨w.toNat!, h.toNat!, depth.toNat!, color.toNat!, pixels, palette, ByteArray.empty⟩
+    let (palette, trns) ← match rest with
+      | p :: t :: _ => do
+        let pal ← if p == "-" || p.isEmpty then pure ByteArray.empty else IO.FS.readBinFile p
+        let tr ← IO.FS.readBinFile t
+        pure (pal, tr)
+      | [p] => do
+        let pal ← if p == "-" || p.isEmpty then pure ByteArray.empty else IO.FS.readBinFile p
+        pure (pal, ByteArray.empty)
+      | [] => pure (ByteArray.empty, ByteArray.empty)
+    let img : PngImage := ⟨w.toNat!, h.toNat!, depth.toNat!, color.toNat!, pixels, palette, trns⟩
     match pngEncode img with
     | some bytes => IO.FS.writeBinFile output bytes; return 0
     | none => IO.eprintln "invalid png image"; return 1
@@ -2420,6 +2426,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Audio.flacStereoPair64_all_modes_roundtrip
 #print axioms LeanAV.Audio.flacFixedList_roundtrip
 #print axioms LeanAV.Audio.flacStream_and_stereo_modes_roundtrip
+#print axioms LeanAV.Audio.flacResidualValueGateSpec_iff
 #print axioms LeanAV.Audio.flacRiceResidualGateSpec_iff
 #print axioms LeanAV.Audio.flacRiceFits64_bounds
 #print axioms LeanAV.Audio.flacAudioFrameFormatGateSpec_iff

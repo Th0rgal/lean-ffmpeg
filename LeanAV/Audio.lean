@@ -564,6 +564,32 @@ def writeSignedBitsMSB64 (w : BitWriter) (v : Int64) (n : Nat) : BitWriter :=
 def writeSignedBitsMSB (w : BitWriter) (v : Int32) (n : Nat) : BitWriter :=
   writeSignedBitsMSB64 w v.toInt64 n
 
+@[inline]
+def isFlacResidualValueValid64 (x : Int64) : Bool :=
+  decide ((-2147483647 : Int64) ≤ x) && decide (x ≤ (2147483647 : Int64))
+
+def FlacResidualValueSafe (x : Int64) : Prop :=
+  (-2147483647 : Int64) ≤ x ∧ x ≤ (2147483647 : Int64)
+
+def flacResidualValueGateSpec : AVGateSpec Int64 FlacResidualValueSafe where
+  gate := isFlacResidualValueValid64
+  sound x h := by
+    unfold isFlacResidualValueValid64 FlacResidualValueSafe at *
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+    exact h
+  complete x h := by
+    unfold isFlacResidualValueValid64 FlacResidualValueSafe at *
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact h
+  posWitness := -2147483647
+  negWitness := -2147483648
+  nonVacuous := by decide
+  tight := by decide
+
+theorem flacResidualValueGateSpec_iff (x : Int64) :
+    flacResidualValueGateSpec.gate x = true ↔ FlacResidualValueSafe x :=
+  flacResidualValueGateSpec.iff_safe x
+
 def readSignedSamplesLoop64 (rawBps : Nat) (cur : BitReader) : Nat → List Int64 → Option (List Int64 × BitReader)
   | 0, acc => some (acc.reverse, cur)
   | rem + 1, acc =>
@@ -574,12 +600,26 @@ def readSignedSamplesLoop64 (rawBps : Nat) (cur : BitReader) : Nat → List Int6
       | none => none
       | some (sv, rNext) => readSignedSamplesLoop64 rawBps rNext rem (sv :: acc)
 
+def readEscapedResidualsLoop64 (rawBps : Nat) (cur : BitReader) : Nat → List Int64 → Option (List Int64 × BitReader)
+  | 0, acc => some (acc.reverse, cur)
+  | rem + 1, acc =>
+    if rawBps == 0 then
+      readEscapedResidualsLoop64 0 cur rem (0 :: acc)
+    else
+      match readSignedBitsMSB64 cur rawBps with
+      | none => none
+      | some (sv, rNext) =>
+        if !flacResidualValueGateSpec.gate sv then none
+        else readEscapedResidualsLoop64 rawBps rNext rem (sv :: acc)
+
 def readRiceSamplesLoop64 (k : Nat) (cur : BitReader) : Nat → List Int64 → Option (List Int64 × BitReader)
   | 0, acc => some (acc.reverse, cur)
   | rem + 1, acc =>
     match cur.readRiceSigned k with
     | none => none
-    | some (sv, rNext) => readRiceSamplesLoop64 k rNext rem (sv :: acc)
+    | some (sv, rNext) =>
+      if !flacResidualValueGateSpec.gate sv then none
+      else readRiceSamplesLoop64 k rNext rem (sv :: acc)
 
 def decodeFlacRicePartitionsLoop64 (blockSize predOrder partOrder numParts paramBits : Nat) (escapeParam : UInt64)
     (cur : BitReader) (p : Nat) : Nat → List Int64 → Option (List Int64 × BitReader)
@@ -597,7 +637,7 @@ def decodeFlacRicePartitionsLoop64 (blockSize predOrder partOrder numParts param
         match rP.readBitsMSB 5 with
         | none => none
         | some (rawBpsBits, rEsc) =>
-          match readSignedSamplesLoop64 rawBpsBits.toNat rEsc nSamplesInPart [] with
+          match readEscapedResidualsLoop64 rawBpsBits.toNat rEsc nSamplesInPart [] with
           | none => none
           | some (partSamples, rNext) =>
             decodeFlacRicePartitionsLoop64 blockSize predOrder partOrder numParts paramBits escapeParam
@@ -767,7 +807,8 @@ def flacWriteSubframeBits64 (w0 : BitWriter) (mode : FlacSubframeSpecMode) (bps 
     let w3 := (w2.writeBitsMSB cm 2).writeBitsMSB 0 4
     let allResList := (flacEncodeFixedResiduals64 ord samples).toList.drop predOrder
     if escaped then
-      let w4 := (w3.writeBitsMSB escCode paramBits).writeBitsMSB rawBps.toUInt64 5
+      let rawCode : UInt64 := if rawBps == 0 || rawBps > 32 then 0 else rawBps.toUInt64
+      let w4 := (w3.writeBitsMSB escCode paramBits).writeBitsMSB rawCode 5
       writeSignedListMSB64 rawBps w4 allResList
     else
       let w4 := w3.writeBitsMSB riceK.toUInt64 paramBits
@@ -2345,13 +2386,13 @@ def flacSampleAbs (x : Int32) : Nat :=
   flacSampleAbs64 x.toInt64
 
 def flacRiceFits64 (x : Int64) (k : Nat) : Bool :=
-  decide ((-2147483648 : Int64) ≤ x) &&
+  decide ((-2147483647 : Int64) ≤ x) &&
   decide (x ≤ (2147483647 : Int64)) &&
   decide (k ≤ 30) &&
   decide (((flacZigzag64 x) >>> k.toUInt64) < 1048576)
 
 def FlacRiceResidualSafe (p : Int64 × Nat) : Prop :=
-  (-2147483648 : Int64) ≤ p.1 ∧ p.1 ≤ (2147483647 : Int64) ∧
+  (-2147483647 : Int64) ≤ p.1 ∧ p.1 ≤ (2147483647 : Int64) ∧
   p.2 ≤ 30 ∧ ((flacZigzag64 p.1) >>> p.2.toUInt64) < 1048576
 
 def flacRiceResidualGateSpec : AVGateSpec (Int64 × Nat) FlacRiceResidualSafe where
@@ -2367,7 +2408,7 @@ def flacRiceResidualGateSpec : AVGateSpec (Int64 × Nat) FlacRiceResidualSafe wh
     simp only [Bool.and_eq_true, decide_eq_true_eq]
     exact ⟨⟨⟨hlo, hhi⟩, hk⟩, hq⟩
   posWitness := (2147483647, 30)
-  negWitness := (2147483648, 30)
+  negWitness := (-2147483648, 30)
   nonVacuous := by decide
   tight := by decide
 
@@ -2376,7 +2417,7 @@ theorem flacRiceResidualGateSpec_iff (p : Int64 × Nat) :
   flacRiceResidualGateSpec.iff_safe p
 
 theorem flacRiceFits64_bounds (x : Int64) (k : Nat) (h : flacRiceFits64 x k = true) :
-    (-2147483648 : Int64) ≤ x ∧ x ≤ (2147483647 : Int64) ∧
+    (-2147483647 : Int64) ≤ x ∧ x ≤ (2147483647 : Int64) ∧
       k ≤ 30 ∧ ((flacZigzag64 x) >>> k.toUInt64) < 1048576 :=
   flacRiceResidualGateSpec.sound (x, k) h
 
@@ -2843,7 +2884,14 @@ theorem flacStream_and_stereo_modes_roundtrip :
     flacRoundtripStereoMode c0 c1 .midSide = some exp ∧
     flacRoundtripStereoMode c32L c32R .midSide 32 (some .verbatim) = some exp32 ∧
     flacRoundtripStereoMode c32L c32R .leftSide 32 none = some exp32 ∧
-    flacChooseSubframeMode64 #[4294967295, -4294967295, 4294967295, -4294967295, 4294967295, -4294967295] 33 false = .verbatim := by
+    flacChooseSubframeMode64 #[4294967295, -4294967295, 4294967295, -4294967295, 4294967295, -4294967295] 33 false = .verbatim ∧
+    flacChooseSubframeMode64 #[0, 0, 0, 0, -2147483648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 32 false = .verbatim ∧
+    flacChooseSubframeMode64 #[0, 0, 0, 0, -2147483648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 32 true = .verbatim ∧
+    decodeFlacSubframeSpec (ByteSlice.ofByteArray
+      (encodeFlacSubframeSpec (.fixed .order0 0 0 true 31) 32 #[0, -1073741824])) 2 32 = some #[0, -1073741824] ∧
+    decodeFlacSubframeSpec (ByteSlice.ofByteArray
+      (encodeFlacSubframeSpec (.fixed .order0 1 30 false 32) 32 #[0, -2147483648])) 2 32 = none ∧
+    decodeFlacSubframeSpec { ba := { data := #[0x10, 0x43, 0xC0, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0x80] }, off := 0, len := 11 } 2 32 = none := by
   decide
 
 set_option maxHeartbeats 1600000 in

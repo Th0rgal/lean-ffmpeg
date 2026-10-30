@@ -2,26 +2,29 @@
 
 The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
-audited **10,296 declarations with zero sorryAx/custom axioms** and **319/319
-tight specifications** (`Format`: 56, `Video`: 46, `Audio`: 33, `Encoder`: 30,
+audited **10,309 declarations with zero sorryAx/custom axioms** and **320/320
+tight specifications** (`Format`: 56, `Video`: 46, `Audio`: 34, `Encoder`: 30,
 `Scale`: 28, `Bitstream`: 27, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 20,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
 shadowed), adding pure Lean 4 `independent_verified` Zlib/DEFLATE (RFC 1950 /
 RFC 1951 stored, fixed, and dynamic canonical Huffman + LZ77 + Adler-32), PNG
 (filters `0..4`, Adam7 interlace, strict RFC 2083 chunk ordering/multiplicity,
-`PLTE`/`tRNS` including 16-bit RGB and sub-8-bit keys, exact `(v + 128) / 257`
+`PLTE`/`tRNS` including 16-bit RGB and sub-8-bit keys, 1-bit grayscale `tRNS`
+with low-`bitDepth` high-bit masking, exact `(v + 128) / 257`
 16->8 downscaling and `-c:v copy`/`-c copy` chunk-exact stream copy, 8/16-bit
 rawvideo CLI roundtrip), and FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC
-subframes, 33-bit full-scale `[-2^31, 2^31-1]` signed Rice residuals and adaptive
-partition order selection, `AudioFrame` 8..32-bit sign-extension/denormalization
-roundtrip, wasted bits, 4 stereo modes, STREAMINFO MD5 + CRC-8/CRC-16, `-c:a copy`/
-`-c copy` metadata-preserving stream copy, 3-way `independentVerified` /
-out-of-domain `fallbackDelegated` / corrupt fail-closed dispatch, and
-`WAVE_FORMAT_EXTENSIBLE` 8/12/16/20/24/32-bit WAV & raw PCM CLI roundtrip)
-decode and encode with zero `ffmpeg` subprocesses (verified under
-`PATH=/nonexistent`, `LEANAV_FFMPEG_BIN=/nonexistent`, and `strace -f -e trace=execve`),
-passing `121` unit suite entries (`119` passed, `2` skipped without `clang-18`) and
-`76` differential suite entries (`72` passed, `4` skipped).
+subframes, 33-bit stereo side-channel samples with RFC 9639 §9.2.7.3
+`[-2147483647, 2147483647]` signed Rice residuals and adaptive
+partition order selection, fail-closed rejection of residual values outside
+`[-2147483647, 2147483647]` with verbatim fallback, `AudioFrame` 8..32-bit
+sign-extension/denormalization roundtrip, wasted bits, 4 stereo modes,
+STREAMINFO MD5 + CRC-8/CRC-16, `-c:a copy`/`-c copy` metadata-preserving stream
+copy, 3-way `independentVerified` / out-of-domain `fallbackDelegated` / corrupt
+fail-closed dispatch, and `WAVE_FORMAT_EXTENSIBLE` 8/12/16/20/24/32-bit WAV &
+raw PCM CLI roundtrip) decode and encode with zero `ffmpeg` subprocesses
+(verified under `PATH=/nonexistent` and `LEANAV_FFMPEG_BIN=/nonexistent`),
+passing `121` unit suite entries (`119` passed, `2` skipped without `clang-18`)
+and `78` differential suite entries (`74` passed, `4` skipped).
 
 The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited

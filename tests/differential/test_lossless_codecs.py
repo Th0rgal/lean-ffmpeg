@@ -671,6 +671,143 @@ class LosslessCodecTests(unittest.TestCase):
             bytes([0,0,0,0,0,0,255,255, 85,85,85,85,85,85,255,255, 170,170,170,170,170,170,0,0, 255,255,255,255,255,255,255,255]),
         )
 
+    @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
+    def test_flac_rfc9639_residual_bounds_and_fail_closed(self):
+        iso_env = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+        mono_s32 = [0] * 4 + [-2147483648] + [0] * 123
+        mono_bytes = struct.pack(f"<{len(mono_s32)}i", *mono_s32)
+        mono_in = self.write("mono_res_min32.pcm", mono_bytes)
+        mono_flac = self.dir / "mono_res_min32.flac"
+        run(LFFMPEG, "-y", "-f", "s32le", "-ar", "48000", "-ac", "1", "-i", mono_in, mono_flac, env=iso_env)
+        ff_mono = self.dir / "ff_mono_res_min32.pcm"
+        ff_r1 = run(FFMPEG, "-y", "-v", "error", "-i", mono_flac, "-f", "s32le", ff_mono)
+        self.assertEqual(ff_r1.stderr, b"")
+        self.assertEqual(ff_mono.read_bytes(), mono_bytes)
+        lean_mono = self.dir / "lean_mono_res_min32.pcm"
+        run(LFFMPEG, "-y", "-i", mono_flac, "-f", "s32le", lean_mono, env=iso_env)
+        self.assertEqual(lean_mono.read_bytes(), mono_bytes)
+
+        st_pairs = [(0, 0)] * 4 + [(-1073741824, 1073741824)] + [(0, 0)] * 123
+        st_bytes = b"".join(struct.pack("<ii", l_v, r_v) for l_v, r_v in st_pairs)
+        st_in = self.write("st_midside_min32.pcm", st_bytes)
+        st_flac = self.dir / "st_midside_min32.flac"
+        run(LFFMPEG, "-y", "-f", "s32le", "-ar", "48000", "-ac", "2", "-i", st_in, st_flac, env=iso_env)
+        ff_st = self.dir / "ff_st_midside_min32.pcm"
+        ff_r2 = run(FFMPEG, "-y", "-v", "error", "-i", st_flac, "-f", "s32le", ff_st)
+        self.assertEqual(ff_r2.stderr, b"")
+        self.assertEqual(ff_st.read_bytes(), st_bytes)
+        lean_st = self.dir / "lean_st_midside_min32.pcm"
+        run(LFFMPEG, "-y", "-i", st_flac, "-f", "s32le", lean_st, env=iso_env)
+        self.assertEqual(lean_st.read_bytes(), st_bytes)
+
+        def crc8_flac(data):
+            crc = 0
+            for b in data:
+                crc ^= b
+                for _ in range(8):
+                    crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else ((crc << 1) & 0xFF)
+            return crc
+
+        def crc16_flac(data):
+            crc = 0
+            for b in data:
+                crc ^= b << 8
+                for _ in range(8):
+                    crc = ((crc << 1) ^ 0x8005) & 0xFFFF if (crc & 0x8000) else ((crc << 1) & 0xFFFF)
+            return crc
+
+        def pack_bits(bit_pairs):
+            bits = []
+            for val, width in bit_pairs:
+                for shift in range(width - 1, -1, -1):
+                    bits.append((val >> shift) & 1)
+            while len(bits) % 8:
+                bits.append(0)
+            return bytes(
+                sum(bits[i + j] << (7 - j) for j in range(8))
+                for i in range(0, len(bits), 8)
+            )
+
+        si_bytes = pack_bits([(16, 16), (16, 16), (0, 24), (0, 24), (48000, 20), (0, 3), (31, 5), (16, 36)]) + b"\x00" * 16
+        stream_hdr = b"fLaC\x80\x00\x00\x22" + si_bytes
+        fh = bytearray([0xFF, 0xF8, (6 << 4) | 10, (0 << 4) | (7 << 1), 0x00, 15])
+        fh.append(crc8_flac(fh))
+
+        spy_log = self.dir / "ffmpeg_spy.log"
+        spy_bin = self.dir / "ffmpeg"
+        spy_bin.write_text(f"#!/bin/sh\necho invoked >> '{spy_log}'\nexit 0\n")
+        spy_bin.chmod(0o755)
+        spy_env = dict(os.environ)
+        spy_env["PATH"] = f"{self.dir}:{spy_env.get('PATH', '')}"
+        spy_env["LEANAV_FFMPEG_BIN"] = str(spy_bin)
+
+        for tag, u_val in (("neg_2p31", 4294967295), ("pos_2p31", 4294967296)):
+            q, rem = u_val >> 30, u_val & ((1 << 30) - 1)
+            sub_pairs = [(0, 1), (8, 6), (0, 1), (1, 2), (0, 4), (30, 5), (1, q + 1), (rem, 30)] + [(1, 1), (0, 30)] * 15
+            fn = bytes(fh) + pack_bits(sub_pairs)
+            c16 = crc16_flac(fn)
+            bad_flac = self.write(f"bad_rice_{tag}.flac", stream_hdr + fn + struct.pack(">H", c16))
+            rc = subprocess.run([str(LFFMPEG), "-y", "-i", str(bad_flac), str(self.dir / f"out_{tag}.wav")], env=spy_env, capture_output=True)
+            self.assertNotEqual(rc.returncode, 0, f"Expected fail-closed rc!=0 for {tag}")
+            self.assertFalse(spy_log.exists(), f"Invalid FLAC {tag} must never invoke delegated ffmpeg")
+
+        fh_ms = bytearray([0xFF, 0xF8, (6 << 4) | 10, (10 << 4) | (7 << 1), 0x00, 15])
+        fh_ms.append(crc8_flac(fh_ms))
+        sub_mid = [(0, 1), (0, 6), (0, 1), (0, 32)]
+        sub_side_wasted_esc = [(0, 1), (8, 6), (1, 1), (1, 1), (0, 2), (0, 4), (15, 4), (31, 5), (0x40000000, 31)] + [(0, 31)] * 15
+        fn_w_esc = bytes(fh_ms) + pack_bits(sub_mid + sub_side_wasted_esc)
+        si_stereo = pack_bits([(16, 16), (16, 16), (0, 24), (0, 24), (48000, 20), (1, 3), (31, 5), (16, 36)]) + b"\x00" * 16
+        w_esc_flac = self.write("wasted_esc31.flac", b"fLaC\x80\x00\x00\x22" + si_stereo + fn_w_esc + struct.pack(">H", crc16_flac(fn_w_esc)))
+        lean_w_esc = self.dir / "lean_w_esc.pcm"
+        ff_w_esc = self.dir / "ff_w_esc.pcm"
+        run(LFFMPEG, "-y", "-i", w_esc_flac, "-f", "s32le", lean_w_esc, env=iso_env)
+        run(FFMPEG, "-y", "-v", "error", "-i", w_esc_flac, "-f", "s32le", ff_w_esc)
+        self.assertEqual(lean_w_esc.read_bytes(), ff_w_esc.read_bytes())
+
+        esc_pairs = [(0, 1), (8, 6), (0, 1), (0, 2), (0, 4), (15, 4), (31, 5), (0x40000000, 31)] + [(0, 31)] * 15
+        fn_esc = bytes(fh) + pack_bits(esc_pairs)
+        ok_esc_flac = self.write("ok_esc31.flac", stream_hdr + fn_esc + struct.pack(">H", crc16_flac(fn_esc)))
+        lean_esc_pcm = self.dir / "lean_esc31.pcm"
+        ff_esc_pcm = self.dir / "ff_esc31.pcm"
+        run(LFFMPEG, "-y", "-i", ok_esc_flac, "-f", "s32le", lean_esc_pcm, env=iso_env)
+        run(FFMPEG, "-y", "-v", "error", "-i", ok_esc_flac, "-f", "s32le", ff_esc_pcm)
+        self.assertEqual(lean_esc_pcm.read_bytes(), ff_esc_pcm.read_bytes())
+
+    def test_png_grayscale_trns_bitdepth1_and_highbit_masking(self):
+        iso_env = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+        for tag, trns_val in (("exact1", b"\x00\x01"), ("masked1", b"\xff\xfd")):
+            p1 = self.write(f"g1_{tag}.png", png_bytes(4, 1, 1, 0, b"\x00\x50", trns=trns_val))
+            o_rgba = self.dir / f"g1_{tag}.rgba"
+            o_ya8 = self.dir / f"g1_{tag}.ya8"
+            run(LFFMPEG, "-y", "-i", p1, "-f", "rawvideo", "-pix_fmt", "rgba", o_rgba, env=iso_env)
+            run(LFFMPEG, "-y", "-i", p1, "-f", "rawvideo", o_ya8, env=iso_env)
+            self.assertEqual(o_rgba.read_bytes(), bytes([0,0,0,255, 255,255,255,0, 0,0,0,255, 255,255,255,0]))
+            self.assertEqual(o_ya8.read_bytes(), bytes([0,255, 255,0, 0,255, 255,0]))
+
+        raw1 = self.write("g1_raw.bin", b"\x50")
+        tr1 = self.write("g1_trns.bin", b"\x00\x01")
+        enc1 = self.dir / "g1_enc.png"
+        run(LFFMPEG, "lossless-codec", "png-encode", "4", "1", "1", "0", raw1, enc1, "-", tr1, env=iso_env)
+        self.assertIn(b"\x00\x00\x00\x02tRNS\x00\x01", enc1.read_bytes())
+        reenc1 = self.dir / "g1_reenc.png"
+        run(LFFMPEG, "-y", "-i", enc1, reenc1, env=iso_env)
+        self.assertIn(b"\x00\x00\x00\x02tRNS\x00\x01", reenc1.read_bytes())
+        o_re_rgba = self.dir / "g1_reenc.rgba"
+        run(LFFMPEG, "-y", "-i", reenc1, "-f", "rawvideo", "-pix_fmt", "rgba", o_re_rgba, env=iso_env)
+        self.assertEqual(o_re_rgba.read_bytes(), bytes([0,0,0,255, 255,255,255,0, 0,0,0,255, 255,255,255,0]))
+
+        cases = [
+            (2, 4, b"\x00\x1b", b"\xff\xfe", bytes([0,0,0,255, 85,85,85,255, 170,170,170,0, 255,255,255,255])),
+            (4, 2, b"\x00\x5a", b"\xab\xca", bytes([85,85,85,255, 170,170,170,0])),
+            (8, 2, b"\x00\x12\x34", b"\x99\x34", bytes([0x12,0x12,0x12,255, 0x34,0x34,0x34,0])),
+            (16, 2, b"\x00\x12\x34\x56\x78", b"\x12\x34", bytes([0x12,0x12,0x12,0, 0x56,0x56,0x56,255])),
+        ]
+        for bd, w, rows, tr_bytes, exp_rgba in cases:
+            p = self.write(f"g{bd}_mask.png", png_bytes(w, 1, bd, 0, rows, trns=tr_bytes))
+            out_p = self.dir / f"g{bd}_mask.rgba"
+            run(LFFMPEG, "-y", "-i", p, "-f", "rawvideo", "-pix_fmt", "rgba", out_p, env=iso_env)
+            self.assertEqual(out_p.read_bytes(), exp_rgba, f"Failed masked gray tRNS at bd={bd}")
+
 
 if __name__ == "__main__":
     unittest.main()
