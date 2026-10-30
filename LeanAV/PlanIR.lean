@@ -1287,7 +1287,6 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     isDelegatedVideoCodec
 
   let nativeCopyFormat := ["mp4", "mov", "ivf", "wav", "flac", "matroska", "mkv", "webm"].contains inferredFmt
-  let nativeTrimFormat := ["mp4", "mov", "ivf", "wav"].contains inferredFmt
   let nativeMetadataOk := extMetadataEntries.isEmpty ||
     ((inferredFmt == "mp4" || inferredFmt == "mov") && extMetadataEntries.all (fun kv => (nativeMp4MetadataTag kv.key).isSome))
   let nativeFamily (f : String) : String :=
@@ -1298,14 +1297,24 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       let inFmt := if strEndsWithFast lowerIn ".m4v" then "mp4" else inferContainerFormat none i.path
       !anyConcatInput && nativeFamily inFmt == nativeFamily inferredFmt
     | _ => false
+  let nativeCopyCodecsOk : Bool :=
+    (cfgVideoCodec == some .copy && cfgAudioCodec == some .copy) ||
+    (cfgVideoCodec == some .copy && cfgAudioCodec.isNone &&
+      (cfgNoAudio || (!extMaps.isEmpty && extMaps.all (fun m => m.kind == .video)) || inferredFmt == "ivf")) ||
+    (cfgAudioCodec == some .copy && cfgVideoCodec.isNone &&
+      (cfgNoVideo || (!extMaps.isEmpty && extMaps.all (fun m => m.kind == .audio)) ||
+       inferredFmt == "wav" || inferredFmt == "flac"))
+  let nativeMapsOk : Bool :=
+    extMaps.all (fun m => m.inputIdx == 0)
+  let nativeSubtitleCodecOk : Bool :=
+    extSubtitleCodec.isNone || extSubtitleCodec == some .copy
   let isNativeStreamCopy : Bool :=
     nativeCopyFormat && nativeSingleInput && nativeMetadataOk &&
-    (nativeTrimFormat || (cfgStartSec.isNone && cfgDurationSec.isNone)) &&
-    cfgVideoCodec == some .copy && cfgAudioCodec == some .copy &&
-    !cfgNoVideo && !cfgNoAudio &&
+    nativeCopyCodecsOk && nativeMapsOk && nativeSubtitleCodecOk &&
+    !(cfgNoVideo && cfgNoAudio && extNoSubtitle) &&
     extExtraOutputs.isEmpty && !extHasExtraDelegatedFlags && extMpegOptions.isEmpty &&
-    !extNoSubtitle && extMaps.isEmpty && extMapMetadataSource == -1 && extMapChaptersSource == -1 &&
-    extSubtitleCodec.isNone && extBsfs.isEmpty && cfgVideoFilter.isNone && cfgAudioFilter.isNone &&
+    extMapMetadataSource == -1 && extMapChaptersSource == -1 &&
+    extBsfs.isEmpty && cfgVideoFilter.isNone && cfgAudioFilter.isNone &&
     cfgVideoFrames.isNone && cfgVideoSize.isNone && cfgAudioRate.isNone && cfgAudioChannels.isNone &&
     cfgPixelFormat.isNone && cfgThreads.isNone && cfgBFrames.isNone && cfgGopSize.isNone &&
     cfgMovflags.isNone && cfgPreset.isNone && cfgCrf.isNone && cfgVideoBitrate.isNone &&
@@ -1392,6 +1401,34 @@ def parseArgsToPlanIR (args : List String) : MediaPlanIR :=
   let ext0 := extractExtendedPlanFlagsLoop args {}
   let cfg := parseFFmpegArgs ext0.baseArgs
   lowerCliWithExtToPlanIR cfg ext0
+
+def streamKindToNativeKind : StreamKind → NativeStreamKind
+  | .video    => .video
+  | .audio    => .audio
+  | .subtitle => .subtitle
+  | .data     => .data
+  | .all      => .all
+
+def extractNativeRemuxSelectors (plan : MediaPlanIR) : List NativeStreamSelector × Bool :=
+  let outOpt := plan.outputs.head?
+  let noVid := match outOpt with | some o => o.noVideo | none => false
+  let noAud := match outOpt with | some o => o.noAudio | none => false
+  let noSub := match outOpt with | some o => o.noSubtitle | none => false
+  let hasExplicitMaps := plan.maps != plan.streams
+  if hasExplicitMaps then
+    let filtered := plan.maps.filter (fun m =>
+      !(m.kind == .video && noVid) &&
+      !(m.kind == .audio && noAud) &&
+      !(m.kind == .subtitle && noSub))
+    let sels := filtered.map (fun m =>
+      { kind := streamKindToNativeKind m.kind, streamIdx := m.streamIdx, optional := m.optional })
+    (sels, true)
+  else
+    let sels :=
+      (if noVid then [] else [{ kind := .video, streamIdx := some 0, optional := true }]) ++
+      (if noAud then [] else [{ kind := .audio, streamIdx := some 0, optional := true }]) ++
+      (if noSub then [] else [{ kind := .subtitle, streamIdx := some 0, optional := true }])
+    (sels, false)
 
 /--
   Unified argv renderer for `MediaPlanIR`:

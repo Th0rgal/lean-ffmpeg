@@ -2,8 +2,8 @@
 
 The 2026-10-29 Wave 2–3 integrated validation under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
-**9,032 declarations with zero sorryAx/custom axioms** and **269/269 tight
-specifications** (`Format`: 59, `Video`: 31, `Encoder`: 30, `Scale`: 28,
+**9,496 declarations with zero sorryAx/custom axioms** and **271/271 tight
+specifications** (`Format`: 61, `Video`: 31, `Encoder`: 30, `Scale`: 28,
 `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
 `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with `16/16` `LNIR_WIRE_V1`
 kernels passing `SymbolicTV` (`validate-tv --samples 64`) and certificate

@@ -45,7 +45,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 266 or total_tight != 266:
+          if total_audited != 271 or total_tight != 271:
               sys.exit(1)
           PY
       - name: Self-test & C-ABI / LNIR Kernel Verification

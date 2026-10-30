@@ -1282,8 +1282,9 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
   if !(← System.FilePath.pathExists inp.path) then return plan
   let bytes ← IO.FS.readBinFile inp.path
   let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
+  let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
   match nativeRemuxBytes inFmt outFmt bytes (plan.timeline.startMs.getD 0).toNat
-      (plan.timeline.durationMs.getD 0).toNat metadata with
+      (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps with
   | .fallback => return demoteNativePlan plan
   | _ => return plan
 
@@ -1304,7 +1305,8 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let startMs := (plan.timeline.startMs.getD 0).toNat
   let durMs := (plan.timeline.durationMs.getD 0).toNat
   let metadata := plan.metadata.entries.map (fun e => (e.key, e.value))
-  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata with
+  let (selectors, explicitMaps) := extractNativeRemuxSelectors plan
+  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps with
   | .fallback => return none
   | .invalid reason =>
     return some (← reportCliError cfg
