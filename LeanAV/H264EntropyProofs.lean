@@ -403,6 +403,33 @@ theorem cabacPcmReinit_byteAligned_roundtrip :
        pcmOut.data == pcm.data && bAfter == 0 && tEnd == 1) = true := by
   decide
 
+theorem cabacDecodeTerminate_one_noRenorm_itu_9_3_3_2_4
+    (dec : CabacDec) (st : Array UInt8) (ctxIdx : Nat)
+    (hTerm : dec.ioffset ≥ dec.irange - 2) :
+    dec.decodeTerminate = (1, dec) ∧
+    (dec.decodeTerminate).2.decodeDecision st ctxIdx = dec.decodeDecision st ctxIdx ∧
+    (dec.decodeTerminate).2.decodeBypass = dec.decodeBypass := by
+  unfold CabacDec.decodeTerminate
+  simp [hTerm]
+
+set_option maxRecDepth 200000 in
+theorem cabacIpcmTerminate_preserves_pos_for_pcm_and_following_decision_bypass :
+    let st0 : Array UInt8 := #[92, 40]
+    let e0 := CabacEnc.init BitWriter.empty
+    let (e1, _) := e0.encodeDecision st0 0 1
+    let eTerm := e1.encodeTerminate 1
+    let d0 := CabacDec.init eTerm.w.toByteArray 0
+    let (b0, d1, ds1) := d0.decodeDecision st0 0
+    let (term, d2) := d1.decodeTerminate
+    let (bFollow, d3, _) := d2.decodeDecision ds1 1
+    let (bpFollow, d4) := d3.decodeBypass
+    let (bRef, d3Ref, _) := d1.decodeDecision ds1 1
+    let (bpRef, d4Ref) := d3Ref.decodeBypass
+    (b0 == 1 && term == 1 && d1.pos == 13 &&
+     d2.pos == 13 && d2.irange == 352 && d2.ioffset == 351 &&
+     bFollow == bRef && bpFollow == bpRef && d4.pos == d4Ref.pos) = true := by
+  decide
+
 theorem cabacPcmReinit_rejects_truncated_buffer :
     let d0 := CabacDec.init ({ data := #[0x00, 0x00] }) 0
     (d0.readPcmAndReinit 16).isNone = true := by
@@ -441,6 +468,21 @@ theorem cabacCbfCtx_unavailable_defaults_intra_one_inter_zero :
     cabacCbfCtx g 0 0 false 2 z16 zc 0 = 93 ∧
     cabacCbfCtx g 0 0 true 3 z16 zc 0 = 100 ∧
     cabacCbfCtx g 0 0 false 3 z16 zc 0 = 97 := by
+  decide
+
+theorem populateResidualGrid_8x8_cavlc_subblock0_not_overwritten_by_sum :
+    let c8 : Array Int := #[5, 3, 7, 9,  0, -2, -1, 2,  0, 4, 0, -6,  0, 0, 0, 8]
+    let mb : MbSyntax := { transform8x8 := 1, cbp := 1, luma8x8 := #[c8] }
+    let rec0 := populateResidualGrid mb {} false
+    let g := MbGrid.init 2 1
+    (rec0.lumaNnzCavlc.getD 0 99 == 1 &&
+     rec0.lumaNnzCavlc.getD 1 99 == 3 &&
+     rec0.lumaNnzCavlc.getD 2 99 == 2 &&
+     rec0.lumaNnzCavlc.getD 3 99 == 4 &&
+     cavlcLumaNC g 0 0 rec0.lumaNnzCavlc 1 == 1 &&
+     cavlcLumaNC g 0 0 rec0.lumaNnzCavlc 2 == 1) = true := by
+  unfold populateResidualGrid
+  simp [Id.run, List.range']
   decide
 
 set_option maxRecDepth 200000 in

@@ -265,6 +265,43 @@ class H264EntropyDifferentialTests(unittest.TestCase):
                 self.assertEqual(r_bad.returncode, 1)
                 self.assertFalse(out_path.exists())
 
+    def test_cavlc_8x8_unequal_subblock_totalcoeff_nc_vs_ffmpeg(self):
+        if not self.has_libx264:
+            self.skipTest("libx264 encoder unavailable in reference FFmpeg")
+        with tempfile.TemporaryDirectory(prefix="leanav-h264-8x8-nc-") as tmp:
+            root = Path(tmp)
+            w, h = 64, 48
+            out = bytearray()
+            for f in range(2):
+                for y in range(h):
+                    for x in range(w):
+                        base = ((x * 29 + y * 47) ^ ((x * y) & 0x3F)) & 0xFF
+                        if f == 0:
+                            v = base
+                        else:
+                            delta = ((x * 19 ^ y * 37) % 23) - 11 if ((x + y) % 3 == 0) else 0
+                            v = max(0, min(255, base + delta * 3))
+                        out.append(v)
+                out.extend([128] * (2 * (w // 2) * (h // 2)))
+            raw_path = root / "unequal_8x8.yuv"
+            raw_path.write_bytes(bytes(out))
+
+            for tag, cabac_flag in (("unequal_8x8_cavlc", 0), ("unequal_8x8_cabac", 1)):
+                with self.subTest(case=tag):
+                    src_264 = root / f"{tag}.264"
+                    self.encode_h264(
+                        raw_path,
+                        src_264,
+                        w,
+                        h,
+                        "yuv420p",
+                        "yuv420p",
+                        "high",
+                        28,
+                        f"cabac={cabac_flag}:8x8dct=1:bframes=0:ref=1:aq-mode=0:trellis=0:annexb=1",
+                    )
+                    self.assert_all_modes_pixel_exact(src_264, "yuv420p", root, tag)
+
 
 if __name__ == "__main__":
     unittest.main()

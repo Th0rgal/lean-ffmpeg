@@ -1275,8 +1275,7 @@ def CabacDec.decodeBypass (dec : CabacDec) : Nat × CabacDec :=
 def CabacDec.decodeTerminate (dec : CabacDec) : Nat × CabacDec :=
   let rng := dec.irange - 2
   if dec.ioffset ≥ rng then
-    let (pos', rng', off') := cabacDecRenormLoop dec.rbsp dec.total 8 dec.pos 2 (dec.ioffset - rng)
-    (1, { dec with pos := pos', irange := rng', ioffset := off' })
+    (1, dec)
   else
     let (pos', rng', off') := cabacDecRenormLoop dec.rbsp dec.total 8 dec.pos rng dec.ioffset
     (0, { dec with pos := pos', irange := rng', ioffset := off' })
@@ -1786,7 +1785,6 @@ def populateResidualGrid (mb : MbSyntax) (r0 : MbGridRecord) (hasChroma : Bool) 
               if c8.getD (4 * k + sub) 0 != 0 then stc := stc + 1
             lNnz := lNnz.set! (4 * i8 + sub) stc
             tot := tot + stc
-          lNnz := lNnz.set! (4 * i8) tot
           let cbf := if tot > 0 then 1 else 0
           for sub in [:4] do
             lCbf := lCbf.set! (4 * i8 + sub) cbf
@@ -1961,9 +1959,6 @@ private def cavlcDecodeResidualMb (r0 : BitReader) (g : MbGrid) (mx my : Nat)
               for k in [:16] do
                 c8 := c8.set! (4 * k + sub) (coeffs.getD k 0)
             luma8 := luma8.set! i8 c8
-            let sum8 := curNnz.getD (4 * i8) 0 + curNnz.getD (4 * i8 + 1) 0 +
-                        curNnz.getD (4 * i8 + 2) 0 + curNnz.getD (4 * i8 + 3) 0
-            curNnz := curNnz.set! (4 * i8) sum8
           else
             for sub in [:4] do
               let idx := 4 * i8 + sub
@@ -2201,9 +2196,6 @@ private def cavlcEncodeResidualMb (w0 : BitWriter) (g : MbGrid) (mx my : Nat)
               let (wNext2, tc) ← cavlcEncodeBlock wCur coeffs 16 nc
               wCur := wNext2
               curNnz := curNnz.set! idx tc
-            let sum8 := curNnz.getD (4 * i8) 0 + curNnz.getD (4 * i8 + 1) 0 +
-                        curNnz.getD (4 * i8 + 2) 0 + curNnz.getD (4 * i8 + 3) 0
-            curNnz := curNnz.set! (4 * i8) sum8
           else
             for sub in [:4] do
               let idx := 4 * i8 + sub
