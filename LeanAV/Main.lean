@@ -23,6 +23,7 @@ open LeanAV.H264Entropy
 open LeanAV.H264EntropyProofs
 open LeanAV.H264InterDeblockDpb
 open LeanAV.H264InterDeblockDpbProofs
+open LeanAV.AacLc
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -1691,6 +1692,130 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
       IO.println j
     return 0
 
+def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
+    (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
+  if !validCfg.overwrite then
+    if (← System.FilePath.pathExists outPath) then
+      if validCfg.jsonOutput then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+          "File exists"
+      else if !(args.contains "-n") then
+        if !cliQuiet validCfg.logLevel then
+          IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+        return 0
+      else
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
+          "File exists"
+  let t0 ← IO.monoNanosNow
+  let rawIn ← IO.FS.readBinFile inPath
+  let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawIn
+  let lowerIn := strToLowerAscii inPath
+  let lowerOut := strToLowerAscii outPath
+  let outFmtLower := validCfg.format.map strToLowerAscii
+  let isAdtsIn := strEndsWithFast lowerIn ".aac" || strEndsWithFast lowerIn ".adts"
+  if isAdtsIn then
+    let some (chans, sr, _) := aacDecodeAdtsStream inSlice true | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid or corrupt ADTS AAC-LC stream\"}"
+        (s!"Invalid or corrupt ADTS AAC-LC stream: {inPath}")
+    if let some reqSr := validCfg.audioRate then
+      if reqSr != sr.toNat then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"resampling requires -af\"}"
+          "Sample rate conversion requires audio filter (-af)"
+    if let some reqCh := validCfg.audioChannels then
+      if reqCh != chans.size then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"channel remix requires -af\"}"
+          "Channel count conversion requires audio filter (-af)"
+    let isFlacOut :=
+      (strEndsWithFast lowerOut ".flac" && (outFmtLower == none || outFmtLower == some "flac")) ||
+      outFmtLower == some "flac"
+    let outCodecBps := ext.outputAudioCodecRaw.bind isStandalonePcmCodecBps
+    let outBytesOpt : Option (ByteArray × String) :=
+      if isFlacOut then
+        (flacEncodeStream chans sr 16 4096 true).map (fun b => (b, "flac"))
+      else
+        let targetBps := outCodecBps.getD 16
+        let scaled := scaleChannelsBps chans 16 targetBps
+        some (muxWavPcmLE scaled sr targetBps, "wav")
+    let some (outBytes, fmtStr) := outBytesOpt | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"AAC-LC decoded output muxing failed\"}"
+        (s!"AAC-LC decoded output muxing failed: {outPath}")
+    match ← writeMediaFileAtomic outPath outBytes with
+    | .ok _ => pure ()
+    | .error _ =>
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"failed to write output file\"}"
+        (s!"Failed to write output file: {outPath}")
+    let t1 ← IO.monoNanosNow
+    if validCfg.jsonOutput then
+      let nSamples := (chans.getD 0 #[]).size
+      let j :=
+        s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-independent-verified\",\"tier\":\"independent_verified\"," ++
+        s!"\"codec\":\"aac\",\"format\":\"{jsonEscape fmtStr}\",\"sample_rate\":{sr},\"channels\":{chans.size}," ++
+        s!"\"samples\":{nSamples},\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"," ++
+        s!"\"in_bytes\":{rawIn.size},\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+      IO.println j
+    return 0
+  else
+    let isWavIn := strEndsWithFast lowerIn ".wav"
+    let audioDisp : LosslessDecodeDispatch (Array (Array Int32) × UInt32 × Nat) :=
+      if isWavIn then
+        classifyWavDemux3Way inSlice
+      else
+        match classifyFlacDecode3Way inSlice true with
+        | .independentVerified dec =>
+          .independentVerified (dec.channelsData, dec.info.sampleRate, dec.info.bitsPerSample.toNat)
+        | .fallbackDelegated r => .fallbackDelegated r
+        | .invalidCorrupt r => .invalidCorrupt r
+    let (chansIn, srIn, bpsIn) ← match audioDisp with
+      | .independentVerified triple => pure triple
+      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .invalidCorrupt _ =>
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid WAV or FLAC input\"}"
+          (s!"Invalid WAV or FLAC input: {inPath}")
+    if let some reqSr := validCfg.audioRate then
+      if reqSr != srIn.toNat then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"resampling requires -af\"}"
+          "Sample rate conversion requires audio filter (-af)"
+    if let some reqCh := validCfg.audioChannels then
+      if reqCh != chansIn.size then
+        return ← reportCliError validCfg
+          "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"channel remix requires -af\"}"
+          "Channel count conversion requires audio filter (-af)"
+    if (aacSampleRateToIndex srIn).isNone || chansIn.isEmpty || chansIn.size > 2 then
+      return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+    let targetBitrate : Nat :=
+      match validCfg.audioBitrate.bind parseBitrateBpsSpec with
+      | some b => b
+      | none => if chansIn.size == 1 then 96000 else 128000
+    let some outBytes := aacEncodeAdtsStream chansIn srIn bpsIn targetBitrate true | do
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"AAC-LC ADTS encoding failed\"}"
+        (s!"AAC-LC ADTS encoding failed: {outPath}")
+    match ← writeMediaFileAtomic outPath outBytes with
+    | .ok _ => pure ()
+    | .error _ =>
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"failed to write output file\"}"
+        (s!"Failed to write output file: {outPath}")
+    let t1 ← IO.monoNanosNow
+    if validCfg.jsonOutput then
+      let nSamples := (chansIn.getD 0 #[]).size
+      let j :=
+        s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-independent-verified\",\"tier\":\"independent_verified\"," ++
+        s!"\"codec\":\"aac\",\"format\":\"adts\",\"sample_rate\":{srIn},\"channels\":{chansIn.size}," ++
+        s!"\"samples\":{nSamples},\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"," ++
+        s!"\"in_bytes\":{rawIn.size},\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+      IO.println j
+    return 0
+
 def runFFmpegCli (args : List String) : IO UInt32 := do
   if !args.contains "-i" && !args.contains "-lavfi" && !args.contains "-filter_complex" && !args.contains "-/filter_complex" && args.any isIntrospectionFlag then
     if let some rc ← runNativeIntrospection args then return rc
@@ -1759,6 +1884,8 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
             (s!"{inP}: No such file or directory")
     if standaloneLosslessPlanGateSpec.gate plan then
       return ← runStandaloneLosslessCli args validCfg ext plan inPath outPath
+    if standaloneAacAdtsPlanGateSpec.gate plan then
+      return ← runStandaloneAacAdtsCli args validCfg ext plan inPath outPath
     let plan ←
       if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "native_stream_copy" then
         match ← runNativeStreamCopy validCfg plan args with
@@ -2835,6 +2962,37 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264InterDeblockDpbProofs.parseAnnexBSpsFull_scaling_matrix_zero_next_scale_exact
 #print axioms LeanAV.H264InterDeblockDpbProofs.annexBSpsValidSpec
 #print axioms LeanAV.H264InterDeblockDpbProofs.annexBPpsValidSpec
+#print axioms LeanAV.PlanIR.standaloneAacAdtsPlanGateSpec_iff
+#print axioms LeanAV.AacLcProofs.aacSampleRate_all_indices_roundtrip
+#print axioms LeanAV.AacLcProofs.aacLcAsc_all_rates_mono_stereo_roundtrip
+#print axioms LeanAV.AacLcProofs.aacAdtsHeader_all_rates_crc_and_nocrc_roundtrip
+#print axioms LeanAV.AacLcProofs.aacLcAscValidSpec
+#print axioms LeanAV.AacLcProofs.aacLcAdtsHeaderValidSpec
+#print axioms LeanAV.AacLcProofs.aacSwbTableValidSpec
+#print axioms LeanAV.AacLcProofs.aacWindowTransitionValidSpec
+#print axioms LeanAV.AacLcProofs.aacQuantCoeffValidSpec
+#print axioms LeanAV.AacLcProofs.aacScaleFactorValidSpec
+#print axioms LeanAV.AacLcProofs.aacSwbOffsets_all_rates_valid
+#print axioms LeanAV.AacLcProofs.aacWindowSequence_roundtrip
+#print axioms LeanAV.AacLcProofs.aacMidSide_int_butterfly
+#print axioms LeanAV.AacLcProofs.aacStandalonePlan_wav_to_aac_and_aac_to_wav
+#print axioms LeanAV.AacLcProofs.aacAdtsCrc16_standard_vector_123456789
+#print axioms LeanAV.AacLcProofs.aacAdtsCrc16_mux_demux_roundtrip_and_tamper
+#print axioms LeanAV.AacLcProofs.aacCompositeLongWindow_start_and_stop_zones
+#print axioms LeanAV.AacLcProofs.aacSynthesizeFrame_all_four_sequences_size
+#print axioms LeanAV.AacLcProofs.aacClipTnsFilterLength_bounds
+#print axioms LeanAV.AacLcProofs.aacTns_24k_short_bottom_starts_at_num_swb
+#print axioms LeanAV.AacLcProofs.aacHuffman_all_11_books_escape_and_book12
+#print axioms LeanAV.AacLcProofs.aacSectionBookValidSpec
+#print axioms LeanAV.AacLcProofs.aacPulseData_roundtrip_apply_and_bounds
+#print axioms LeanAV.AacLcProofs.aacPns_deterministic_seed_and_dequant
+#print axioms LeanAV.AacLcProofs.aacEncodeMidSide_active_and_inactive
+#print axioms LeanAV.AacLcProofs.aacDecodeMidSide_butterfly_and_pns_suppression
+#print axioms LeanAV.AacLcProofs.aacDecodeIntensityStereo_books_14_15_and_ms_flip
+#print axioms LeanAV.AacLcProofs.aacCpe_tns_and_ms_raw_roundtrip
+#print axioms LeanAV.AacLcProofs.aacStream_payload_step_matches_frame_decode
+#print axioms LeanAV.AacLcProofs.aacDecodeAdtsStream_two_identical_frames
+#print axioms LeanAV.AacLcProofs.aacPnsAdts_frame_and_two_frame_stream_deterministic
 
 #print axioms LeanAV.H264SyntaxProofs.strip_insert_emul_loop
 #print axioms LeanAV.H264SyntaxProofs.strip_insert_emulation_list_roundtrip

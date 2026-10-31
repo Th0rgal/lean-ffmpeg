@@ -30,3 +30,5 @@ import LeanAV.H264IntraTransform
 import LeanAV.H264IntraTransformProofs
 import LeanAV.H264InterDeblockDpb
 import LeanAV.H264InterDeblockDpbProofs
+import LeanAV.AacLc
+import LeanAV.AacLcProofs
