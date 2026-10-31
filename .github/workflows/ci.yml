@@ -45,7 +45,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 473 or total_tight != 473:
+          if total_audited != 513 or total_tight != 513:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -59,7 +59,7 @@ jobs:
         run: |
           out="$(lake env lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 12599 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 13142 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Unit & Differential Test Suite
         run: |
           python3 -m unittest discover -s tests -p "test_*.py"
@@ -106,7 +106,7 @@ jobs:
         run: |
           out="$(lake env lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 12599 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 13142 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Unit & Differential Test Suite
         run: |
           python3 -m unittest discover -s tests -p "test_*.py"

@@ -2768,6 +2768,23 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.AacLcProofs.aacWindowSequence_roundtrip
 #print axioms LeanAV.AacLcProofs.aacMidSide_int_butterfly
 #print axioms LeanAV.AacLcProofs.aacStandalonePlan_wav_to_aac_and_aac_to_wav
+#print axioms LeanAV.AacLcProofs.aacAdtsCrc16_standard_vector_123456789
+#print axioms LeanAV.AacLcProofs.aacAdtsCrc16_mux_demux_roundtrip_and_tamper
+#print axioms LeanAV.AacLcProofs.aacCompositeLongWindow_start_and_stop_zones
+#print axioms LeanAV.AacLcProofs.aacSynthesizeFrame_all_four_sequences_size
+#print axioms LeanAV.AacLcProofs.aacClipTnsFilterLength_bounds
+#print axioms LeanAV.AacLcProofs.aacTns_24k_short_bottom_starts_at_num_swb
+#print axioms LeanAV.AacLcProofs.aacHuffman_all_11_books_escape_and_book12
+#print axioms LeanAV.AacLcProofs.aacSectionBookValidSpec
+#print axioms LeanAV.AacLcProofs.aacPulseData_roundtrip_apply_and_bounds
+#print axioms LeanAV.AacLcProofs.aacPns_deterministic_seed_and_dequant
+#print axioms LeanAV.AacLcProofs.aacEncodeMidSide_active_and_inactive
+#print axioms LeanAV.AacLcProofs.aacDecodeMidSide_butterfly_and_pns_suppression
+#print axioms LeanAV.AacLcProofs.aacDecodeIntensityStereo_books_14_15_and_ms_flip
+#print axioms LeanAV.AacLcProofs.aacCpe_tns_and_ms_raw_roundtrip
+#print axioms LeanAV.AacLcProofs.aacStream_payload_step_matches_frame_decode
+#print axioms LeanAV.AacLcProofs.aacDecodeAdtsStream_two_identical_frames
+#print axioms LeanAV.AacLcProofs.aacPnsAdts_frame_and_two_frame_stream_deterministic
 
 
 

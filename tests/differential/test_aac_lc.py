@@ -101,27 +101,39 @@ class AacLcDifferentialTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _bidir(self, sr, nch, freqs, step_at=None):
+    def _bidir(self, sr, nch, freqs, step_at=None, min_snr=75.0):
         chans = tone(sr, nch, 0.35, freqs, step_at)
-        wav = self.dir / f"in_{sr}_{nch}.wav"
+        wav = self.dir / f"in_{sr}_{nch}_{int(min_snr)}.wav"
         write_wav(wav, sr, chans)
         lean = self.dir / f"lean_{sr}_{nch}.aac"
         ff = self.dir / f"ff_{sr}_{nch}.aac"
+        ff_nopns = self.dir / f"ff_nopns_{sr}_{nch}.aac"
         run(LFFMPEG, "-y", "-i", wav, "-c:a", "aac", "-b:a", "128k", lean, env=ISO_ENV)
         run(FFMPEG, "-y", "-v", "error", "-i", wav, "-c:a", "aac", "-b:a", "128k", "-f", "adts", ff)
+        run(FFMPEG, "-y", "-v", "error", "-i", wav, "-c:a", "aac", "-aac_pns", "0", "-b:a", "128k", "-f", "adts", ff_nopns)
         lean_pcm = self.dir / f"lean_dec_{sr}_{nch}.pcm"
         ff_ref_pcm = self.dir / f"ff_ref_dec_{sr}_{nch}.pcm"
         ff_lean_wav = self.dir / f"ff_lean_dec_{sr}_{nch}.wav"
+        ff_lean_wav2 = self.dir / f"ff_lean_dec2_{sr}_{nch}.wav"
+        ff_nopns_pcm = self.dir / f"ff_nopns_dec_{sr}_{nch}.pcm"
+        ff_nopns_wav = self.dir / f"ff_nopns_lean_{sr}_{nch}.wav"
         run(FFMPEG, "-y", "-v", "error", "-i", lean, "-f", "s16le", "-ac", str(nch), lean_pcm)
         run(FFMPEG, "-y", "-v", "error", "-i", ff, "-f", "s16le", "-ac", str(nch), ff_ref_pcm)
         run(LFFMPEG, "-y", "-i", ff, ff_lean_wav, env=ISO_ENV)
+        run(LFFMPEG, "-y", "-i", ff, ff_lean_wav2, env=ISO_ENV)
+        run(FFMPEG, "-y", "-v", "error", "-i", ff_nopns, "-f", "s16le", "-ac", str(nch), ff_nopns_pcm)
+        run(LFFMPEG, "-y", "-i", ff_nopns, ff_nopns_wav, env=ISO_ENV)
+        self.assertEqual(ff_lean_wav.read_bytes(), ff_lean_wav2.read_bytes())
         ref = read_wav_pcm(wav)
         ours = read_pcm(lean_pcm, nch)
         ff_oracle = read_pcm(ff_ref_pcm, nch)
         theirs = read_wav_pcm(ff_lean_wav)
+        nopns_oracle = read_pcm(ff_nopns_pcm, nch)
+        nopns_theirs = read_wav_pcm(ff_nopns_wav)
         for c in range(nch):
-            self.assertGreater(snr_db(ref[c], ours[c], LAG), 30.0)
-            self.assertGreater(snr_db(ff_oracle[c], theirs[c], 0), 30.0)
+            self.assertGreater(snr_db(ref[c], ours[c], LAG), min_snr)
+            self.assertGreater(snr_db(nopns_oracle[c], nopns_theirs[c], 0), min_snr)
+            self.assertGreater(snr_db(ff_oracle[c], theirs[c], 0), 50.0)
         self.assertGreater(lean.stat().st_size, 7)
         self.assertGreater(ff.stat().st_size, 7)
 
@@ -130,9 +142,56 @@ class AacLcDifferentialTests(unittest.TestCase):
         self._bidir(44100, 2, (440.0, 1000.0))
 
     def test_bidirectional_transient_48k_and_44100(self):
-        self._bidir(48000, 2, (440.0, 880.0), step_at=0.10)
-        self._bidir(44100, 2, (440.0, 880.0), step_at=0.10)
-        self._bidir(48000, 1, (660.0,), step_at=0.10)
+        self._bidir(48000, 2, (440.0, 880.0), step_at=0.10, min_snr=50.0)
+        self._bidir(44100, 2, (440.0, 880.0), step_at=0.10, min_snr=50.0)
+        self._bidir(24000, 2, (440.0, 880.0), step_at=0.10, min_snr=50.0)
+        self._bidir(48000, 1, (660.0,), step_at=0.10, min_snr=50.0)
+
+    def test_pulse_data_matches_ffmpeg_decode(self):
+        bits = []
+
+        def w(val, n):
+            for i in range(n - 1, -1, -1):
+                bits.append((val >> i) & 1)
+
+        w(0, 3); w(0, 4); w(168, 8); w(0, 1); w(0, 2); w(0, 1); w(1, 6); w(0, 1)
+        w(3, 4); w(1, 5); w(0, 1)
+        w(1, 1); w(0, 2); w(0, 6); w(0, 5); w(7, 4)
+        w(0, 1); w(0, 1)
+        w(0x8, 4); w(0, 1)
+        w(7, 3)
+        while len(bits) % 8 != 0:
+            bits.append(0)
+        raw = bytes(int("".join(str(x) for x in bits[i:i + 8]), 2) for i in range(0, len(bits), 8))
+        fl = 7 + len(raw)
+        hdr = bytes([
+            0xFF, 0xF1, (1 << 6) | (3 << 2), (1 << 6) | ((fl >> 11) & 3), (fl >> 3) & 0xFF,
+            ((fl & 7) << 5) | 0x1F, 0xFC,
+        ])
+        adts = self.dir / "pulse.aac"
+        adts.write_bytes((hdr + raw) * 2)
+        ff_pcm = self.dir / "pulse_ff.pcm"
+        lean_wav = self.dir / "pulse_lean.wav"
+        run(FFMPEG, "-y", "-v", "error", "-i", adts, "-f", "s16le", "-ac", "1", ff_pcm)
+        run(LFFMPEG, "-y", "-i", adts, lean_wav, env=ISO_ENV)
+        oracle = read_pcm(ff_pcm, 1)
+        ours = read_wav_pcm(lean_wav)
+        self.assertGreater(max(abs(x) for x in oracle[0]), 1000)
+        self.assertGreater(snr_db(oracle[0], ours[0], 0), 75.0)
+
+    def test_ffmpeg_pns_disabled_matches_lean_decode(self):
+        wav = self.dir / "pns.wav"
+        write_wav(wav, 48000, tone(48000, 2, 0.20, (440.0, 1000.0)))
+        ff = self.dir / "pns_off.aac"
+        run(FFMPEG, "-y", "-v", "error", "-i", wav, "-c:a", "aac", "-aac_pns", "0", "-b:a", "128k", "-f", "adts", ff)
+        ff_pcm = self.dir / "pns_off_ff.pcm"
+        lean_wav = self.dir / "pns_off_lean.wav"
+        run(FFMPEG, "-y", "-v", "error", "-i", ff, "-f", "s16le", "-ac", "2", ff_pcm)
+        run(LFFMPEG, "-y", "-i", ff, lean_wav, env=ISO_ENV)
+        oracle = read_pcm(ff_pcm, 2)
+        ours = read_wav_pcm(lean_wav)
+        for c in range(2):
+            self.assertGreater(snr_db(oracle[c], ours[c], 0), 75.0)
 
     def test_flac_to_adts_to_flac_and_plan_routing(self):
         wav = self.dir / "src.wav"
