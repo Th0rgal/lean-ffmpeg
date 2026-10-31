@@ -73,7 +73,7 @@ def _h264_luma_qpel_16_oracle(grid: list[list[int]], x0: int, y0: int) -> list[i
         [g, avg(g, b), b, avg(b, m)],
         [avg(g, h), avg(b, h), avg(b, j), avg(b, mv)],
         [h, avg(h, j), j, avg(j, mv)],
-        [avg(h, s0), avg(h, s), s, avg(s, mv)],
+        [avg(h, s0), avg(h, s), avg(j, s), avg(s, mv)],
     ]
     return [table[yf][xf] for yf in range(4) for xf in range(4)]
 
@@ -95,6 +95,41 @@ def _h264_chroma_opel_64_oracle(grid: list[list[int]], x0: int, y0: int) -> list
             ) >> 6
             out.append(_clip1y(val))
     return out
+
+
+def _ue_bits(v: int) -> str:
+    b = bin(v + 1)[2:]
+    return "0" * (len(b) - 1) + b
+
+
+def _se_bits(v: int) -> str:
+    return _ue_bits((-2 * v) if v <= 0 else (2 * v - 1))
+
+
+def _rbsp_to_annexb_nalu(hdr_byte: int, bitstr: str, pcm_bytes: bytes = b"") -> bytes:
+    bits = bitstr
+    if pcm_bytes:
+        while len(bits) % 8 != 0:
+            bits += "0"
+        body = (
+            bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+            + pcm_bytes
+            + b"\x80"
+        )
+    else:
+        bits += "1"
+        while len(bits) % 8 != 0:
+            bits += "0"
+        body = bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+    out = bytearray([hdr_byte])
+    zeros = 0
+    for b in body:
+        if zeros >= 2 and b <= 3:
+            out.append(0x03)
+            zeros = 0
+        out.append(b)
+        zeros = zeros + 1 if b == 0 else 0
+    return b"\x00\x00\x00\x01" + bytes(out)
 
 
 class H264InterDeblockDpbTests(unittest.TestCase):
@@ -234,6 +269,13 @@ class H264InterDeblockDpbTests(unittest.TestCase):
                 [],
                 20,
             ),
+            (
+                "high_ref8_bpyramid_dpb_full_nonref",
+                "high",
+                "bframes=3:b-pyramid=normal:ref=8:keyint=30:min-keyint=30:scenecut=0",
+                [],
+                20,
+            ),
         )
         slice_char = {0: "P", 1: "B", 2: "I"}
         with tempfile.TemporaryDirectory(prefix="lean-h264-dpb-") as tmp:
@@ -338,6 +380,110 @@ class H264InterDeblockDpbTests(unittest.TestCase):
                                 slice_char[lf["slice_type"]], ff["pict_type"]
                             )
                             self.assertEqual(lf["is_idr"], bool(ff["key_frame"]))
+
+    def test_qpel_16_positions_ffmpeg_decoded_pixels_bit_exact(self):
+        res = self.run_isolated("h264-inter-dpb-vectors")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        vec = json.loads(res.stdout)
+        sps_bits = (
+            f"{66:08b}{0:08b}{30:08b}"
+            + _ue_bits(0) + _ue_bits(0) + _ue_bits(0) + _ue_bits(0)
+            + _ue_bits(1) + "0" + _ue_bits(0) + _ue_bits(0) + "1100"
+        )
+        pps_bits = (
+            _ue_bits(0) + _ue_bits(0) + "00" + _ue_bits(0) + _ue_bits(0)
+            + _ue_bits(0) + "0" + "00" + _se_bits(0) + _se_bits(0)
+            + _se_bits(0) + "100"
+        )
+        idr_sh = (
+            _ue_bits(0) + _ue_bits(2) + _ue_bits(0) + "0000" + _ue_bits(0)
+            + "0000" + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
+        )
+        luma_16x16 = bytearray(
+            (17 * min(r, 7) + 31 * min(c, 7) + 5 * min(r, 7) * min(c, 7) + 23) % 256
+            for r in range(16)
+            for c in range(16)
+        )
+        sps_nal = _rbsp_to_annexb_nalu(0x67, sps_bits)
+        pps_nal = _rbsp_to_annexb_nalu(0x68, pps_bits)
+        idr_nal = _rbsp_to_annexb_nalu(0x65, idr_sh, bytes(luma_16x16) + bytes([128] * 128))
+        ff_pixels: list[int] = []
+        with tempfile.TemporaryDirectory(prefix="lean-h264-qpel-") as tmp:
+            root = Path(tmp)
+            for yf in range(4):
+                for xf in range(4):
+                    p_bits = (
+                        _ue_bits(0) + _ue_bits(0) + _ue_bits(0) + "0001" + "0010"
+                        + "000" + _se_bits(0) + _ue_bits(1)
+                        + _ue_bits(0) + _ue_bits(0) + _se_bits(xf) + _se_bits(yf) + _ue_bits(0)
+                    )
+                    p264 = root / f"q_{yf}_{xf}.264"
+                    pyuv = root / f"q_{yf}_{xf}.yuv"
+                    p264.write_bytes(sps_nal + pps_nal + idr_nal + _rbsp_to_annexb_nalu(0x41, p_bits))
+                    dec = self.run_ffmpeg(
+                        "-y", "-loglevel", "error", "-i", str(p264),
+                        "-f", "rawvideo", "-pix_fmt", "yuv420p", str(pyuv),
+                    )
+                    self.assertEqual(dec.returncode, 0, dec.stderr)
+                    ff_pixels.append(pyuv.read_bytes()[384 + 3 * 16 + 3])
+        self.assertEqual(vec["qpel16"], ff_pixels)
+        self.assertEqual(vec["qpel16"][3 * 4 + 2], 133)
+
+    def test_sps_scaling_matrix_poc_type1_and_mmco5_reset_parity(self):
+        pcm = bytes([128] * 384)
+        pps0 = (
+            _ue_bits(0) + _ue_bits(0) + "00" + _ue_bits(0) + _ue_bits(0)
+            + _ue_bits(0) + "0" + "00" + _se_bits(0) + _se_bits(0)
+            + _se_bits(0) + "100"
+        )
+        sps_scale = (
+            f"{100:08b}{0:08b}{30:08b}"
+            + _ue_bits(0) + _ue_bits(1) + _ue_bits(0) + _ue_bits(0) + "0" + "1"
+            + ("1" + _se_bits(-8)) + "00000" + ("1" + _se_bits(2) + _se_bits(-10)) + "0"
+            + _ue_bits(0) + _ue_bits(0) + _ue_bits(0) + _ue_bits(2) + "0"
+            + _ue_bits(0) + _ue_bits(0) + "1100"
+        )
+        idr0 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + "0000" + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
+        p0_1 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0001" + "0010" + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        sps1 = (
+            f"{66:08b}{0:08b}{30:08b}"
+            + _ue_bits(0) + _ue_bits(0) + _ue_bits(1) + "0" + _se_bits(-2)
+            + _se_bits(0) + _ue_bits(2) + _se_bits(4) + _se_bits(6) + _ue_bits(2)
+            + "0" + _ue_bits(0) + _ue_bits(0) + "1100"
+        )
+        idr1 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + _se_bits(0) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
+        p1 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0001" + _se_bits(0) + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        p2_nr = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0010" + _se_bits(-1) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        p3_r = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0010" + _se_bits(2) + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        sps2 = f"{66:08b}{0:08b}{30:08b}" + _ue_bits(0) + _ue_bits(0) + _ue_bits(2) + _ue_bits(2) + "0" + _ue_bits(0) + _ue_bits(0) + "1100"
+        idr2 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
+        p_fn1 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0001" + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        p_mmco5 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0010" + "00" + "1" + _ue_bits(5) + _ue_bits(0) + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        with tempfile.TemporaryDirectory(prefix="lean-h264-syn-") as tmp:
+            root = Path(tmp)
+            p_sc = root / "scale_sps.264"
+            p_sc.write_bytes(_rbsp_to_annexb_nalu(0x67, sps_scale) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr0, pcm) + _rbsp_to_annexb_nalu(0x41, p0_1))
+            p_t1 = root / "poc_type1.264"
+            p_t1.write_bytes(_rbsp_to_annexb_nalu(0x67, sps1) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr1, pcm) + _rbsp_to_annexb_nalu(0x41, p1) + _rbsp_to_annexb_nalu(0x01, p2_nr) + _rbsp_to_annexb_nalu(0x41, p3_r))
+            p_m5 = root / "mmco5_poc2.264"
+            p_m5.write_bytes(_rbsp_to_annexb_nalu(0x67, sps2) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr2, pcm) + _rbsp_to_annexb_nalu(0x41, p_fn1) + _rbsp_to_annexb_nalu(0x41, p_mmco5) + _rbsp_to_annexb_nalu(0x41, p_fn1))
+            for f in (p_sc, p_t1, p_m5):
+                dec = self.run_ffmpeg("-v", "error", "-i", str(f), "-f", "null", "-")
+                self.assertEqual(dec.returncode, 0, dec.stderr)
+            r_sc = json.loads(self.run_isolated("h264-inter-dpb-probe", str(p_sc)).stdout)
+            self.assertTrue(r_sc["ok"])
+            self.assertEqual(r_sc["output_poc_order"], [0, 2])
+            r_t1 = json.loads(self.run_isolated("h264-inter-dpb-probe", str(p_t1)).stdout)
+            self.assertTrue(r_t1["ok"])
+            self.assertEqual([t["poc"] for t in r_t1["traces"]], [0, 4, 1, 12])
+            self.assertEqual(r_t1["output_poc_order"], [0, 1, 4, 12])
+            if self.ffprobe:
+                ffp = subprocess.run([self.ffprobe, "-v", "error", "-show_frames", "-show_entries", "frame=coded_picture_number", "-of", "json", str(p_t1)], capture_output=True, text=True, check=True)
+                self.assertEqual([fr["coded_picture_number"] for fr in json.loads(ffp.stdout)["frames"]], [0, 2, 1, 3])
+            r_m5 = json.loads(self.run_isolated("h264-inter-dpb-probe", str(p_m5)).stdout)
+            self.assertTrue(r_m5["ok"])
+            self.assertEqual([t["poc"] for t in r_m5["traces"]], [0, 2, 0, 2])
+            self.assertEqual([t["frame_num"] for t in r_m5["traces"]], [0, 1, 0, 1])
 
     def test_empty_or_non_h264_annexb_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="lean-h264-bad-") as tmp:

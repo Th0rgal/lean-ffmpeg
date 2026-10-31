@@ -146,6 +146,25 @@ theorem h264LumaHalfPel_matches_video_helper_step :
     h264LumaFrac p 3 0 0 2 = clip1Y (h264LumaFracInt p 3 0 0 2) := by
   decide
 
+theorem h264LumaFracInt_qpel_2_3_avg_j_s (p : Plane2D) (xInt yInt : Int) :
+    h264LumaFracInt p xInt yInt 2 3 =
+      avgRound (h264Round6 (h264CenterJ1 p xInt yInt))
+               (h264Round5 (h264HorizB1 p xInt (yInt + 1))) := by
+  rfl
+
+theorem h264LumaFrac_non_dc_2_3_exact :
+    let p : Plane2D := {
+      width := 8, height := 8, stride := 8,
+      data := ⟨((List.range 64).map fun idx =>
+        let r := idx / 8
+        let c := idx % 8
+        UInt8.ofNat ((17 * r + 31 * c + 5 * r * c + 23) % 256)).toArray⟩
+    }
+    h264Round6 (h264CenterJ1 p 3 3) = 123 ∧
+    h264Round5 (h264HorizB1 p 3 4) = 142 ∧
+    h264LumaFrac p 3 3 2 3 = 133 := by
+  decide
+
 theorem h264LumaFrac_dc_all_16_exact :
     let p := Plane2D.alloc 8 8 8 137
     (List.range 4).all (fun yf =>
@@ -460,14 +479,63 @@ structure DeblockEdgeQuery where
   bS         : Nat
   deriving Repr, DecidableEq, Inhabited
 
+def DeblockEdgeActiveProp (q : DeblockEdgeQuery) : Prop :=
+  1 ≤ q.bS ∧ q.bS ≤ 4 ∧ q.disableIdc ≤ 2 ∧ q.disableIdc ≠ 1 ∧
+  ¬(q.disableIdc = 2 ∧ q.isSlice = true) ∧
+  ¬(q.trans8x8 = true ∧ q.coord % 8 = 4)
+
 def deblockEdgeActiveGate (q : DeblockEdgeQuery) : Bool :=
   shouldFilterEdge q.disableIdc q.isSlice q.trans8x8 q.coord q.bS
 
-def deblockEdgeActiveSpec : AVGateSpec DeblockEdgeQuery
-    (fun q => shouldFilterEdge q.disableIdc q.isSlice q.trans8x8 q.coord q.bS = true) where
+theorem shouldFilterEdge_iff (q : DeblockEdgeQuery) :
+    shouldFilterEdge q.disableIdc q.isSlice q.trans8x8 q.coord q.bS = true ↔
+    DeblockEdgeActiveProp q := by
+  unfold shouldFilterEdge skipInternalEdge8x8 DeblockEdgeActiveProp
+  constructor
+  · intro h
+    split at h
+    · cases h
+    · next h1 =>
+      split at h
+      · cases h
+      · next h2 =>
+        split at h
+        · cases h
+        · next h3 =>
+          split at h
+          · cases h
+          · next h4 =>
+            split at h
+            · cases h
+            · next h5 =>
+              simp only [beq_iff_eq, decide_eq_true_eq, Bool.and_eq_true, Bool.or_eq_true,
+                not_and, not_or] at h1 h2 h3 h4 h5
+              refine ⟨by omega, by omega, by omega, h1, ?_, ?_⟩
+              · intro ⟨hd2, hs⟩
+                exact h3 hd2 hs
+              · intro ⟨ht8, hm8⟩
+                have h5' := h5 ht8
+                omega
+  · rintro ⟨hbs1, hbs4, hle2, hne1, hns, hn8⟩
+    have hc1 : (q.disableIdc == 1) = false := beq_false_of_ne hne1
+    have hge3 : ¬(q.disableIdc ≥ 3) := by omega
+    have hc3 : ((q.disableIdc == 2) && q.isSlice) = false := by
+      cases hs : q.isSlice <;> simp_all
+    have hb0 : (q.bS == 0) = false := beq_false_of_ne (by omega)
+    have hbgt4 : ¬(q.bS > 4) := by omega
+    have hc5 : (q.trans8x8 && (q.coord % 16 == 4 || q.coord % 16 == 12)) = false := by
+      cases ht : q.trans8x8
+      · simp
+      · have hm : q.coord % 8 ≠ 4 := fun hm => hn8 ⟨ht, hm⟩
+        have hm4 : (q.coord % 16 == 4) = false := beq_false_of_ne (by omega)
+        have hm12 : (q.coord % 16 == 12) = false := beq_false_of_ne (by omega)
+        simp [hm4, hm12]
+    simp [hc1, hge3, hc3, hb0, hbgt4, hc5]
+
+def deblockEdgeActiveSpec : AVGateSpec DeblockEdgeQuery DeblockEdgeActiveProp where
   gate := deblockEdgeActiveGate
-  sound := fun _ h => h
-  complete := fun _ h => h
+  sound := fun q hg => (shouldFilterEdge_iff q).mp hg
+  complete := fun q hp => (shouldFilterEdge_iff q).mpr hp
   posWitness := ⟨0, false, true, 8, 2⟩
   negWitness := ⟨0, false, true, 4, 2⟩
   nonVacuous := by decide
@@ -547,7 +615,7 @@ theorem dpb_rplm_and_mmco_all_ops_exact :
     let d1 := insertDecodedPicture d0 true false false true 0 0 false []
     let d2 := insertDecodedPicture d1 false false false true 1 2 false []
     let d3 := insertDecodedPicture d2 false false false true 2 4 true
-      [.assignLongTermIdx 1 0, .markCurrLongTerm 1]
+      [.setMaxLongTermIdxPlus1 2, .assignLongTermIdx 1 0, .markCurrLongTerm 1]
     let initL0 := buildRefPicListP0 d3 3 3
     let modL0 := applyRefPicListMod d3 initL0 3 2 [.longTermPic 1, .subPicNum 1, .endLoop]
     let d4 := insertDecodedPicture d3 false false false true 3 6 true
@@ -562,6 +630,48 @@ theorem dpb_rplm_and_mmco_all_ops_exact :
     df.priorCvsMonitor = true := by
   decide
 
+theorem dpb_mmco_rejects_lt_idx_gt_max (dpb : H264Dpb) (currFn dpm1 ltIdx : Nat)
+    (cm : DpbRefMark) (m5 : Bool) (hgt : (ltIdx : Int) > dpb.maxLongTermIdx) :
+    let refreshed := refreshShortTermPicNums dpb.entries currFn dpb.maxFrameNum
+    applySingleMmco dpb currFn cm m5 (.assignLongTermIdx dpm1 ltIdx) =
+      ({ dpb with entries := refreshed }, cm, m5) ∧
+    applySingleMmco dpb currFn cm m5 (.markCurrLongTerm ltIdx) =
+      ({ dpb with entries := refreshed }, cm, m5) := by
+  unfold applySingleMmco
+  simp
+  constructor <;> intro hle <;> omega
+
+theorem dpb_marking_before_bump_reproducer_monotone :
+    let d0 : H264Dpb := { maxRefFrames := 3, maxDpbCapacity := 3, maxFrameNum := 16 }
+    let d1 := insertDecodedPicture d0 false false false true 0 0 false []
+    let d2 := insertDecodedPicture d1 false false false true 1 2 false []
+    let d3 := insertDecodedPicture d2 false false false true 2 8 false []
+    let d4 := insertDecodedPicture d3 false false false true 3 4 false []
+    let df := flushDpb d4
+    dpbCapacityValid d4 = true ∧
+    df.outputPocLog = [0, 2, 4, 8] ∧
+    df.priorCvsMonitor = true := by
+  decide
+
+theorem derivePocType1_cycle_nonref_and_mmco5_exact :
+    let offsets : Array Int := #[4, 6]
+    let (p0, off0) := derivePocType1 true true false false false 0 4 0 0 (-2) 0 offsets 0 0
+    let (p1, off1) := derivePocType1 false true false false false 1 4 off0 0 (-2) 0 offsets 0 0
+    let (p2, off2) := derivePocType1 false false false false false 2 4 off1 1 (-2) 0 offsets (-1) 0
+    let (p3, off3) := derivePocType1 false true false false false 2 4 off2 2 (-2) 0 offsets 2 0
+    let (pPostM5, offPostM5) := derivePocType1 false true true false false 1 4 16 15 (-2) 0 offsets 0 0
+    (p0, off0) = (0, 0) ∧
+    (p1, off1) = (4, 0) ∧
+    (p2, off2) = (1, 0) ∧
+    (p3, off3) = (12, 0) ∧
+    (pPostM5, offPostM5) = (4, 0) := by
+  decide
+
+theorem derivePocType2_mmco5_resets_prev_offset :
+    let (pPost, offPost) := derivePocType2 false true true 1 4 16 15
+    pPost = 2 ∧ offPost = 0 := by
+  decide
+
 theorem dpb_b_pyramid_bumping_monotone_poc :
     let d0 : H264Dpb := { maxRefFrames := 4, maxDpbCapacity := 4, maxFrameNum := 16 }
     let d1 := insertDecodedPicture d0 true false false true 0 0 false []
@@ -571,6 +681,18 @@ theorem dpb_b_pyramid_bumping_monotone_poc :
     let d5 := insertDecodedPicture d4 false false false false 3 6 false []
     let df := flushDpb d5
     dpbCapacityValid d5 = true ∧ df.outputPocLog = [0, 2, 4, 6, 8] ∧ df.priorCvsMonitor = true := by
+  decide
+
+theorem parseAnnexBSpsFull_scaling_matrix_zero_next_scale_exact :
+    let spsBytes : Array UInt8 := #[0x67, 0x64, 0x00, 0x1E, 0xAD, 0x84, 0x40, 0x76, 0x23, 0xC8]
+    parseAnnexBSpsFull { ba := ⟨spsBytes⟩, off := 0, len := spsBytes.size } =
+      some {
+        spsId := 0, log2MaxFrameNum := 4, picOrderCntType := 0,
+        log2MaxPicOrderCntLsb := 4, deltaPicOrderAlwaysZero := false,
+        offsetForNonRefPic := 0, offsetForTopToBottomField := 0, offsetForRefFrame := #[],
+        maxNumRefFrames := 2, frameMbsOnly := true,
+        separateColourPlane := false, chromaArrayType := 1
+      } := by
   decide
 
 def annexBSpsValidGate (bs : Array UInt8) : Bool :=

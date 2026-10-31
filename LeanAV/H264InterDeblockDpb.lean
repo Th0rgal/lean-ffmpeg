@@ -97,7 +97,7 @@ def h264LumaFracInt (p : Plane2D) (xInt yInt : Int) (xFracL yFracL : Nat) : Int 
   | 3, 2 => avgRound j mV
   | 0, 3 => avgRound h s0
   | 1, 3 => avgRound h s
-  | 2, 3 => s
+  | 2, 3 => avgRound j s
   | _, _ => avgRound s mV
 
 @[inline]
@@ -831,6 +831,23 @@ def bumpToCapacity (dpb : H264Dpb) (fuel : Nat := 32) : H264Dpb :=
          !(next.entries.any DpbPicture.neededForOut) then next
       else bumpToCapacity next f
 
+def bumpLowerPocUntilSpace (dpb : H264Dpb) (currPoc : Int) (fuel : Nat := 32) : H264Dpb :=
+  match fuel with
+  | 0 => dpb
+  | f + 1 =>
+    if dpb.entries.length < dpb.maxDpbCapacity then dpb
+    else
+      let outCands := (dpb.entries.filter DpbPicture.neededForOut).foldl (fun acc p => insertSortedAscPoc p acc) []
+      match outCands with
+      | [] =>
+        let pruned := dpb.entries.filter (fun p => isUsedForRef p || p.neededForOut)
+        { dpb with entries := pruned }
+      | lowest :: _ =>
+        if lowest.poc < currPoc then
+          bumpLowerPocUntilSpace (bumpOneDpb dpb) currPoc f
+        else
+          dpb
+
 def flushDpb (dpb : H264Dpb) : H264Dpb :=
   let outCands := (dpb.entries.filter DpbPicture.neededForOut).foldl (fun acc p => insertSortedAscPoc p acc) []
   let outPocs := outCands.map DpbPicture.poc
@@ -896,14 +913,16 @@ def applySingleMmco (dpb : H264Dpb) (currFrameNum : Nat) (currMark : DpbRefMark)
       (fun p => isUsedForRef p || p.neededForOut)
     ({ dpb with entries := ents }, currMark, mmco5Seen)
   | .assignLongTermIdx dpm1 ltIdx =>
-    let tgtPn := currPn - (Int.ofNat dpm1 + 1)
-    let cleared := refreshed.map fun p =>
-      if p.mark == .longTerm ltIdx then { p with mark := .unused } else p
-    let assigned := cleared.map fun p =>
-      if isShortTermRef p && p.picNum == tgtPn then { p with mark := .longTerm ltIdx } else p
-    let ents := assigned.filter (fun p => isUsedForRef p || p.neededForOut)
-    let nextMaxLt := if Int.ofNat ltIdx > dpb.maxLongTermIdx then Int.ofNat ltIdx else dpb.maxLongTermIdx
-    ({ dpb with entries := ents, maxLongTermIdx := nextMaxLt }, currMark, mmco5Seen)
+    if Int.ofNat ltIdx > dpb.maxLongTermIdx then
+      ({ dpb with entries := refreshed }, currMark, mmco5Seen)
+    else
+      let tgtPn := currPn - (Int.ofNat dpm1 + 1)
+      let cleared := refreshed.map fun p =>
+        if p.mark == .longTerm ltIdx then { p with mark := .unused } else p
+      let assigned := cleared.map fun p =>
+        if isShortTermRef p && p.picNum == tgtPn then { p with mark := .longTerm ltIdx } else p
+      let ents := assigned.filter (fun p => isUsedForRef p || p.neededForOut)
+      ({ dpb with entries := ents }, currMark, mmco5Seen)
   | .setMaxLongTermIdxPlus1 mPlus1 =>
     let newMax : Int := if mPlus1 == 0 then -1 else Int.ofNat mPlus1 - 1
     let ents := (refreshed.map fun p =>
@@ -918,11 +937,13 @@ def applySingleMmco (dpb : H264Dpb) (currFrameNum : Nat) (currMark : DpbRefMark)
       | other => other
     ({ dpb with entries := ents, maxLongTermIdx := -1 }, newCurrMark, true)
   | .markCurrLongTerm ltIdx =>
-    let ents := (refreshed.map fun p =>
-      if p.mark == .longTerm ltIdx then { p with mark := .unused } else p).filter
-      (fun p => isUsedForRef p || p.neededForOut)
-    let nextMaxLt := if Int.ofNat ltIdx > dpb.maxLongTermIdx then Int.ofNat ltIdx else dpb.maxLongTermIdx
-    ({ dpb with entries := ents, maxLongTermIdx := nextMaxLt }, .longTerm ltIdx, mmco5Seen)
+    if Int.ofNat ltIdx > dpb.maxLongTermIdx then
+      ({ dpb with entries := refreshed }, currMark, mmco5Seen)
+    else
+      let ents := (refreshed.map fun p =>
+        if p.mark == .longTerm ltIdx then { p with mark := .unused } else p).filter
+        (fun p => isUsedForRef p || p.neededForOut)
+      ({ dpb with entries := ents }, .longTerm ltIdx, mmco5Seen)
 
 def insertDecodedPicture (dpb : H264Dpb) (isIdr noOutputPrior longTermIdr isRef : Bool)
     (frameNum : Nat) (poc : Int) (adaptiveMode : Bool) (mmcoOps : List MmcoOp)
@@ -930,53 +951,97 @@ def insertDecodedPicture (dpb : H264Dpb) (isIdr noOutputPrior longTermIdr isRef 
   if isIdr then
     clearIdrDpb dpb noOutputPrior longTermIdr poc lumaDigest
   else
-    let dpb1 := bumpToCapacity dpb
-    if !isRef || dpb1.maxRefFrames == 0 then
-      let nonRefPic : DpbPicture := {
-        uid := dpb1.nextUid, frameNum := frameNum, picNum := Int.ofNat frameNum,
-        poc := poc, mark := .unused, neededForOut := true, lumaDigest := lumaDigest
-      }
-      let cap := Nat.max 1 dpb1.maxDpbCapacity
-      { dpb1 with nextUid := dpb1.nextUid + 1, entries := (dpb1.entries ++ [nonRefPic]).take cap }
+    let pruned0 := dpb.entries.filter (fun p => isUsedForRef p || p.neededForOut)
+    let dpb0 := { dpb with entries := pruned0 }
+    if !isRef || dpb0.maxRefFrames == 0 then
+      let dpb1 := bumpLowerPocUntilSpace dpb0 poc (dpb0.entries.length + 1)
+      if dpb1.entries.length < dpb1.maxDpbCapacity then
+        let nonRefPic : DpbPicture := {
+          uid := dpb1.nextUid, frameNum := frameNum, picNum := Int.ofNat frameNum,
+          poc := poc, mark := .unused, neededForOut := true, lumaDigest := lumaDigest
+        }
+        { dpb1 with nextUid := dpb1.nextUid + 1, entries := dpb1.entries ++ [nonRefPic] }
+      else
+        { dpb1 with
+          nextUid := dpb1.nextUid + 1,
+          outputPocLog := dpb1.outputPocLog ++ [poc],
+          currCvsPocLog := dpb1.currCvsPocLog ++ [poc] }
     else if !adaptiveMode then
-      let dpb2 := slidingWindowMark dpb1 frameNum
-      let dpb3 := bumpToCapacity dpb2
+      let dpb2 := slidingWindowMark dpb0 frameNum
+      let dpb3 := bumpToCapacity dpb2 (dpb2.entries.length + 1)
       let stPic : DpbPicture := {
         uid := dpb3.nextUid, frameNum := frameNum, picNum := Int.ofNat frameNum,
         poc := poc, mark := .shortTerm (Int.ofNat frameNum), neededForOut := true, lumaDigest := lumaDigest
       }
-      let cap := Nat.max 1 dpb3.maxDpbCapacity
-      { dpb3 with nextUid := dpb3.nextUid + 1, entries := (dpb3.entries ++ [stPic]).take cap }
+      { dpb3 with nextUid := dpb3.nextUid + 1, entries := dpb3.entries ++ [stPic] }
     else
       let initMark : DpbRefMark := .shortTerm (Int.ofNat frameNum)
       let (dpb2, finalMark, mmco5) := mmcoOps.foldl
         (fun (st, cm, m5) op => applySingleMmco st frameNum cm m5 op)
-        (dpb1, initMark, false)
+        (dpb0, initMark, false)
       let dpb3 :=
         if mmco5 then
           let fl := flushDpb dpb2
           { fl with maxLongTermIdx := dpb2.maxLongTermIdx }
-        else bumpToCapacity dpb2
+        else bumpToCapacity dpb2 (dpb2.entries.length + 1)
       let effFn := if mmco5 then 0 else frameNum
       let effPoc := if mmco5 then 0 else poc
       let pic : DpbPicture := {
         uid := dpb3.nextUid, frameNum := effFn, picNum := Int.ofNat effFn,
         poc := effPoc, mark := finalMark, neededForOut := true, lumaDigest := lumaDigest
       }
-      let cap := Nat.max 1 dpb3.maxDpbCapacity
-      { dpb3 with nextUid := dpb3.nextUid + 1, entries := (dpb3.entries ++ [pic]).take cap }
+      { dpb3 with nextUid := dpb3.nextUid + 1, entries := dpb3.entries ++ [pic] }
 
 structure AnnexBSpsInfo where
-  spsId                   : Nat := 0
-  log2MaxFrameNum         : Nat := 4
-  picOrderCntType         : Nat := 0
-  log2MaxPicOrderCntLsb   : Nat := 4
-  deltaPicOrderAlwaysZero : Bool := false
-  maxNumRefFrames         : Nat := 4
-  frameMbsOnly            : Bool := true
-  separateColourPlane     : Bool := false
-  chromaArrayType         : Nat := 1
+  spsId                     : Nat := 0
+  log2MaxFrameNum           : Nat := 4
+  picOrderCntType           : Nat := 0
+  log2MaxPicOrderCntLsb     : Nat := 4
+  deltaPicOrderAlwaysZero   : Bool := false
+  offsetForNonRefPic        : Int := 0
+  offsetForTopToBottomField : Int := 0
+  offsetForRefFrame         : Array Int := #[]
+  maxNumRefFrames           : Nat := 4
+  frameMbsOnly              : Bool := true
+  separateColourPlane       : Bool := false
+  chromaArrayType           : Nat := 1
   deriving Repr, DecidableEq, Inhabited
+
+def skipH264ScalingList (r : BitReader) (remaining : Nat) (lastScale nextScale : Int) : Option BitReader :=
+  match remaining with
+  | 0 => some r
+  | k + 1 =>
+    if nextScale != 0 then do
+      let (deltaScale, r1) ← r.readSE
+      let ns := (lastScale + deltaScale.toInt + 256).emod 256
+      let ls := if ns == 0 then lastScale else ns
+      skipH264ScalingList r1 k ls ns
+    else
+      skipH264ScalingList r k lastScale 0
+
+def skipSeqScalingMatrixLoop (r : BitReader) (idx remaining : Nat) : Option BitReader :=
+  match remaining with
+  | 0 => some r
+  | k + 1 => do
+    let (presentFlag, r1) ← r.readBit
+    let r2 ←
+      if presentFlag == 1 then
+        let listSize := if idx < 6 then 16 else 64
+        skipH264ScalingList r1 listSize 8 8
+      else
+        some r1
+    skipSeqScalingMatrixLoop r2 (idx + 1) k
+
+def skipSeqScalingMatrix (r : BitReader) (idx total : Nat) : Option BitReader :=
+  skipSeqScalingMatrixLoop r idx (total - idx)
+
+def readOffsetForRefFrameLoop (r : BitReader) (remaining : Nat) (acc : Array Int) :
+    Option (Array Int × BitReader) :=
+  match remaining with
+  | 0 => some (acc, r)
+  | k + 1 => do
+    let (v, r1) ← r.readSE
+    readOffsetForRefFrameLoop r1 k (acc.push v.toInt)
 
 structure AnnexBPpsInfo where
   ppsId                         : Nat := 0
@@ -1013,23 +1078,30 @@ def parseAnnexBSpsFull (nalPayload : ByteSlice) : Option AnnexBSpsInfo := do
         let (_, rC) ← rB.readUE
         let (_, rD) ← rC.readBit
         let (seqScalePresent, rE) ← rD.readBit
-        let rF := if seqScalePresent == 1 then skipBitsLoop rE (if chromaIdc != 3 then 8 else 12) else rE
+        let rF ←
+          if seqScalePresent == 1 then
+            skipSeqScalingMatrix rE 0 (if chromaIdc != 3 then 8 else 12)
+          else
+            pure rE
         let cat := if sep then 0 else chromaIdc.toNat
         pure (rF, sep, cat)
       else pure (r1, false, 1)
     let (log2FnM4, r2) ← rAfterHigh.readUE
     let (pocType, r3) ← r2.readUE
-    let (log2PocLsb, deltaZero, rAfterPoc) ←
+    let (log2PocLsb, deltaZero, offNonRef, offTopBot, offRefArr, rAfterPoc) ←
       if pocType == 0 then do
         let (l4, rP) ← r3.readUE
-        pure (l4.toNat + 4, false, rP)
+        pure (l4.toNat + 4, false, (0 : Int), (0 : Int), #[], rP)
       else if pocType == 1 then do
         let (dz, rP1) ← r3.readBit
-        let (_, rP2) ← rP1.readSE
-        let (_, rP3) ← rP2.readSE
+        let (onr, rP2) ← rP1.readSE
+        let (otb, rP3) ← rP2.readSE
         let (nCycle, rP4) ← rP3.readUE
-        pure (4, dz == 1, skipSELoop rP4 nCycle.toNat)
-      else pure (4, false, r3)
+        if nCycle.toNat > 255 then none
+        else
+          let (arr, rP5) ← readOffsetForRefFrameLoop rP4 nCycle.toNat #[]
+          pure (4, dz == 1, onr.toInt, otb.toInt, arr, rP5)
+      else pure (4, false, (0 : Int), (0 : Int), #[], r3)
     let (maxRefs, r4) ← rAfterPoc.readUE
     let (_, r5) ← r4.readBit
     let (_, r6) ← r5.readUE
@@ -1041,6 +1113,9 @@ def parseAnnexBSpsFull (nalPayload : ByteSlice) : Option AnnexBSpsInfo := do
       picOrderCntType := pocType.toNat
       log2MaxPicOrderCntLsb := log2PocLsb
       deltaPicOrderAlwaysZero := deltaZero
+      offsetForNonRefPic := offNonRef
+      offsetForTopToBottomField := offTopBot
+      offsetForRefFrame := offRefArr
       maxNumRefFrames := maxRefs.toNat
       frameMbsOnly := fmo == 1
       separateColourPlane := sepCol
@@ -1161,8 +1236,12 @@ structure ParsedSliceHeaderDpb where
   firstMbInSlice      : Nat
   sliceTypeMod5       : Nat
   frameNum            : Nat
+  fieldPicFlag        : Bool := false
+  bottomFieldFlag     : Bool := false
   pocLsb              : Nat
   deltaPocBottom      : Int
+  deltaPoc0           : Int := 0
+  deltaPoc1           : Int := 0
   directSpatialMvPred : Bool
   numRefIdxL0Active   : Nat
   numRefIdxL1Active   : Nat
@@ -1195,24 +1274,29 @@ def parseAnnexBSliceHeader (nalPayload : ByteSlice) (sps : AnnexBSpsInfo) (pps :
       let (_, r3) ← r2.readUE
       let r3c ← if sps.separateColourPlane then r3.readBitsMSB 2 |>.map Prod.snd else some r3
       let (fnBits, r4) ← r3c.readBitsMSB sps.log2MaxFrameNum
-      let r5 ←
+      let (fieldPic, botField, r5) ←
         if !sps.frameMbsOnly then do
           let (fpFlag, rf1) ← r4.readBit
-          if fpFlag == 1 then rf1.readBit.map Prod.snd else some rf1
-        else some r4
+          if fpFlag == 1 then do
+            let (bfFlag, rf2) ← rf1.readBit
+            pure (true, bfFlag == 1, rf2)
+          else pure (false, false, rf1)
+        else pure (false, false, r4)
       let r6 ← if isIdr then r5.readUE.map Prod.snd else some r5
-      let (pocLsb, deltaBot, r7) ←
+      let (pocLsb, deltaBot, delta0, delta1, r7) ←
         if sps.picOrderCntType == 0 then do
           let (lsb, rp1) ← r6.readBitsMSB sps.log2MaxPicOrderCntLsb
-          if pps.bottomFieldPicOrder then do
+          if pps.bottomFieldPicOrder && !fieldPic then do
             let (db, rp2) ← rp1.readSE
-            pure (lsb.toNat, db.toInt, rp2)
-          else pure (lsb.toNat, 0, rp1)
+            pure (lsb.toNat, db.toInt, (0 : Int), (0 : Int), rp2)
+          else pure (lsb.toNat, (0 : Int), (0 : Int), (0 : Int), rp1)
         else if sps.picOrderCntType == 1 && !sps.deltaPicOrderAlwaysZero then do
-          let (_, rp1) ← r6.readSE
-          let rp2 ← if pps.bottomFieldPicOrder then rp1.readSE.map Prod.snd else some rp1
-          pure (0, 0, rp2)
-        else pure (0, 0, r6)
+          let (d0, rp1) ← r6.readSE
+          if pps.bottomFieldPicOrder && !fieldPic then do
+            let (d1, rp2) ← rp1.readSE
+            pure (0, (0 : Int), d0.toInt, d1.toInt, rp2)
+          else pure (0, (0 : Int), d0.toInt, (0 : Int), rp1)
+        else pure (0, (0 : Int), (0 : Int), (0 : Int), r6)
       let r8 ← if pps.redundantPicCntPresent then r7.readUE.map Prod.snd else some r7
       let (dirSpatial, r9) ←
         if stMod == 1 then do
@@ -1280,8 +1364,11 @@ def parseAnnexBSliceHeader (nalPayload : ByteSlice) (sps : AnnexBSpsInfo) (pps :
         else pure (0, 0, 0)
       some {
         isIdr := isIdr, nalRefIdc := nalRefIdc, firstMbInSlice := firstMb.toNat,
-        sliceTypeMod5 := stMod, frameNum := fnBits.toNat, pocLsb := pocLsb,
-        deltaPocBottom := deltaBot, directSpatialMvPred := dirSpatial,
+        sliceTypeMod5 := stMod, frameNum := fnBits.toNat,
+        fieldPicFlag := fieldPic, bottomFieldFlag := botField,
+        pocLsb := pocLsb, deltaPocBottom := deltaBot,
+        deltaPoc0 := delta0, deltaPoc1 := delta1,
+        directSpatialMvPred := dirSpatial,
         numRefIdxL0Active := nL0, numRefIdxL1Active := nL1,
         rplmL0 := opsL0, rplmL1 := opsL1,
         noOutputPriorPics := noOut, longTermRefFlag := ltIdr,
@@ -1289,25 +1376,80 @@ def parseAnnexBSliceHeader (nalPayload : ByteSlice) (sps : AnnexBSpsInfo) (pps :
         disableDeblockIdc := disIdc, alphaOffsetDiv2 := aOff, betaOffsetDiv2 := bOff
       }
 
-def derivePocType0 (isIdr : Bool) (pocLsb log2MaxPocLsb : Nat) (prevPocMsb prevPocLsb : Int) : Int × Int × Int :=
+def derivePocType0 (isIdr prevHasMmco5 prevBottomField fieldPic bottomField : Bool)
+    (pocLsb log2MaxPocLsb : Nat) (deltaPocBottom prevPocMsb prevPocLsb : Int) : Int × Int × Int :=
   if isIdr then (0, 0, 0)
   else
+    let effPrevMsb : Int := if prevHasMmco5 then 0 else prevPocMsb
+    let effPrevLsb : Int :=
+      if prevHasMmco5 then
+        if prevBottomField then 0 else prevPocLsb
+      else prevPocLsb
     let maxLsb : Int := Int.ofNat (1 <<< log2MaxPocLsb)
     let lsb : Int := Int.ofNat pocLsb
     let msb : Int :=
-      if lsb < prevPocLsb && (prevPocLsb - lsb) >= (maxLsb / 2) then
-        prevPocMsb + maxLsb
-      else if lsb > prevPocLsb && (lsb - prevPocLsb) > (maxLsb / 2) then
-        prevPocMsb - maxLsb
-      else prevPocMsb
-    (msb + lsb, msb, lsb)
+      if lsb < effPrevLsb && (effPrevLsb - lsb) >= (maxLsb / 2) then
+        effPrevMsb + maxLsb
+      else if lsb > effPrevLsb && (lsb - effPrevLsb) > (maxLsb / 2) then
+        effPrevMsb - maxLsb
+      else effPrevMsb
+    let topPoc := msb + lsb
+    let botPoc := if !fieldPic then topPoc + deltaPocBottom else msb + lsb
+    let poc :=
+      if !fieldPic then min topPoc botPoc
+      else if bottomField then botPoc
+      else topPoc
+    (poc, msb, topPoc)
 
-def derivePocType2 (isIdr isRef : Bool) (frameNum log2MaxFrameNum : Nat)
+def sumRefFrameOffsets (offsets : Array Int) (limit : Nat) : Int :=
+  (List.range (Nat.min limit offsets.size)).foldl (fun acc i => acc + offsets.getD i 0) 0
+
+def derivePocType1 (isIdr isRef prevHasMmco5 fieldPic bottomField : Bool)
+    (frameNum log2MaxFrameNum prevFrameNumOffset prevFrameNum : Nat)
+    (offsetForNonRefPic offsetForTopToBottomField : Int)
+    (offsetForRefFrame : Array Int) (deltaPoc0 deltaPoc1 : Int) : Int × Nat :=
+  if isIdr then (0, 0)
+  else
+    let maxFn := 1 <<< log2MaxFrameNum
+    let effPrevFnOff := if prevHasMmco5 then 0 else prevFrameNumOffset
+    let fnOff :=
+      if prevHasMmco5 then 0
+      else if prevFrameNum > frameNum then effPrevFnOff + maxFn
+      else effPrevFnOff
+    let numRefCycle := offsetForRefFrame.size
+    let absFnBase : Int :=
+      if numRefCycle != 0 then Int.ofNat (fnOff + frameNum) else 0
+    let absFn : Int :=
+      if !isRef && absFnBase > 0 then absFnBase - 1 else absFnBase
+    let expectedPoc : Int :=
+      if absFn > 0 && numRefCycle > 0 then
+        let nCy : Int := Int.ofNat numRefCycle
+        let pocCycleCnt := (absFn - 1).tdiv nCy
+        let fnInCycle := ((absFn - 1).tmod nCy).toNat
+        let expectedDeltaPerCycle := sumRefFrameOffsets offsetForRefFrame numRefCycle
+        pocCycleCnt * expectedDeltaPerCycle + sumRefFrameOffsets offsetForRefFrame (fnInCycle + 1)
+      else 0
+    let expectedPocAdj := if !isRef then expectedPoc + offsetForNonRefPic else expectedPoc
+    let topPoc := expectedPocAdj + deltaPoc0
+    let botPoc :=
+      if !fieldPic then topPoc + offsetForTopToBottomField + deltaPoc1
+      else expectedPocAdj + offsetForTopToBottomField + deltaPoc0
+    let poc :=
+      if !fieldPic then min topPoc botPoc
+      else if bottomField then botPoc
+      else topPoc
+    (poc, fnOff)
+
+def derivePocType2 (isIdr isRef prevHasMmco5 : Bool) (frameNum log2MaxFrameNum : Nat)
     (prevFrameNumOffset prevFrameNum : Nat) : Int × Nat :=
   if isIdr then (0, 0)
   else
     let maxFn := 1 <<< log2MaxFrameNum
-    let fnOff := if prevFrameNum > frameNum then prevFrameNumOffset + maxFn else prevFrameNumOffset
+    let effPrevFnOff := if prevHasMmco5 then 0 else prevFrameNumOffset
+    let fnOff :=
+      if prevHasMmco5 then 0
+      else if prevFrameNum > frameNum then effPrevFnOff + maxFn
+      else effPrevFnOff
     let tempPoc : Int :=
       if !isRef then 2 * Int.ofNat (fnOff + frameNum) - 1
       else 2 * Int.ofNat (fnOff + frameNum)
@@ -1347,6 +1489,8 @@ def simulateAnnexBDpbStream (annexB : ByteSlice) : AnnexBDpbSimReport := Id.run 
   let mut prevPocLsb : Int := 0
   let mut prevFnOff  : Nat := 0
   let mut prevFn     : Nat := 0
+  let mut prevHasMmco5 : Bool := false
+  let mut prevBotField : Bool := false
   let mut traces : Array AnnexBDpbTraceEntry := #[]
   let mut capOk : Bool := true
   let mut sliceIdx : Nat := 0
@@ -1367,21 +1511,42 @@ def simulateAnnexBDpbStream (annexB : ByteSlice) : AnnexBDpbSimReport := Id.run 
         if let some sh := parseAnnexBSliceHeader nal.payload sps pps then
           if sh.firstMbInSlice == 0 then
             let isRef := sh.nalRefIdc != 0
+            let hasMmco5 := isRef && !sh.isIdr && sh.adaptiveMarking && sh.mmcoOps.any (· == .markAllUnused)
             let mut poc : Int := 0
             if sps.picOrderCntType == 0 then
-              let (p, msb, lsb) := derivePocType0 sh.isIdr sh.pocLsb sps.log2MaxPicOrderCntLsb prevPocMsb prevPocLsb
+              let (p, msb, topPoc) := derivePocType0 sh.isIdr prevHasMmco5 prevBotField
+                sh.fieldPicFlag sh.bottomFieldFlag sh.pocLsb sps.log2MaxPicOrderCntLsb
+                sh.deltaPocBottom prevPocMsb prevPocLsb
               if isRef then
-                let hasMmco5 := sh.adaptiveMarking && sh.mmcoOps.any (· == .markAllUnused)
                 prevPocMsb := if hasMmco5 then 0 else msb
-                prevPocLsb := if hasMmco5 then 0 else lsb
+                prevPocLsb :=
+                  if hasMmco5 then
+                    if sh.fieldPicFlag && sh.bottomFieldFlag then 0
+                    else topPoc - p
+                  else Int.ofNat sh.pocLsb
+                prevHasMmco5 := hasMmco5
+                prevBotField := sh.fieldPicFlag && sh.bottomFieldFlag
+              prevFnOff := if hasMmco5 then 0 else if sh.isIdr then 0 else prevFnOff
+              prevFn := if hasMmco5 || sh.isIdr then 0 else sh.frameNum
               poc := p
-            else if sps.picOrderCntType == 2 then
-              let (p, fnOff) := derivePocType2 sh.isIdr isRef sh.frameNum sps.log2MaxFrameNum prevFnOff prevFn
-              prevFnOff := fnOff
-              prevFn := sh.frameNum
+            else if sps.picOrderCntType == 1 then
+              let (p, fnOff) := derivePocType1 sh.isIdr isRef prevHasMmco5
+                sh.fieldPicFlag sh.bottomFieldFlag sh.frameNum sps.log2MaxFrameNum
+                prevFnOff prevFn sps.offsetForNonRefPic sps.offsetForTopToBottomField
+                sps.offsetForRefFrame sh.deltaPoc0 sh.deltaPoc1
+              prevFnOff := if hasMmco5 then 0 else fnOff
+              prevFn := if hasMmco5 then 0 else sh.frameNum
+              prevHasMmco5 := hasMmco5
               poc := p
             else
-              poc := Int.ofNat (2 * sh.frameNum)
+              let (p, fnOff) := derivePocType2 sh.isIdr isRef prevHasMmco5
+                sh.frameNum sps.log2MaxFrameNum prevFnOff prevFn
+              prevFnOff := if hasMmco5 then 0 else fnOff
+              prevFn := if hasMmco5 then 0 else sh.frameNum
+              prevHasMmco5 := hasMmco5
+              poc := p
+            let effPoc := if hasMmco5 then 0 else poc
+            let effFrameNum := if hasMmco5 then 0 else sh.frameNum
             let (l0Init, l1Init) :=
               if sh.sliceTypeMod5 == 0 || sh.sliceTypeMod5 == 3 then
                 (buildRefPicListP0 dpb sh.frameNum sh.numRefIdxL0Active, [])
@@ -1395,7 +1560,7 @@ def simulateAnnexBDpbStream (annexB : ByteSlice) : AnnexBDpbSimReport := Id.run 
             capOk := capOk && dpbCapacityValid dpb
             traces := traces.push {
               sliceIdx := sliceIdx, sliceType := sh.sliceTypeMod5, isIdr := sh.isIdr,
-              isRef := isRef, frameNum := sh.frameNum, poc := poc,
+              isRef := isRef, frameNum := effFrameNum, poc := effPoc,
               refL0Pocs := l0Mod.map DpbPicture.poc, refL1Pocs := l1Mod.map DpbPicture.poc,
               disableDbf := sh.disableDeblockIdc
             }

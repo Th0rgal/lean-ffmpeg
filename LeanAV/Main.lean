@@ -2677,6 +2677,8 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264CenterJ1_eq_vert
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFracCoordsValidSpec
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFrac_dc_all_16_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFracInt_qpel_2_3_avg_j_s
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFrac_non_dc_2_3_exact
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFracCoordsValidSpec
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaBilinear_weights_sum_64
 #print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFrac_dc_all_64_exact
@@ -2686,6 +2688,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264InterDeblockDpbProofs.bDirectTemporal_mv_diff_conserves_collocated
 #print axioms LeanAV.H264InterDeblockDpbProofs.refineMotionSubpel_recovers_qpel_shift
 #print axioms LeanAV.H264InterDeblockDpbProofs.disableDeblockIdcValidSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.shouldFilterEdge_iff
 #print axioms LeanAV.H264InterDeblockDpbProofs.deblockEdgeActiveSpec
 #print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8_preserves_p3_q3
 #print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8_normal_preserves_p2_q2
@@ -2694,7 +2697,12 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264InterDeblockDpbProofs.dpb_b_slice_swaps_identical_l1_when_all_past
 #print axioms LeanAV.H264InterDeblockDpbProofs.dpb_sliding_window_wraparound_evicts_oldest
 #print axioms LeanAV.H264InterDeblockDpbProofs.dpb_rplm_and_mmco_all_ops_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_mmco_rejects_lt_idx_gt_max
+#print axioms LeanAV.H264InterDeblockDpbProofs.dpb_marking_before_bump_reproducer_monotone
+#print axioms LeanAV.H264InterDeblockDpbProofs.derivePocType1_cycle_nonref_and_mmco5_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.derivePocType2_mmco5_resets_prev_offset
 #print axioms LeanAV.H264InterDeblockDpbProofs.dpb_b_pyramid_bumping_monotone_poc
+#print axioms LeanAV.H264InterDeblockDpbProofs.parseAnnexBSpsFull_scaling_matrix_zero_next_scale_exact
 #print axioms LeanAV.H264InterDeblockDpbProofs.annexBSpsValidSpec
 #print axioms LeanAV.H264InterDeblockDpbProofs.annexBPpsValidSpec
 

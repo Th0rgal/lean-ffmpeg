@@ -3,11 +3,11 @@
 The 2026-10-30 M2-B2 H.264 6-tap inter prediction, in-loop deblocking, and Decoded
 Picture Buffer validation (`campaign/m2-b2-h264-inter-dpb-20261030`, over M1
 integrated closure `a39d5516`) under Lean v4.35.0 and `turbo-lean`
-(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited **13,150
-declarations with zero sorryAx/custom axioms** (`40,224` LOC across 22 formal
-`LeanAV/*.lean` modules) and **481/481 `non_vacuous_and_tight` specifications**
-(`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `H264InterDeblockDpbProofs`:
-53, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`:
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited **13,219
+declarations with zero sorryAx/custom axioms** (`40,519` LOC across 22 formal
+`LeanAV/*.lean` modules) and **489/489 `non_vacuous_and_tight` specifications**
+(`Format`: 63, `H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`:
+59, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`:
 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6; `0`
 vacuous, `0` trivial, `0` shadowed), adding ITU-T H.264 §8.4.2.2.1 `[1, -5, 20,
 20, -5, 1]` 6-tap quarter-pel luma interpolation across all 16 sub-pel positions,
@@ -18,13 +18,14 @@ B-direct modes, sub-pel diamond motion estimation with Lagrangian RDO, §8.7 in-
 deblocking (`bS 0..4`, `α`/`β`/`t_C0` QP tables, strong and normal luma/chroma
 filtering), and §8.2.4/§8.2.5 Decoded Picture Buffer management (`pic_order_cnt_type`
 `0`/`1`/`2`, `DefaultRefPicListP`/`B`, RPLM, MMCO `1..6`, sliding-window wraparound,
-B-pyramid POC bumping, and Annex-B stream simulation in
+B-pyramid POC bumping, SPS `seq_scaling_matrix` fallback, and Annex-B stream simulation in
 `LeanAV/H264InterDeblockDpb.lean` + `LeanAV/H264InterDeblockDpbProofs.lean`),
 verified by `tests/differential/test_h264_inter_dpb.py` under `PATH=/nonexistent`
-against `libx264` Baseline/Main/High streams (`trace_headers` + `ffprobe`), passing
+against `libx264` Baseline/Main/High streams and synthetic High SPS / POC type 1 /
+MMCO-5 streams (`trace_headers` + `ffprobe` + decoded pixel comparison), passing
 `53/53` self-test waves (+ `m1c1_lossless_ok` and `m2b2_h264_inter_dpb_ok`),
 `verify-ffi`, `verify-kernels`, `./scripts/regen_lnir_c_kernels.sh --check-ir`,
-`137/137` unit tests, and `111` differential suite entries (`107` passed, `4`
+`137/137` unit tests, and `113` differential suite entries (`109` passed, `4`
 skipped without optional external fixtures).
 
 The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,
