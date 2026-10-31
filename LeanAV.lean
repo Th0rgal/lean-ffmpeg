@@ -28,3 +28,5 @@ import LeanAV.H264Entropy
 import LeanAV.H264EntropyProofs
 import LeanAV.H264IntraTransform
 import LeanAV.H264IntraTransformProofs
+import LeanAV.H264InterDeblockDpb
+import LeanAV.H264InterDeblockDpbProofs
