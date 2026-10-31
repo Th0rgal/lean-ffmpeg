@@ -1,9 +1,9 @@
 # lean-ffmpeg (`LeanAV`)
 
-Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **20 formal Lean 4 modules** (`LeanAV/*.lean`, `38,045` LOC), **21 direct `@[export]` C-ABI entrypoints** (`leanav_lean_*`), **46 compiled `LNIR_WIRE_V1` DSP/stencil/pixel-core kernels** (`c/leanav_lnir_kernels.lnir`: 29 data-parallel SIMD kernels + 17 scalar `@lnir_px_*` pixel cores), and **14 thin 2D strided/reduction/filter/16-bit LLVM 18 outer-loop shells** (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, deterministically emitted by `scripts/gen_lnir_outer_shells.py` and calling the compiled `@lnir_px_*` cores directly) with a **`1,179`-line** C-ABI/POSIX/SIMD bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** and **`0` custom axioms** across **`12,019`** declarations (`scripts/check_axioms.lean`) and **`428 / 428` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean) (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`).
+Formally verified **Lean 4** (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). It pairs **22 formal Lean 4 modules** (`LeanAV/*.lean`, `42,259` LOC), **21 direct `@[export]` C-ABI entrypoints** (`leanav_lean_*`), **46 compiled `LNIR_WIRE_V1` DSP/stencil/pixel-core kernels** (`c/leanav_lnir_kernels.lnir`: 29 data-parallel SIMD kernels + 17 scalar `@lnir_px_*` pixel cores), and **14 thin 2D strided/reduction/filter/16-bit LLVM 18 outer-loop shells** (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, deterministically emitted by `scripts/gen_lnir_outer_shells.py` and calling the compiled `@lnir_px_*` cores directly) with a **`1,179`-line** C-ABI/POSIX/SIMD bridge (`c/leanav_simd_kernels.c`), backed by **`0 sorryAx`** and **`0` custom axioms** across **`12,769`** declarations (`scripts/check_axioms.lean`) and **`453 / 453` `non_vacuous_and_tight`** formal specifications audited by [`turbo-lean`](https://github.com/Th0rgal/turbo-lean) (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`).
 
 `lffmpeg` is currently a **formally gated hybrid multimedia pipeline**, not yet a standalone zero-dependency replacement for `ffmpeg`:
-- **Native in-process execution (`independent_verified` & pure Lean/LNIR stages of `translated_partial`)**: CLI parsing and `MediaPlanIR` validation, fail-closed path/protocol security gates, standalone FFV1 version 3 lossless video encode/decode/remux (`yuv420p`, `gray`, `rgb24`, `bgr0`, Golomb-Rice & range coders, context models `0`/`1`, `1..64` slices, CRC-32 `slicecrc`) across Matroska (`.mkv`), QuickTime (`.mov`), AVI (`.avi`), `rawvideo`, `yuv4mpegpipe` (`.y4m`), `md5`, and `framemd5`, standalone lossless PNG + Zlib/DEFLATE (RFC 1950 / RFC 1951) and FLAC (RFC 9639) stream decode/encode (`rawvideo <-> .png`, `.png -> .png`, `.wav` / `u8` / `s16le` / `s24le` / `s32le <-> .flac`, `.flac -> .flac`), and native zero-exec stream copy & trim across MP4/MOV/M4V/M4A, MKV/WebM, WAV, FLAC, and IVF (all with zero `ffmpeg` subprocesses), exact `AVRational` timestamp rescaling, 8-bit and 10-bit (`U16LE`) plane scaling (`1:1` zero-copy identity, `2:1`, `3:1`, `3:2`, and general Q8 bilinear), 64-bit SWAR Annex-B NAL scanning, PQ10/BT.2020 -> BT.709 colorimetry and tonemapping, AV1 CDEF/Wiener and HEVC SAO filtering, Order-4 FLAC LPC prediction/decoding, 16x16 macroblock PSNR/SAD luma acceptance, and ISO BMFF (`moov`, `colr`, `clli`, `mdcv`, `pasp`, `edts`/`elst`), IVF, Matroska (`SimpleBlock`), and 188-byte MPEG-TS container parsing/patching execute in Lean 4 + compiled LNIR/LLVM routines.
+- **Native in-process execution (`independent_verified` & pure Lean/LNIR stages of `translated_partial`)**: CLI parsing and `MediaPlanIR` validation, fail-closed path/protocol security gates, standalone ITU-T H.264 §9.2 CAVLC and §9.3 CABAC Annex-B entropy decoding, encoding, and CAVLC<->CABAC lossless syntax transcoding (`lffmpeg h264-entropy transcode`, `LeanAV/H264Entropy.lean`, `LeanAV/H264EntropyProofs.lean`), standalone FFV1 version 3 lossless video encode/decode/remux (`yuv420p`, `gray`, `rgb24`, `bgr0`, Golomb-Rice & range coders, context models `0`/`1`, `1..64` slices, CRC-32 `slicecrc`) across Matroska (`.mkv`), QuickTime (`.mov`), AVI (`.avi`), `rawvideo`, `yuv4mpegpipe` (`.y4m`), `md5`, and `framemd5`, standalone lossless PNG + Zlib/DEFLATE (RFC 1950 / RFC 1951) and FLAC (RFC 9639) stream decode/encode (`rawvideo <-> .png`, `.png -> .png`, `.wav` / `u8` / `s16le` / `s24le` / `s32le <-> .flac`, `.flac -> .flac`), and native zero-exec stream copy & trim across MP4/MOV/M4V/M4A, MKV/WebM, WAV, FLAC, and IVF (all with zero `ffmpeg` subprocesses), exact `AVRational` timestamp rescaling, 8-bit and 10-bit (`U16LE`) plane scaling (`1:1` zero-copy identity, `2:1`, `3:1`, `3:2`, and general Q8 bilinear), 64-bit SWAR Annex-B NAL scanning, PQ10/BT.2020 -> BT.709 colorimetry and tonemapping, AV1 CDEF/Wiener and HEVC SAO filtering, Order-4 FLAC LPC prediction/decoding, 16x16 macroblock PSNR/SAD luma acceptance, and ISO BMFF (`moov`, `colr`, `clli`, `mdcv`, `pasp`, `edts`/`elst`), IVF, Matroska (`SimpleBlock`), and 188-byte MPEG-TS container parsing/patching execute in Lean 4 + compiled LNIR/LLVM routines.
 - **External `ffmpeg` process delegation (`translated_partial` raw bitstream pipes & `delegated_faithful`)**: Full entropy/transform video/audio codec bitstream decode/encode (`h264`, `hevc`, `av1`, `aac`, etc.) in `translated_partial` pipelines uses ring-buffered POSIX pipes to `ffmpeg` without `/bin/sh`, and general container/filtergraph/muxer workflows in `delegated_faithful` lower through `MediaPlanIR` to structured `fork` + `execvp` calls against a pinned reference `ffmpeg` (`6.1.1`).
 
 ---
@@ -25,8 +25,8 @@ Every CLI invocation is parsed into [`MediaPlanIR`](LeanAV/PlanIR.lean), checked
 
 | Layer | Component | Verification Status |
 | :--- | :--- | :--- |
-| **Verified Lean 4 Core** | 20 `LeanAV/*.lean` modules (`12,019` declarations) | Kernel-checked under Lean `v4.35.0` (`0 sorryAx`, `0` custom axioms; standard axioms `{propext, Quot.sound, Classical.choice}` only) |
-| **Specification Audit** | `428 / 428` `AVGateSpec` & theorem specs | Audited by `turbo-lean@dc1656d` (`audit-spec` v2.1): `428/428 non_vacuous_and_tight`, `0 vacuous`, `0 trivial`, `0 shadowed` |
+| **Verified Lean 4 Core** | 22 `LeanAV/*.lean` modules (`12,769` declarations) | Kernel-checked under Lean `v4.35.0` (`0 sorryAx`, `0` custom axioms; standard axioms `{propext, Quot.sound, Classical.choice}` only) |
+| **Specification Audit** | `453 / 453` `AVGateSpec` & theorem specs | Audited by `turbo-lean@dc1656d` (`audit-spec` v2.1): `453/453 non_vacuous_and_tight`, `0 vacuous`, `0 trivial`, `0 shadowed` |
 | **Compiled `LNIR_WIRE_V1` Kernels** | 46 DSP/stencil/pixel-core kernels in `c/leanav_lnir_kernels.lnir` (29 data-parallel SIMD + 17 scalar `@lnir_px_*` cores) | `46/46` pass `lean-native-core validate-tv --samples 64` (`SymbolicTV` UB/domain/poison/return/memory refinement); `verify-certs` passes (`verified: true`, `chainValid: true`, `theoremsValid: true` across all 46 kernels: `37 VerifiedKernelProof`, `8 TranslationValidated`, `1 Tested`) |
 | **Unverified TCB (§6.8 Disclosure)** | `c/leanav_simd_kernels.c` (`1,179` lines), 14 thin 2D strided/tiling/narrow-memory (`i8`/`i16` GEP + `zext`/`trunc`) + scalar-accumulator outer LLVM IR shells (`1,454` lines in `c/leanav_lnir_{x86_64,arm64}.ll` generated by `scripts/gen_lnir_outer_shells.py` that delegate all pixel arithmetic to the verified `@lnir_px_*` cores; strided narrow-width loops remain blocked upstream at `turbo-lean@dc1656d`, see [`docs/M1_LNIR_DSP_LIFT_BLOCKER_20261029.md`](docs/M1_LNIR_DSP_LIFT_BLOCKER_20261029.md)), Lean 4 runtime + `lean-sys` POSIX shim (`63` lines), LLVM 18 backend, and external `ffmpeg` (`6.1.1`) when delegated | Zero-drift IR gate (`./scripts/regen_lnir_c_kernels.sh --check-ir`), IR-structural/call-wiring (`tests/test_u16le_kernels_ir.py`, `tests/test_pixel_filters_ir.py`), differential, and runtime (`verify-ffi`, `verify-kernels`) tested, **outer shells not formally proved in Lean** |
 
@@ -94,28 +94,28 @@ DGX Spark figures above measure the Grace ARM64 CPU path (PTX assembly validatio
 
 Each safety and conformance gate implements [`AVGateSpec`](LeanAV/Spec.lean), connecting an executable C-ABI gate (`UInt8`) to an independent declarative `Prop` predicate (`sound`, `complete`, `posWitness`, `negWitness`, `nonVacuous`, `tight`).
 
-All **20** `LeanAV/*.lean` modules (**`428 / 428` specifications**) pass `turbo-lean --json audit-spec` (`dc1656d`, v2.1) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`12,019`** kernel-checked declarations (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`: 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6).
+All **22** `LeanAV/*.lean` modules (**`453 / 453` specifications**) pass `turbo-lean --json audit-spec` (`dc1656d`, v2.1) as `non_vacuous_and_tight` with **`0 vacuous`**, **`0 trivial`**, **`0 shadowed`**, and **`0 sorryAx`** across **`12,769`** kernel-checked declarations (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `H264EntropyProofs`: 25, `Spec`: 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6).
 
 ---
 
 ## Build & Verification
 
-Requires Lean `v4.35.0` ([`lean-toolchain`](lean-toolchain)), sibling checkout [`Th0rgal/lean-sys`](https://github.com/Th0rgal/lean-sys) (`../lean-sys` at `077775ba387f1eeb2976cb8763b4633b8d5ce313`), `clang`, and `ffmpeg` (`>= 6.1`) for differential/delegated tests.
+Requires Lean `v4.35.0` ([`lean-toolchain`](lean-toolchain)), sibling checkout [`Th0rgal/lean-sys`](https://github.com/Th0rgal/lean-sys) (`../lean-sys` at `077775ba387f1eeb2976cb8763b8d5ce313`), `clang`, and `ffmpeg` (`>= 6.1`) for differential/delegated tests.
 
 ```bash
 # 1. Build LeanAV, 46 LNIR kernels + 14 wired 2D/16-bit outer shells, and the 1,179-line C-ABI bridge
 lake build
 
-# 2. Run all 53 formal self-test waves, C-ABI gates, compiled LNIR kernel checks, and zero-drift IR check
+# 2. Run all 54 formal self-test waves, C-ABI gates, compiled LNIR kernel checks, and zero-drift IR check
 ./scripts/regen_lnir_c_kernels.sh --check-ir
 ./.lake/build/bin/lffmpeg self-test
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 12,019 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 12,769 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
-# 4. Audit all 20 formal modules with turbo-lean (428/428 non_vacuous_and_tight)
+# 4. Audit all 22 formal modules with turbo-lean (453/453 non_vacuous_and_tight)
 for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done
 
 # 5. Validate the 46 LNIR_WIRE_V1 kernels via SymbolicTV and certificate checking
@@ -131,7 +131,7 @@ python3 -m unittest discover -s tests/differential -p "test_*.py"
 
 ## Repository Structure
 
-- [`LeanAV/`](LeanAV/): 20 formal Lean 4 modules (`0 sorryAx`, `12,019` declarations, `428/428` tight specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `Md5.lean`, `Ffv1.lean`, `Ffv1Container.lean`, `Ffv1Pipeline.lean`, `Ffv1Proofs.lean`, `IO.lean`, `Main.lean`.
+- [`LeanAV/`](LeanAV/): 22 formal Lean 4 modules (`0 sorryAx`, `12,769` declarations, `453/453` tight specs): `Spec.lean`, `Domain.lean`, `Core.lean`, `Bitstream.lean`, `Format.lean`, `Video.lean`, `Audio.lean`, `Scale.lean`, `Filter.lean`, `Encoder.lean`, `NativeKernels.lean`, `Cli.lean`, `PlanIR.lean`, `Md5.lean`, `Ffv1.lean`, `Ffv1Container.lean`, `Ffv1Pipeline.lean`, `Ffv1Proofs.lean`, `H264Entropy.lean`, `H264EntropyProofs.lean`, `IO.lean`, `Main.lean`.
 - [`c/`](c/):
   - [`c/leanav_simd_kernels.c`](c/leanav_simd_kernels.c) (`1,179` lines): POSIX `fork` + `execvp` delegation shim, `pread`/`pwrite` window I/O shims, 64-slot ring-buffered POSIX pipe/pthread `leanav_c_exec_pipe_transcode_u8` raw-frame bridge, Phase 5 FFI ABI / `__ATOMIC_SEQ_CST` cancellation shims, and zero-copy `lean_sarray_object` wrappers for the compiled LLVM routines.
   - [`c/leanav_lnir_kernels.lnir`](c/leanav_lnir_kernels.lnir), [`c/leanav_lnir_kernels.h`](c/leanav_lnir_kernels.h), [`c/leanav_lnir_x86_64.ll`](c/leanav_lnir_x86_64.ll), [`c/leanav_lnir_arm64.ll`](c/leanav_lnir_arm64.ll): 46 `LNIR_WIRE_V1` DSP/stencil/pixel-core kernels (29 data-parallel SIMD + 17 scalar `@lnir_px_*` cores) + 14 thin 2D strided/reduction/filter/16-bit LLVM 18 outer-loop shells (`x86_64` and `arm64`, wired directly to `@lnir_px_*`) linked into `libleanav_dsp.a`.

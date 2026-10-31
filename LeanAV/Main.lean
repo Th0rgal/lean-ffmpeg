@@ -18,6 +18,8 @@ open LeanAV.Cli
 open LeanAV.NativeKernels
 open LeanAV.PlanIR
 open LeanAV.Ffv1Pipeline
+open LeanAV.H264Entropy
+open LeanAV.H264EntropyProofs
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -912,6 +914,39 @@ def runSelfTest : IO UInt32 := do
      | .fallbackDelegated _ => false)
   let w53Ok := w53IrOk && w53FfiOk && w53KernelsOk
 
+  let w54CavlcStream : ByteArray := ByteArray.mk #[
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0A, 0xDA, 0x7B, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
+    0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x22, 0x6A,
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x32, 0xC8,
+    0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x3F, 0x26, 0x28, 0xE0
+  ]
+  let w54GatesOk :=
+    entropyModeValidSpec.gate entropyModeValidSpec.posWitness &&
+    !(entropyModeValidSpec.gate entropyModeValidSpec.negWitness) &&
+    supportedChromaAndBitDepthSpec.gate supportedChromaAndBitDepthSpec.posWitness &&
+    !(supportedChromaAndBitDepthSpec.gate supportedChromaAndBitDepthSpec.negWitness) &&
+    cavlcZeroBudgetSpec.gate cavlcZeroBudgetSpec.posWitness &&
+    !(cavlcZeroBudgetSpec.gate cavlcZeroBudgetSpec.negWitness) &&
+    h264SliceNalTypeSpec.gate h264SliceNalTypeSpec.posWitness &&
+    !(h264SliceNalTypeSpec.gate h264SliceNalTypeSpec.negWitness) &&
+    cabacStateByteSpec.gate cabacStateByteSpec.posWitness &&
+    !(cabacStateByteSpec.gate cabacStateByteSpec.negWitness)
+  let w54TranscodeOk :=
+    (match transcodeAnnexB w54CavlcStream .cabac with
+     | .ok cabacBytes =>
+       match transcodeAnnexB cabacBytes .cavlc with
+       | .ok cavlcBack =>
+         let nalsCab := splitAnnexB cabacBytes
+         let nalsCav := splitAnnexB cavlcBack
+         nalsCab.size == 3 && nalsCav.size == 3 &&
+         (nalsCab.getD 0 ByteArray.empty).data.getD 1 0 == 77
+       | .error _ => false
+     | .error _ => false) &&
+    (match transcodeAnnexB ByteArray.empty .preserve with
+     | .error _ => true
+     | .ok _ => false)
+  let w54Ok := w54GatesOk && w54TranscodeOk
+
   let m1cZlibIn : ByteArray := "LeanAV-M1-C1-Lossless-Zlib-PNG-FLAC-0123456789".toUTF8
   let m1cZlibEnc := zlibEncode m1cZlibIn true
   let m1cZlibOk := zlibDecode (LeanSys.Posix.ByteSlice.ofByteArray m1cZlibEnc) == some m1cZlibIn
@@ -942,9 +977,9 @@ def runSelfTest : IO UInt32 := do
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
-  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok && w53Ok
+  let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok && w53Ok && w54Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 53, \"c_abi_gates\": 15, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 54, \"c_abi_gates\": 15, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -953,7 +988,7 @@ def runSelfTest : IO UInt32 := do
   let j5a := s!"\"enc_ffv1_ok\": {encFfv1Ok}, \"enc_h264_ok\": {encH264Ok}, \"enc_av1_ok\": {encAv1Ok}, \"pipeline_d_ok\": {pipeDOk}, \"wave6_ok\": {w6Ok}, \"wave7_ok\": {w7Ok}, \"wave8_ok\": {w8Ok}, \"wave9_ok\": {w9Ok}, \"wave10_ok\": {w10Ok}, \"wave11_ok\": {w11Ok}, \"wave12_ok\": {w12Ok}, \"wave13_ok\": {w13Ok}, \"wave14_ok\": {w14Ok}, \"wave15_ok\": {w15Ok}, \"wave16_ok\": {w16Ok}, \"wave17_ok\": {w17Ok}, \"wave18_ok\": {w18Ok}, "
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
-  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk} }"
+  let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"wave54_ok\": {w54Ok}, \"m1c1_lossless_ok\": {m1cLosslessOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d)
   return if allOk then 0 else 1
 
@@ -2079,10 +2114,29 @@ def runLosslessCodec (args : List String) : IO UInt32 := do
     IO.eprintln "usage: lossless-codec zlib-encode|zlib-decode|png-encode|png-decode|flac-encode|flac-decode|flac-frame-roundtrip ..."
     return 2
 
+def runH264EntropyCli (args : List String) : IO UInt32 := do
+  match args with
+  | "transcode" :: modeStr :: inPath :: outPath :: _ =>
+    let some mode := EntropyMode.parse modeStr | do
+      IO.eprintln s!"invalid h264-entropy mode: {modeStr} (expected preserve|cavlc|cabac)"
+      return 2
+    let stream ← IO.FS.readBinFile inPath
+    match transcodeAnnexB stream mode with
+    | .ok outBytes =>
+      IO.FS.writeBinFile outPath outBytes
+      return 0
+    | .error err =>
+      IO.eprintln s!"h264-entropy error: {err}"
+      return 1
+  | _ =>
+    IO.eprintln "usage: h264-entropy transcode preserve|cavlc|cabac <in.264> <out.264>"
+    return 2
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "self-test" :: _ => runSelfTest
   | "lossless-codec" :: rest => runLosslessCodec rest
+  | "h264-entropy" :: rest => runH264EntropyCli rest
   | "plan" :: rest | "dump-plan" :: rest => do
     let plan ← refinePlanWithInput (parseArgsToPlanIR rest)
     IO.println (serializePlanIRJson plan)
@@ -2627,6 +2681,35 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Ffv1Proofs.ffv1DecodeFrameV3_rejects_invalid_dims_and_odd_yuv420p
 #print axioms LeanAV.Ffv1Proofs.ffv1EncodeFrameV3_rejects_mismatch_and_intra_violation
 #print axioms LeanAV.Ffv1Proofs.ffv1MkvSar_roundtrip_unknown_square_and_anamorphic
+
+#print axioms LeanAV.H264EntropyProofs.entropyMode_parse_toString_roundtrip
+#print axioms LeanAV.H264EntropyProofs.entropyModeValidSpec
+#print axioms LeanAV.H264EntropyProofs.blk4XY_xyToBlk4_bijection
+#print axioms LeanAV.H264EntropyProofs.rbspEmulation_insert_and_strip_roundtrip
+#print axioms LeanAV.H264EntropyProofs.annexB_split_short_rejected_and_startcodes_parsed
+#print axioms LeanAV.H264EntropyProofs.supportedChromaAndBitDepthSpec
+#print axioms LeanAV.H264EntropyProofs.cavlcZeroBudgetSpec
+#print axioms LeanAV.H264EntropyProofs.h264SliceNalTypeSpec
+#print axioms LeanAV.H264EntropyProofs.cabacStateByteSpec
+#print axioms LeanAV.H264EntropyProofs.cavlcSignedLevel_decode_encode_nonzero
+#print axioms LeanAV.H264EntropyProofs.cavlcSignedLevel_encode_decode_roundtrip
+#print axioms LeanAV.H264EntropyProofs.cavlcSignedLevel_encode_injective
+#print axioms LeanAV.H264EntropyProofs.cavlcLargeEscape_itu_roundtrip_across_suffixLengths
+#print axioms LeanAV.H264EntropyProofs.cavlcCbpTables_bijection_420_and_monochrome
+#print axioms LeanAV.H264EntropyProofs.cavlcPackedVlcTables_prefix_decode_exact
+#print axioms LeanAV.H264EntropyProofs.cabacTables_bounds_and_state_transition_closure
+#print axioms LeanAV.H264EntropyProofs.unpackCabacInitPure_7bit_universal
+#print axioms LeanAV.H264EntropyProofs.cabacInitTables_spot_exact
+#print axioms LeanAV.H264EntropyProofs.cabacArithmeticCore_decision_bypass_terminate_roundtrip
+#print axioms LeanAV.H264EntropyProofs.cabacPcmReinit_byteAligned_roundtrip
+#print axioms LeanAV.H264EntropyProofs.cabacPcmReinit_rejects_truncated_buffer
+#print axioms LeanAV.H264EntropyProofs.mbKind_intra_inter_disjoint
+#print axioms LeanAV.H264EntropyProofs.mbPartitionTables_itu_cardinalities
+#print axioms LeanAV.H264EntropyProofs.pcmByteCount_420_and_monochrome_exact
+#print axioms LeanAV.H264EntropyProofs.cabacCbfCtx_unavailable_defaults_intra_one_inter_zero
+#print axioms LeanAV.H264EntropyProofs.pps_serialize_parse_noMoreRbsp_override_roundtrip
+#print axioms LeanAV.H264EntropyProofs.sps_baseline_upgradeForCabac_promotes_to_main
+#print axioms LeanAV.H264EntropyProofs.transcodeAnnexB_rejects_empty_and_data_partitioned_nal
 
 
 
