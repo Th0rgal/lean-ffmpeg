@@ -446,14 +446,14 @@ class H264InterDeblockDpbTests(unittest.TestCase):
         idr0 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + "0000" + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
         p0_1 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0001" + "0010" + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
         sps1 = (
-            f"{66:08b}{0:08b}{30:08b}"
+            f"{77:08b}{0:08b}{30:08b}"
             + _ue_bits(0) + _ue_bits(0) + _ue_bits(1) + "0" + _se_bits(-2)
             + _se_bits(0) + _ue_bits(2) + _se_bits(4) + _se_bits(6) + _ue_bits(2)
             + "0" + _ue_bits(0) + _ue_bits(0) + "1100"
         )
         idr1 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + _se_bits(0) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
         p1 = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0001" + _se_bits(0) + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
-        p2_nr = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0010" + _se_bits(-1) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
+        b2_nr = _ue_bits(0) + _ue_bits(6) + _ue_bits(0) + "0010" + _se_bits(-1) + "1" + "0" + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(0)
         p3_r = _ue_bits(0) + _ue_bits(5) + _ue_bits(0) + "0010" + _se_bits(2) + "000" + _se_bits(0) + _ue_bits(1) + _ue_bits(1)
         sps2 = f"{66:08b}{0:08b}{30:08b}" + _ue_bits(0) + _ue_bits(0) + _ue_bits(2) + _ue_bits(2) + "0" + _ue_bits(0) + _ue_bits(0) + "1100"
         idr2 = _ue_bits(0) + _ue_bits(7) + _ue_bits(0) + "0000" + _ue_bits(0) + "00" + _se_bits(0) + _ue_bits(1) + _ue_bits(25)
@@ -464,7 +464,7 @@ class H264InterDeblockDpbTests(unittest.TestCase):
             p_sc = root / "scale_sps.264"
             p_sc.write_bytes(_rbsp_to_annexb_nalu(0x67, sps_scale) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr0, pcm) + _rbsp_to_annexb_nalu(0x41, p0_1))
             p_t1 = root / "poc_type1.264"
-            p_t1.write_bytes(_rbsp_to_annexb_nalu(0x67, sps1) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr1, pcm) + _rbsp_to_annexb_nalu(0x41, p1) + _rbsp_to_annexb_nalu(0x01, p2_nr) + _rbsp_to_annexb_nalu(0x41, p3_r))
+            p_t1.write_bytes(_rbsp_to_annexb_nalu(0x67, sps1) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr1, pcm) + _rbsp_to_annexb_nalu(0x41, p1) + _rbsp_to_annexb_nalu(0x01, b2_nr) + _rbsp_to_annexb_nalu(0x41, p3_r))
             p_m5 = root / "mmco5_poc2.264"
             p_m5.write_bytes(_rbsp_to_annexb_nalu(0x67, sps2) + _rbsp_to_annexb_nalu(0x68, pps0) + _rbsp_to_annexb_nalu(0x65, idr2, pcm) + _rbsp_to_annexb_nalu(0x41, p_fn1) + _rbsp_to_annexb_nalu(0x41, p_mmco5) + _rbsp_to_annexb_nalu(0x41, p_fn1))
             for f in (p_sc, p_t1, p_m5):
@@ -478,8 +478,27 @@ class H264InterDeblockDpbTests(unittest.TestCase):
             self.assertEqual([t["poc"] for t in r_t1["traces"]], [0, 4, 1, 12])
             self.assertEqual(r_t1["output_poc_order"], [0, 1, 4, 12])
             if self.ffprobe:
-                ffp = subprocess.run([self.ffprobe, "-v", "error", "-show_frames", "-show_entries", "frame=coded_picture_number", "-of", "json", str(p_t1)], capture_output=True, text=True, check=True)
-                self.assertEqual([fr["coded_picture_number"] for fr in json.loads(ffp.stdout)["frames"]], [0, 2, 1, 3])
+                ffp = subprocess.run(
+                    [
+                        self.ffprobe,
+                        "-v",
+                        "error",
+                        "-show_frames",
+                        "-show_entries",
+                        "frame=pict_type,key_frame",
+                        "-of",
+                        "json",
+                        str(p_t1),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                ff_frames = json.loads(ffp.stdout)["frames"]
+                self.assertEqual(len(ff_frames), 4)
+                self.assertTrue(bool(ff_frames[0]["key_frame"]))
+                self.assertFalse(any(bool(fr["key_frame"]) for fr in ff_frames[1:]))
+                self.assertEqual([fr["pict_type"] for fr in ff_frames], ["I", "B", "P", "P"])
             r_m5 = json.loads(self.run_isolated("h264-inter-dpb-probe", str(p_m5)).stdout)
             self.assertTrue(r_m5["ok"])
             self.assertEqual([t["poc"] for t in r_m5["traces"]], [0, 2, 0, 2])
