@@ -1,10 +1,14 @@
+import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Bitstream
 
 namespace LeanAV.H264IntraTransform
 
+open LeanSys.Posix
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Bitstream
 
 @[inline] def asrInt (x : Int) (n : Nat) : Int :=
   Int.fdiv x ((2 : Int) ^ n)
@@ -1039,41 +1043,94 @@ def decodeSubblocks8x8List (canvas256 : Array UInt8) (nbrs : H264IntraMbNeighbor
     let canvas' := writeMbBlock8 canvas256 xO yO blk64
     blk64 :: decodeSubblocks8x8List canvas' nbrs rest (modes.drop 1) (lvs.drop 1)
 
+def ipcmMbTypeI : UInt64 := 25
+
+def ipcmBlockNonZeroCount (blkIdx : Nat) : Nat :=
+  if blkIdx < 24 then 16 else 0
+
+def encodeIpcmMb420 (mb : H264Yuv420pMb) : Array UInt8 :=
+  mb.y ++ mb.u ++ mb.v
+
+def decodeIpcmMb420 (pcm : Array UInt8) : Option H264Yuv420pMb :=
+  if pcm.size == 384 then
+    some {
+      y := Array.ofFn fun i : Fin 256 => pcm.getD i.val 0,
+      u := Array.ofFn fun i : Fin 64 => pcm.getD (256 + i.val) 0,
+      v := Array.ofFn fun i : Fin 64 => pcm.getD (320 + i.val) 0 }
+  else
+    none
+
+def writeIpcmMb420Bits (w : BitWriter) (mb : H264Yuv420pMb) : BitWriter :=
+  let wAligned := (w.writeUE ipcmMbTypeI).alignToByte
+  let raw := encodeIpcmMb420 mb
+  { bytes := { data := wAligned.bytes.data ++ raw }, curByte := 0, bitsUsed := 0 }
+
+def readIpcmBytesList (s : ByteSlice) (byteStart : Nat) : Nat → List UInt8
+  | 0 => []
+  | k + 1 => s.getByteD byteStart 0 :: readIpcmBytesList s (byteStart + 1) k
+
+def readIpcmMb420Bits (r : BitReader) : Option (H264Yuv420pMb × BitReader) :=
+  match r.readUE 5 with
+  | none => none
+  | some (mbType, rAfterType) =>
+    if mbType != ipcmMbTypeI then none
+    else
+      let rAligned := rAfterType.alignToByte
+      let byteStart := rAligned.bitOffset / 8
+      if rAligned.bitOffset % 8 != 0 || byteStart + 384 > rAligned.slice.len then
+        none
+      else
+        let raw := (readIpcmBytesList rAligned.slice byteStart 384).toArray
+        match decodeIpcmMb420 raw with
+        | none => none
+        | some mb => some (mb, { rAligned with bitOffset := (byteStart + 384) * 8 })
+
 def encodeLosslessIntraMb (mb : H264Yuv420pMb) (nbrs : H264IntraMbNeighbors)
     (partitionKind : Nat) (lumaModes : List Nat) (chromaMode : Nat) : LosslessIntraMbCoded :=
-  let zeroCanvas := Array.replicate 256 (0 : UInt8)
-  let yBlocks :=
-    if partitionKind == 0 then
-      encodeSubblocks4x4List mb.y zeroCanvas nbrs (zScan4Schedule nbrs.topAvail nbrs.topRightAvail) lumaModes
-    else if partitionKind == 1 then
-      encodeSubblocks8x8List mb.y zeroCanvas nbrs (zScan8Schedule nbrs.topAvail nbrs.topRightAvail) lumaModes
-    else
-      let predY := pred16x16 (lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY nbrs.leftAvail nbrs.topAvail
-      [encodeSamplesLossless mb.y predY]
-  let predU := predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail
-  let predV := predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail
-  { partitionKind := partitionKind, lumaModes := lumaModes, chromaMode := chromaMode,
-    yBlocks := yBlocks, uLevels := encodeSamplesLossless mb.u predU,
-    vLevels := encodeSamplesLossless mb.v predV }
+  if partitionKind == 3 then
+    { partitionKind := 3, lumaModes := [], chromaMode := 0,
+      yBlocks := [mb.y.map fun s => (s.toNat : Int)],
+      uLevels := mb.u.map fun s => (s.toNat : Int),
+      vLevels := mb.v.map fun s => (s.toNat : Int) }
+  else
+    let zeroCanvas := Array.replicate 256 (0 : UInt8)
+    let yBlocks :=
+      if partitionKind == 0 then
+        encodeSubblocks4x4List mb.y zeroCanvas nbrs (zScan4Schedule nbrs.topAvail nbrs.topRightAvail) lumaModes
+      else if partitionKind == 1 then
+        encodeSubblocks8x8List mb.y zeroCanvas nbrs (zScan8Schedule nbrs.topAvail nbrs.topRightAvail) lumaModes
+      else
+        let predY := pred16x16 (lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY nbrs.leftAvail nbrs.topAvail
+        [encodeSamplesLossless mb.y predY]
+    let predU := predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail
+    let predV := predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail
+    { partitionKind := partitionKind, lumaModes := lumaModes, chromaMode := chromaMode,
+      yBlocks := yBlocks, uLevels := encodeSamplesLossless mb.u predU,
+      vLevels := encodeSamplesLossless mb.v predV }
 
 def decodeLosslessIntraMb (coded : LosslessIntraMbCoded) (nbrs : H264IntraMbNeighbors) : H264Yuv420pMb :=
-  let zeroCanvas := Array.replicate 256 (0 : UInt8)
-  let recY :=
-    if coded.partitionKind == 0 then
-      let blks := decodeSubblocks4x4List zeroCanvas nbrs
-        (zScan4Schedule nbrs.topAvail nbrs.topRightAvail) coded.lumaModes coded.yBlocks
-      assembleMbBlocks4 blks
-    else if coded.partitionKind == 1 then
-      let blks := decodeSubblocks8x8List zeroCanvas nbrs
-        (zScan8Schedule nbrs.topAvail nbrs.topRightAvail) coded.lumaModes coded.yBlocks
-      assembleMbBlocks8 blks
-    else
-      let predY := pred16x16 (coded.lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY nbrs.leftAvail nbrs.topAvail
-      decodeSamplesLossless predY (coded.yBlocks.headD (Array.replicate 256 0))
-  let predU := predChroma coded.chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail
-  let predV := predChroma coded.chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail
-  { y := recY, u := decodeSamplesLossless predU coded.uLevels,
-    v := decodeSamplesLossless predV coded.vLevels }
+  if coded.partitionKind == 3 then
+    { y := (coded.yBlocks.headD #[]).map clipU8,
+      u := coded.uLevels.map clipU8,
+      v := coded.vLevels.map clipU8 }
+  else
+    let zeroCanvas := Array.replicate 256 (0 : UInt8)
+    let recY :=
+      if coded.partitionKind == 0 then
+        let blks := decodeSubblocks4x4List zeroCanvas nbrs
+          (zScan4Schedule nbrs.topAvail nbrs.topRightAvail) coded.lumaModes coded.yBlocks
+        assembleMbBlocks4 blks
+      else if coded.partitionKind == 1 then
+        let blks := decodeSubblocks8x8List zeroCanvas nbrs
+          (zScan8Schedule nbrs.topAvail nbrs.topRightAvail) coded.lumaModes coded.yBlocks
+        assembleMbBlocks8 blks
+      else
+        let predY := pred16x16 (coded.lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY nbrs.leftAvail nbrs.topAvail
+        decodeSamplesLossless predY (coded.yBlocks.headD (Array.replicate 256 0))
+    let predU := predChroma coded.chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail
+    let predV := predChroma coded.chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail
+    { y := recY, u := decodeSamplesLossless predU coded.uLevels,
+      v := decodeSamplesLossless predV coded.vLevels }
 
 def reconstructChroma8x8Lossy (pred64 : Array UInt8) (dc4 : Array Int)
     (ac4x4s : Array (Array Int)) (qpc : Nat) : Array UInt8 := Id.run do
@@ -1257,6 +1314,98 @@ def encodeLossyIntraMb (mb : H264Yuv420pMb) (nbrs : H264IntraMbNeighbors)
            lumaModes := lumaModes, chromaMode := cm, lumaDc16 := lumaDc16,
            yBlocks := yBlocks, uDc4 := uDc4, uAc4 := uAc4, vDc4 := vDc4, vAc4 := vAc4 }
 
+def insertRbspEmulationBytes (rbsp : ByteArray) : ByteArray := Id.run do
+  let mut out : Array UInt8 := #[]
+  let mut zeroRun : Nat := 0
+  for i in [:rbsp.size] do
+    let b := rbsp.get! i
+    if zeroRun >= 2 && b <= 3 then
+      out := out.push 3
+      zeroRun := 0
+    out := out.push b
+    zeroRun := if b == 0 then zeroRun + 1 else 0
+  return { data := out }
+
+def stripRbspEmulationList (zeroRun : Nat) : List UInt8 → List UInt8 → List UInt8
+  | [], accRev => accRev.reverse
+  | b :: rest, accRev =>
+    if zeroRun == 2 && b == 3 then
+      stripRbspEmulationList 0 rest accRev
+    else
+      let nextRun := if b == 0 then zeroRun + 1 else 0
+      stripRbspEmulationList nextRun rest (b :: accRev)
+
+def stripRbspBytes (ebsp : ByteSlice) : ByteArray :=
+  let xs := (ebsp.ba.data.toList.drop ebsp.off).take ebsp.len
+  { data := (stripRbspEmulationList 0 xs []).toArray }
+
+def encodeAnnexBNal (nalHeader : UInt8) (rbsp : ByteArray) : ByteArray :=
+  let ebsp := insertRbspEmulationBytes rbsp
+  { data := #[0, 0, 0, 1, nalHeader] ++ ebsp.data }
+
+def encodeMinimalBaselineSps16x16 : ByteArray :=
+  let w0 := BitWriter.empty
+  let w1 := (((w0.writeBitsMSB 66 8).writeBitsMSB 0xC0 8).writeBitsMSB 10 8).writeUE 0
+  let w2 := (((w1.writeUE 0).writeUE 2).writeUE 0).writeBit 0
+  let w3 := (((((w2.writeUE 0).writeUE 0).writeBit 1).writeBit 1).writeBit 0).writeBit 0
+  encodeAnnexBNal 0x67 (w3.writeBit 1).toByteArray
+
+def encodeMinimalBaselinePps : ByteArray :=
+  let w0 := BitWriter.empty
+  let w1 := ((((w0.writeUE 0).writeUE 0).writeBit 0).writeBit 0).writeUE 0
+  let w2 := (((w1.writeUE 0).writeUE 0).writeBit 0).writeBitsMSB 0 2
+  let w3 := ((((w2.writeSE 0).writeSE 0).writeSE 0).writeBit 1).writeBit 0
+  encodeAnnexBNal 0x68 ((w3.writeBit 0).writeBit 1).toByteArray
+
+def encodeAnnexBIpcmIdr16x16 (mb : H264Yuv420pMb) : ByteArray :=
+  let w0 := BitWriter.empty
+  let wHdr := ((((((((w0.writeUE 0).writeUE 7).writeUE 0).writeBitsMSB 0 4).writeUE 0).writeBit 0).writeBit 0).writeSE 0).writeUE 1
+  let wMb := writeIpcmMb420Bits wHdr mb
+  let sliceRbsp := (wMb.writeBit 1).toByteArray
+  encodeMinimalBaselineSps16x16 ++ encodeMinimalBaselinePps ++ encodeAnnexBNal 0x65 sliceRbsp
+
+def decodeAnnexBIpcmIdr16x16 (stream : ByteArray) : Option H264Yuv420pMb := Id.run do
+  let s := ByteSlice.ofByteArray stream
+  let mut p : Nat := 0
+  let mut starts : Array (Nat × Nat) := #[]
+  while p + 3 ≤ s.len do
+    if p + 4 ≤ s.len && s.getByteD p 1 == 0 && s.getByteD (p + 1) 1 == 0 &&
+       s.getByteD (p + 2) 1 == 0 && s.getByteD (p + 3) 0 == 1 then
+      starts := starts.push (p, 4)
+      p := p + 4
+    else if s.getByteD p 1 == 0 && s.getByteD (p + 1) 1 == 0 && s.getByteD (p + 2) 0 == 1 then
+      starts := starts.push (p, 3)
+      p := p + 3
+    else
+      p := p + 1
+  for idx in [:starts.size] do
+    let (scPos, scLen) := starts[idx]!
+    let endPos := if idx + 1 < starts.size then (starts[idx + 1]!).1 else s.len
+    if scPos + scLen + 1 ≤ endPos then
+      let hdr := s.getByteD (scPos + scLen) 0
+      if (hdr &&& 0x1F) == 5 then
+        if let some bodySlice := s.subSlice? (scPos + scLen + 1) (endPos - (scPos + scLen + 1)) then
+          let rbsp := stripRbspBytes bodySlice
+          let r0 := BitReader.ofSlice (ByteSlice.ofByteArray rbsp)
+          if let some (_, r1) := r0.readUE 8 then
+          if let some (_, r2) := r1.readUE 8 then
+          if let some (_, r3) := r2.readUE 8 then
+          if let some (_, r4) := r3.readBitsMSB 4 then
+          if let some (_, r5) := r4.readUE 8 then
+          if let some (_, r6) := r5.readBit then
+          if let some (_, r7) := r6.readBit then
+          if let some (_, r8) := r7.readSE 8 then
+          if let some (disDeblock, r9) := r8.readUE 8 then
+            let rMbOpt :=
+              if disDeblock == 1 then some r9
+              else match r9.readSE 8 with
+                   | none => none
+                   | some (_, rA) => rA.readSE 8 |>.map Prod.snd
+            if let some rMb := rMbOpt then
+              if let some (mb, _) := readIpcmMb420Bits rMb then
+                return some mb
+  return none
+
 private def parseSignedInt? (s : String) : Option Int :=
   match s.toList with
   | '-' :: cs => (String.ofList cs).toNat?.map fun n => -(n : Int)
@@ -1384,6 +1533,54 @@ def runH264IntraProbeCli (args : List String) : IO UInt32 := do
     let valid := H264Yuv420pMb.valid recMb
     IO.println s!"\{\"ok\":{valid},\"err_y\":{errY},\"err_u\":{errU},\"err_v\":{errV},\"qpc\":{qpcFromQpy (clampQp qp) off}}"
     return if valid then 0 else 1
+  | "ipcm-roundtrip" :: rest =>
+    let padBits := match rest with
+      | p :: _ => (p.toNat?.getD 3) % 8
+      | [] => 3
+    let yArr := (List.range 256).map (fun i =>
+      if i == 10 || i == 11 || i == 12 then (0 : UInt8)
+      else if i == 13 then 1
+      else if i == 20 || i == 21 then 0
+      else if i == 22 then 3
+      else ((i * 29 + (i / 16) * 13 + 7) % 256).toUInt8) |>.toArray
+    let uArr := (List.range 64).map (fun i => ((110 + i * 7 + (i / 8) * 19) % 256).toUInt8) |>.toArray
+    let vArr := (List.range 64).map (fun i => ((140 + i * 11 + (i / 8) * 5) % 256).toUInt8) |>.toArray
+    let mb : H264Yuv420pMb := { y := yArr, u := uArr, v := vArr }
+    let raw := encodeIpcmMb420 mb
+    let decRaw := decodeIpcmMb420 raw
+    let wPre := BitWriter.empty.writeBitsMSB 0 padBits
+    let wPost := writeIpcmMb420Bits wPre mb
+    let bs := wPost.toByteArray
+    let rPre : BitReader := { slice := ByteSlice.ofByteArray bs, bitOffset := padBits }
+    let decBits := readIpcmMb420Bits rPre
+    let dummyNbrs : H264IntraMbNeighbors := default
+    let decCoded := decodeLosslessIntraMb (encodeLosslessIntraMb mb dummyNbrs 3 [] 0) dummyNbrs
+    let annexB := encodeAnnexBIpcmIdr16x16 mb
+    let decAnnexB := decodeAnnexBIpcmIdr16x16 annexB
+    let nzOk := (List.range 24).all (fun k => ipcmBlockNonZeroCount k == 16) && ipcmBlockNonZeroCount 24 == 0
+    let bitsOk := match decBits with
+      | some (mbB, rAfter) => mbB == mb && rAfter.bitOffset % 8 == 0 && wPost.bitsUsed == 0
+      | none => false
+    let ok := raw.size == 384 && decRaw == some mb && bitsOk && decCoded == mb && decAnnexB == some mb && nzOk
+    let msg :=
+      s!"\{\"ok\":{ok},\"pcm_bytes\":{raw.size},\"mb_type\":{ipcmMbTypeI}," ++
+      s!"\"nz\":{ipcmBlockNonZeroCount 0},\"annexb_bytes\":{annexB.size}}"
+    IO.println msg
+    return if ok then 0 else 1
+  | "ipcm-encode-annexb" :: inRawPath :: outH264Path :: _ =>
+    let raw ← IO.FS.readBinFile inRawPath
+    match decodeIpcmMb420 raw.data with
+    | none => return 1
+    | some mb =>
+      IO.FS.writeBinFile outH264Path (encodeAnnexBIpcmIdr16x16 mb)
+      return 0
+  | "ipcm-decode-annexb" :: inH264Path :: outRawPath :: _ =>
+    let h264 ← IO.FS.readBinFile inH264Path
+    match decodeAnnexBIpcmIdr16x16 h264 with
+    | none => return 1
+    | some mb =>
+      IO.FS.writeBinFile outRawPath { data := encodeIpcmMb420 mb }
+      return 0
   | _ => return 2
 
 end LeanAV.H264IntraTransform

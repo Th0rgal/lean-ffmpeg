@@ -945,6 +945,16 @@ def runSelfTest : IO UInt32 := do
     topRightY := Array.replicate 16 128, topLeftY := 104,
     leftU := Array.replicate 8 120, topU := Array.replicate 8 120, topLeftU := 120,
     leftV := Array.replicate 8 136, topV := Array.replicate 8 136, topLeftV := 136 }
+  let m2b1IpcmBitsOk :=
+    let wPre := LeanAV.Bitstream.BitWriter.empty.writeBitsMSB 0 3
+    let bs := (LeanAV.H264IntraTransform.writeIpcmMb420Bits wPre m2b1Mb).toByteArray
+    match LeanAV.H264IntraTransform.readIpcmMb420Bits
+        { slice := LeanSys.Posix.ByteSlice.ofByteArray bs, bitOffset := 3 } with
+    | some (decMb, rAfter) => decMb == m2b1Mb && rAfter.bitOffset == (2 + 384) * 8
+    | none => false
+  let m2b1IpcmAnnexBOk :=
+    LeanAV.H264IntraTransform.decodeAnnexBIpcmIdr16x16
+      (LeanAV.H264IntraTransform.encodeAnnexBIpcmIdr16x16 m2b1Mb) == some m2b1Mb
   let m2b1Ok :=
     LeanAV.H264IntraTransform.decodeLosslessIntraMb
       (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 0 [0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6] 3) m2b1Nbrs == m2b1Mb &&
@@ -952,6 +962,9 @@ def runSelfTest : IO UInt32 := do
       (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 1 [0,1,4,8] 2) m2b1Nbrs == m2b1Mb &&
     LeanAV.H264IntraTransform.decodeLosslessIntraMb
       (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 2 [3] 0) m2b1Nbrs == m2b1Mb &&
+    LeanAV.H264IntraTransform.decodeLosslessIntraMb
+      (LeanAV.H264IntraTransform.encodeLosslessIntraMb m2b1Mb m2b1Nbrs 3 [] 0) m2b1Nbrs == m2b1Mb &&
+    m2b1IpcmBitsOk && m2b1IpcmAnnexBOk &&
     LeanAV.H264IntraTransform.H264Yuv420pMb.valid
       (LeanAV.H264IntraTransform.reconstructLossyIntraMb
         (LeanAV.H264IntraTransform.encodeLossyIntraMb m2b1Mb m2b1Nbrs 1 18 0) m2b1Nbrs)
@@ -2654,7 +2667,12 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264IntraTransformProofs.h264IntraNxNModeGateSpec
 #print axioms LeanAV.H264IntraTransformProofs.h264Intra16x16ModeGateSpec
 #print axioms LeanAV.H264IntraTransformProofs.h264IntraChromaModeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.isLegalIntraNxNMode_iff
 #print axioms LeanAV.H264IntraTransformProofs.h264IntraNxNLegalityGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.isLegalIntra16x16Mode_iff
+#print axioms LeanAV.H264IntraTransformProofs.h264Intra16x16LegalityGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.isLegalIntraChromaMode_iff
+#print axioms LeanAV.H264IntraTransformProofs.h264IntraChromaLegalityGateSpec
 #print axioms LeanAV.H264IntraTransformProofs.h264ValidYuv420pMbGateSpec
 #print axioms LeanAV.H264IntraTransformProofs.h264Clip1_valid_and_saturates
 #print axioms LeanAV.H264IntraTransformProofs.h264ClampQp_valid
@@ -2666,6 +2684,12 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264IntraTransformProofs.h264LosslessIntraMb_encode_decode_roundtrip
 #print axioms LeanAV.H264IntraTransformProofs.h264ChromaDcDequant_threshold30_no_rounding
 #print axioms LeanAV.H264IntraTransformProofs.h264LumaDcDequant_threshold36_witnesses
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_raw_size
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_raw_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_bits_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_byte_aligned
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_nz_16
+#print axioms LeanAV.H264IntraTransformProofs.h264Ipcm_nz_beyond_chroma
 
 
 

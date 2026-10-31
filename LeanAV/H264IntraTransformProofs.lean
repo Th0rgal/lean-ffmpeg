@@ -1,11 +1,15 @@
+import LeanSys.Posix
 import LeanAV.Spec
 import LeanAV.Core
+import LeanAV.Bitstream
 import LeanAV.H264IntraTransform
 
 namespace LeanAV.H264IntraTransformProofs
 
+open LeanSys.Posix
 open LeanAV.Spec
 open LeanAV.Core
+open LeanAV.Bitstream
 open LeanAV.H264IntraTransform
 
 def h264QpGateSpec : AVGateSpec Int (fun qp => 0 ≤ qp ∧ qp ≤ 51) where
@@ -86,18 +90,103 @@ def h264IntraChromaModeGateSpec : AVGateSpec Nat (fun m => m ≤ 3) where
   nonVacuous := by decide
   tight := by decide
 
+def IntraNxNModeLegalSafe (mode : Nat) (n : IntraNeighbors) : Prop :=
+  ((mode = 0 ∨ mode = 3 ∨ mode = 7) ∧ n.topAvail = true) ∨
+  ((mode = 1 ∨ mode = 8) ∧ n.leftAvail = true) ∨
+  mode = 2 ∨
+  ((mode = 4 ∨ mode = 5 ∨ mode = 6) ∧
+    n.topAvail = true ∧ n.leftAvail = true ∧ n.topLeftAvail = true)
+
 def h264IntraNxNLegalityGate (p : Nat × IntraNeighbors) : Bool :=
   isLegalIntraNxNMode p.1 p.2
 
+theorem isLegalIntraNxNMode_iff (mode : Nat) (n : IntraNeighbors) :
+    isLegalIntraNxNMode mode n = true ↔ IntraNxNModeLegalSafe mode n := by
+  unfold isLegalIntraNxNMode IntraNxNModeLegalSafe
+  match mode with
+  | 0 | 3 | 7 => simp
+  | 1 | 8 => simp
+  | 2 => simp
+  | 4 | 5 | 6 => simp [Bool.and_eq_true, and_assoc]
+  | _ + 9 => simp
+
 def h264IntraNxNLegalityGateSpec : AVGateSpec (Nat × IntraNeighbors)
-    (fun p => isLegalIntraNxNMode p.1 p.2 = true) where
+    (fun p => IntraNxNModeLegalSafe p.1 p.2) where
   gate := h264IntraNxNLegalityGate
-  sound := by intro p h; exact h
-  complete := by intro p h; exact h
+  sound := by
+    intro p h
+    exact (isLegalIntraNxNMode_iff p.1 p.2).mp h
+  complete := by
+    intro p h
+    exact (isLegalIntraNxNMode_iff p.1 p.2).mpr h
   posWitness := (2, { leftAvail := false, topAvail := false, topRightAvail := false,
                       topLeftAvail := false, left := #[], top := #[], topRight := #[], topLeft := 128 })
   negWitness := (4, { leftAvail := false, topAvail := true, topRightAvail := false,
                       topLeftAvail := false, left := #[], top := #[], topRight := #[], topLeft := 128 })
+  nonVacuous := by decide
+  tight := by decide
+
+def Intra16x16ModeLegalSafe (mode : Nat) (leftAvail topAvail topLeftAvail : Bool) : Prop :=
+  (mode = 0 ∧ topAvail = true) ∨
+  (mode = 1 ∧ leftAvail = true) ∨
+  mode = 2 ∨
+  (mode = 3 ∧ topAvail = true ∧ leftAvail = true ∧ topLeftAvail = true)
+
+def h264Intra16x16LegalityGate (p : Nat × Bool × Bool × Bool) : Bool :=
+  isLegalIntra16x16Mode p.1 p.2.1 p.2.2.1 p.2.2.2
+
+theorem isLegalIntra16x16Mode_iff (mode : Nat) (leftAvail topAvail topLeftAvail : Bool) :
+    isLegalIntra16x16Mode mode leftAvail topAvail topLeftAvail = true ↔
+      Intra16x16ModeLegalSafe mode leftAvail topAvail topLeftAvail := by
+  unfold isLegalIntra16x16Mode Intra16x16ModeLegalSafe
+  match mode with
+  | 0 | 1 | 2 => simp
+  | 3 => simp [Bool.and_eq_true, and_assoc]
+  | _ + 4 => simp
+
+def h264Intra16x16LegalityGateSpec : AVGateSpec (Nat × Bool × Bool × Bool)
+    (fun p => Intra16x16ModeLegalSafe p.1 p.2.1 p.2.2.1 p.2.2.2) where
+  gate := h264Intra16x16LegalityGate
+  sound := by
+    intro p h
+    exact (isLegalIntra16x16Mode_iff p.1 p.2.1 p.2.2.1 p.2.2.2).mp h
+  complete := by
+    intro p h
+    exact (isLegalIntra16x16Mode_iff p.1 p.2.1 p.2.2.1 p.2.2.2).mpr h
+  posWitness := (2, (false, false, false))
+  negWitness := (3, (true, true, false))
+  nonVacuous := by decide
+  tight := by decide
+
+def IntraChromaModeLegalSafe (mode : Nat) (leftAvail topAvail topLeftAvail : Bool) : Prop :=
+  mode = 0 ∨
+  (mode = 1 ∧ leftAvail = true) ∨
+  (mode = 2 ∧ topAvail = true) ∨
+  (mode = 3 ∧ topAvail = true ∧ leftAvail = true ∧ topLeftAvail = true)
+
+def h264IntraChromaLegalityGate (p : Nat × Bool × Bool × Bool) : Bool :=
+  isLegalIntraChromaMode p.1 p.2.1 p.2.2.1 p.2.2.2
+
+theorem isLegalIntraChromaMode_iff (mode : Nat) (leftAvail topAvail topLeftAvail : Bool) :
+    isLegalIntraChromaMode mode leftAvail topAvail topLeftAvail = true ↔
+      IntraChromaModeLegalSafe mode leftAvail topAvail topLeftAvail := by
+  unfold isLegalIntraChromaMode IntraChromaModeLegalSafe
+  match mode with
+  | 0 | 1 | 2 => simp
+  | 3 => simp [Bool.and_eq_true, and_assoc]
+  | _ + 4 => simp
+
+def h264IntraChromaLegalityGateSpec : AVGateSpec (Nat × Bool × Bool × Bool)
+    (fun p => IntraChromaModeLegalSafe p.1 p.2.1 p.2.2.1 p.2.2.2) where
+  gate := h264IntraChromaLegalityGate
+  sound := by
+    intro p h
+    exact (isLegalIntraChromaMode_iff p.1 p.2.1 p.2.2.1 p.2.2.2).mp h
+  complete := by
+    intro p h
+    exact (isLegalIntraChromaMode_iff p.1 p.2.1 p.2.2.1 p.2.2.2).mpr h
+  posWitness := (0, (false, false, false))
+  negWitness := (3, (false, true, true))
   nonVacuous := by decide
   tight := by decide
 
@@ -640,6 +729,22 @@ theorem h264AssembleMbBlocks8_extract (srcY256 : Array UInt8) (hsz : srcY256.siz
       rw [hb3, hblk, h264ExtractMbBlock8_getD _ _ _ _ hsub, hpix]
       simp [Array.getD, hi2]
 
+theorem h264ClipU8_of_u8 (s : UInt8) :
+    clipU8 (s.toNat : Int) = s := by
+  have hs : s.toNat < 256 := s.toBitVec.isLt
+  have hclip : clip1 (s.toNat : Int) = (s.toNat : Int) :=
+    h264Clip1_id_on_valid_pixel (s.toNat : Int) (by omega) (by omega)
+  unfold clipU8
+  rw [hclip]
+  simp
+
+theorem h264MapClipU8_of_toNat (arr : Array UInt8) :
+    (arr.map fun s => (s.toNat : Int)).map clipU8 = arr := by
+  apply Array.ext
+  · simp
+  · intro i hi1 hi2
+    simp [h264ClipU8_of_u8]
+
 theorem h264LosslessIntraMb_encode_decode_roundtrip
     (mb : H264Yuv420pMb) (nbrs : H264IntraMbNeighbors)
     (partitionKind : Nat) (lumaModes : List Nat) (chromaMode : Nat)
@@ -648,34 +753,37 @@ theorem h264LosslessIntraMb_encode_decode_roundtrip
   unfold H264Yuv420pMb.valid at hvalid
   simp only [Bool.and_eq_true, beq_iff_eq] at hvalid
   rcases hvalid with ⟨⟨hy, hu⟩, hv⟩
-  have hpu : (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail).size = 64 := by
-    unfold predChroma; exact Array.size_ofFn
-  have hpv : (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail).size = 64 := by
-    unfold predChroma; exact Array.size_ofFn
-  have hrecU : decodeSamplesLossless
-      (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail)
-      (encodeSamplesLossless mb.u
-        (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail)) = mb.u :=
-    h264SamplesLossless_roundtrip mb.u _ (by omega)
-  have hrecV : decodeSamplesLossless
-      (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail)
-      (encodeSamplesLossless mb.v
-        (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail)) = mb.v :=
-    h264SamplesLossless_roundtrip mb.v _ (by omega)
-  unfold encodeLosslessIntraMb decodeLosslessIntraMb
-  dsimp only
-  rw [hrecU, hrecV]
-  by_cases hp0 : (partitionKind == 0) = true
-  · simp only [hp0, ↓reduceIte]
-    rw [h264Subblocks4x4_roundtrip, h264AssembleMbBlocks4_extract mb.y hy]
-  · by_cases hp1 : (partitionKind == 1) = true
-    · simp only [hp0, hp1, Bool.false_eq_true, ↓reduceIte]
-      rw [h264Subblocks8x8_roundtrip, h264AssembleMbBlocks8_extract mb.y hy]
-    · simp only [hp0, hp1, Bool.false_eq_true, ↓reduceIte, List.headD_cons]
-      have hpy : (pred16x16 (lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY
-          nbrs.leftAvail nbrs.topAvail).size = 256 := by
-        unfold pred16x16; exact Array.size_ofFn
-      rw [h264SamplesLossless_roundtrip mb.y _ (by omega)]
+  by_cases hp3 : (partitionKind == 3) = true
+  · unfold encodeLosslessIntraMb decodeLosslessIntraMb
+    simp only [hp3, ↓reduceIte, beq_self_eq_true, List.headD_cons, h264MapClipU8_of_toNat]
+  · have hpu : (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail).size = 64 := by
+      unfold predChroma; exact Array.size_ofFn
+    have hpv : (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail).size = 64 := by
+      unfold predChroma; exact Array.size_ofFn
+    have hrecU : decodeSamplesLossless
+        (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail)
+        (encodeSamplesLossless mb.u
+          (predChroma chromaMode nbrs.leftU nbrs.topU nbrs.topLeftU nbrs.leftAvail nbrs.topAvail)) = mb.u :=
+      h264SamplesLossless_roundtrip mb.u _ (by omega)
+    have hrecV : decodeSamplesLossless
+        (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail)
+        (encodeSamplesLossless mb.v
+          (predChroma chromaMode nbrs.leftV nbrs.topV nbrs.topLeftV nbrs.leftAvail nbrs.topAvail)) = mb.v :=
+      h264SamplesLossless_roundtrip mb.v _ (by omega)
+    unfold encodeLosslessIntraMb decodeLosslessIntraMb
+    simp only [hp3, Bool.false_eq_true, ↓reduceIte]
+    rw [hrecU, hrecV]
+    by_cases hp0 : (partitionKind == 0) = true
+    · simp only [hp0, ↓reduceIte]
+      rw [h264Subblocks4x4_roundtrip, h264AssembleMbBlocks4_extract mb.y hy]
+    · by_cases hp1 : (partitionKind == 1) = true
+      · simp only [hp0, hp1, Bool.false_eq_true, ↓reduceIte]
+        rw [h264Subblocks8x8_roundtrip, h264AssembleMbBlocks8_extract mb.y hy]
+      · simp only [hp0, hp1, Bool.false_eq_true, ↓reduceIte, List.headD_cons]
+        have hpy : (pred16x16 (lumaModes.headD 2) nbrs.leftY nbrs.topY nbrs.topLeftY
+            nbrs.leftAvail nbrs.topAvail).size = 256 := by
+          unfold pred16x16; exact Array.size_ofFn
+        rw [h264SamplesLossless_roundtrip mb.y _ (by omega)]
 
 def h264ValidYuv420pMbGateSpec : AVGateSpec H264Yuv420pMb
     (fun mb => mb.y.size = 256 ∧ mb.u.size = 64 ∧ mb.v.size = 64) where
@@ -737,5 +845,374 @@ theorem h264ZScan4AllowTopRight_bottom_right_corners_unavailable (topAv trAv : B
     zScan4AllowTopRight 5 topAv trAv = trAv ∧
     zScan4AllowTopRight 0 topAv trAv = topAv := by
   cases topAv <;> cases trAv <;> decide
+
+theorem h264Ipcm_raw_size (mb : H264Yuv420pMb) (hvalid : mb.valid = true) :
+    (encodeIpcmMb420 mb).size = 384 := by
+  unfold H264Yuv420pMb.valid at hvalid
+  simp only [Bool.and_eq_true, beq_iff_eq] at hvalid
+  rcases hvalid with ⟨⟨hy, hu⟩, hv⟩
+  unfold encodeIpcmMb420
+  simp [Array.size_append, hy, hu, hv]
+
+theorem h264Ipcm_raw_roundtrip (mb : H264Yuv420pMb) (hvalid : mb.valid = true) :
+    decodeIpcmMb420 (encodeIpcmMb420 mb) = some mb := by
+  unfold H264Yuv420pMb.valid at hvalid
+  simp only [Bool.and_eq_true, beq_iff_eq] at hvalid
+  rcases hvalid with ⟨⟨hy, hu⟩, hv⟩
+  unfold decodeIpcmMb420 encodeIpcmMb420
+  have hsize : ((mb.y ++ mb.u ++ mb.v).size == 384) = true := by
+    simp [Array.size_append, hy, hu, hv]
+  simp only [hsize, ↓reduceIte, Option.some.injEq]
+  have hyEq : (Array.ofFn fun i : Fin 256 => (mb.y ++ mb.u ++ mb.v).getD i.val 0) = mb.y := by
+    apply Array.ext
+    · simp [hy]
+    · intro i hi1 hi2
+      have hb : i < mb.y.size + (mb.u.size + mb.v.size) := by omega
+      simp [Array.getElem_ofFn, Array.getD, Array.getElem_append, hb, hi2]
+  have huEq : (Array.ofFn fun i : Fin 64 => (mb.y ++ mb.u ++ mb.v).getD (256 + i.val) 0) = mb.u := by
+    apply Array.ext
+    · simp [hu]
+    · intro i hi1 hi2
+      have hb : 256 + i < mb.y.size + (mb.u.size + mb.v.size) := by omega
+      have hnlt : ¬ (256 + i < mb.y.size) := by omega
+      have hsub : 256 + i - mb.y.size = i := by omega
+      simp [Array.getElem_ofFn, Array.getD, Array.getElem_append, hb, hnlt, hsub, hi2]
+  have hvEq : (Array.ofFn fun i : Fin 64 => (mb.y ++ mb.u ++ mb.v).getD (320 + i.val) 0) = mb.v := by
+    apply Array.ext
+    · simp [hv]
+    · intro i hi1 hi2
+      have hb : 320 + i < mb.y.size + (mb.u.size + mb.v.size) := by omega
+      have hnlt1 : ¬ (320 + i < mb.y.size) := by omega
+      have hnlt2 : ¬ (320 + i - mb.y.size < mb.u.size) := by omega
+      have hsub : 320 + i - mb.y.size - mb.u.size = i := by omega
+      simp [Array.getElem_ofFn, Array.getD, Array.getElem_append, hb, hnlt1, hnlt2, hsub]
+  cases mb
+  dsimp only at hyEq huEq hvEq
+  rw [hyEq, huEq, hvEq]
+
+private def ipcmPrefixBytes (padBits : Nat) : Array UInt8 :=
+  (((BitWriter.empty.writeBitsMSB 0 padBits).writeUE ipcmMbTypeI).alignToByte).bytes.data
+
+private theorem h264Ipcm_prefix_size (padBits : Fin 8) :
+    (ipcmPrefixBytes padBits.val).size = 2 := by
+  revert padBits
+  decide
+
+private theorem h264Ipcm_prefix_cz_bool (padBits : Fin 8) :
+    (match BitReader.readUE.countZeros 6
+        { slice := ByteSlice.ofByteArray { data := ipcmPrefixBytes padBits.val },
+          bitOffset := padBits.val } 0 with
+     | some (z, r1) => z == 4 && r1.bitOffset == padBits.val + 5
+     | none => false) = true := by
+  revert padBits
+  decide
+
+private theorem h264Ipcm_prefix_msb_bool (padBits : Fin 8) :
+    (match BitReader.readBitsMSB
+        { slice := ByteSlice.ofByteArray { data := ipcmPrefixBytes padBits.val },
+          bitOffset := padBits.val + 5 } 4 with
+     | some (suf, r2) => suf == 10 && r2.bitOffset == padBits.val + 9
+     | none => false) = true := by
+  revert padBits
+  decide
+
+private theorem h264Ipcm_pad9_align (padBits : Fin 8) :
+    (if (padBits.val + 9) % 8 == 0 then padBits.val + 9 else (padBits.val + 9) + (8 - (padBits.val + 9) % 8)) = 16 := by
+  revert padBits
+  decide
+
+private theorem ipcmCursorOk (off req tot : Nat)
+    (h1 : off + req ≤ tot) (h2 : req ≤ 64) (h3 : tot < UInt64.size) :
+    verifyBitstreamCursor off.toUInt64 req.toUInt64 tot.toUInt64 = 1 := by
+  unfold verifyBitstreamCursor
+  have ho : off.toUInt64.toNat = off := UInt64.toNat_ofNat_of_lt (Nat.lt_of_le_of_lt (by omega) h3)
+  have hr : req.toUInt64.toNat = req := UInt64.toNat_ofNat_of_lt (Nat.lt_of_le_of_lt (by omega) h3)
+  have ht : tot.toUInt64.toNat = tot := UInt64.toNat_ofNat_of_lt h3
+  have c1 : off.toUInt64 ≤ tot.toUInt64 := by
+    rw [UInt64.le_iff_toNat_le, ho, ht]; omega
+  have c2 : req.toUInt64 ≤ tot.toUInt64 - off.toUInt64 := by
+    rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le _ _ c1, hr, ht, ho]; omega
+  have c3 : req.toUInt64 ≤ 64 := by
+    rw [UInt64.le_iff_toNat_le, hr]; change req ≤ 64; omega
+  simp [c1, c2, c3]
+
+private theorem readBit_pre_eq (pre : Array UInt8) (off : Nat)
+    (hoff : off + 1 ≤ pre.size * 8) (hsmall : pre.size * 8 < UInt64.size) :
+    let sPre := ByteSlice.ofByteArray { data := pre }
+    let bit := ((pre.getD (0 + off / 8) 0) >>> (7 - off % 8).toUInt8) &&& 1
+    BitReader.readBit { slice := sPre, bitOffset := off } =
+      some (bit, { slice := sPre, bitOffset := off + 1 }) := by
+  dsimp only
+  unfold BitReader.readBit BitReader.totalBits ByteSlice.ofByteArray ByteArray.size
+  have hok : verifyBitstreamCursor off.toUInt64 1 (pre.size * 8).toUInt64 = 1 :=
+    ipcmCursorOk off 1 (pre.size * 8) hoff (by omega) hsmall
+  have hlt : off / 8 < pre.size := by omega
+  simp only [hok, beq_self_eq_true, ↓reduceIte, hlt]
+
+private theorem readBit_append_prefix (pre post : Array UInt8) (off : Nat)
+    (hoff : off + 1 ≤ pre.size * 8)
+    (hsmall : (pre.size + post.size) * 8 < UInt64.size) :
+    let sPre := ByteSlice.ofByteArray { data := pre }
+    let sFull := ByteSlice.ofByteArray { data := pre ++ post }
+    let bit := ((pre.getD (0 + off / 8) 0) >>> (7 - off % 8).toUInt8) &&& 1
+    BitReader.readBit { slice := sPre, bitOffset := off } =
+      some (bit, { slice := sPre, bitOffset := off + 1 }) ∧
+    BitReader.readBit { slice := sFull, bitOffset := off } =
+      some (bit, { slice := sFull, bitOffset := off + 1 }) := by
+  have hsz : (pre ++ post).size = pre.size + post.size := Array.size_append
+  have hpre := readBit_pre_eq pre off hoff (by omega)
+  have hfull := readBit_pre_eq (pre ++ post) off (by rw [hsz]; omega) (by rw [hsz]; exact hsmall)
+  dsimp only at hpre hfull ⊢
+  have hlt1 : off / 8 < pre.size := by omega
+  have hlt2' : off / 8 < pre.size + post.size := by omega
+  have hget : (pre ++ post).getD (0 + off / 8) 0 = pre.getD (0 + off / 8) 0 := by
+    have hz : 0 + off / 8 = off / 8 := by omega
+    rw [hz]
+    simp [Array.getD, hlt1, hlt2']
+  rw [hget] at hfull
+  exact ⟨hpre, hfull⟩
+
+private theorem readBitsMSBLoop_append_prefix (pre post : Array UInt8) (off0 : Nat) :
+    ∀ (k cur : Nat) (acc : UInt64),
+      cur + k ≤ pre.size * 8 →
+      let sPre := ByteSlice.ofByteArray { data := pre }
+      let sFull := ByteSlice.ofByteArray { data := pre ++ post }
+      BitReader.readBitsMSB.loop { slice := sFull, bitOffset := off0 } k cur acc =
+        let (v, _) := BitReader.readBitsMSB.loop { slice := sPre, bitOffset := off0 } k cur acc
+        (v, { slice := sFull, bitOffset := cur + k })
+  | 0, cur, acc, _ => by simp [BitReader.readBitsMSB.loop]
+  | k + 1, cur, acc, hbound => by
+    intro sPre sFull
+    have hsz : (pre ++ post).size = pre.size + post.size := Array.size_append
+    have hlt1 : cur / 8 < pre.size := by omega
+    have hlt2 : cur / 8 < (pre ++ post).size := by rw [hsz]; omega
+    have hlt2' : cur / 8 < pre.size + post.size := by omega
+    have hget : (pre ++ post).getD (0 + cur / 8) 0 = pre.getD (0 + cur / 8) 0 := by
+      have hz : 0 + cur / 8 = cur / 8 := by omega
+      rw [hz]
+      simp [Array.getD, hlt1, hlt2']
+    unfold BitReader.readBitsMSB.loop
+    dsimp only [sPre, sFull, ByteSlice.ofByteArray, ByteArray.size]
+    simp only [hlt1, hlt2, ↓reduceIte, hget]
+    have ih := readBitsMSBLoop_append_prefix pre post off0 k (cur + 1)
+      ((acc <<< 1) ||| (((pre.getD (0 + cur / 8) 0) >>> (7 - cur % 8).toUInt8) &&& 1).toUInt64) (by omega)
+    dsimp only [ByteSlice.ofByteArray, ByteArray.size] at ih
+    rw [ih]
+    have heq : cur + 1 + k = cur + (k + 1) := by omega
+    simp [heq]
+
+private theorem readBitsMSB_append_prefix (pre post : Array UInt8) (off n : Nat)
+    (hoff : off + n ≤ pre.size * 8) (hn : n ≤ 64)
+    (hsmall : (pre.size + post.size) * 8 < UInt64.size) :
+    let sPre := ByteSlice.ofByteArray { data := pre }
+    let sFull := ByteSlice.ofByteArray { data := pre ++ post }
+    BitReader.readBitsMSB { slice := sFull, bitOffset := off } n =
+      match BitReader.readBitsMSB { slice := sPre, bitOffset := off } n with
+      | some (v, r1) => some (v, { slice := sFull, bitOffset := r1.bitOffset })
+      | none => none := by
+  dsimp only [BitReader.readBitsMSB, BitReader.totalBits, ByteSlice.ofByteArray, ByteArray.size]
+  have hsz : (pre ++ post).size = pre.size + post.size := Array.size_append
+  have hok1 : verifyBitstreamCursor off.toUInt64 n.toUInt64 (pre.size * 8).toUInt64 = 1 :=
+    ipcmCursorOk off n (pre.size * 8) hoff hn (by omega)
+  have hok2 : verifyBitstreamCursor off.toUInt64 n.toUInt64 ((pre ++ post).size * 8).toUInt64 = 1 := by
+    rw [hsz]; exact ipcmCursorOk off n ((pre.size + post.size) * 8) (by omega) hn hsmall
+  simp only [hok1, hok2, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  have hloop := readBitsMSBLoop_append_prefix pre post off n off 0 hoff
+  dsimp only [ByteSlice.ofByteArray, ByteArray.size] at hloop
+  have hoff_pre :
+      (BitReader.readBitsMSB.loop
+        { slice := { ba := { data := pre }, off := 0, len := pre.size },
+          bitOffset := off } n off 0).2.bitOffset = off + n := by
+    let rec loop_off (k cur : Nat) (acc : UInt64) :
+        (BitReader.readBitsMSB.loop
+          { slice := { ba := { data := pre }, off := 0, len := pre.size },
+            bitOffset := off } k cur acc).2.bitOffset = cur + k := by
+      cases k with
+      | zero => simp [BitReader.readBitsMSB.loop]
+      | succ k' =>
+        unfold BitReader.readBitsMSB.loop
+        rw [loop_off k' (cur + 1)]
+        omega
+    exact loop_off n off 0
+  rw [hloop, ← hoff_pre]
+
+private theorem countZeros_append_prefix (pre post : Array UInt8) :
+    ∀ (fuel off lz : Nat),
+      off + fuel ≤ pre.size * 8 →
+      (pre.size + post.size) * 8 < UInt64.size →
+      let sPre := ByteSlice.ofByteArray { data := pre }
+      let sFull := ByteSlice.ofByteArray { data := pre ++ post }
+      BitReader.readUE.countZeros fuel { slice := sFull, bitOffset := off } lz =
+        match BitReader.readUE.countZeros fuel { slice := sPre, bitOffset := off } lz with
+        | some (z, r1) => some (z, { slice := sFull, bitOffset := r1.bitOffset })
+        | none => none
+  | 0, off, lz, _, _ => by simp [BitReader.readUE.countZeros]
+  | fuel + 1, off, lz, hbound, hsmall => by
+    intro sPre sFull
+    have ⟨hpre, hfull⟩ := readBit_append_prefix pre post off (by omega) hsmall
+    unfold BitReader.readUE.countZeros
+    dsimp only [sPre, sFull]
+    rw [hpre, hfull]
+    by_cases hb1 : (((pre.getD (0 + off / 8) 0) >>> (7 - off % 8).toUInt8) &&& 1 == 1) = true
+    · simp only [hb1, ↓reduceIte]
+    · simp only [hb1, Bool.false_eq_true, ↓reduceIte]
+      have ih := countZeros_append_prefix pre post fuel (off + 1) (lz + 1) (by omega) hsmall
+      dsimp only at ih
+      exact ih
+
+private theorem readIpcmBytesList_exact (pre raw : Array UInt8) :
+    ∀ (i k : Nat),
+      i + k ≤ raw.size →
+      readIpcmBytesList (ByteSlice.ofByteArray { data := pre ++ raw }) (pre.size + i) k =
+        (raw.toList.drop i).take k
+  | i, 0, _ => by simp [readIpcmBytesList]
+  | i, k + 1, hbound => by
+    unfold readIpcmBytesList
+    have hi : i < raw.size := by omega
+    have hget : (ByteSlice.ofByteArray { data := pre ++ raw }).getByteD (pre.size + i) 0 = raw[i]'hi := by
+      unfold ByteSlice.getByteD ByteSlice.ofByteArray ByteArray.size
+      have hsub : pre.size + i - pre.size = i := by omega
+      simp [ByteArray.get!, hsub, hi]
+    have hstep : pre.size + i + 1 = pre.size + (i + 1) := by omega
+    rw [hget, hstep, readIpcmBytesList_exact pre raw (i + 1) k (by omega)]
+    have hdrop : raw.toList.drop i = raw.toList[i] :: raw.toList.drop (i + 1) :=
+      List.drop_eq_getElem_cons (l := raw.toList) (i := i) (by simpa using hi)
+    rw [hdrop]
+    simp [Array.getElem_toList]
+
+theorem h264Ipcm_bits_roundtrip (padBits : Fin 8) (mb : H264Yuv420pMb) (hvalid : mb.valid = true) :
+    let wPre := BitWriter.empty.writeBitsMSB 0 padBits.val
+    let wPost := writeIpcmMb420Bits wPre mb
+    let bs := wPost.toByteArray
+    let rPre : BitReader := { slice := ByteSlice.ofByteArray bs, bitOffset := padBits.val }
+    readIpcmMb420Bits rPre = some (mb, { slice := ByteSlice.ofByteArray bs, bitOffset := (2 + 384) * 8 }) := by
+  have hrawSz : (encodeIpcmMb420 mb).size = 384 := h264Ipcm_raw_size mb hvalid
+  have hrawRt : decodeIpcmMb420 (encodeIpcmMb420 mb) = some mb := h264Ipcm_raw_roundtrip mb hvalid
+  have hpreSz := h264Ipcm_prefix_size padBits
+  have hczBool := h264Ipcm_prefix_cz_bool padBits
+  have hmsbBool := h264Ipcm_prefix_msb_bool padBits
+  have hal9 := h264Ipcm_pad9_align padBits
+  have hpBound : padBits.val < 8 := padBits.isLt
+  have hsmall : ((ipcmPrefixBytes padBits.val).size + (encodeIpcmMb420 mb).size) * 8 < UInt64.size := by
+    rw [hpreSz, hrawSz]; decide
+  have hczApp :=
+    countZeros_append_prefix (ipcmPrefixBytes padBits.val) (encodeIpcmMb420 mb)
+      6 padBits.val 0 (by omega) hsmall
+  have hmsbApp :=
+    readBitsMSB_append_prefix (ipcmPrefixBytes padBits.val) (encodeIpcmMb420 mb)
+      (padBits.val + 5) 4 (by omega) (by omega) hsmall
+  dsimp only at hczApp hmsbApp
+  cases hczM :
+      BitReader.readUE.countZeros 6
+        { slice := ByteSlice.ofByteArray { data := ipcmPrefixBytes padBits.val },
+          bitOffset := padBits.val } 0 with
+  | none =>
+    rw [hczM] at hczBool
+    exact False.elim (Bool.false_ne_true hczBool)
+  | some zr =>
+    rcases zr with ⟨z, r1⟩
+    rw [hczM] at hczBool hczApp
+    dsimp only at hczApp
+    simp only [Bool.and_eq_true, beq_iff_eq] at hczBool
+    rcases hczBool with ⟨rfl, hr1o⟩
+    rw [hr1o] at hczApp
+    cases hmsbM :
+        BitReader.readBitsMSB
+          { slice := ByteSlice.ofByteArray { data := ipcmPrefixBytes padBits.val },
+            bitOffset := padBits.val + 5 } 4 with
+    | none =>
+      rw [hmsbM] at hmsbBool
+      exact False.elim (Bool.false_ne_true hmsbBool)
+    | some sr =>
+      rcases sr with ⟨suf, r2⟩
+      rw [hmsbM] at hmsbBool hmsbApp
+      dsimp only at hmsbApp
+      simp only [Bool.and_eq_true, beq_iff_eq] at hmsbBool
+      rcases hmsbBool with ⟨rfl, hr2o⟩
+      rw [hr2o] at hmsbApp
+      have hbsEq : ((writeIpcmMb420Bits (BitWriter.empty.writeBitsMSB 0 padBits.val) mb).toByteArray) =
+          { data := ipcmPrefixBytes padBits.val ++ encodeIpcmMb420 mb } := by
+        unfold writeIpcmMb420Bits BitWriter.toByteArray ipcmPrefixBytes
+        change (BitWriter.alignToByte
+          { bytes := { data :=
+              (((BitWriter.empty.writeBitsMSB 0 padBits.val).writeUE ipcmMbTypeI).alignToByte).bytes.data ++
+                encodeIpcmMb420 mb },
+            curByte := 0, bitsUsed := 0 }).bytes = _
+        unfold BitWriter.alignToByte
+        rfl
+      dsimp only
+      rw [hbsEq]
+      unfold readIpcmMb420Bits
+      let fullSlice := ByteSlice.ofByteArray { data := ipcmPrefixBytes padBits.val ++ encodeIpcmMb420 mb }
+      have hrue :
+          ({ slice := fullSlice, bitOffset := padBits.val } : BitReader).readUE 5 =
+            some (ipcmMbTypeI, { slice := fullSlice, bitOffset := padBits.val + 9 }) := by
+        unfold BitReader.readUE
+        dsimp only
+        rw [hczApp]
+        change (match ({ slice := fullSlice, bitOffset := padBits.val + 5 } : BitReader).readBitsMSB 4 with
+                | none => none
+                | some (suffix, finalR) =>
+                  some (((1 : UInt64) <<< (4 : Nat).toUInt64) - 1 + suffix, finalR)) = _
+        rw [hmsbApp]
+        dsimp only
+        have hmEq : (((1 : UInt64) <<< (4 : Nat).toUInt64) - 1 + 10) = ipcmMbTypeI := by decide
+        rw [hmEq]
+      dsimp only
+      rw [hrue]
+      dsimp only
+      have htypeEq : (ipcmMbTypeI != ipcmMbTypeI) = false := by decide
+      simp only [htypeEq, Bool.false_eq_true, ↓reduceIte]
+      have halOff :
+          ({ slice := fullSlice, bitOffset := padBits.val + 9 } : BitReader).alignToByte =
+            { slice := fullSlice, bitOffset := 16 } := by
+        unfold BitReader.alignToByte
+        dsimp only
+        cases hrem : (padBits.val + 9) % 8 == 0
+        · rw [hrem] at hal9
+          simp only [Bool.false_eq_true, ↓reduceIte] at hal9 ⊢
+          rw [hal9]
+        · rw [hrem] at hal9
+          simp only [↓reduceIte] at hal9 ⊢
+          rw [hal9]
+      rw [halOff]
+      have hslen : fullSlice.len = 386 := by
+        dsimp only [fullSlice]
+        unfold ByteSlice.ofByteArray ByteArray.size
+        dsimp only
+        rw [Array.size_append, hpreSz, hrawSz]
+      have hcond : ((16 : Nat) % 8 != 0 || 16 / 8 + 384 > fullSlice.len) = false := by
+        rw [hslen]; decide
+      simp only [hcond, Bool.false_eq_true, ↓reduceIte]
+      have hbytes :=
+        readIpcmBytesList_exact (ipcmPrefixBytes padBits.val) (encodeIpcmMb420 mb) 0 384 (by omega)
+      have hzero : (ipcmPrefixBytes padBits.val).size + 0 = 16 / 8 := by omega
+      rw [hzero] at hbytes
+      have htake : ((encodeIpcmMb420 mb).toList.drop 0).take 384 = (encodeIpcmMb420 mb).toList := by
+        have hlen : (encodeIpcmMb420 mb).toList.length = 384 := by simpa using hrawSz
+        simp [List.take_of_length_le (Nat.le_of_eq hlen)]
+      have htoArr : (encodeIpcmMb420 mb).toList.toArray = encodeIpcmMb420 mb := Array.toArray_toList
+      rw [hbytes, htake, htoArr]
+      change (match decodeIpcmMb420 (encodeIpcmMb420 mb) with
+              | none => none
+              | some mb' =>
+                some (mb', ({ slice := fullSlice, bitOffset := (16 / 8 + 384) * 8 } : BitReader))) =
+             some (mb, ({ slice := fullSlice, bitOffset := (2 + 384) * 8 } : BitReader))
+      rw [hrawRt]
+
+theorem h264Ipcm_byte_aligned (w : BitWriter) (mb : H264Yuv420pMb) :
+    (writeIpcmMb420Bits w mb).bitsUsed = 0 := by
+  unfold writeIpcmMb420Bits
+  simp
+
+theorem h264Ipcm_nz_16 (blkIdx : Nat) (h : blkIdx < 24) :
+    ipcmBlockNonZeroCount blkIdx = 16 := by
+  unfold ipcmBlockNonZeroCount
+  simp [h]
+
+theorem h264Ipcm_nz_beyond_chroma (blkIdx : Nat) (h : 24 ≤ blkIdx) :
+    ipcmBlockNonZeroCount blkIdx = 0 := by
+  unfold ipcmBlockNonZeroCount
+  simp [h]
 
 end LeanAV.H264IntraTransformProofs

@@ -1,27 +1,33 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
-The 2026-10-30 M2-B1 H.264 intra spatial prediction, 4x4/8x8/Hadamard transforms,
-scaling/quantization & lossless DPCM bypass qualification
+The 2026-10-31 M2-B1 v2 H.264 intra spatial prediction, 4x4/8x8/Hadamard transforms,
+scaling/quantization, `I_PCM`, & lossless DPCM bypass qualification
 (`campaign/m2-b1-h264-intra-idct-20261030`, over base `a39d5516`) under Lean v4.35.0
 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
-audited **12,640 declarations with zero sorryAx/custom axioms** (`40,214` LOC across
-22 formal `LeanAV/*.lean` modules) and **476/476 `non_vacuous_and_tight`
-specifications** (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59,
-`H264IntraTransformProofs`: 48, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28,
+audited **12,734 declarations with zero sorryAx/custom axioms** (`40,912` LOC across
+22 formal `LeanAV/*.lean` modules) and **498/498 `non_vacuous_and_tight`
+specifications** (`H264IntraTransformProofs`: 70, `Format`: 63, `Ffv1Proofs`: 60,
+`NativeKernels`: 59, `Video`: 46, `Audio`: 34, `Encoder`: 30, `Scale`: 28,
 `Bitstream`: 27, `Spec`: 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`:
 6, `Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 ITU-T
 H.264 §8.3 intra prediction (`Intra_4x4` modes `0..8` with 16-block Z-scan neighbor
 availability, `Intra_8x8` modes `0..8` with availability-conditional `[1,2,1]>>2`
 reference filtering, `Intra_16x16` modes `0..3`, and `4:2:0` `Intra_Chroma` modes
-`0..3`), §8.5 `4x4` & `8x8` integer inverse/forward transforms, `4x4` luma DC
+`0..3`, each backed by independent declarative `Safe` legality predicates in
+`AVGateSpec`), §8.5 `4x4` & `8x8` integer inverse/forward transforms, `4x4` luma DC
 (`QP >= 36` threshold + post-dequant DC override) and `2x2` chroma DC (`QPC >= 30`
 threshold, no rounding add for `QPC < 30`, Table 8-15 `qPi -> QPC`) Hadamard
-transforms, deadzone forward quantization, and `qpprime_y_zero_transform_bypass_flag = 1`
-lossless sample & horizontal/vertical DPCM macroblock encode/decode with universal
-identity proof (`h264LosslessIntraMb_encode_decode_roundtrip`), passing `53/53`
-self-test waves (`m2b1_h264_intra_idct_ok: true`), `verify-ffi`, `verify-kernels`,
-`137` unit tests, and `114` differential tests (`110` passed, `4` skipped without
-optional external fixtures).
+transforms, deadzone forward quantization, `I_PCM` (`mb_type = 25`, byte-aligned
+`384`-byte raw `4:2:0` sample copy, `nZ = 16`, bitstream roundtrip
+`h264Ipcm_bits_roundtrip` for all `padBits : Fin 8`, and Annex-B IDR roundtrip),
+and `qpprime_y_zero_transform_bypass_flag = 1` lossless sample & horizontal/vertical
+DPCM macroblock encode/decode with universal identity proof
+(`h264LosslessIntraMb_encode_decode_roundtrip`), passing `53/53` self-test waves
+(`m2b1_h264_intra_idct_ok: true`), `verify-ffi`, `verify-kernels`, `137` unit tests,
+and `116` differential tests (`112` passed including real `ffmpeg` pixel-equality
+verification across all `Intra_4x4`, `Intra_8x8`, `Intra_16x16`, `Intra_Chroma`,
+`4x4` IDCT basis streams, and `I_PCM` Annex-B decode, `4` skipped without optional
+external fixtures).
 
 The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,
 combining M1-A2 `c0a811f4`, M1-B2 `f619a6ab`, M1-C1 v4 `64028fe3`, and M1-C2 v2
