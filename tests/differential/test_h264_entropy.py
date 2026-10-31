@@ -302,6 +302,90 @@ class H264EntropyDifferentialTests(unittest.TestCase):
                     )
                     self.assert_all_modes_pixel_exact(src_264, "yuv420p", root, tag)
 
+    def test_ipcm_multi_mb_midbyte_cabac_cavlc_roundtrip(self):
+        def pack_nal(nal_hdr: int, bits: list[int]) -> bytes:
+            padded = list(bits) + [1]
+            while len(padded) % 8 != 0:
+                padded.append(0)
+            rbsp = bytearray()
+            for i in range(0, len(padded), 8):
+                v = 0
+                for b in padded[i : i + 8]:
+                    v = (v << 1) | b
+                rbsp.append(v)
+            out = bytearray([0, 0, 0, 1, nal_hdr])
+            zeros = 0
+            for b in rbsp:
+                if zeros == 2 and b <= 3:
+                    out.append(3)
+                    zeros = 0
+                out.append(b)
+                zeros = zeros + 1 if b == 0 else 0
+            return bytes(out)
+
+        def put_u(bits: list[int], val: int, n: int):
+            for i in range(n - 1, -1, -1):
+                bits.append((val >> i) & 1)
+
+        def put_ue(bits: list[int], val: int):
+            x = val + 1
+            k = x.bit_length() - 1
+            put_u(bits, 0, k)
+            put_u(bits, x, k + 1)
+
+        def put_se(bits: list[int], val: int):
+            put_ue(bits, 0 if val == 0 else (2 * val - 1 if val > 0 else -2 * val))
+
+        def put_pcm(bits: list[int], pcm: bytes):
+            while len(bits) % 8 != 0:
+                bits.append(0)
+            for b in pcm:
+                put_u(bits, b, 8)
+
+        sps: list[int] = []
+        put_u(sps, 66, 8); put_u(sps, 0xC0, 8); put_u(sps, 30, 8)
+        put_ue(sps, 0); put_ue(sps, 0); put_ue(sps, 2); put_ue(sps, 0); put_u(sps, 0, 1)
+        put_ue(sps, 1); put_ue(sps, 1); put_u(sps, 1, 1); put_u(sps, 1, 1); put_u(sps, 0, 1); put_u(sps, 0, 1)
+
+        pps: list[int] = []
+        put_ue(pps, 0); put_ue(pps, 0); put_u(pps, 0, 1); put_u(pps, 0, 1)
+        put_ue(pps, 0); put_ue(pps, 0); put_ue(pps, 0); put_u(pps, 0, 1); put_u(pps, 0, 2)
+        put_se(pps, 0); put_se(pps, 0); put_se(pps, 0); put_u(pps, 1, 1); put_u(pps, 0, 1); put_u(pps, 0, 1)
+
+        pcm1 = bytes(((0x17 + i * 37 + (i >> 3) * 11) & 0xFF) or 1 for i in range(384))
+        pcm3 = bytes(((0x2B + i * 53 + (i >> 2) * 7) & 0xFF) or 2 for i in range(384))
+        sl: list[int] = []
+        put_ue(sl, 0); put_ue(sl, 7); put_ue(sl, 0); put_u(sl, 0, 4); put_ue(sl, 0)
+        put_u(sl, 0, 1); put_u(sl, 0, 1); put_se(sl, 0); put_ue(sl, 1)
+        put_ue(sl, 3); put_ue(sl, 0); put_se(sl, 0); put_u(sl, 1, 1)
+        put_ue(sl, 25); put_pcm(sl, pcm1)
+        put_ue(sl, 1); put_ue(sl, 0); put_se(sl, 0); put_u(sl, 1, 1)
+        put_ue(sl, 25); put_pcm(sl, pcm3)
+
+        with tempfile.TemporaryDirectory(prefix="leanav-h264-ipcm-") as tmp:
+            root = Path(tmp)
+            src_264 = root / "ipcm_mixed_cavlc.264"
+            src_264.write_bytes(pack_nal(0x67, sps) + pack_nal(0x68, pps) + pack_nal(0x65, sl))
+            r_src = self.run_ref("-i", str(src_264), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-")
+            self.assertEqual(r_src.returncode, 0, r_src.stderr.decode(errors="replace"))
+            self.assertEqual(r_src.stderr, b"")
+            ref_sha = hashlib.sha256(r_src.stdout).hexdigest()
+
+            out_cabac = root / "ipcm_cabac.264"
+            out_cabac_pres = root / "ipcm_cabac_preserve.264"
+            out_rt_cavlc = root / "ipcm_cabac_to_cavlc.264"
+            for mode, inp, dst in (
+                ("cabac", src_264, out_cabac),
+                ("preserve", out_cabac, out_cabac_pres),
+                ("cavlc", out_cabac, out_rt_cavlc),
+            ):
+                rt = self.run_isolated("h264-entropy", "transcode", mode, str(inp), str(dst))
+                self.assertEqual(rt.returncode, 0, rt.stderr.decode(errors="replace"))
+                rd = self.run_ref("-i", str(dst), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-")
+                self.assertEqual(rd.returncode, 0, rd.stderr.decode(errors="replace"))
+                self.assertEqual(rd.stderr, b"")
+                self.assertEqual(hashlib.sha256(rd.stdout).hexdigest(), ref_sha, f"ipcm {mode} mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

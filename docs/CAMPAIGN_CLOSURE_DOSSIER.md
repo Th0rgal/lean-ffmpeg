@@ -3,10 +3,10 @@
 The 2026-10-31 M2-A2 standalone H.264 §9.2 CAVLC & §9.3 CABAC entropy qualification
 (`campaign/m2-a2-h264-entropy-20261030` over `a39d5516`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
-**12,772 declarations with zero sorryAx/custom axioms** (`42,296` LOC across 22
-formal `LeanAV/*.lean` modules) and **456/456 `non_vacuous_and_tight`
+**12,777 declarations with zero sorryAx/custom axioms** (`42,360` LOC across 22
+formal `LeanAV/*.lean` modules) and **459/459 `non_vacuous_and_tight`
 specifications** (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46,
-`Audio`: 34, `Encoder`: 30, `Scale`: 28, `H264EntropyProofs`: 28, `Bitstream`: 27,
+`Audio`: 34, `H264EntropyProofs`: 31, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27,
 `Spec`: 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6;
 `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 progressive frame
 (`frame_mbs_only_flag = 1`, `chroma_format_idc ∈ {0, 1}`, 8/10-bit I/P/B slices
@@ -16,7 +16,7 @@ CAVLC<->CABAC lossless syntax transcoding (`lffmpeg h264-entropy transcode`,
 Baseline->Main profile promotion when targeting CABAC, zero `ffmpeg` subprocesses
 verified under `PATH=/nonexistent` and fake `LEANAV_FFMPEG_BIN` /
 `LEANAV_FFPROBE_BIN`), with `54/54` self-test waves, `verify-ffi`, `verify-kernels`,
-`137` unit tests, and `113` differential tests (`109` passed, `4` skipped without
+`137` unit tests, and `114` differential tests (`110` passed, `4` skipped without
 optional external fixtures).
 
 The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,

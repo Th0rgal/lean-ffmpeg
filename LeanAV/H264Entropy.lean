@@ -187,11 +187,8 @@ def readBytesAlignedLoop (r : BitReader) : Nat → Array UInt8 → Option (ByteA
     | some (v, r') => readBytesAlignedLoop r' k (acc.push v.toUInt8)
     | none => none
 
-def writeBytesAligned (w : BitWriter) (ba : ByteArray) : BitWriter := Id.run do
-  let mut cur := w.alignToByte
-  for i in [:ba.size] do
-    cur := cur.writeBitsMSB (ba.get! i).toUInt64 8
-  return cur
+def writeBytesAligned (w : BitWriter) (ba : ByteArray) : BitWriter :=
+  ba.data.foldl (fun cur b => cur.writeBitsMSB b.toUInt64 8) w.alignToByte
 
 private def isHighProfileIdc (p : Nat) : Bool :=
   p == 100 || p == 110 || p == 122 || p == 244 || p == 44 || p == 83 ||
@@ -1281,7 +1278,7 @@ def CabacDec.decodeTerminate (dec : CabacDec) : Nat × CabacDec :=
     (0, { dec with pos := pos', irange := rng', ioffset := off' })
 
 def CabacDec.readPcmAndReinit (dec : CabacDec) (nbytes : Nat) : Option (ByteArray × CabacDec) :=
-  let byteStart := dec.pos >>> 3
+  let byteStart := (dec.pos + 7) >>> 3
   if byteStart + nbytes > dec.rbsp.data.size then none
   else
     let pcm : ByteArray := { data := ((dec.rbsp.data.toList.drop byteStart).take nbytes).toArray }

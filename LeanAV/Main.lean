@@ -2704,6 +2704,9 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264EntropyProofs.cabacPcmReinit_byteAligned_roundtrip
 #print axioms LeanAV.H264EntropyProofs.cabacDecodeTerminate_one_noRenorm_itu_9_3_3_2_4
 #print axioms LeanAV.H264EntropyProofs.cabacIpcmTerminate_preserves_pos_for_pcm_and_following_decision_bypass
+#print axioms LeanAV.H264EntropyProofs.cabacPcmByteStart_bit_eq_alignUp
+#print axioms LeanAV.H264EntropyProofs.cabacIpcm_nonAligned_pcmReinit_roundtrip
+#print axioms LeanAV.H264EntropyProofs.cabacIpcm_alignedPos16_pcmReinit_roundtrip
 #print axioms LeanAV.H264EntropyProofs.cabacPcmReinit_rejects_truncated_buffer
 #print axioms LeanAV.H264EntropyProofs.mbKind_intra_inter_disjoint
 #print axioms LeanAV.H264EntropyProofs.mbPartitionTables_itu_cardinalities

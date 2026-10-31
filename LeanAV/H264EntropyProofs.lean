@@ -430,6 +430,70 @@ theorem cabacIpcmTerminate_preserves_pos_for_pcm_and_following_decision_bypass :
      bFollow == bRef && bpFollow == bpRef && d4.pos == d4Ref.pos) = true := by
   decide
 
+theorem cabacPcmByteStart_bit_eq_alignUp (pos : Nat) :
+    ((pos + 7) >>> 3) * 8 =
+      (if pos % 8 = 0 then pos else pos + (8 - (pos % 8))) ∧
+    pos ≤ ((pos + 7) >>> 3) * 8 ∧
+    ((pos + 7) >>> 3) * 8 < pos + 8 := by
+  simp only [Nat.shiftRight_eq_div_pow]
+  split <;> omega
+
+set_option maxHeartbeats 800000 in
+set_option maxRecDepth 400000 in
+theorem cabacIpcm_nonAligned_pcmReinit_roundtrip :
+    let st0 : Array UInt8 := #[92, 40]
+    let pcm : ByteArray := { data := #[0x13, 0x32, 0x57, 0xA9] }
+    let e0 := CabacEnc.init BitWriter.empty
+    let (e1, es1) := e0.encodeDecision st0 0 1
+    let eTerm := (e1.encodeBypass 0).encodeTerminate 1
+    let ePcm := eTerm.writePcmAndReinit pcm
+    let (ePost1, _) := ePcm.encodeDecision es1 1 1
+    let ePostEnd := ((ePost1.encodeBypass 1).encodeTerminate 0).encodeTerminate 1
+    let d0 := CabacDec.init ePostEnd.w.toByteArray 0
+    let (a0, d1, ds1) := d0.decodeDecision st0 0
+    let (abp0, d2) := d1.decodeBypass
+    let (term, dTerm) := d2.decodeTerminate
+    (match dTerm.readPcmAndReinit 4 with
+     | none => false
+     | some (pcmOut, dAfter) =>
+       let (ap1, dAfter1, _) := dAfter.decodeDecision ds1 1
+       let (apBp, dAfter2) := dAfter1.decodeBypass
+       let (apT0, dAfter3) := dAfter2.decodeTerminate
+       let (apT1, _) := dAfter3.decodeTerminate
+       a0 == 1 && abp0 == 0 && term == 1 && (dTerm.pos % 8 != 0) &&
+       pcmOut.data == pcm.data &&
+       ap1 == 1 && apBp == 1 && apT0 == 0 && apT1 == 1) = true := by
+  decide
+
+set_option maxHeartbeats 800000 in
+set_option maxRecDepth 400000 in
+theorem cabacIpcm_alignedPos16_pcmReinit_roundtrip :
+    let pcm : ByteArray := { data := #[0x42, 0x99, 0xC3, 0x07] }
+    let f0 := CabacEnc.init BitWriter.empty
+    let f7 := (((((((f0.encodeBypass 1).encodeBypass 0).encodeBypass 1).encodeBypass 1).encodeBypass 0).encodeBypass 0).encodeBypass 1)
+    let fPcm := (f7.encodeTerminate 1).writePcmAndReinit pcm
+    let (fPost1, _) := fPcm.encodeDecision #[55] 0 1
+    let fPostEnd := (fPost1.encodeBypass 0).encodeTerminate 1
+    let g0 := CabacDec.init fPostEnd.w.toByteArray 0
+    let (gb0, g1) := g0.decodeBypass
+    let (gb1, g2) := g1.decodeBypass
+    let (gb2, g3) := g2.decodeBypass
+    let (gb3, g4) := g3.decodeBypass
+    let (gb4, g5) := g4.decodeBypass
+    let (gb5, g6) := g5.decodeBypass
+    let (gb6, g7) := g6.decodeBypass
+    let (term, dTerm) := g7.decodeTerminate
+    (match dTerm.readPcmAndReinit 4 with
+     | none => false
+     | some (pcmOut, dAfter) =>
+       let (bp1, dAfter1, _) := dAfter.decodeDecision #[55] 0
+       let (bpBp, dAfter2) := dAfter1.decodeBypass
+       let (bpT1, _) := dAfter2.decodeTerminate
+       gb0 == 1 && gb1 == 0 && gb2 == 1 && gb3 == 1 && gb4 == 0 && gb5 == 0 && gb6 == 1 &&
+       term == 1 && dTerm.pos == 16 && (dTerm.pos % 8 == 0) &&
+       pcmOut.data == pcm.data && bp1 == 1 && bpBp == 0 && bpT1 == 1) = true := by
+  decide
+
 theorem cabacPcmReinit_rejects_truncated_buffer :
     let d0 := CabacDec.init ({ data := #[0x00, 0x00] }) 0
     (d0.readPcmAndReinit 16).isNone = true := by
