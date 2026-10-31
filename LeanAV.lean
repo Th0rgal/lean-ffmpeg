@@ -24,3 +24,5 @@ import LeanAV.Ffv1Pipeline
 import LeanAV.Ffv1Proofs
 import LeanAV.H264Syntax
 import LeanAV.H264SyntaxProofs
+import LeanAV.H264Entropy
+import LeanAV.H264EntropyProofs
