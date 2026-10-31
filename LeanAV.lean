@@ -26,3 +26,5 @@ import LeanAV.H264Syntax
 import LeanAV.H264SyntaxProofs
 import LeanAV.H264Entropy
 import LeanAV.H264EntropyProofs
+import LeanAV.H264IntraTransform
+import LeanAV.H264IntraTransformProofs
