@@ -50,7 +50,7 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
             raise unittest.SkipTest("lffmpeg binary is unavailable")
         if not _ffmpeg_usable() or not FFPROBE.is_file():
             raise unittest.SkipTest("reference ffmpeg/ffprobe unavailable")
-        cls.fixture_dir = Path(tempfile.mkdtemp(prefix="lean-ffmpeg-inproc-diff-"))
+        cls.fixture_dir = Path(tempfile.mkdtemp(prefix="leanav-inproc-diff-"))
         cls.cases = {
             "baseline_cavlc_ip": ["-profile:v", "baseline", "-bf", "0", "-x264-params", "weightp=0"],
             "high_cabac_ipb_8x8_weightp": ["-profile:v", "high", "-bf", "2"],
@@ -99,7 +99,7 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
     def _run_inproc(self, src: Path, out: Path, extra_args):
         if STRACE.is_file():
             log = out.with_suffix(".strace")
-            cmd = [str(STRACE), "-f", "-e", "trace=execve", "-o", str(log), str(BINARY)]
+            cmd = [str(STRACE), "-f", "-s", "4096", "-e", "trace=execve", "-o", str(log), str(BINARY)]
         else:
             log = None
             cmd = [str(BINARY)]
@@ -173,7 +173,7 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
         src.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\xff" * 256)
         out = self.fixture_dir / "corrupt_out.mp4"
         log = out.with_suffix(".strace") if STRACE.is_file() else None
-        cmd = [str(STRACE), "-f", "-e", "trace=execve", "-o", str(log), str(BINARY)] if log is not None else [str(BINARY)]
+        cmd = [str(STRACE), "-f", "-s", "4096", "-e", "trace=execve", "-o", str(log), str(BINARY)] if log is not None else [str(BINARY)]
         bad_stub = self.fixture_dir / "hostile_ffmpeg_stub"
         if not bad_stub.exists():
             bad_stub.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
