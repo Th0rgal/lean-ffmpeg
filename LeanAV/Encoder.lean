@@ -2801,4 +2801,189 @@ theorem measurePlanesAcceptance_and_lumaStats_verified :
     computeLumaStatsU8Pure plane4 0 = (0, 0) := by
   decide
 
+/-! ## Bounded In-Process Packet Ring (`InprocPacketRing`) -/
+
+def inprocRingDefaultCap : Nat := 64
+
+structure InprocPacketRing (α : Type) where
+  slots : Array (Option α)
+  cap   : Nat
+  head  : Nat
+  len   : Nat
+  deriving Repr
+
+namespace InprocPacketRing
+
+def empty {α : Type} (cap : Nat := inprocRingDefaultCap) : InprocPacketRing α :=
+  let c := if cap == 0 then 1 else cap
+  { slots := Array.replicate c none, cap := c, head := 0, len := 0 }
+
+def WellFormed {α : Type} (r : InprocPacketRing α) : Prop :=
+  0 < r.cap ∧ r.slots.size = r.cap ∧ r.head < r.cap ∧ r.len ≤ r.cap
+
+instance {α : Type} (r : InprocPacketRing α) : Decidable r.WellFormed :=
+  inferInstanceAs (Decidable (0 < r.cap ∧ r.slots.size = r.cap ∧ r.head < r.cap ∧ r.len ≤ r.cap))
+
+def push {α : Type} (r : InprocPacketRing α) (x : α) : Option (InprocPacketRing α) :=
+  if r.cap == 0 || r.slots.size != r.cap || !(r.head < r.cap) || !(r.len < r.cap) then
+    none
+  else
+    let writeIdx := (r.head + r.len) % r.cap
+    some { r with slots := r.slots.set! writeIdx (some x), len := r.len + 1 }
+
+def pop {α : Type} (r : InprocPacketRing α) : Option α × InprocPacketRing α :=
+  if r.cap == 0 || r.slots.size != r.cap || !(r.head < r.cap) || r.len == 0 then
+    (none, r)
+  else
+    let x? := r.slots.getD r.head none
+    let slots' := r.slots.set! r.head none
+    let head' := (r.head + 1) % r.cap
+    (x?, { r with slots := slots', head := head', len := r.len - 1 })
+
+end InprocPacketRing
+
+def InprocRingPushSafe {α : Type} (r : InprocPacketRing α) : Prop :=
+  r.WellFormed ∧ r.len < r.cap
+
+instance {α : Type} (r : InprocPacketRing α) : Decidable (InprocRingPushSafe r) :=
+  inferInstanceAs (Decidable (r.WellFormed ∧ r.len < r.cap))
+
+def inprocRingGateSpec : AVGateSpec (Nat × Nat × Nat × Nat)
+    (fun (slotsSz, cap, head, len) =>
+      0 < cap ∧ slotsSz = cap ∧ head < cap ∧ len < cap) where
+  gate := fun (slotsSz, cap, head, len) =>
+    decide (0 < cap ∧ slotsSz = cap ∧ head < cap ∧ len < cap)
+  sound := by
+    intro ⟨slotsSz, cap, head, len⟩ h
+    exact of_decide_eq_true h
+  complete := by
+    intro ⟨slotsSz, cap, head, len⟩ h
+    exact decide_eq_true h
+  posWitness := (64, 64, 0, 0)
+  negWitness := (64, 64, 0, 64)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem inprocRingGateSpec_iff (slotsSz cap head len : Nat) :
+    inprocRingGateSpec.gate (slotsSz, cap, head, len) = true ↔
+      0 < cap ∧ slotsSz = cap ∧ head < cap ∧ len < cap :=
+  inprocRingGateSpec.iff_safe (slotsSz, cap, head, len)
+
+theorem inprocRing_empty_wellFormed {α : Type} (cap : Nat) :
+    (InprocPacketRing.empty (α := α) cap).WellFormed := by
+  unfold InprocPacketRing.empty InprocPacketRing.WellFormed
+  by_cases h0 : cap == 0
+  · simp [h0]
+  · have hpos : 0 < cap := Nat.pos_of_ne_zero (by simpa using h0)
+    simp [h0, hpos]
+
+theorem inprocRing_push_occupancy {α : Type} (r r' : InprocPacketRing α) (x : α)
+    (hPush : r.push x = some r') :
+    r'.len = r.len + 1 ∧ r.len < r.cap := by
+  unfold InprocPacketRing.push at hPush
+  split at hPush
+  · cases hPush
+  · rename_i hGuard
+    have hLt : r.len < r.cap := by
+      cases hDec : decide (r.len < r.cap) with
+      | false =>
+        exfalso
+        apply hGuard
+        simp [hDec]
+      | true => exact of_decide_eq_true hDec
+    dsimp only at hPush
+    injection hPush with hEq
+    subst hEq
+    exact ⟨rfl, hLt⟩
+
+theorem inprocRing_pop_occupancy {α : Type} (r : InprocPacketRing α)
+    (hWf : r.WellFormed) (hPos : 0 < r.len) :
+    (r.pop.2).len = r.len - 1 := by
+  rcases hWf with ⟨hCap, hSz, hHead, _⟩
+  unfold InprocPacketRing.pop
+  have hCapNe : (r.cap == 0) = false := beq_false_of_ne (Nat.ne_of_gt hCap)
+  have hSzNe : (r.slots.size != r.cap) = false := by simp [hSz]
+  have hHeadDec : (!(decide (r.head < r.cap))) = false := by simp [hHead]
+  have hLenNe : (r.len == 0) = false := beq_false_of_ne (Nat.ne_of_gt hPos)
+  simp [hCapNe, hSzNe, hHeadDec, hLenNe]
+
+theorem inprocRing_push_preserves_wellFormed {α : Type} (r r' : InprocPacketRing α) (x : α)
+    (hWf : r.WellFormed) (hPush : r.push x = some r') :
+    r'.WellFormed := by
+  rcases hWf with ⟨hCap, hSz, hHead, _⟩
+  have ⟨_, hLt⟩ := inprocRing_push_occupancy r r' x hPush
+  unfold InprocPacketRing.push at hPush
+  split at hPush
+  · cases hPush
+  · dsimp only at hPush
+    injection hPush with hEq
+    subst hEq
+    refine ⟨hCap, ?_, hHead, Nat.succ_le_of_lt hLt⟩
+    simpa [Array.set!, Array.size_setIfInBounds] using hSz
+
+theorem inprocRing_pop_preserves_wellFormed {α : Type} (r : InprocPacketRing α)
+    (hWf : r.WellFormed) :
+    (r.pop.2).WellFormed := by
+  rcases hWf with ⟨hCap, hSz, hHead, hLenLe⟩
+  unfold InprocPacketRing.pop
+  split
+  · exact ⟨hCap, hSz, hHead, hLenLe⟩
+  · refine ⟨hCap, ?_, Nat.mod_lt _ hCap, Nat.le_trans (Nat.sub_le _ _) hLenLe⟩
+    simpa [Array.set!, Array.size_setIfInBounds] using hSz
+
+theorem inprocRing_push_pop_fifo_empty {α : Type} (cap : Nat) (x : α) :
+    ∃ r1, (InprocPacketRing.empty cap).push x = some r1 ∧
+      r1.pop.1 = some x ∧ r1.pop.2.len = 0 := by
+  by_cases h0 : cap = 0
+  · subst h0
+    refine ⟨{ slots := #[some x], cap := 1, head := 0, len := 1 }, ?_, ?_, ?_⟩
+    · rfl
+    · rfl
+    · rfl
+  · have hCapPos : 0 < cap := Nat.pos_of_ne_zero h0
+    let r0 := InprocPacketRing.empty (α := α) cap
+    have hr0 : r0 = { slots := Array.replicate cap none, cap := cap, head := 0, len := 0 } := by
+      simp [r0, InprocPacketRing.empty, h0]
+    let r1 : InprocPacketRing α :=
+      { slots := (Array.replicate cap (none : Option α)).set! 0 (some x),
+        cap := cap, head := 0, len := 1 }
+    refine ⟨r1, ?_, ?_, ?_⟩
+    · simp [r0, hr0, r1, InprocPacketRing.push, h0, hCapPos]
+    · simp [r1, InprocPacketRing.pop, h0, hCapPos, Array.set!, Array.getD]
+    · simp [r1, InprocPacketRing.pop, h0, hCapPos]
+
+def runBoundedRingStageIO {α β : Type}
+    (items : Array α) (cap : Nat := inprocRingDefaultCap)
+    (consume : α → IO (Except String β)) : IO (Except String (Array β)) := do
+  let ringRef ← IO.mkRef (InprocPacketRing.empty (α := α) cap)
+  let mut out : Array β := Array.mkEmpty items.size
+  for item in items do
+    let rCur ← ringRef.get
+    if !inprocRingGateSpec.gate (rCur.slots.size, rCur.cap, rCur.head, rCur.len) then
+      let mut rDrain := rCur
+      while rDrain.len > 0 do
+        let (popped?, rNext) := rDrain.pop
+        rDrain := rNext
+        if let some v := popped? then
+          match (← consume v) with
+          | .ok b => out := out.push b
+          | .error e => return .error e
+      ringRef.set rDrain
+    let rReady ← ringRef.get
+    if !inprocRingGateSpec.gate (rReady.slots.size, rReady.cap, rReady.head, rReady.len) then
+      return .error "inproc_ring_overflow"
+    match rReady.push item with
+    | none => return .error "inproc_ring_overflow"
+    | some rPushed => ringRef.set rPushed
+  let mut rFinal ← ringRef.get
+  while rFinal.len > 0 do
+    let (popped?, rNext) := rFinal.pop
+    rFinal := rNext
+    if let some v := popped? then
+      match (← consume v) with
+      | .ok b => out := out.push b
+      | .error e => return .error e
+  ringRef.set rFinal
+  return .ok out
+
 end LeanAV.Encoder

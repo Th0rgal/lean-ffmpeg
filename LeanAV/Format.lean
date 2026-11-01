@@ -9585,4 +9585,321 @@ def scaleChannelsBps (channelsData : Array (Array Int32)) (srcBps dstBps : Nat) 
   if srcBps == dstBps then channelsData
   else channelsData.map (fun ch => ch.map (fun v => scaleAudioSampleBps v srcBps dstBps))
 
+/-! ## M2-D synthetic MP4 demux / mux (in-process H.264 + AAC) -/
+
+structure SynthMp4Sample where
+  data    : ByteArray
+  dur     : Nat
+  cttsOff : Int
+  isSync  : Bool
+  deriving Inhabited
+
+structure SynthMp4Track where
+  kind         : NativeStreamKind
+  timescale    : Nat
+  width        : Nat
+  height       : Nat
+  stsdBox      : ByteArray
+  samples      : Array SynthMp4Sample
+  deriving Inhabited
+
+def extractMp4StsdAvcCBody (stsdBox : ByteArray) : Option ByteArray := Id.run do
+  let top := ByteSlice.ofByteArray stsdBox
+  let some tops := mp4SubBoxesExact top | return none
+  let some stsd := tops.find? (fun b => b.fourcc == "stsd") | return none
+  if stsd.bodySlice.len < 16 then return none
+  let entryCnt := (readU32BE stsd.bodySlice 4).toNat
+  if entryCnt != 1 then return none
+  let some entrySub := stsd.bodySlice.subSlice? 8 (stsd.bodySlice.len - 8) | return none
+  let some entries := mp4SubBoxesExact entrySub | return none
+  if entries.size != 1 then return none
+  let entry := entries[0]!
+  if entry.fourcc != "avc1" && entry.fourcc != "avc3" then return none
+  if entry.bodySlice.len < 78 then return none
+  let some kidsSub := entry.bodySlice.subSlice? 78 (entry.bodySlice.len - 78) | return none
+  let some kids := mp4SubBoxesExact kidsSub | return none
+  let some avcc := kids.find? (fun b => b.fourcc == "avcC") | return none
+  if avcc.bodySlice.len == 0 then return none
+  return some avcc.bodySlice.toByteArray
+
+def extractMp4StsdMp4aEsdsBox (stsdBox : ByteArray) : Option ByteArray := Id.run do
+  let top := ByteSlice.ofByteArray stsdBox
+  let some tops := mp4SubBoxesExact top | return none
+  let some stsd := tops.find? (fun b => b.fourcc == "stsd") | return none
+  if stsd.bodySlice.len < 16 then return none
+  let entryCnt := (readU32BE stsd.bodySlice 4).toNat
+  if entryCnt != 1 then return none
+  let some entrySub := stsd.bodySlice.subSlice? 8 (stsd.bodySlice.len - 8) | return none
+  let some entries := mp4SubBoxesExact entrySub | return none
+  if entries.size != 1 then return none
+  let entry := entries[0]!
+  if entry.fourcc != "mp4a" then return none
+  if entry.bodySlice.len < 28 then return none
+  let qtVer := (readU16BE entry.bodySlice 8).toNat
+  let skip : Nat :=
+    if qtVer == 2 then 64
+    else if qtVer == 1 then 44
+    else if qtVer == 0 then 28
+    else 0
+  if skip == 0 || entry.bodySlice.len < skip then return none
+  let some kidsSub := entry.bodySlice.subSlice? skip (entry.bodySlice.len - skip) | return none
+  let some kids := mp4SubBoxesExact kidsSub | return none
+  for k in kids do
+    if k.fourcc == "esds" && k.boxSlice.len > 0 then
+      return some k.boxSlice.toByteArray
+    if k.fourcc == "wave" then
+      if let some wKids := mp4SubBoxesExact k.bodySlice then
+        if let some esds := wKids.find? (fun b => b.fourcc == "esds") then
+          if esds.boxSlice.len > 0 then return some esds.boxSlice.toByteArray
+  return none
+
+def buildAvc1StsdBox (width height : Nat) (avcCBody : ByteArray) : ByteArray := Id.run do
+  let avccBox := wrapMp4Box 'a' 'v' 'c' 'C' avcCBody
+  let mut vse := ByteArray.emptyWithCapacity (78 + avccBox.size)
+  vse := pushZeros vse 6
+  vse := pushU16BE vse 1
+  vse := pushZeros vse 16
+  vse := pushU16BE vse width.toUInt16
+  vse := pushU16BE vse height.toUInt16
+  vse := pushU32BE vse 0x00480000
+  vse := pushU32BE vse 0x00480000
+  vse := pushU32BE vse 0
+  vse := pushU16BE vse 1
+  vse := pushZeros vse 32
+  vse := pushU16BE vse 0x0018
+  vse := pushU16BE vse 0xFFFF
+  vse := vse ++ avccBox
+  let avc1Box := wrapMp4Box 'a' 'v' 'c' '1' vse
+  let mut stsdBody := ByteArray.emptyWithCapacity (8 + avc1Box.size)
+  stsdBody := pushU32BE stsdBody 0
+  stsdBody := pushU32BE stsdBody 1
+  stsdBody := stsdBody ++ avc1Box
+  return wrapMp4Box 's' 't' 's' 'd' stsdBody
+
+def buildMp4aStsdBoxFromEntry (mp4aEntry : ByteArray) : ByteArray := Id.run do
+  let mut stsdBody := ByteArray.emptyWithCapacity (8 + mp4aEntry.size)
+  stsdBody := pushU32BE stsdBody 0
+  stsdBody := pushU32BE stsdBody 1
+  stsdBody := stsdBody ++ mp4aEntry
+  return wrapMp4Box 's' 't' 's' 'd' stsdBody
+
+def SynthMp4TrackSafe (t : SynthMp4Track) : Prop :=
+  0 < t.timescale ∧ 0 < t.samples.size ∧
+  (t.kind = .video ∨ t.kind = .audio) ∧
+  (t.kind ≠ .video ∨ (0 < t.width ∧ 0 < t.height ∧ t.width % 2 = 0 ∧ t.height % 2 = 0)) ∧
+  ∀ s ∈ t.samples.toList, 0 < s.dur ∧ 0 < s.data.data.size
+
+instance (t : SynthMp4Track) : Decidable (SynthMp4TrackSafe t) :=
+  inferInstanceAs (Decidable
+    (0 < t.timescale ∧ 0 < t.samples.size ∧
+     (t.kind = .video ∨ t.kind = .audio) ∧
+     (t.kind ≠ .video ∨ (0 < t.width ∧ 0 < t.height ∧ t.width % 2 = 0 ∧ t.height % 2 = 0)) ∧
+     ∀ s ∈ t.samples.toList, 0 < s.dur ∧ 0 < s.data.data.size))
+
+def synthMp4TrackGate (t : SynthMp4Track) : Bool :=
+  decide (SynthMp4TrackSafe t)
+
+def synthMp4TrackGateSpec : AVGateSpec SynthMp4Track SynthMp4TrackSafe where
+  gate := synthMp4TrackGate
+  sound := by
+    intro t h
+    exact of_decide_eq_true h
+  complete := by
+    intro t h
+    exact decide_eq_true h
+  posWitness := {
+    kind := .video
+    timescale := 1000
+    width := 2
+    height := 2
+    stsdBox := { data := #[] }
+    samples := #[{ data := { data := #[0] }, dur := 1, cttsOff := 0, isSync := true }]
+  }
+  negWitness := {
+    kind := .video
+    timescale := 0
+    width := 2
+    height := 2
+    stsdBox := { data := #[] }
+    samples := #[{ data := { data := #[0] }, dur := 1, cttsOff := 0, isSync := true }]
+  }
+  nonVacuous := rfl
+  tight := rfl
+
+theorem synthMp4TrackGateSpec_iff (t : SynthMp4Track) :
+    synthMp4TrackGateSpec.gate t = true ↔ SynthMp4TrackSafe t :=
+  synthMp4TrackGateSpec.iff_safe t
+
+def synthSamplesToNative (t : SynthMp4Track) : Array NativeMp4Sample := Id.run do
+  let mut out : Array NativeMp4Sample := Array.mkEmpty t.samples.size
+  let mut curDts : Nat := 0
+  for i in [:t.samples.size] do
+    let s := t.samples[i]!
+    let d := if s.dur == 0 then 1 else s.dur
+    out := out.push {
+      fileOff := i
+      byteLen := s.data.size
+      dts := curDts
+      dur := d
+      cttsOff := s.cttsOff
+      isSync := s.isSync
+    }
+    curDts := curDts + d
+  return out
+
+def synthTrackToNative (t : SynthMp4Track) : NativeMp4Track :=
+  let matrix :=
+    let m := pushU32BE ByteArray.empty 0x00010000
+    let m := pushZeros m 12
+    let m := pushU32BE m 0x00010000
+    let m := pushZeros m 12
+    pushU32BE m 0x40000000
+  let hdlrBody :=
+    let b := pushU32BE (pushU32BE ByteArray.empty 0) 0
+    let fcc : ByteArray :=
+      if t.kind == .video then
+        let x := pushFourCC ByteArray.empty 'v' 'i' 'd' 'e'
+        let x := pushZeros x 12
+        let x := x ++ "VideoHandler".toUTF8
+        x.push 0
+      else if t.kind == .audio then
+        let x := pushFourCC ByteArray.empty 's' 'o' 'u' 'n'
+        let x := pushZeros x 12
+        let x := x ++ "SoundHandler".toUTF8
+        x.push 0
+      else
+        let x := pushFourCC ByteArray.empty 'd' 'a' 't' 'a'
+        let x := pushZeros x 12
+        let x := x ++ "DataHandler".toUTF8
+        x.push 0
+    wrapMp4Box 'h' 'd' 'l' 'r' (b ++ fcc)
+  let mediaHdr :=
+    if t.kind == .video then wrapMp4Box 'v' 'm' 'h' 'd' (pushZeros (pushU32BE ByteArray.empty 1) 8)
+    else if t.kind == .audio then wrapMp4Box 's' 'm' 'h' 'd' (pushZeros ByteArray.empty 8)
+    else wrapMp4Box 'n' 'm' 'h' 'd' (pushZeros ByteArray.empty 4)
+  let urlBox := wrapMp4Box 'u' 'r' 'l' ' ' (pushU32BE ByteArray.empty 1)
+  let dref := wrapMp4Box 'd' 'r' 'e' 'f' (pushU32BE (pushU32BE ByteArray.empty 0) 1 ++ urlBox)
+  let dinf := wrapMp4Box 'd' 'i' 'n' 'f' dref
+  {
+    kind := t.kind
+    timescale := t.timescale
+    langFlags := 0x55C40000
+    tkhdWidth16 := (t.width <<< 16).toUInt32
+    tkhdHeight16 := (t.height <<< 16).toUInt32
+    tkhdVolume := if t.kind == .audio then 0x0100 else 0
+    tkhdMatrix := matrix
+    hdlrBox := hdlrBody
+    mediaHdrBox := mediaHdr
+    dinfBox := dinf
+    stsdBox := t.stsdBox
+    stsdFourcc := if t.kind == .video then "avc1" else "mp4a"
+    multiStsd := false
+    origEdtsBox? := none
+    origPreRoll := 0
+    hasStss := t.kind == .video
+    hasCtts := t.samples.any (fun s => s.cttsOff != 0)
+    cttsVer := if t.samples.any (fun s => s.cttsOff < 0) then 1 else 0
+    hasEncrypted := false
+    samples := synthSamplesToNative t
+  }
+
+def muxSynthMp4Container (tracks : Array SynthMp4Track) : Option ByteArray := Id.run do
+  if tracks.isEmpty then return none
+  if tracks.any (fun t => !synthMp4TrackGateSpec.gate t) then return none
+  let ftyp := Id.run do
+    let mut b := ByteArray.emptyWithCapacity 28
+    b := pushU32BE b 28
+    b := pushFourCC b 'f' 't' 'y' 'p'
+    b := pushFourCC b 'i' 's' 'o' 'm'
+    b := pushU32BE b 512
+    b := pushFourCC b 'i' 's' 'o' '2'
+    b := pushFourCC b 'a' 'v' 'c' '1'
+    b := pushFourCC b 'm' 'p' '4' '1'
+    return b
+  let natives := tracks.map synthTrackToNative
+  let mut prepared : Array NativePreparedMp4Track := #[]
+  let mut maxMovieDurMs : Nat := 0
+  let mut totalMdatPayload : Nat := 0
+  for trk in natives do
+    let some prep := prepareNativeMp4Track trk 1000 false 0 0 0 | return none
+    if prep.movieDurMs > maxMovieDurMs then maxMovieDurMs := prep.movieDurMs
+    totalMdatPayload := totalMdatPayload + prep.payloadBytes
+    prepared := prepared.push prep
+  if maxMovieDurMs == 0 then maxMovieDurMs := 1
+  let mvhdBox := Id.run do
+    let mut b := ByteArray.emptyWithCapacity 100
+    b := pushU32BE b 0
+    b := pushU32BE b 0
+    b := pushU32BE b 0
+    b := pushU32BE b 1000
+    b := pushU32BE b maxMovieDurMs.toUInt32
+    b := pushU32BE b 0x00010000
+    b := pushU16BE b 0x0100
+    b := pushZeros b 10
+    b := pushU32BE b 0x00010000
+    b := pushZeros b 12
+    b := pushU32BE b 0x00010000
+    b := pushZeros b 12
+    b := pushU32BE b 0x40000000
+    b := pushZeros b 24
+    b := pushU32BE b (prepared.size + 1).toUInt32
+    return wrapMp4Box 'm' 'v' 'h' 'd' b
+  let dummyTraksSize : Nat := Id.run do
+    let mut sum := 0
+    for i in [:prepared.size] do
+      sum := sum + (assembleNativeMp4Trak prepared[i]! (i + 1) 0 false).size
+    return sum
+  let moovSize32 := 8 + mvhdBox.size + dummyTraksSize
+  let mdatHeaderLen := 8
+  let dataCursor0 := ftyp.size + moovSize32 + mdatHeaderLen
+  let mut dataCursor := dataCursor0
+  let mut traksBytes := ByteArray.emptyWithCapacity dummyTraksSize
+  for i in [:prepared.size] do
+    let prep := prepared[i]!
+    traksBytes := traksBytes ++ assembleNativeMp4Trak prep (i + 1) dataCursor false
+    dataCursor := dataCursor + prep.payloadBytes
+  let moovBox := wrapMp4Box 'm' 'o' 'o' 'v' (mvhdBox ++ traksBytes)
+  let mut out := ByteArray.emptyWithCapacity (ftyp.size + moovBox.size + mdatHeaderLen + totalMdatPayload)
+  out := out ++ ftyp ++ moovBox
+  out := pushU32BE out (8 + totalMdatPayload).toUInt32
+  out := pushFourCC out 'm' 'd' 'a' 't'
+  for trk in tracks do
+    for smp in trk.samples do
+      out := out ++ smp.data
+  return some out
+
+def demuxNativeMp4ContainerTracks (s : ByteSlice) : Option (Array NativeMp4Track) := Id.run do
+  if !validNativeMp4Container s then return none
+  let some topBoxes := mp4SubBoxesExact s | return none
+  for b in topBoxes do
+    if b.fourcc == "moof" || b.fourcc == "sidx" || b.fourcc == "mvex" then return none
+  let mut moovSlice? : Option ByteSlice := none
+  let mut sawFtyp := false
+  for b in topBoxes do
+    if b.fourcc == "ftyp" then sawFtyp := true
+    if b.fourcc == "moov" then
+      if moovSlice?.isSome then return none
+      moovSlice? := some b.bodySlice
+  if !sawFtyp then return none
+  let some moovSlice := moovSlice? | return none
+  let some moovKids := mp4SubBoxesExact moovSlice | return none
+  let mut mvhdTimescale : Nat := 1000
+  for mk in moovKids do
+    if mk.fourcc == "mvex" then return none
+    if mk.fourcc == "mvhd" then
+      let ver := mk.bodySlice.getByteD 0 0
+      if ver == 1 && mk.bodySlice.len ≥ 28 then
+        mvhdTimescale := (readU32BE mk.bodySlice 20).toNat
+      else if mk.bodySlice.len ≥ 20 then
+        mvhdTimescale := (readU32BE mk.bodySlice 12).toNat
+      if mvhdTimescale == 0 then return none
+  let mut tracks : Array NativeMp4Track := #[]
+  for mk in moovKids do
+    if mk.fourcc == "trak" then
+      let some trk := parseNativeMp4Track s mk.bodySlice mvhdTimescale | return none
+      if trk.hasEncrypted || trk.multiStsd then return none
+      tracks := tracks.push trk
+  if tracks.isEmpty then return none
+  return some tracks
+
 end LeanAV.Format

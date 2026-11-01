@@ -24,10 +24,12 @@ open LeanAV.H264EntropyProofs
 open LeanAV.H264InterDeblockDpb
 open LeanAV.H264InterDeblockDpbProofs
 open LeanAV.AacLc
+open LeanAV.InprocTranscode
 open LeanSys.Posix
 open LeanSys.Store
 
 set_option maxRecDepth 4096
+set_option maxHeartbeats 800000
 
 /-- Synthetic MP4 fixtures exercise the actual file patcher against its pure oracle. -/
 def runSurgicalMoovTailTests : IO Unit := do
@@ -1041,11 +1043,28 @@ def runSelfTest : IO UInt32 := do
     m2b2DpbFinal.outputPocLog == [0, 2, 4] &&
     m2b2DpbFinal.priorCvsMonitor
   let m2b2H264InterOk := m2b2QpelOk && m2b2DeblockOk && m2b2DpbOk
+  let m2dRing0 := LeanAV.Encoder.InprocPacketRing.empty (α := Nat) 4
+  let m2dRingOk :=
+    LeanAV.Encoder.inprocRingGateSpec.gate LeanAV.Encoder.inprocRingGateSpec.posWitness &&
+    !(LeanAV.Encoder.inprocRingGateSpec.gate LeanAV.Encoder.inprocRingGateSpec.negWitness) &&
+    (match LeanAV.Encoder.InprocPacketRing.push m2dRing0 42 with
+     | some r1 =>
+       r1.len == 1 &&
+       (match LeanAV.Encoder.InprocPacketRing.pop r1 with
+        | (some v, r2) => v == 42 && r2.len == 0
+        | (none, _) => false)
+     | none => false) &&
+    LeanAV.Format.synthMp4TrackGateSpec.gate LeanAV.Format.synthMp4TrackGateSpec.posWitness &&
+    !(LeanAV.Format.synthMp4TrackGateSpec.gate LeanAV.Format.synthMp4TrackGateSpec.negWitness) &&
+    inprocTranscodeGateSpec.gate inprocTranscodeGateSpec.posWitness &&
+    !(inprocTranscodeGateSpec.gate inprocTranscodeGateSpec.negWitness) &&
+    evalExplicitUniWeight 120 3 8 0 == 120 &&
+    evalExplicitBiWeight 100 140 2 4 0 4 0 == 120
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk &&
-                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk
+                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk && m2dRingOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
@@ -1061,7 +1080,7 @@ def runSelfTest : IO UInt32 := do
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
   let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"wave54_ok\": {w54Ok}, "
-  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk} }"
+  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk}, \"m2d_inproc_transcode_ok\": {m2dRingOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d ++ j5e)
   return if allOk then 0 else 1
 
@@ -1413,7 +1432,89 @@ def demoteNativePlan (plan : MediaPlanIR) : MediaPlanIR :=
       tier := .delegatedFaithful, delegatedContainer := true,
       reasons := ["native_stream_copy_layout_unsupported"] } }
 
+private def extractInprocH264ScaleSpec
+    (videoFilter : Option String) (videoSize : Option (Nat × Nat))
+    : Option (Option (Nat × Nat)) :=
+  match videoFilter, videoSize with
+  | none, none => some none
+  | none, some (sw, sh) => if sw > 0 && sh > 0 then some (some (sw, sh)) else none
+  | some vfStr, none =>
+    match parseVideoFilterGraph vfStr with
+    | .ok [.scale w h] => some (some (w, h))
+    | _ => none
+  | some _, some _ => none
+
+private def inprocH264CandidateParams
+    (plan : MediaPlanIR) : Option (String × String × Option (Nat × Nat) × Bool × Nat) := do
+  guard plan.errors.isEmpty
+  guard (plan.backend.tier == .translatedPartial)
+  guard (!plan.backend.delegatedContainer)
+  guard (plan.backend.reasons == ["mp4_seek_or_pixel_simd_transcode"])
+  guard (plan.timeline.startSec.isNone && plan.timeline.durationSec.isNone && plan.timeline.frameRate.isNone)
+  guard (plan.graphs.audioFilter.isNone && plan.graphs.bitstreamFilters.isEmpty)
+  guard (plan.metadata.entries.isEmpty && plan.metadata.mapMetadataSource == -1 && plan.metadata.mapChaptersSource == -1)
+  guard plan.mpegOptions.isEmpty
+  match plan.inputs, plan.outputs with
+  | [inp], [out] =>
+    guard (inp.safePath && out.safePath)
+    guard (inp.path != "-" && !(inp.path.toList.contains '%') && !(strStartsWithFast inp.path "concat:"))
+    let lowerIn := strToLowerAscii inp.path
+    guard (strEndsWithFast lowerIn ".mp4" || strEndsWithFast lowerIn ".m4v")
+    guard (out.path != "-" && out.path != "/dev/null" && out.path != "md5:" &&
+           !(strStartsWithFast out.path "md5:") && !(strStartsWithFast out.path "pipe:") &&
+           !(out.path.toList.contains '%'))
+    let lowerOut := strToLowerAscii out.path
+    guard (strEndsWithFast lowerOut ".mp4" || strEndsWithFast lowerOut ".m4v")
+    guard (out.format == "mp4")
+    guard (out.videoCodec == some .h264)
+    guard (!out.noVideo && !out.noSubtitle && !out.noData && !out.globalCopy && !out.copyData)
+    guard (out.subtitleCodec.isNone && out.videoFrames.isNone && out.audioRate.isNone && out.audioChannels.isNone)
+    guard (out.bFrames.isNone && out.gopSize.isNone && out.movflags.isNone && out.frameRate.isNone)
+    let pixOk : Bool := match out.pixelFormat with
+      | none => true
+      | some pf => strToLowerAscii pf == "yuv420p"
+    guard (pixOk == true)
+    let audioOk : Bool := out.noAudio || out.audioCodec == none || out.audioCodec == some .aac
+    guard (audioOk == true)
+    let scaleSpec ← extractInprocH264ScaleSpec plan.graphs.videoFilter out.videoSize
+    let qpY : Nat :=
+      match out.crf.bind String.toNat? with
+      | some q => Nat.min 51 q
+      | none => 20
+    let wantAudio := !out.noAudio
+    some (inp.path, out.path, scaleSpec, wantAudio, qpY)
+  | _, _ => none
+
+private def probeInprocH264PlanBytes
+    (raw : ByteArray) (scaleSpec : Option (Nat × Nat)) (wantAudio : Bool)
+    : Option InprocMp4Probe := do
+  let probe0 ← probeInprocMp4Bytes raw 0 0 wantAudio false
+  match scaleSpec with
+  | none => some probe0
+  | some (reqW, reqH) =>
+    let (dstW, dstH) := resolveScaleDims probe0.srcW probe0.srcH reqW reqH
+    guard (dstW > 0 && dstH > 0)
+    probeInprocMp4Bytes raw dstW dstH wantAudio false
+
 def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
+  if let some (inPath, _, scaleSpec, wantAudio, _) := inprocH264CandidateParams plan then
+    if (← System.FilePath.pathExists inPath) then
+      let rawOpt ← try
+          let b ← IO.FS.readBinFile inPath
+          pure (some b)
+        catch _ =>
+          pure none
+      if let some raw := rawOpt then
+        if (probeInprocH264PlanBytes raw scaleSpec wantAudio).isSome then
+          return {
+            plan with
+            backend := {
+              tier := .independentVerified
+              delegatedContainer := false
+              fallbackAllowed := false
+              reasons := ["inproc_h264_aac_mp4_transcode"]
+            }
+          }
   if plan.backend.tier != .independentVerified then return plan
   if !plan.backend.reasons.contains "native_stream_copy" then return plan
   let some inp := plan.inputs.head? | return plan
@@ -1435,6 +1536,68 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
       copyVideo copyAudio copySubtitle copyData with
   | .fallback => return demoteNativePlan plan
   | _ => return plan
+
+def runInprocH264TranscodeCli
+    (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO UInt32 := do
+  let some (inPath, outPath, scaleSpec, wantAudio, qpY) :=
+    inprocH264CandidateParams {
+      plan with
+      backend := {
+        tier := .translatedPartial
+        delegatedContainer := false
+        fallbackAllowed := true
+        reasons := ["mp4_seek_or_pixel_simd_transcode"]
+      }
+    }
+    | return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"invalid in-process H.264 plan state\"}"
+        "Invalid in-process H.264 plan state"
+  let explicitNoOverwrite := args.contains "-n"
+  if !cfg.overwrite && (← System.FilePath.pathExists outPath) then
+    if cfg.jsonOutput || explicitNoOverwrite then
+      return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists"
+    if !cliQuiet cfg.logLevel then
+      IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+    return 0
+  let t0 ← IO.monoNanosNow
+  let raw ← try
+      IO.FS.readBinFile inPath
+    catch e =>
+      return ← reportCliError cfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"{jsonEscape e.toString}\"}")
+        (s!"Failed to read input MP4: {inPath}")
+  let some probe := probeInprocH264PlanBytes raw scaleSpec wantAudio
+    | return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"in-process MP4 probe rejected input\"}"
+        "In-process MP4 H.264/AAC probe rejected input"
+  let tDemux ← IO.monoNanosNow
+  let (mp4Out, nFrames, hasAudioOut) ← match (← runInprocTranscodeWithProbeStatsIO raw probe qpY) with
+    | .ok res => pure res
+    | .error err =>
+      return ← reportCliError cfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"{jsonEscape err}\"}")
+        (s!"In-process H.264/AAC MP4 transcode failed: {err}")
+  match (← writeMediaFileAtomic outPath mp4Out) with
+  | .ok _ => pure ()
+  | .error e =>
+    return ← reportCliError cfg
+      (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"{jsonEscape (reprStr e)}\"}")
+      (s!"Failed to write output MP4: {outPath}")
+  let tEnd ← IO.monoNanosNow
+  let demuxUs := (tDemux - t0) / 1000
+  let transcodeUs := (tEnd - tDemux) / 1000
+  let totalUs := (tEnd - t0) / 1000
+  let fps := if totalUs == 0 then 0 else (nFrames * 1000000) / totalUs
+  if cfg.jsonOutput then
+    let c0 := s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-inproc-h264-aac-mp4\",\"tier\":\"independent_verified\","
+    let c1 := s!"\"codec\":\"h264\",\"audio_track\":{hasAudioOut},"
+    let c2 := s!"\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\","
+    let c3 := s!"\"src_res\":\"{probe.srcW}x{probe.srcH}\",\"dst_res\":\"{probe.dstW}x{probe.dstH}\","
+    let c4 := s!"\"frames\":{nFrames},\"demux_us\":{demuxUs},\"transcode_mux_us\":{transcodeUs},"
+    let c5 := s!"\"total_us\":{totalUs},\"fps\":{fps},\"in_bytes\":{raw.size},\"out_bytes\":{mp4Out.size}}"
+    IO.println (c0 ++ c1 ++ c2 ++ c3 ++ c4 ++ c5)
+  return 0
 
 def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO (Option UInt32) := do
   let inPath := cfg.inputs.headD ""
@@ -1886,6 +2049,9 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return ← runStandaloneLosslessCli args validCfg ext plan inPath outPath
     if standaloneAacAdtsPlanGateSpec.gate plan then
       return ← runStandaloneAacAdtsCli args validCfg ext plan inPath outPath
+    if plan.backend.tier == .independentVerified &&
+       plan.backend.reasons.contains "inproc_h264_aac_mp4_transcode" then
+      return ← runInprocH264TranscodeCli validCfg plan args
     let plan ←
       if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "native_stream_copy" then
         match ← runNativeStreamCopy validCfg plan args with
@@ -3058,4 +3224,15 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.H264EntropyProofs.pps_serialize_parse_noMoreRbsp_override_roundtrip
 #print axioms LeanAV.H264EntropyProofs.sps_baseline_upgradeForCabac_promotes_to_main
 #print axioms LeanAV.H264EntropyProofs.transcodeAnnexB_rejects_empty_and_data_partitioned_nal
+#print axioms LeanAV.InprocTranscode.inprocTranscodeGateSpec
+#print axioms LeanAV.InprocTranscode.inprocTranscodeGateSpec_iff
+#print axioms LeanAV.InprocTranscode.evalExplicitUniWeight_bounds
+#print axioms LeanAV.InprocTranscode.evalExplicitBiWeight_bounds
+#print axioms LeanAV.InprocTranscode.evalExplicitUniWeight_default_identity
+#print axioms LeanAV.InprocTranscode.evalExplicitBiWeight_default_eq_biPredSample
+#print axioms LeanAV.Encoder.inprocRingGateSpec
+#print axioms LeanAV.Encoder.inprocRing_push_preserves_wellFormed
+#print axioms LeanAV.Encoder.inprocRing_pop_preserves_wellFormed
+#print axioms LeanAV.Encoder.inprocRing_push_pop_fifo_empty
+#print axioms LeanAV.Format.synthMp4TrackGateSpec
 

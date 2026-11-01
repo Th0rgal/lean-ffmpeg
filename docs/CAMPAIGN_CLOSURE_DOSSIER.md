@@ -1,5 +1,25 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-01 M2-D in-process H.264 + AAC-LC MP4 transcode qualification
+(`campaign/m2-complete-20261031` over `77c6ca9`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**17,478 declarations with zero sorryAx/custom axioms** (`58,674` LOC across 31
+formal `LeanAV/*.lean` modules) and **717/717 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 21, `Core`: 11,
+`Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6; `0` vacuous,
+`0` trivial, `0` shadowed), adding the zero-delegation in-process transcoder
+(`inproc_h264_aac_mp4_transcode`): 8-bit 4:2:0 Baseline/Main/High CAVLC & CABAC
+I/P/B slices, 8x8 transform, frame cropping, ITU-T H.264 explicit weighted
+prediction (`weighted_pred_flag` / `weighted_bipred_idc == 1`, with proofs that
+default weights reduce to the identity and to `biPredSample`) and implicit
+weighted biprediction (`weighted_bipred_idc == 2`), Q8 bilinear scaling,
+mono/stereo AAC-LC re-encode, a bounded in-process packet ring, and synthetic
+ISO-BMFF mux, all with zero `ffmpeg` subprocesses and fail-closed rejection of
+10-bit, 4:4:4, FMO, scaling-matrix, and qpprime-bypass inputs.
+
 The 2026-10-30 M2-A1 H.264 / AVC bitstream syntax qualification
 (`campaign/m2-a1-h264-syntax-20261030` over `a39d5516`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
