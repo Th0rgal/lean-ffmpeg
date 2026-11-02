@@ -4234,13 +4234,18 @@ def intraPred8 (plane0 : ByteArray) (stride : Nat) (sps : HevcSps) (pps : HevcPp
     let baseT := (y - 1) * stride + x
     for i in [:size] do
       topArr := topArr.set! (1 + i) (Int.ofNat (baGetD plane0 (baseT + i) 128).toNat)
-  if candUpRight && y > 0 && topRightSize > 0 then
-    let baseT := (y - 1) * stride + x
-    for i in [:topRightSize] do
-      topArr := topArr.set! (1 + size + i) (Int.ofNat (baGetD plane0 (baseT + size + i) 128).toNat)
-    let extV := Int.ofNat (baGetD plane0 (baseT + size + topRightSize - 1) 128).toNat
-    for i in [topRightSize:size] do
-      topArr := topArr.set! (1 + size + i) extV
+  if candUpRight && y > 0 then
+    if topRightSize > 0 then
+      let baseT := (y - 1) * stride + x
+      for i in [:topRightSize] do
+        topArr := topArr.set! (1 + size + i) (Int.ofNat (baGetD plane0 (baseT + size + i) 128).toNat)
+      let extV := Int.ofNat (baGetD plane0 (baseT + size + topRightSize - 1) 128).toNat
+      for i in [topRightSize:size] do
+        topArr := topArr.set! (1 + size + i) extV
+    else if x + size > 0 then
+      let extV := Int.ofNat (baGetD plane0 ((y - 1) * stride + x + size - 1) 128).toNat
+      for i in [:size] do
+        topArr := topArr.set! (1 + size + i) extV
   if candLeft && x > 0 then
     for i in [:size] do
       leftArr := leftArr.set! (1 + i) (Int.ofNat (baGetD plane0 ((y + i) * stride + (x - 1)) 128).toNat)
