@@ -25,6 +25,8 @@ open LeanAV.H264InterDeblockDpb
 open LeanAV.H264InterDeblockDpbProofs
 open LeanAV.AacLc
 open LeanAV.InprocTranscode
+open LeanAV.HevcMain hiding splitAnnexB
+open LeanAV.HevcMainProofs
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -976,6 +978,14 @@ def runSelfTest : IO UInt32 := do
       | .fallbackDelegated _ => false
     | .fallbackDelegated _ => false
   let m1cLosslessOk := m1cZlibOk && m1cPngOk && m1cFlacOk
+  let m3aYuv := ByteArray.mk (Array.replicate (32 * 32 * 3 / 2) (128 : UInt8))
+  let m3aHevcMainOk :=
+    match encodeHevcFromYuv420p 32 32 m3aYuv 28 false 5 1 1 with
+    | some bs =>
+      match decodeHevcToYuv420p bs with
+      | some (w, h, nf, yuv) => w == 32 && h == 32 && nf == 1 && yuv == m3aYuv && (probeHevcStreamJson bs).isSome
+      | none => false
+    | none => false
   let m2a1H264SyntaxOk := runH264SyntaxSelfCheck
   let m2b1Mb : LeanAV.H264IntraTransform.H264Yuv420pMb := {
     y := ((List.range 256).map fun i => ((i * 29 + (i / 16) * 13 + 7) % 256).toUInt8).toArray,
@@ -1064,13 +1074,13 @@ def runSelfTest : IO UInt32 := do
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk &&
-                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk && m2dRingOk
+                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk && m2dRingOk && m3aHevcMainOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
   let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok && w53Ok && w54Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 54, \"c_abi_gates\": 15, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 55, \"c_abi_gates\": 15, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -1080,7 +1090,7 @@ def runSelfTest : IO UInt32 := do
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
   let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"wave54_ok\": {w54Ok}, "
-  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk}, \"m2d_inproc_transcode_ok\": {m2dRingOk} }"
+  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk}, \"m2d_inproc_transcode_ok\": {m2dRingOk}, \"m3a_hevc_main_ok\": {m3aHevcMainOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d ++ j5e)
   return if allOk then 0 else 1
 
@@ -2800,6 +2810,47 @@ def main (args : List String) : IO UInt32 := do
   | ["h264-inter-dpb-vectors"] => do
     IO.println h264KernelVectorsJson
     return 0
+  | "hevc-probe" :: inPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match probeHevcStreamJson rawBytes with
+    | some js =>
+      IO.println js
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-probe failed: {inPath}"
+      return 1
+  | "hevc-decode-raw" :: inPath :: outYuvPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match decodeHevcToYuv420p rawBytes with
+    | some (w, h, nf, yuv) =>
+      if outYuvPath != "" && outYuvPath != "-" then
+        let _ ← writeMediaFileAtomic outYuvPath yuv
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"yuv_bytes\": {yuv.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-decode-raw failed: {inPath}"
+      return 1
+  | "hevc-encode-raw" :: wStr :: hStr :: inYuvPath :: outPath :: rest => do
+    let some w := wStr.toNat? | do IO.eprintln "invalid width"; return 1
+    let some h := hStr.toNat? | do IO.eprintln "invalid height"; return 1
+    let qpNat := (rest[0]?.bind String.toNat?).getD 28
+    let fmt := rest[1]?.getD (if outPath.endsWith ".mp4" then "mp4" else "annexb")
+    let log2Ctb := (rest[2]?.bind String.toNat?).getD 6
+    let tilesCol := (rest[3]?.bind String.toNat?).getD 1
+    let tilesRow := (rest[4]?.bind String.toNat?).getD 1
+    let mp4 := fmt == "mp4" || fmt == "hvcc"
+    let yuv ← IO.FS.readBinFile inYuvPath
+    match encodeHevcFromYuv420p w h yuv (Int.ofNat qpNat) mp4 log2Ctb tilesCol tilesRow with
+    | some bs =>
+      if outPath != "" && outPath != "-" then
+        let _ ← writeMediaFileAtomic outPath bs
+      let frameBytes := w * h * 3 / 2
+      let nf := if frameBytes > 0 then yuv.size / frameBytes else 0
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"qp\": {qpNat}, \"mp4\": {mp4}, \"log2_ctb\": {log2Ctb}, \"tiles_col\": {tilesCol}, \"tiles_row\": {tilesRow}, \"out_bytes\": {bs.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-encode-raw failed: {inYuvPath}"
+      return 1
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
     if a.startsWith "-" then runFFmpegCli args
@@ -3235,4 +3286,34 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Encoder.inprocRing_pop_preserves_wellFormed
 #print axioms LeanAV.Encoder.inprocRing_push_pop_fifo_empty
 #print axioms LeanAV.Format.synthMp4TrackGateSpec
+#print axioms LeanAV.HevcMainProofs.hevcMain8Bit420SpsSpec
+#print axioms LeanAV.HevcMainProofs.hevcMain8Bit420SpsSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcEncoderGeomSpec
+#print axioms LeanAV.HevcMainProofs.hevcEncoderGeomSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcQpRangeSpec
+#print axioms LeanAV.HevcMainProofs.hevcQpRangeSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcIntraModeRangeSpec
+#print axioms LeanAV.HevcMainProofs.hevcIntraModeRangeSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcSample8BoundSpec
+#print axioms LeanAV.HevcMainProofs.hevcSample8BoundSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcDpbOccupancySpec
+#print axioms LeanAV.HevcMainProofs.hevcDpbOccupancySpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcClipInt_bounds_and_id
+#print axioms LeanAV.HevcMainProofs.hevcClipU8Int_bounds
+#print axioms LeanAV.HevcMainProofs.hevcClipU8Int_all_256_id
+#print axioms LeanAV.HevcMainProofs.hevcRbspEpb_roundtrip_and_rejects_bad_epb
+#print axioms LeanAV.HevcMainProofs.hevcNalHeader_pack_parse_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcExpGolomb_ue_se_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcVpsSps_and_nonMain_failclosed_verified
+#print axioms LeanAV.HevcMainProofs.hevcCabac_core_decision_bypass_terminate_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcCabac_ipcm_write_read_reinit_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcMc_8tap_luma_and_4tap_chroma_dc_gain_and_const_exact
+#print axioms LeanAV.HevcMainProofs.hevcDst7_and_Dct2_basis_and_roundtrip_verified
+#print axioms LeanAV.HevcMainProofs.hevcIntra_planar_and_angular_bounds
+#print axioms LeanAV.HevcMainProofs.hevcAngular_const_exact_unrounded
+#print axioms LeanAV.HevcMainProofs.hevcIntra_planar_dc_angular_const_exact
+#print axioms LeanAV.HevcMainProofs.hevcDeblock_flat_zero_delta
+#print axioms LeanAV.HevcMainProofs.hevcDeblock_and_Sao_clamped_bounds
+#print axioms LeanAV.HevcMainProofs.hevcDpb_poc_reorder_monotone_and_capacity_checked
+
 

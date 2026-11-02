@@ -6319,9 +6319,10 @@ def decodeTransformUnit (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : Hevc
       let (delta, c', st') ← decCuQpDelta c st
       c := c'
       st := st'
-      let (qpPred, firstNext) := qpyPredAt ctx pic sps pps sh cbX cbY
+      let ctxCoded := { ctx with cuQpDelta := delta, cuQpDeltaCoded := true }
+      let (qpPred, firstNext) := qpyPredAt ctxCoded pic sps pps sh cbX cbY
       let qpY := if delta != 0 then (qpPred + delta + 52) % 52 else qpPred
-      ctx := { ctx with cuQpDelta := delta, cuQpDeltaCoded := true, qpY := qpY, firstQpGroup := firstNext }
+      ctx := { ctxCoded with qpY := qpY, firstQpGroup := firstNext }
   let (scan, scanC) :=
     if predMode == modeIntra && log2Size < 4 then
       let s := if 6 <= mode && mode <= 14 then scanVert else if 22 <= mode && mode <= 30 then scanHoriz else scanDiag
