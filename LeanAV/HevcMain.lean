@@ -2684,4 +2684,1155 @@ def hevcMain8BitScopeSafe (data : ByteArray) : Bool :=
               ok := false
     ok && sawSlice
 
+def hevcRangeTabLPS : Array Nat := #[
+  128, 176, 208, 240, 128, 167, 197, 227, 128, 158, 187, 216, 123, 150, 178, 205,
+  116, 142, 169, 195, 111, 135, 160, 185, 105, 128, 152, 175, 100, 122, 144, 166,
+   95, 116, 137, 158,  90, 110, 130, 150,  85, 104, 123, 142,  81,  99, 117, 135,
+   77,  94, 111, 128,  73,  89, 105, 122,  69,  85, 100, 116,  66,  80,  95, 110,
+   62,  76,  90, 104,  59,  72,  86,  99,  56,  69,  81,  94,  53,  65,  77,  89,
+   51,  62,  73,  85,  48,  59,  69,  80,  46,  56,  66,  76,  43,  53,  63,  72,
+   41,  50,  59,  69,  39,  48,  56,  65,  37,  45,  54,  62,  35,  43,  51,  59,
+   33,  41,  48,  56,  32,  39,  46,  53,  30,  37,  43,  50,  29,  35,  41,  48,
+   27,  33,  39,  45,  26,  31,  37,  43,  24,  30,  35,  41,  23,  28,  33,  39,
+   22,  27,  32,  37,  21,  26,  30,  35,  20,  24,  29,  33,  19,  23,  27,  31,
+   18,  22,  26,  30,  17,  21,  25,  28,  16,  20,  23,  27,  15,  19,  22,  25,
+   14,  18,  21,  24,  14,  17,  20,  23,  13,  16,  19,  22,  12,  15,  18,  21,
+   12,  14,  17,  20,  11,  14,  16,  19,  11,  13,  15,  18,  10,  12,  15,  17,
+   10,  12,  14,  16,   9,  11,  13,  15,   9,  11,  12,  14,   8,  10,  12,  14,
+    8,   9,  11,  13,   7,   9,  11,  12,   7,   9,  10,  12,   7,   8,  10,  11,
+    6,   8,   9,  11,   6,   7,   9,  10,   6,   7,   8,   9,   2,   2,   2,   2
+]
+
+def hevcTransIdxLPS : Array Nat := #[
+   0,  0,  1,  2,  2,  4,  4,  5,  6,  7,  8,  9,  9, 11, 11, 12,
+  13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24,
+  24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33,
+  33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63
+]
+
+def hevcTransIdxMPS : Array Nat := #[
+   1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+  17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+  33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+  49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63
+]
+
+def elemSaoMergeFlag : Nat := 0
+def elemSaoTypeIdx : Nat := 1
+def elemEndOfSliceFlag : Nat := 6
+def elemSplitCuFlag : Nat := 7
+def elemCuTransquantBypass : Nat := 8
+def elemSkipFlag : Nat := 9
+def elemCuQpDelta : Nat := 10
+def elemPredModeFlag : Nat := 11
+def elemPartMode : Nat := 12
+def elemPrevIntraLumaPredFlag : Nat := 14
+def elemIntraChromaPredMode : Nat := 17
+def elemMergeFlag : Nat := 18
+def elemMergeIdx : Nat := 19
+def elemInterPredIdc : Nat := 20
+def elemRefIdxL0 : Nat := 21
+def elemAbsMvdGreater0 : Nat := 23
+def elemAbsMvdGreater1 : Nat := 24
+def elemMvpLxFlag : Nat := 27
+def elemNoResidualDataFlag : Nat := 28
+def elemSplitTransformFlag : Nat := 29
+def elemCbfLuma : Nat := 30
+def elemCbfCbCr : Nat := 31
+def elemTransformSkipFlag : Nat := 32
+def elemLastSigXPrefix : Nat := 35
+def elemLastSigYPrefix : Nat := 36
+def elemSigCoeffGroupFlag : Nat := 39
+def elemSigCoeffFlag : Nat := 40
+def elemCoeffAbsLevelGt1 : Nat := 41
+def elemCoeffAbsLevelGt2 : Nat := 42
+def elemCuChromaQpOffsetFlag : Nat := 47
+def elemCuChromaQpOffsetIdx : Nat := 48
+
+def part2Nx2N : Nat := 0
+def part2NxN : Nat := 1
+def partNx2N : Nat := 2
+def partNxN : Nat := 3
+def part2NxnU : Nat := 4
+def part2NxnD : Nat := 5
+def partNLx2N : Nat := 6
+def partNRx2N : Nat := 7
+
+def modeInter : Nat := 0
+def modeIntra : Nat := 1
+def modeSkip : Nat := 2
+
+def predL0 : Nat := 0
+def predL1 : Nat := 1
+def predBi : Nat := 2
+
+def saoNone : Nat := 0
+def saoBand : Nat := 1
+def saoEdge : Nat := 2
+
+def scanDiag : Nat := 0
+def scanHoriz : Nat := 1
+def scanVert : Nat := 2
+
+def hevcVertScan2x2X : Array Nat := hevcHorizScan2x2Y
+def hevcVertScan2x2Y : Array Nat := hevcHorizScan2x2X
+def hevcVertScan4x4X : Array Nat := hevcHorizScan4x4Y
+def hevcVertScan4x4Y : Array Nat := hevcHorizScan4x4X
+
+def initCabacStates (sliceType cabacInitFlag : Nat) (sliceQp : Int) : Array Nat := Id.run do
+  let mut initType := 2 - sliceType
+  if cabacInitFlag == 1 && sliceType != 2 then initType := initType ^^^ 3
+  let qp : Int := if sliceQp < 0 then 0 else if sliceQp > 51 then 51 else sliceQp
+  let row := hevcCabacInitValues.getD initType #[]
+  let mut st : Array Nat := Array.mkEmpty row.size
+  for initVal in row do
+    let m : Int := Int.ofNat (initVal >>> 4) * 5 - 45
+    let n : Int := Int.ofNat ((initVal &&& 15) <<< 3) - 16
+    let mut pre : Int := 2 * (asrInt (m * qp) 4 + n) - 127
+    if pre < 0 then pre := -pre - 1
+    if pre > 124 then pre := 124 + Int.ofNat (pre.toNat &&& 1)
+    st := st.push pre.toNat
+  return st
+
+structure HevcCabacReader where
+  rbsp  : ByteArray
+  total : Nat
+  pos   : Nat
+  irange : Nat
+  ioffset : Nat
+  deriving Inhabited
+
+namespace HevcCabacReader
+
+def rawBit (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  let p := c.pos
+  let c' := { c with pos := p + 1 }
+  if p >= c.total then (0, c')
+  else
+    let b := (baGetD c.rbsp (p >>> 3) 0).toNat
+    ((b >>> (7 - (p &&& 7))) &&& 1, c')
+
+def init? (rbsp : ByteArray) (bitPos : Nat) : Option HevcCabacReader := do
+  if rbsp.size == 0 then none
+  let aligned := if (bitPos &&& 7) == 0 then bitPos else bitPos + (8 - (bitPos &&& 7))
+  if (aligned >>> 3) > rbsp.size then none
+  let c0 : HevcCabacReader := { rbsp := rbsp, total := rbsp.size * 8, pos := aligned, irange := 510, ioffset := 0 }
+  let rec load (k : Nat) (ioff : Nat) (c : HevcCabacReader) : Nat × HevcCabacReader :=
+    match k with
+    | 0 => (ioff, c)
+    | k' + 1 =>
+      let (b, c') := c.rawBit
+      load k' ((ioff <<< 1) ||| b) c'
+  let (ioff, c1) := load 9 0 c0
+  if ioff >= 510 then none else some { c1 with ioffset := ioff }
+
+def decodeDecision (c : HevcCabacReader) (st : Array Nat) (ctx : Nat) : Nat × HevcCabacReader × Array Nat :=
+  let entry := st.getD ctx 0
+  let p := entry >>> 1
+  let mps := entry &&& 1
+  let qIdx := (c.irange >>> 6) &&& 3
+  let rLps := hevcRangeTabLPS.getD ((p <<< 2) + qIdx) 2
+  let rMps := c.irange - rLps
+  let (binVal, mpsNext, pNext, rng0, off0) :=
+    if c.ioffset >= rMps then
+      let mpsN := if p == 0 then 1 - mps else mps
+      (1 - mps, mpsN, hevcTransIdxLPS.getD p 0, rLps, c.ioffset - rMps)
+    else
+      (mps, mps, hevcTransIdxMPS.getD p 0, rMps, c.ioffset)
+  let st' := st.set! ctx ((pNext <<< 1) ||| mpsNext)
+  let rec ren (fuel : Nat) (rng off : Nat) (cur : HevcCabacReader) : Nat × Nat × HevcCabacReader :=
+    match fuel with
+    | 0 => (rng, off, cur)
+    | fuel' + 1 =>
+      if rng < 256 then
+        let (b, cur') := cur.rawBit
+        ren fuel' (rng <<< 1) ((off <<< 1) ||| b) cur'
+      else (rng, off, cur)
+  let (rng', off', cur') := ren 16 rng0 off0 c
+  (binVal, { cur' with irange := rng', ioffset := off' }, st')
+
+def decodeBypass (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  let (b, c1) := c.rawBit
+  let off := (c.ioffset <<< 1) ||| b
+  if off >= c.irange then (1, { c1 with ioffset := off - c.irange })
+  else (0, { c1 with ioffset := off })
+
+def decodeBypassBits (c : HevcCabacReader) (n : Nat) : Nat × HevcCabacReader :=
+  let rec loop (k v : Nat) (cur : HevcCabacReader) : Nat × HevcCabacReader :=
+    match k with
+    | 0 => (v, cur)
+    | k' + 1 =>
+      let (b, cur') := cur.decodeBypass
+      loop k' ((v <<< 1) ||| b) cur'
+  loop n 0 c
+
+def decodeTerminate (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  let rng := c.irange - 2
+  if c.ioffset >= rng then (1, c)
+  else
+    let rec ren (fuel : Nat) (rng off : Nat) (cur : HevcCabacReader) : Nat × Nat × HevcCabacReader :=
+      match fuel with
+      | 0 => (rng, off, cur)
+      | fuel' + 1 =>
+        if rng < 256 then
+          let (b, cur') := cur.rawBit
+          ren fuel' (rng <<< 1) ((off <<< 1) ||| b) cur'
+        else (rng, off, cur)
+    let (rng', off', cur') := ren 16 rng c.ioffset c
+    (0, { cur' with irange := rng', ioffset := off' })
+
+def readPcmAndReinit (c : HevcCabacReader) (nbytes : Nat) : Option (ByteArray × HevcCabacReader) := do
+  let delta : Int := Int.ofNat c.pos - 9 + 7
+  let byteStart := asrInt delta 3
+  let bs := if byteStart < 0 then 0 else byteStart.toNat
+  if bs + nbytes > c.rbsp.size then none
+  let pcm := c.rbsp.extract bs (bs + nbytes)
+  let c0 := { c with pos := (bs + nbytes) * 8, irange := 510, ioffset := 0 }
+  let rec load (k ioff : Nat) (cur : HevcCabacReader) : Nat × HevcCabacReader :=
+    match k with
+    | 0 => (ioff, cur)
+    | k' + 1 =>
+      let (b, cur') := cur.rawBit
+      load k' ((ioff <<< 1) ||| b) cur'
+  let (ioff, c1) := load 9 0 c0
+  some (pcm, { c1 with ioffset := ioff })
+
+def reinit (c : HevcCabacReader) : Option HevcCabacReader := do
+  let delta : Int := Int.ofNat c.pos - 9 + 7
+  let byteStart := asrInt delta 3
+  let bs := if byteStart < 0 then 0 else byteStart.toNat
+  if bs >= c.rbsp.size then none
+  let c0 := { c with pos := bs * 8, irange := 510, ioffset := 0 }
+  let rec load (k ioff : Nat) (cur : HevcCabacReader) : Nat × HevcCabacReader :=
+    match k with
+    | 0 => (ioff, cur)
+    | k' + 1 =>
+      let (b, cur') := cur.rawBit
+      load k' ((ioff <<< 1) ||| b) cur'
+  let (ioff, c1) := load 9 0 c0
+  some { c1 with ioffset := ioff }
+
+end HevcCabacReader
+
+structure HevcCabacWriter where
+  w : HevcBitWriter
+  ilow : Nat
+  irange : Nat
+  bitsOutstanding : Nat
+  firstBit : Bool
+  deriving Inhabited
+
+namespace HevcCabacWriter
+
+def fresh : HevcCabacWriter :=
+  { w := HevcBitWriter.empty, ilow := 0, irange := 510, bitsOutstanding := 0, firstBit := true }
+
+def putBit (c : HevcCabacWriter) (b : Nat) : HevcCabacWriter := Id.run do
+  let mut c := c
+  if c.firstBit then c := { c with firstBit := false }
+  else c := { c with w := c.w.putBit b }
+  let inv := 1 - b
+  let mut fuel := c.bitsOutstanding
+  while fuel > 0 do
+    c := { c with w := c.w.putBit inv }
+    fuel := fuel - 1
+  return { c with bitsOutstanding := 0 }
+
+def renorm (c : HevcCabacWriter) : HevcCabacWriter := Id.run do
+  let mut c := c
+  let mut fuel := 32
+  while c.irange < 256 && fuel > 0 do
+    fuel := fuel - 1
+    if c.ilow < 256 then
+      c := c.putBit 0
+    else if c.ilow >= 512 then
+      c := { c with ilow := c.ilow - 512 }
+      c := c.putBit 1
+    else
+      c := { c with ilow := c.ilow - 256, bitsOutstanding := c.bitsOutstanding + 1 }
+    c := { c with irange := c.irange <<< 1, ilow := c.ilow <<< 1 }
+  return c
+
+def encodeDecision (c : HevcCabacWriter) (st : Array Nat) (ctx binVal : Nat) :
+    HevcCabacWriter × Array Nat :=
+  let entry := st.getD ctx 0
+  let p := entry >>> 1
+  let mps := entry &&& 1
+  let qIdx := (c.irange >>> 6) &&& 3
+  let rLps := hevcRangeTabLPS.getD ((p <<< 2) + qIdx) 2
+  let rMps := c.irange - rLps
+  let b := if binVal == 0 then 0 else 1
+  if b != mps then
+    let mpsN := if p == 0 then 1 - mps else mps
+    let st' := st.set! ctx ((hevcTransIdxLPS.getD p 0 <<< 1) ||| mpsN)
+    ({ c with ilow := c.ilow + rMps, irange := rLps }.renorm, st')
+  else
+    let st' := st.set! ctx ((hevcTransIdxMPS.getD p 0 <<< 1) ||| mps)
+    ({ c with irange := rMps }.renorm, st')
+
+def encodeBypass (c : HevcCabacWriter) (binVal : Nat) : HevcCabacWriter :=
+  let ilow0 := c.ilow <<< 1
+  let ilow := if binVal != 0 then ilow0 + c.irange else ilow0
+  if ilow >= 1024 then
+    { c.putBit 1 with ilow := ilow - 1024 }
+  else if ilow < 512 then
+    { c.putBit 0 with ilow := ilow }
+  else
+    { c with ilow := ilow - 512, bitsOutstanding := c.bitsOutstanding + 1 }
+
+def encodeBypassBits (c : HevcCabacWriter) (val n : Nat) : HevcCabacWriter := Id.run do
+  let mut c := c
+  let mut i := n
+  while i > 0 do
+    i := i - 1
+    c := c.encodeBypass ((val >>> i) &&& 1)
+  return c
+
+def encodeTerminate (c : HevcCabacWriter) (binVal : Nat) : HevcCabacWriter :=
+  let rng := c.irange - 2
+  if binVal != 0 then
+    let c1 := { c with ilow := c.ilow + rng, irange := 2 }.renorm
+    let c2 := c1.putBit ((c1.ilow >>> 9) &&& 1)
+    let c3 := { c2 with w := c2.w.putBit ((c2.ilow >>> 8) &&& 1) }
+    { c3 with w := (c3.w.putBit 1).alignZero }
+  else
+    { c with irange := rng }.renorm
+
+def writePcmAndReinit (c : HevcCabacWriter) (pcm : ByteArray) : HevcCabacWriter := Id.run do
+  let mut c := { c with w := c.w.alignZero }
+  for b in pcm do
+    c := { c with w := c.w.putBits b.toNat 8 }
+  return { c with ilow := 0, irange := 510, bitsOutstanding := 0, firstBit := true }
+
+def toBytes (c : HevcCabacWriter) : Option ByteArray :=
+  c.w.toBytes
+
+end HevcCabacWriter
+
+def decSaoMergeFlag (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemSaoMergeFlag 0)
+
+def decSaoTypeIdx (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  let (b, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemSaoTypeIdx 0)
+  if b == 0 then (saoNone, c1, st1)
+  else
+    let (bp, c2) := c1.decodeBypass
+    if bp == 0 then (saoBand, c2, st1) else (saoEdge, c2, st1)
+
+def decSaoBandPosition (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  c.decodeBypassBits 5
+
+def decSaoOffsetAbs (c : HevcCabacReader) (bitDepth : Nat) : Nat × HevcCabacReader := Id.run do
+  let bd := if bitDepth < 10 then bitDepth else 10
+  let length := (1 <<< (bd - 5)) - 1
+  let mut i := 0
+  let mut c := c
+  let mut fuel := length + 1
+  while i < length && fuel > 0 do
+    fuel := fuel - 1
+    let (b, c') := c.decodeBypass
+    c := c'
+    if b == 0 then break
+    i := i + 1
+  return (i, c)
+
+def decSaoEoClass (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  c.decodeBypassBits 2
+
+def decSplitCuFlag (c : HevcCabacReader) (st : Array Nat) (depthLeft depthTop ctDepth : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  let inc := (if depthLeft > ctDepth then 1 else 0) + (if depthTop > ctDepth then 1 else 0)
+  c.decodeDecision st (hevcCabacElemOffset.getD elemSplitCuFlag 0 + inc)
+
+def decCuTransquantBypass (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemCuTransquantBypass 0)
+
+def decSkipFlag (c : HevcCabacReader) (st : Array Nat) (skipLeft skipUp : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  let inc := (if skipLeft != 0 then 1 else 0) + (if skipUp != 0 then 1 else 0)
+  c.decodeDecision st (hevcCabacElemOffset.getD elemSkipFlag 0 + inc)
+
+def decPredMode (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  let (b, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemPredModeFlag 0)
+  if b != 0 then (modeIntra, c1, st1) else (modeInter, c1, st1)
+
+def decPartMode (c : HevcCabacReader) (st : Array Nat)
+    (log2CbSize log2MinCbSize predMode ampEnabled : Nat) : Nat × HevcCabacReader × Array Nat :=
+  let base := hevcCabacElemOffset.getD elemPartMode 0
+  let (b0, c1, st1) := c.decodeDecision st base
+  if b0 != 0 then (part2Nx2N, c1, st1)
+  else if log2CbSize == log2MinCbSize then
+    if predMode == modeIntra then (partNxN, c1, st1)
+    else
+      let (b1, c2, st2) := c1.decodeDecision st1 (base + 1)
+      if b1 != 0 then (part2NxN, c2, st2)
+      else if log2CbSize == 3 then (partNx2N, c2, st2)
+      else
+        let (b2, c3, st3) := c2.decodeDecision st2 (base + 2)
+        if b2 != 0 then (partNx2N, c3, st3) else (partNxN, c3, st3)
+  else if ampEnabled == 0 then
+    let (b1, c2, st2) := c1.decodeDecision st1 (base + 1)
+    if b1 != 0 then (part2NxN, c2, st2) else (partNx2N, c2, st2)
+  else
+    let (b1, c2, st2) := c1.decodeDecision st1 (base + 1)
+    if b1 != 0 then
+      let (b3, c3, st3) := c2.decodeDecision st2 (base + 3)
+      if b3 != 0 then (part2NxN, c3, st3)
+      else
+        let (bp, c4) := c3.decodeBypass
+        if bp != 0 then (part2NxnD, c4, st3) else (part2NxnU, c4, st3)
+    else
+      let (b3, c3, st3) := c2.decodeDecision st2 (base + 3)
+      if b3 != 0 then (partNx2N, c3, st3)
+      else
+        let (bp, c4) := c3.decodeBypass
+        if bp != 0 then (partNRx2N, c4, st3) else (partNLx2N, c4, st3)
+
+def decPcmFlag (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  c.decodeTerminate
+
+def decPrevIntraLumaPredFlag (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemPrevIntraLumaPredFlag 0)
+
+def decMpmIdx (c : HevcCabacReader) : Nat × HevcCabacReader := Id.run do
+  let mut i := 0
+  let mut c := c
+  while i < 2 do
+    let (b, c') := c.decodeBypass
+    c := c'
+    if b == 0 then break
+    i := i + 1
+  return (i, c)
+
+def decRemIntraLumaPredMode (c : HevcCabacReader) : Nat × HevcCabacReader :=
+  c.decodeBypassBits 5
+
+def decIntraChromaPredMode (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  let (b, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemIntraChromaPredMode 0)
+  if b == 0 then (4, c1, st1) else
+    let (v, c2) := c1.decodeBypassBits 2
+    (v, c2, st1)
+
+def decMergeFlag (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemMergeFlag 0)
+
+def decMergeIdx (c : HevcCabacReader) (st : Array Nat) (maxNumMergeCand : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  if maxNumMergeCand <= 1 then (0, c, st)
+  else
+    let (b, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemMergeIdx 0)
+    if b == 0 then (0, c1, st1)
+    else Id.run do
+      let mut i := 1
+      let mut c := c1
+      while i < maxNumMergeCand - 1 do
+        let (bp, c') := c.decodeBypass
+        c := c'
+        if bp == 0 then break
+        i := i + 1
+      return (i, c, st1)
+
+def decInterPredIdc (c : HevcCabacReader) (st : Array Nat) (nPbW nPbH ctDepth : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  let base := hevcCabacElemOffset.getD elemInterPredIdc 0
+  if nPbW + nPbH == 12 then
+    c.decodeDecision st (base + 4)
+  else
+    let (b, c1, st1) := c.decodeDecision st (base + ctDepth)
+    if b != 0 then (predBi, c1, st1) else c1.decodeDecision st1 (base + 4)
+
+def decRefIdx (c : HevcCabacReader) (st : Array Nat) (nbRefs : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  if nbRefs <= 1 then (0, c, st)
+  else Id.run do
+    let maxIdx := nbRefs - 1
+    let base := hevcCabacElemOffset.getD elemRefIdxL0 0
+    let mut i := 0
+    let mut c := c
+    let mut st := st
+    let lim := if maxIdx < 2 then maxIdx else 2
+    while i < lim do
+      let (b, c', st') := c.decodeDecision st (base + i)
+      c := c'
+      st := st'
+      if b == 0 then break
+      i := i + 1
+    if i == 2 then
+      while i < maxIdx do
+        let (bp, c') := c.decodeBypass
+        c := c'
+        if bp == 0 then break
+        i := i + 1
+    return (i, c, st)
+
+def decMvpLxFlag (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemMvpLxFlag 0)
+
+def decEg1 (c : HevcCabacReader) : Option (Nat × HevcCabacReader) := Id.run do
+  let mut k := 1
+  let mut val := 2
+  let mut c := c
+  while k < 17 do
+    let (b, c') := c.decodeBypass
+    c := c'
+    if b == 0 then break
+    val := val + (1 <<< k)
+    k := k + 1
+  if k == 17 then return none
+  while k > 0 do
+    k := k - 1
+    let (b, c') := c.decodeBypass
+    c := c'
+    val := val + (b <<< k)
+  return some (val, c)
+
+def decMvd (c : HevcCabacReader) (st : Array Nat) : Option (Int × Int × HevcCabacReader × Array Nat) := do
+  let (gt0x, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemAbsMvdGreater0 0)
+  let (gt0y, c2, st2) := c1.decodeDecision st1 (hevcCabacElemOffset.getD elemAbsMvdGreater0 0)
+  let (gt1x, c3, st3) :=
+    if gt0x != 0 then c2.decodeDecision st2 (hevcCabacElemOffset.getD elemAbsMvdGreater1 0 + 1)
+    else (0, c2, st2)
+  let (gt1y, c4, st4) :=
+    if gt0y != 0 then c3.decodeDecision st3 (hevcCabacElemOffset.getD elemAbsMvdGreater1 0 + 1)
+    else (0, c3, st3)
+  let finish (gt0 gt1 : Nat) (cur : HevcCabacReader) : Option (Int × HevcCabacReader) := do
+    if gt0 == 0 then some (0, cur)
+    else if gt1 == 0 then
+      let (s, cur') := cur.decodeBypass
+      some (if s != 0 then (-1 : Int) else 1, cur')
+    else
+      let (val, cur') ← decEg1 cur
+      let (s, cur'') := cur'.decodeBypass
+      some (if s != 0 then -val else val, cur'')
+  let (mx, c5) ← finish gt0x gt1x c4
+  let (my, c6) ← finish gt0y gt1y c5
+  some (mx, my, c6, st4)
+
+def decNoResidualDataFlag (c : HevcCabacReader) (st : Array Nat) : Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemNoResidualDataFlag 0)
+
+def decSplitTransformFlag (c : HevcCabacReader) (st : Array Nat) (log2TrafoSize : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemSplitTransformFlag 0 + 5 - log2TrafoSize)
+
+def decCbfCbCr (c : HevcCabacReader) (st : Array Nat) (trafoDepth : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemCbfCbCr 0 + trafoDepth)
+
+def decCbfLuma (c : HevcCabacReader) (st : Array Nat) (trafoDepth : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemCbfLuma 0 + (if trafoDepth == 0 then 1 else 0))
+
+def decCuQpDelta (c : HevcCabacReader) (st : Array Nat) : Option (Int × HevcCabacReader × Array Nat) := do
+  let mut prefLen := 0
+  let mut inc := 0
+  let mut c := c
+  let mut st := st
+  let base := hevcCabacElemOffset.getD elemCuQpDelta 0
+  while prefLen < 5 do
+    let (b, c', st') := c.decodeDecision st (base + inc)
+    c := c'
+    st := st'
+    if b == 0 then break
+    prefLen := prefLen + 1
+    inc := 1
+  let mut suffix := 0
+  if prefLen >= 5 then
+    let mut k := 0
+    while k < 7 do
+      let (b, c') := c.decodeBypass
+      c := c'
+      if b == 0 then break
+      suffix := suffix + (1 <<< k)
+      k := k + 1
+    if k == 7 then none
+    else
+      let mut kk := k
+      while kk > 0 do
+        kk := kk - 1
+        let (b, c') := c.decodeBypass
+        c := c'
+        suffix := suffix + (b <<< kk)
+      let absVal := prefLen + suffix
+      if absVal == 0 then some (0, c, st)
+      else
+        let (s, c') := c.decodeBypass
+        some (if s != 0 then -Int.ofNat absVal else Int.ofNat absVal, c', st)
+  else
+    let absVal := prefLen
+    if absVal == 0 then some (0, c, st)
+    else
+      let (s, c') := c.decodeBypass
+      some (if s != 0 then -Int.ofNat absVal else Int.ofNat absVal, c', st)
+
+def decCuChromaQpOffset (c : HevcCabacReader) (st : Array Nat) (listLenMinus1 : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  let (b, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemCuChromaQpOffsetFlag 0)
+  if b == 0 then (0, c1, st1)
+  else if listLenMinus1 == 0 then (1, c1, st1)
+  else Id.run do
+    let cMax := if 5 > listLenMinus1 then 5 else listLenMinus1
+    let mut i := 0
+    let mut c := c1
+    let mut st := st1
+    let base := hevcCabacElemOffset.getD elemCuChromaQpOffsetIdx 0
+    while i < cMax do
+      let (b, c', st') := c.decodeDecision st base
+      c := c'
+      st := st'
+      if b == 0 then break
+      i := i + 1
+    return (i + 1, c, st)
+
+def decTransformSkipFlag (c : HevcCabacReader) (st : Array Nat) (cIdx : Nat) :
+    Nat × HevcCabacReader × Array Nat :=
+  c.decodeDecision st (hevcCabacElemOffset.getD elemTransformSkipFlag 0 + (if cIdx != 0 then 1 else 0))
+
+def sigCoeffCtxInc (log2TrafoSize cIdx scanIdx xCg yCg prevSig xS yS : Nat) : Nat := Id.run do
+  if log2TrafoSize == 2 then
+    let scfOffset := if cIdx != 0 then 27 else 0
+    return hevcCabacCtxIdxMap.getD ((yS <<< 2) + xS) 0 + scfOffset
+  let mut scfOffset := if cIdx != 0 then 27 else 0
+  if cIdx == 0 then
+    if xCg > 0 || yCg > 0 then scfOffset := scfOffset + 3
+    if log2TrafoSize == 3 then
+      scfOffset := scfOffset + (if scanIdx == scanDiag then 9 else 15)
+    else
+      scfOffset := scfOffset + 21
+  else
+    if log2TrafoSize == 3 then scfOffset := scfOffset + 9 else scfOffset := scfOffset + 12
+  if xS == 0 && yS == 0 then
+    if xCg == 0 && yCg == 0 then return (if cIdx == 0 then 0 else 27)
+    else return 2 + scfOffset
+  return hevcCabacCtxIdxMap.getD (((prevSig + 1) <<< 4) + (yS <<< 2) + xS) 0 + scfOffset
+
+def getScanTables (log2TrafoSize scanIdx : Nat) :
+    Array Nat × Array Nat × Array Nat × Array Nat :=
+  let (sxCg, syCg) :=
+    if log2TrafoSize == 2 then (hevcScan1x1, hevcScan1x1)
+    else if log2TrafoSize == 3 then
+      if scanIdx == scanDiag then (hevcDiagScan2x2X, hevcDiagScan2x2Y)
+      else if scanIdx == scanHoriz then (hevcHorizScan2x2X, hevcHorizScan2x2Y)
+      else (hevcVertScan2x2X, hevcVertScan2x2Y)
+    else if log2TrafoSize == 4 then (hevcDiagScan4x4X, hevcDiagScan4x4Y)
+    else (hevcDiagScan8x8X, hevcDiagScan8x8Y)
+  let (sxOff, syOff) :=
+    if scanIdx == scanDiag then (hevcDiagScan4x4X, hevcDiagScan4x4Y)
+    else if scanIdx == scanHoriz then (hevcHorizScan4x4X, hevcHorizScan4x4Y)
+    else (hevcVertScan4x4X, hevcVertScan4x4Y)
+  (sxCg, syCg, sxOff, syOff)
+
+def lastSigCoeffXY (c : HevcCabacReader) (st : Array Nat) (log2Size cIdx : Nat) :
+    Nat × Nat × HevcCabacReader × Array Nat := Id.run do
+  let maxPref := (log2Size <<< 1) - 1
+  let (ctxOffset, ctxShift) :=
+    if cIdx == 0 then
+      (3 * (log2Size - 2) + ((log2Size - 1) >>> 2), (log2Size + 1) >>> 2)
+    else (15, log2Size - 2)
+  let mut px := 0
+  let mut c := c
+  let mut st := st
+  let baseX := hevcCabacElemOffset.getD elemLastSigXPrefix 0
+  while px < maxPref do
+    let (b, c', st') := c.decodeDecision st (baseX + (px >>> ctxShift) + ctxOffset)
+    c := c'
+    st := st'
+    if b == 0 then break
+    px := px + 1
+  let mut py := 0
+  let baseY := hevcCabacElemOffset.getD elemLastSigYPrefix 0
+  while py < maxPref do
+    let (b, c', st') := c.decodeDecision st (baseY + (py >>> ctxShift) + ctxOffset)
+    c := c'
+    st := st'
+    if b == 0 then break
+    py := py + 1
+  let finishLast (pref : Nat) (cur : HevcCabacReader) : Nat × HevcCabacReader :=
+    if pref > 3 then
+      let nbits := (pref >>> 1) - 1
+      let (suff, cur') := cur.decodeBypassBits nbits
+      (((2 + (pref &&& 1)) <<< nbits) + suff, cur')
+    else (pref, cur)
+  let (lx, c1) := finishLast px c
+  let (ly, c2) := finishLast py c1
+  return (lx, ly, c2, st)
+
+def coeffAbsLevelRemainingDecode (c : HevcCabacReader) (rcRiceParam : Nat) :
+    Option (Nat × HevcCabacReader) := do
+  let mut prefLen := 0
+  let mut c := c
+  while prefLen < 32 do
+    let (b, c') := c.decodeBypass
+    c := c'
+    if b == 0 then break
+    prefLen := prefLen + 1
+  if prefLen < 3 then
+    let (suffix, c') := c.decodeBypassBits rcRiceParam
+    some ((prefLen <<< rcRiceParam) + suffix, c')
+  else if prefLen > 20 then none
+  else
+    let nbits := prefLen - 3 + rcRiceParam
+    let (suffix, c') := c.decodeBypassBits nbits
+    some ((((1 <<< (prefLen - 3)) + 2) <<< rcRiceParam) + suffix, c')
+
+structure HevcResidual where
+  coeffs : Array Int
+  transformSkipFlag : Nat
+  dcOnly : Bool
+  colLimit : Nat
+  deriving Inhabited
+
+def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
+    (sps : HevcSps) (pps : HevcPps) (log2TrafoSize scanIdx cIdx predMode
+      cuTransquantBypass : Nat) (qpY qpCb qpCr : Int) :
+    Option (HevcResidual × HevcCabacReader × Array Nat) := do
+  let size := 1 <<< log2TrafoSize
+  let mut coeffs : Array Int := Array.replicate (size * size) 0
+  let mut c := c0
+  let mut st := st0
+  let mut transformSkipFlag := 0
+  if pps.transformSkipEnabledFlag && cuTransquantBypass == 0 &&
+      log2TrafoSize <= pps.log2MaxTransformSkipBlockSize then
+    let (f, c', st') := decTransformSkipFlag c st cIdx
+    c := c'
+    st := st'
+    transformSkipFlag := f
+  let (lx0, ly0, c1, st1) := lastSigCoeffXY c st log2TrafoSize cIdx
+  c := c1
+  st := st1
+  let (lastX, lastY) := if scanIdx == scanVert then (ly0, lx0) else (lx0, ly0)
+  let xCgLast := lastX >>> 2
+  let yCgLast := lastY >>> 2
+  let lastCg :=
+    if log2TrafoSize == 2 then 0
+    else if log2TrafoSize == 3 then
+      if scanIdx == scanDiag then
+        (hevcDiagScan2x2Inv.getD yCgLast #[]).getD xCgLast 0
+      else if scanIdx == scanHoriz then yCgLast * 2 + xCgLast
+      else xCgLast * 2 + yCgLast
+    else if log2TrafoSize == 4 then
+      (hevcDiagScan4x4Inv.getD yCgLast #[]).getD xCgLast 0
+    else
+      (hevcDiagScan8x8Inv.getD yCgLast #[]).getD xCgLast 0
+  let (sxCg, syCg, sxOff, syOff) := getScanTables log2TrafoSize scanIdx
+  let qp := if cIdx == 0 then qpY else if cIdx == 1 then qpCb else qpCr
+  let shiftNat : Nat := 8 + log2TrafoSize - 5
+  let add : Int := Int.ofNat (1 <<< (shiftNat - 1))
+  let scale : Int := (hevcLevelScale.getD (qp.toNat % 6) 40) * Int.ofNat (1 <<< (qp.toNat / 6))
+  let useSl := sps.scalingListEnableFlag && !(transformSkipFlag != 0 && log2TrafoSize > 2)
+  let slData := if pps.scalingListDataPresentFlag then pps.scalingList else sps.scalingList
+  let matrixId := cIdx + (if predMode != modeIntra then 3 else 0)
+  let scaleMatrix := (slData.sl.getD (log2TrafoSize - 2) #[]).getD matrixId #[]
+  let dcScale : Int :=
+    if useSl && log2TrafoSize >= 4 then
+      (slData.slDc.getD (log2TrafoSize - 4) #[]).getD matrixId 16
+    else 16
+  let cgSide := 1 <<< (log2TrafoSize - 2)
+  let mut sigCg : Array (Array Nat) := Array.replicate cgSide (Array.replicate cgSide 0)
+  sigCg := sigCg.set! yCgLast ((sigCg.getD yCgLast #[]).set! xCgLast 1)
+  let mut greater1Ctx := 1
+  let mut dcOnly := true
+  let mut maxXC := 0
+  let mut i := lastCg
+  let mut fuel := lastCg + 1
+  while fuel > 0 do
+    fuel := fuel - 1
+    let xCg := sxCg.getD i 0
+    let yCg := syCg.getD i 0
+    if i < lastCg && i > 0 then
+      let mut ctxCg := 0
+      if xCg < cgSide - 1 then ctxCg := ctxCg ||| (sigCg.getD yCg #[]).getD (xCg + 1) 0
+      if yCg < cgSide - 1 then ctxCg := ctxCg ||| (sigCg.getD (yCg + 1) #[]).getD xCg 0
+      let inc := ctxCg + (if cIdx != 0 then 2 else 0)
+      let (f, c', st') := c.decodeDecision st
+        (hevcCabacElemOffset.getD elemSigCoeffGroupFlag 0 + inc)
+      c := c'
+      st := st'
+      sigCg := sigCg.set! yCg ((sigCg.getD yCg #[]).set! xCg f)
+    else if i == 0 then
+      sigCg := sigCg.set! 0 ((sigCg.getD 0 #[]).set! 0 1)
+    if (sigCg.getD yCg #[]).getD xCg 0 != 0 then
+      let mut prevSig := 0
+      if xCg < cgSide - 1 && (sigCg.getD yCg #[]).getD (xCg + 1) 0 != 0 then prevSig := prevSig ||| 1
+      if yCg < cgSide - 1 && (sigCg.getD (yCg + 1) #[]).getD xCg 0 != 0 then prevSig := prevSig ||| 2
+      let mut nEnd := 15
+      if i == lastCg then
+        let lx4 := lastX &&& 3
+        let ly4 := lastY &&& 3
+        nEnd :=
+          if scanIdx == scanDiag then (hevcDiagScan4x4Inv.getD ly4 #[]).getD lx4 0
+          else if scanIdx == scanHoriz then ly4 * 4 + lx4
+          else lx4 * 4 + ly4
+      let mut nzPos : Array Nat := #[]
+      if i == lastCg then nzPos := nzPos.push nEnd
+      let mut implicitNonZero := if i != lastCg && i > 0 then 1 else 0
+      let nStart :=
+        if i == lastCg then
+          if nEnd == 0 then 0 else nEnd - 1
+        else 15
+      let mut nFuel := if i == lastCg && nEnd == 0 then 0 else nStart + 1
+      let mut n := nStart
+      while nFuel > 0 do
+        nFuel := nFuel - 1
+        let mut sig := 0
+        if n == 0 && implicitNonZero != 0 then sig := 1
+        else
+          let xS := sxOff.getD n 0
+          let yS := syOff.getD n 0
+          let inc := sigCoeffCtxInc log2TrafoSize cIdx scanIdx xCg yCg prevSig xS yS
+          let (f, c', st') := c.decodeDecision st
+            (hevcCabacElemOffset.getD elemSigCoeffFlag 0 + inc)
+          c := c'
+          st := st'
+          sig := f
+          if sig != 0 then implicitNonZero := 0
+        if sig != 0 then nzPos := nzPos.push n
+        if n == 0 then break
+        n := n - 1
+      let numNz := nzPos.size
+      if numNz != 0 then
+        let mut ctxSet := if i > 0 && cIdx == 0 then 2 else 0
+        if i != lastCg && greater1Ctx == 0 then ctxSet := ctxSet + 1
+        greater1Ctx := 1
+        let gt1Base := hevcCabacElemOffset.getD elemCoeffAbsLevelGt1 0 + (ctxSet <<< 2) +
+          (if cIdx != 0 then 16 else 0)
+        let mut gt1Flags : Array Nat := Array.replicate numNz 0
+        let mut firstGt1Idx : Int := -1
+        let mut m := 0
+        let lim8 := if numNz < 8 then numNz else 8
+        while m < lim8 do
+          let (g1, c', st') := c.decodeDecision st (gt1Base + greater1Ctx)
+          c := c'
+          st := st'
+          gt1Flags := gt1Flags.set! m g1
+          if g1 != 0 then
+            greater1Ctx := 0
+            if firstGt1Idx == -1 then firstGt1Idx := m
+          else if greater1Ctx > 0 && greater1Ctx < 3 then
+            greater1Ctx := greater1Ctx + 1
+          m := m + 1
+        let mut gt2Flag := 0
+        if firstGt1Idx != -1 then
+          let gt2Ctx := hevcCabacElemOffset.getD elemCoeffAbsLevelGt2 0 + ctxSet +
+            (if cIdx != 0 then 4 else 0)
+          let (g2, c', st') := c.decodeDecision st gt2Ctx
+          c := c'
+          st := st'
+          gt2Flag := g2
+        let firstNzPosInCg := nzPos.getD (numNz - 1) 0
+        let lastNzPosInCg := nzPos.getD 0 0
+        let signHidden := pps.signDataHidingFlag && cuTransquantBypass == 0 &&
+          lastNzPosInCg >= firstNzPosInCg + 4
+        let numSigns := if signHidden then numNz - 1 else numNz
+        let (signs, c') := c.decodeBypassBits numSigns
+        c := c'
+        let mut cRice := 0
+        let mut sumAbs : Nat := 0
+        m := 0
+        while m < numNz do
+          let baseLvl :=
+            if m >= 8 then 1
+            else 1 + gt1Flags.getD m 0 + (if m == firstGt1Idx.toNat && firstGt1Idx >= 0 then gt2Flag else 0)
+          let needRem := m >= 8 ||
+            (gt1Flags.getD m 0 != 0 && !(m == firstGt1Idx.toNat && firstGt1Idx >= 0 && gt2Flag == 0))
+          let (transLevel, cNext) ←
+            if needRem then
+              match coeffAbsLevelRemainingDecode c cRice with
+              | none => none
+              | some (rem, c'') => some (baseLvl + rem, c'')
+            else some (baseLvl, c)
+          c := cNext
+          if needRem && transLevel > (3 <<< cRice) then cRice := if cRice + 1 < 4 then cRice + 1 else 4
+          sumAbs := sumAbs + transLevel
+          let sgn :=
+            if signHidden && m == numNz - 1 then sumAbs &&& 1
+            else (signs >>> (numSigns - 1 - m)) &&& 1
+          let signedLevel : Int := if sgn != 0 then -Int.ofNat transLevel else Int.ofNat transLevel
+          let nPos := nzPos.getD m 0
+          let xC := (xCg <<< 2) + sxOff.getD nPos 0
+          let yC := (yCg <<< 2) + syOff.getD nPos 0
+          if xC != 0 || yC != 0 then dcOnly := false
+          if xC > maxXC then maxXC := xC
+          let val : Int :=
+            if cuTransquantBypass != 0 then signedLevel
+            else
+              let scaleM : Int :=
+                if !useSl then 16
+                else if xC == 0 && yC == 0 && log2TrafoSize >= 4 then dcScale
+                else if log2TrafoSize == 2 then scaleMatrix.getD ((yC <<< 2) + xC) 16
+                else if log2TrafoSize == 3 then scaleMatrix.getD ((yC <<< 3) + xC) 16
+                else if log2TrafoSize == 4 then
+                  scaleMatrix.getD (((yC >>> 1) <<< 3) + (xC >>> 1)) 16
+                else scaleMatrix.getD (((yC >>> 2) <<< 3) + (xC >>> 2)) 16
+              asrInt ((signedLevel * scale * scaleM) + add) shiftNat
+          let clipped := if val < -32768 then (-32768 : Int) else if val > 32767 then 32767 else val
+          coeffs := coeffs.set! (yC * size + xC) clipped
+          m := m + 1
+    if i == 0 then break
+    i := i - 1
+  some ({
+    coeffs := coeffs
+    transformSkipFlag := transformSkipFlag
+    dcOnly := dcOnly
+    colLimit := if lastX > lastY then lastX else lastY
+  }, c, st)
+
+def lastPrefixEncode (pos : Nat) : Nat × Nat × Nat :=
+  if pos <= 3 then (pos, 0, 0)
+  else
+    let nbits := natBitLen pos - 1
+    let base := 1 <<< nbits
+    let pref := (nbits <<< 1) + (if pos >= base + (base >>> 1) then 1 else 0)
+    (pref, nbits - 1, pos - ((2 + (pref &&& 1)) <<< (nbits - 1)))
+
+def encLastPrefix (w0 : HevcCabacWriter) (st0 : Array Nat) (log2Size cIdx axis pref : Nat) :
+    HevcCabacWriter × Array Nat := Id.run do
+  let maxPref := (log2Size <<< 1) - 1
+  let (ctxOffset, ctxShift) :=
+    if cIdx == 0 then
+      (3 * (log2Size - 2) + ((log2Size - 1) >>> 2), (log2Size + 1) >>> 2)
+    else (15, log2Size - 2)
+  let elem := if axis == 0 then elemLastSigXPrefix else elemLastSigYPrefix
+  let base := hevcCabacElemOffset.getD elem 0
+  let mut w := w0
+  let mut st := st0
+  for i in [:pref] do
+    let (w', st') := w.encodeDecision st (base + (i >>> ctxShift) + ctxOffset) 1
+    w := w'
+    st := st'
+  if pref < maxPref then
+    let (w', st') := w.encodeDecision st (base + (pref >>> ctxShift) + ctxOffset) 0
+    w := w'
+    st := st'
+  return (w, st)
+
+def encRemaining (w0 : HevcCabacWriter) (val rice : Nat) : HevcCabacWriter := Id.run do
+  let mut w := w0
+  if val < (3 <<< rice) then
+    let prefLen := val >>> rice
+    for _ in [:prefLen] do
+      w := w.encodeBypass 1
+    w := w.encodeBypass 0
+    w := w.encodeBypassBits (val &&& ((1 <<< rice) - 1)) rice
+  else
+    let mut prefLen := 3
+    let mut rest := val - (3 <<< rice)
+    let mut fuel := 32
+    while rest >= (1 <<< (prefLen - 3 + rice)) && fuel > 0 do
+      fuel := fuel - 1
+      rest := rest - (1 <<< (prefLen - 3 + rice))
+      prefLen := prefLen + 1
+    for _ in [:prefLen] do
+      w := w.encodeBypass 1
+    w := w.encodeBypass 0
+    w := w.encodeBypassBits rest (prefLen - 3 + rice)
+  return w
+
+def encResidual (w0 : HevcCabacWriter) (st0 : Array Nat) (levels : Array Int)
+    (log2Size scanIdx cIdx : Nat) : HevcCabacWriter × Array Nat := Id.run do
+  let size := 1 <<< log2Size
+  let (sxCg, syCg, sxOff, syOff) := getScanTables log2Size scanIdx
+  let cgSide := 1 <<< (log2Size - 2)
+  let mut lastCg := 0
+  let mut lastX := 0
+  let mut lastY := 0
+  let mut found := false
+  let numCg := cgSide * cgSide
+  let mut ci := numCg
+  while ci > 0 && !found do
+    ci := ci - 1
+    let mut ni := 16
+    while ni > 0 && !found do
+      ni := ni - 1
+      let xC := (sxCg.getD ci 0 <<< 2) + sxOff.getD ni 0
+      let yC := (syCg.getD ci 0 <<< 2) + syOff.getD ni 0
+      if levels.getD (yC * size + xC) 0 != 0 then
+        lastCg := ci
+        lastX := xC
+        lastY := yC
+        found := true
+  let (lxWire, lyWire) := if scanIdx == scanVert then (lastY, lastX) else (lastX, lastY)
+  let (px, pxBits, pxSuff) := lastPrefixEncode lxWire
+  let (py, pyBits, pySuff) := lastPrefixEncode lyWire
+  let (w1, st1) := encLastPrefix w0 st0 log2Size cIdx 0 px
+  let (w2, st2) := encLastPrefix w1 st1 log2Size cIdx 1 py
+  let mut w := w2
+  let mut st := st2
+  if px > 3 then w := w.encodeBypassBits pxSuff pxBits
+  if py > 3 then w := w.encodeBypassBits pySuff pyBits
+  let mut sigCg : Array (Array Nat) := Array.replicate cgSide (Array.replicate cgSide 0)
+  sigCg := sigCg.set! (lastY >>> 2) ((sigCg.getD (lastY >>> 2) #[]).set! (lastX >>> 2) 1)
+  let mut greater1Ctx := 1
+  let mut i := lastCg
+  let mut fuel := lastCg + 1
+  while fuel > 0 do
+    fuel := fuel - 1
+    let xCg := sxCg.getD i 0
+    let yCg := syCg.getD i 0
+    let mut coded := false
+    for n in [:16] do
+      let xC := (xCg <<< 2) + sxOff.getD n 0
+      let yC := (yCg <<< 2) + syOff.getD n 0
+      if levels.getD (yC * size + xC) 0 != 0 then coded := true
+    if i < lastCg && i > 0 then
+      let mut ctxCg := 0
+      if xCg < cgSide - 1 then ctxCg := ctxCg ||| (sigCg.getD yCg #[]).getD (xCg + 1) 0
+      if yCg < cgSide - 1 then ctxCg := ctxCg ||| (sigCg.getD (yCg + 1) #[]).getD xCg 0
+      let inc := ctxCg + (if cIdx != 0 then 2 else 0)
+      let (w', st') := w.encodeDecision st
+        (hevcCabacElemOffset.getD elemSigCoeffGroupFlag 0 + inc) (if coded then 1 else 0)
+      w := w'
+      st := st'
+    else if i == 0 then
+      coded := true
+    if coded then
+      sigCg := sigCg.set! yCg ((sigCg.getD yCg #[]).set! xCg 1)
+      let mut prevSig := 0
+      if xCg < cgSide - 1 && (sigCg.getD yCg #[]).getD (xCg + 1) 0 != 0 then prevSig := prevSig ||| 1
+      if yCg < cgSide - 1 && (sigCg.getD (yCg + 1) #[]).getD xCg 0 != 0 then prevSig := prevSig ||| 2
+      let mut nEnd := 15
+      if i == lastCg then
+        let lx4 := lastX &&& 3
+        let ly4 := lastY &&& 3
+        nEnd :=
+          if scanIdx == scanDiag then (hevcDiagScan4x4Inv.getD ly4 #[]).getD lx4 0
+          else if scanIdx == scanHoriz then ly4 * 4 + lx4
+          else lx4 * 4 + ly4
+      let mut nz : Array Nat := #[]
+      if i == lastCg then nz := nz.push nEnd
+      let mut implicit := if i == lastCg then 0 else if i > 0 then 1 else 0
+      let start := if i == lastCg then (if nEnd == 0 then 0 else nEnd - 1) else 15
+      let mut nFuel := if i == lastCg && nEnd == 0 then 0 else start + 1
+      let mut n := start
+      while nFuel > 0 do
+        nFuel := nFuel - 1
+        let mut sig := 0
+        if n == 0 && implicit != 0 then sig := 1
+        else
+          let inc := sigCoeffCtxInc log2Size cIdx scanIdx xCg yCg prevSig
+            (sxOff.getD n 0) (syOff.getD n 0)
+          let lv := levels.getD (((yCg <<< 2) + syOff.getD n 0) * size + (xCg <<< 2) + sxOff.getD n 0) 0
+          sig := if lv != 0 then 1 else 0
+          let (w', st') := w.encodeDecision st
+            (hevcCabacElemOffset.getD elemSigCoeffFlag 0 + inc) sig
+          w := w'
+          st := st'
+          if sig != 0 then implicit := 0
+        if sig != 0 then nz := nz.push n
+        if n == 0 then break
+        n := n - 1
+      let numNz := nz.size
+      if numNz != 0 then
+        let mut ctxSet := if i > 0 && cIdx == 0 then 2 else 0
+        if i != lastCg && greater1Ctx == 0 then ctxSet := ctxSet + 1
+        greater1Ctx := 1
+        let gt1Base := hevcCabacElemOffset.getD elemCoeffAbsLevelGt1 0 + (ctxSet <<< 2) +
+          (if cIdx != 0 then 16 else 0)
+        let mut gt1 : Array Nat := Array.replicate numNz 0
+        let mut firstGt1 : Int := -1
+        let lim8 := if numNz < 8 then numNz else 8
+        for m in [:lim8] do
+          let nPos := nz.getD m 0
+          let lv := (levels.getD (((yCg <<< 2) + syOff.getD nPos 0) * size +
+            (xCg <<< 2) + sxOff.getD nPos 0) 0).natAbs
+          let g1 := if lv > 1 then 1 else 0
+          let (w', st') := w.encodeDecision st (gt1Base + greater1Ctx) g1
+          w := w'
+          st := st'
+          gt1 := gt1.set! m g1
+          if g1 != 0 then
+            greater1Ctx := 0
+            if firstGt1 == -1 then firstGt1 := m
+          else if greater1Ctx > 0 && greater1Ctx < 3 then
+            greater1Ctx := greater1Ctx + 1
+        let mut gt2 := 0
+        if firstGt1 != -1 then
+          let nPos := nz.getD firstGt1.toNat 0
+          let lv := (levels.getD (((yCg <<< 2) + syOff.getD nPos 0) * size +
+            (xCg <<< 2) + sxOff.getD nPos 0) 0).natAbs
+          gt2 := if lv > 2 then 1 else 0
+          let (w', st') := w.encodeDecision st
+            (hevcCabacElemOffset.getD elemCoeffAbsLevelGt2 0 + ctxSet + (if cIdx != 0 then 4 else 0)) gt2
+          w := w'
+          st := st'
+        let mut signs := 0
+        for m in [:numNz] do
+          let nPos := nz.getD m 0
+          let lv := levels.getD (((yCg <<< 2) + syOff.getD nPos 0) * size +
+            (xCg <<< 2) + sxOff.getD nPos 0) 0
+          signs := (signs <<< 1) ||| (if lv < 0 then 1 else 0)
+        w := w.encodeBypassBits signs numNz
+        let mut rice := 0
+        for m in [:numNz] do
+          let nPos := nz.getD m 0
+          let lv := (levels.getD (((yCg <<< 2) + syOff.getD nPos 0) * size +
+            (xCg <<< 2) + sxOff.getD nPos 0) 0).natAbs
+          let base :=
+            if m >= 8 then 1
+            else 1 + gt1.getD m 0 + (if m == firstGt1.toNat && firstGt1 >= 0 then gt2 else 0)
+          let need := m >= 8 ||
+            (gt1.getD m 0 != 0 && !(m == firstGt1.toNat && firstGt1 >= 0 && gt2 == 0))
+          if need then
+            w := encRemaining w (lv - base) rice
+            if lv > (3 <<< rice) then rice := if rice + 1 < 4 then rice + 1 else 4
+    if i == 0 then break
+    i := i - 1
+  return (w, st)
+
+def encEg1 (w0 : HevcCabacWriter) (val : Nat) : HevcCabacWriter := Id.run do
+  let mut w := w0
+  let mut k := 1
+  let mut base := 2
+  while k < 17 && val >= base + (1 <<< k) do
+    w := w.encodeBypass 1
+    base := base + (1 <<< k)
+    k := k + 1
+  w := w.encodeBypass 0
+  let rem := val - base
+  while k > 0 do
+    k := k - 1
+    w := w.encodeBypass ((rem >>> k) &&& 1)
+  return w
+
+def encMvd (w0 : HevcCabacWriter) (st0 : Array Nat) (mx my : Int) :
+    HevcCabacWriter × Array Nat := Id.run do
+  let base0 := hevcCabacElemOffset.getD elemAbsMvdGreater0 0
+  let base1 := hevcCabacElemOffset.getD elemAbsMvdGreater1 0 + 1
+  let (w1, st1) := w0.encodeDecision st0 base0 (if mx != 0 then 1 else 0)
+  let (w2, st2) := w1.encodeDecision st1 base0 (if my != 0 then 1 else 0)
+  let mut w := w2
+  let mut st := st2
+  if mx != 0 then
+    let (w', st') := w.encodeDecision st base1 (if mx.natAbs > 1 then 1 else 0)
+    w := w'
+    st := st'
+  if my != 0 then
+    let (w', st') := w.encodeDecision st base1 (if my.natAbs > 1 then 1 else 0)
+    w := w'
+    st := st'
+  for v in [mx, my] do
+    if v != 0 then
+      if v.natAbs == 1 then
+        w := w.encodeBypass (if v < 0 then 1 else 0)
+      else
+        w := encEg1 w v.natAbs
+        w := w.encodeBypass (if v < 0 then 1 else 0)
+  return (w, st)
+
+def encMergeIdx (w0 : HevcCabacWriter) (st0 : Array Nat) (idx maxCand : Nat) :
+    HevcCabacWriter × Array Nat := Id.run do
+  if maxCand <= 1 then return (w0, st0)
+  let base := hevcCabacElemOffset.getD elemMergeIdx 0
+  if idx == 0 then
+    return w0.encodeDecision st0 base 0
+  let (w1, st1) := w0.encodeDecision st0 base 1
+  let mut w := w1
+  let mut i := 1
+  while i < maxCand - 1 do
+    let b := if i < idx then 1 else 0
+    w := w.encodeBypass b
+    if b == 0 then break
+    i := i + 1
+  return (w, st1)
+
 end LeanAV.HevcMain
