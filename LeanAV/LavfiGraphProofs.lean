@@ -363,8 +363,8 @@ def graphAcyclicGateSpec : AVGateSpec FilterGraph GraphAcyclic where
   complete := fun g h => (graphIsAcyclic_iff_graphAcyclic g).mpr h
   posWitness := kahnPosGraph
   negWitness := kahnNegGraph
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem graphAcyclicGateSpec_iff (g : FilterGraph) :
     graphAcyclicGateSpec.gate g = true ↔ GraphAcyclic g :=
@@ -404,8 +404,8 @@ def padLinkGateSpec : AVGateSpec (PadFormat × PadFormat) (fun p => PadLinkCompa
   negWitness :=
     ({ kind := .video, width := 320, height := 240 },
      { kind := .audio, sampleRate := 44100, channels := 1 })
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem padLinkGateSpec_iff (p : PadFormat × PadFormat) :
     padLinkGateSpec.gate p = true ↔ PadLinkCompatible p.1 p.2 :=
@@ -539,8 +539,8 @@ def splitOutputGateSpec : AVGateSpec (PadFormat × List PadFormat)
   posWitness := ({ kind := .video, width := 16, height := 16 },
     [{ kind := .video, width := 16, height := 16 }, { kind := .video, width := 16, height := 16 }])
   negWitness := ({ kind := .video, width := 16, height := 16 }, [])
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem splitOutputGateSpec_iff (p : PadFormat × List PadFormat) :
     splitOutputGateSpec.gate p = true ↔ SplitOutputConservation p.1 p.2 :=
@@ -581,8 +581,8 @@ def amixRateGateSpec : AVGateSpec (List PadFormat × PadFormat)
     { kind := .audio, sampleRate := 44100, channels := 2 })
   negWitness := ([{ kind := .audio, sampleRate := 44100, channels := 2 }],
     { kind := .audio, sampleRate := 48000, channels := 2 })
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem amixRateGateSpec_iff (p : List PadFormat × PadFormat) :
     amixRateGateSpec.gate p = true ↔ AmixRateConservation p.1 p.2 :=
@@ -617,8 +617,8 @@ def overlayDimGateSpec : AVGateSpec (PadFormat × PadFormat × PadFormat)
     ({ kind := .video, width := 320, height := 240 },
      { kind := .video, width := 64, height := 64 },
      { kind := .video, width := 64, height := 64 })
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem overlayDimGateSpec_iff (p : PadFormat × PadFormat × PadFormat) :
     overlayDimGateSpec.gate p = true ↔ OverlayDimConservation p.1 p.2.1 p.2.2 :=
@@ -642,8 +642,8 @@ def cropBoundsGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat × Nat)
   complete := by intro p h; simpa [cropBoundsGate] using decide_eq_true h
   posWitness := (320, 240, 16, 16, 64, 48)
   negWitness := (32, 32, 0, 0, 64, 48)
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem cropBoundsGateSpec_iff (p : Nat × Nat × Nat × Nat × Nat × Nat) :
     cropBoundsGateSpec.gate p = true ↔
@@ -668,8 +668,8 @@ def padBoundsGateSpec : AVGateSpec (Nat × Nat × Nat × Nat × Nat × Nat)
   complete := by intro p h; simpa [padBoundsGate] using decide_eq_true h
   posWitness := (320, 240, 640, 480, 0, 0)
   negWitness := (320, 240, 160, 120, 0, 0)
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem padBoundsGateSpec_iff (p : Nat × Nat × Nat × Nat × Nat × Nat) :
     padBoundsGateSpec.gate p = true ↔
@@ -700,8 +700,8 @@ def amergeChannelGateSpec : AVGateSpec (List PadFormat × Nat)
       { kind := .audio, sampleRate := 48000, channels := 1 }], 2)
   negWitness := ([{ kind := .audio, sampleRate := 48000, channels := 6 },
       { kind := .audio, sampleRate := 48000, channels := 6 }], 12)
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem amergeChannelGateSpec_iff (p : List PadFormat × Nat) :
     amergeChannelGateSpec.gate p = true ↔ AmergeChannelSafe p.1 p.2 :=
@@ -727,8 +727,8 @@ def lavfiDurationBoundGateSpec : AVGateSpec (Nat × Nat × Nat)
   complete := by intro p h; simpa [lavfiDurationBoundGate] using decide_eq_true h
   posWitness := (25, 44100, 1000)
   negWitness := (0, 0, 0)
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem lavfiDurationBoundGateSpec_iff (p : Nat × Nat × Nat) :
     lavfiDurationBoundGateSpec.gate p = true ↔ LavfiDurationBoundSafe p.1 p.2.1 p.2.2 :=

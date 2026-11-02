@@ -1,5 +1,25 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-02 M3-C typed `lavfi` filtergraph DAG & synthetic source qualification
+(`campaign/m3-c-lavfi-dag-20261102` over `741fb1d`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**18,429 declarations with zero sorryAx/custom axioms** (`61,925` LOC across 33
+formal `LeanAV/*.lean` modules) and **758/758 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `LavfiGraphProofs`: 36, `Audio`: 34, `H264EntropyProofs`: 31,
+`Scale`: 28, `Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 21,
+`Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6,
+`LavfiGraph`: 5; `0` vacuous, `0` trivial, `0` shadowed), adding the zero-exec
+in-process `lavfi` filtergraph DAG & synthetic source engine (`inproc_lavfi_dag`
+in `LeanAV/LavfiGraph.lean` and `LeanAV/LavfiGraphProofs.lean`): Kahn topological
+ordering with soundness & completeness equivalence to DAG acyclicity, static pad
+link type-safety, bounded per-edge FIFO queues, `SCALEBITS=16` BT.601 color
+conversion, synthetic video/audio sources (`color`, `testsrc`, `nullsrc`, `sine`,
+`anullsrc`), multi-pad DAG nodes (`split`, `asplit`, `overlay`, `hstack`, `vstack`,
+`amix`, `amerge`) plus 19 unary video/audio filters, and zero-subprocess muxing
+across raw/`md5`/`framemd5`/`.mp4`/`.mkv`/`.avi`/`.wav`/`.flac`/`.png`.
+
 The 2026-11-01 M2-D in-process H.264 + AAC-LC MP4 transcode qualification
 (`campaign/m2-complete-20261031` over `77c6ca9`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited

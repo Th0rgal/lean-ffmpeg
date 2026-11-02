@@ -33,3 +33,5 @@ import LeanAV.H264InterDeblockDpbProofs
 import LeanAV.AacLc
 import LeanAV.AacLcProofs
 import LeanAV.InprocTranscode
+import LeanAV.LavfiGraph
+import LeanAV.LavfiGraphProofs

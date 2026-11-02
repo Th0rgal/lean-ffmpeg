@@ -21,6 +21,13 @@ import LeanAV.Filter
 import LeanAV.Video
 import LeanAV.Format
 import LeanAV.IO
+import LeanAV.Bitstream
+import LeanAV.H264Syntax
+import LeanAV.H264Entropy
+import LeanAV.AacLc
+import LeanAV.Md5
+import LeanAV.Ffv1
+import LeanAV.Ffv1Container
 
 namespace LeanAV.LavfiGraph
 
@@ -35,6 +42,10 @@ open LeanAV.Filter
 open LeanAV.Video
 open LeanAV.Format
 open LeanAV.IO
+open LeanAV.Bitstream
+open LeanAV.H264Syntax
+open LeanAV.H264Entropy
+open LeanAV.AacLc
 
 /-! ## 1. Media Kinds, Pad Formats and Bounded Edge Queues -/
 
@@ -350,14 +361,19 @@ def parseFilterGraph (spec : String) : Except String FilterGraph := do
 /-! ## 4. Kahn Topological Ordering (sound and complete acyclicity) -/
 
 /-- Edges implied by shared pad labels: every consumer depends on every producer. -/
-def graphEdges (g : FilterGraph) : List GraphEdge := Id.run do
-  let mut edges : List GraphEdge := []
-  for i in [:g.nodes.size] do
-    for pad in g.nodes[i]!.inputs do
-      for j in [:g.nodes.size] do
-        if g.nodes[j]!.outputs.contains pad then
-          edges := edges ++ [{ src := j, dst := i, padName := pad }]
-  return edges
+def graphEdges (g : FilterGraph) : List GraphEdge :=
+  (List.range g.nodes.size).flatMap fun i =>
+    match g.nodes[i]? with
+    | none => []
+    | some ni =>
+      ni.inputs.flatMap fun pad =>
+        (List.range g.nodes.size).flatMap fun j =>
+          match g.nodes[j]? with
+          | none => []
+          | some nj =>
+            if nj.outputs.any (fun out => decide (out.toList = pad.toList)) then
+              [{ src := j, dst := i, padName := pad }]
+            else []
 
 /-- Predecessors of `i` in `edges`: every `e.src` with `e.dst = i`. -/
 def inNeighbors (edges : List GraphEdge) (i : Nat) : List Nat :=
@@ -441,8 +457,8 @@ def validTopoPairGateSpec : AVGateSpec (FilterGraph × List Nat) ValidTopoPair w
   complete := fun _ h => decide_eq_true h
   posWitness := (kahnPosGraph, [0])
   negWitness := (kahnNegGraph, [0, 1])
-  nonVacuous := by native_decide
-  tight := by native_decide
+  nonVacuous := by decide
+  tight := by decide
 
 theorem validTopoPairGateSpec_iff (p : FilterGraph × List Nat) :
     validTopoPairGateSpec.gate p = true ↔ ValidTopoPair p :=
@@ -553,14 +569,14 @@ def parseLavfiColorRgb (s : String) : Option (UInt8 × UInt8 × UInt8) :=
       some (r, g, b)
     | _ => none
 
-/-- Convert `(R, G, B)` into studio-range BT.601 `(Y, U, V)` matching FFmpeg `lavfi` `color`. -/
+/-- Convert `(R, G, B)` into studio-range BT.601 `(Y, U, V)` matching FFmpeg `RGB_TO_*_CCIR` (`SCALEBITS=16`). -/
 def rgbToBt601Yuv (r g b : UInt8) : UInt8 × UInt8 × UInt8 :=
   let rn := r.toNat
   let gn := g.toNat
   let bn := b.toNat
-  let y := ((66 * rn + 129 * gn + 25 * bn + 128) / 256 + 16).min 235
-  let u := ((((128 * 256) + 112 * bn) - (38 * rn + 74 * gn) + 128) / 256).min 240
-  let v := ((((128 * 256) + 112 * rn) - (94 * gn + 18 * bn) + 128) / 256).min 240
+  let y := ((16829 * rn + 33039 * gn + 6416 * bn + 32768 + (16 <<< 16)) >>> 16).min 235
+  let u := ((((128 <<< 16) + 28784 * bn + 32767) - (9714 * rn + 19070 * gn)) >>> 16).min 240
+  let v := ((((128 <<< 16) + 28784 * rn + 32767) - (24104 * gn + 4681 * bn)) >>> 16).min 240
   (y.toUInt8, u.toUInt8, v.toUInt8)
 
 /-- Parse a decimal gain (`"0.5"`, `"2"`, `"1.25"`, `"-6dB"`) into Q8 (`256 = 1.0`). -/
@@ -1635,6 +1651,35 @@ def packVideoFramesRgb24Raw (frames : Array VideoFrame) : ByteArray := Id.run do
         out := out.push (rgb.getPixel r c)
   return out
 
+/-- Pack `VideoFrame`s into raw `GRAY8` luma bytes. -/
+def packVideoFramesGray8Raw (frames : Array VideoFrame) : ByteArray := Id.run do
+  let mut out := ByteArray.empty
+  for vf in frames do
+    if vf.planes.size >= 1 then
+      let p := vf.planes[0]!
+      for r in [:vf.height] do
+        for c in [:vf.width] do
+          out := out.push (p.getPixel r c)
+  return out
+
+/-- Direct RGB24 emission when a graph is a single `testsrc` node, avoiding 4:2:0 subsampling loss. -/
+def packDirectTestsrcRgb24? (tg : TypedFilterGraph) (maxFrames? : Option Nat := none) : Option ByteArray :=
+  if tg.nodes.size != 1 then none
+  else
+    match tg.nodes[0]!.op with
+    | .srcTestsrc w h fps durMs =>
+      let n0 := lavfiVideoFrameCount fps durMs
+      let n := match maxFrames? with | some m => Nat.min n0 (Nat.max 1 m) | none => n0
+      some <| Id.run do
+        let mut out := ByteArray.emptyWithCapacity (n * w * h * 3)
+        for idx in [:n] do
+          let rgb := genTestsrcRgbPlane w h fps idx
+          for r in [:h] do
+            for c in [:w * 3] do
+              out := out.push (rgb.getPixel r c)
+        return out
+    | _ => none
+
 /-- Convert an `AudioFrame` into per-channel `Array (Array Int32)` for WAV/FLAC/PCM muxers. -/
 def audioFrameToChannelArrays (af : AudioFrame) : Array (Array Int32) := Id.run do
   let nCh := Nat.max 1 af.channels.toNat
@@ -1656,6 +1701,211 @@ def channelArraysToAudioFrame (chans : Array (Array Int32)) (sampleRate : UInt32
     for i in [:Nat.min nS arr.size] do
       af := af.setSample ch i (clipInt16 arr[i]!)
   return af
+
+/-! ## 10. Lossless All-Intra `I_PCM` H.264 + AAC-LC Synthetic MP4 Muxer -/
+
+private def lavfiChooseH264Level (mbsW mbsH : Nat) : UInt8 :=
+  let mbs := mbsW * mbsH
+  if mbs ≤ 99 then 12
+  else if mbs ≤ 396 then 20
+  else if mbs ≤ 1620 then 30
+  else if mbs ≤ 3600 then 31
+  else if mbs ≤ 8192 then 40
+  else 51
+
+private def lavfiBitWriterBits (w : BitWriter) : Array UInt8 :=
+  let totalBits := w.bytes.size * 8 + w.bitsUsed
+  let bytes := (w.alignToByte).toByteArray
+  extractBitArray bytes 0 totalBits
+
+private def packYuv420pMbPcmBytes (vf : VideoFrame) (mbX mbY : Nat) : ByteArray := Id.run do
+  let pY := vf.planes[0]!
+  let pU := vf.planes[1]!
+  let pV := vf.planes[2]!
+  let w := Nat.max 1 vf.width
+  let h := Nat.max 1 vf.height
+  let cw := Nat.max 1 ((w + 1) / 2)
+  let ch := Nat.max 1 ((h + 1) / 2)
+  let mut out := ByteArray.emptyWithCapacity 384
+  for ry in [:16] do
+    let y := Nat.min (h - 1) (mbY * 16 + ry)
+    for rx in [:16] do
+      let x := Nat.min (w - 1) (mbX * 16 + rx)
+      out := out.push (pY.getPixel y x)
+  for ry in [:8] do
+    let y := Nat.min (ch - 1) (mbY * 8 + ry)
+    for rx in [:8] do
+      let x := Nat.min (cw - 1) (mbX * 8 + rx)
+      out := out.push (pU.getPixel y x)
+  for ry in [:8] do
+    let y := Nat.min (ch - 1) (mbY * 8 + ry)
+    for rx in [:8] do
+      let x := Nat.min (cw - 1) (mbX * 8 + rx)
+      out := out.push (pV.getPixel y x)
+  return out
+
+/-- Build a `SynthMp4Track` containing all-IDR `I_PCM` H.264 frames for `frames`. -/
+def muxLavfiVideoH264Track (frames : Array VideoFrame) (fpsNum : Nat) : Option SynthMp4Track := do
+  let vf0 ← frames[0]?
+  let dstW := vf0.width
+  let dstH := vf0.height
+  if dstW == 0 || dstH == 0 || dstW % 2 != 0 || dstH % 2 != 0 then none
+  else
+    let mbsW := (dstW + 15) / 16
+    let mbsH := (dstH + 15) / 16
+    let padW := mbsW * 16 - dstW
+    let padH := mbsH * 16 - dstH
+    let lvl := lavfiChooseH264Level mbsW mbsH
+    let spsSyn : H264SpsFull := {
+      nalRefIdc := 3, profileIdc := 66, constraintSet0Flag := true, constraintSet1Flag := true,
+      levelIdc := lvl, spsId := 0, chromaFormatIdc := 1, log2MaxFrameNumMinus4 := 0,
+      picOrderCntType := 0, log2MaxPicOrderCntLsbMinus4 := 4, maxNumRefFrames := 1,
+      picWidthInMbsMinus1 := (mbsW - 1).toUInt16, picHeightInMapUnitsMinus1 := (mbsH - 1).toUInt16,
+      frameMbsOnlyFlag := true, direct8x8InferenceFlag := true,
+      frameCroppingFlag := padW > 0 || padH > 0,
+      frameCropRightOffset := (padW / 2).toUInt16, frameCropBottomOffset := (padH / 2).toUInt16,
+      widthPx := dstW.toUInt32, heightPx := dstH.toUInt32
+    }
+    let ppsSyn : H264PpsFull := {
+      nalRefIdc := 3, ppsId := 0, spsId := 0, entropyCodingModeFlag := false,
+      deblockingFilterControlPresentFlag := true
+    }
+    let spsNal ← serializeH264SpsFull spsSyn
+    let ppsNal ← serializeH264PpsFull ppsSyn 1 0
+    let spsEnt ← parseSpsFull spsNal
+    let spsArr := (Array.replicate 32 none).set! 0 (some spsEnt)
+    let ppsEnt ← parsePpsFull ppsNal spsArr
+    let avccRec : AvcDecoderConfigRecord := {
+      configurationVersion := 1, avcProfileIndication := 66,
+      profileCompatibility := spsSyn.constraintByte, avcLevelIndication := lvl,
+      lengthSizeMinusOne := 3, spsNalus := #[spsNal], ppsNalus := #[ppsNal], hasHighExt := false
+    }
+    let avccBody ← serializeAvcDecoderConfigRecord avccRec
+    let mut samples : Array SynthMp4Sample := Array.mkEmpty frames.size
+    for idx in [:frames.size] do
+      let vf := frames[idx]!
+      if vf.planes.size < 3 then none
+      let mut mbs : Array MbSyntax := Array.mkEmpty (mbsW * mbsH)
+      for mbY in [:mbsH] do
+        for mbX in [:mbsW] do
+          let pcm := packYuv420pMbPcmBytes vf mbX mbY
+          mbs := mbs.push { isSkip := false, kind := .iPcm, intraIdx := 25, pcmBytes := pcm }
+      let wPre :=
+        let w0 := writeUNat BitWriter.empty 0 4
+        let w1 := writeUENat w0 (idx % 2)
+        let w2 := writeUNat w1 0 8
+        let w3 := writeU1Nat w2 0
+        writeU1Nat w3 0
+      let wSuf :=
+        let w0 := writeUENat BitWriter.empty 0
+        let w1 := writeSEInt w0 0
+        writeSEInt w1 0
+      let shEnt : SliceHeaderFull := {
+        nalHdr := 0x65, firstMbInSlice := 0, sliceType := 7, sliceTypeNos := 2, ppsId := 0,
+        prefixBits := lavfiBitWriterBits wPre, cabacInitIdc := 0, sliceQpDelta := 0,
+        suffixBits := lavfiBitWriterBits wSuf, numRefL0 := 1, numRefL1 := 1, sliceQpY := 26
+      }
+      let sliceNal ← encodeSliceCavlc shEnt mbs spsEnt ppsEnt
+      let pkt ← packAvccPacket #[sliceNal] 4
+      samples := samples.push { data := pkt, dur := 1, cttsOff := 0, isSync := true }
+    some {
+      kind := .video
+      timescale := Nat.max 1 fpsNum
+      width := dstW
+      height := dstH
+      stsdBox := buildAvc1StsdBox dstW dstH avccBody
+      samples := samples
+    }
+
+private def aacSampleRateIdx? (sr : Nat) : Option UInt8 :=
+  match sr with
+  | 96000 => some 0 | 88200 => some 1 | 64000 => some 2 | 48000 => some 3
+  | 44100 => some 4 | 32000 => some 5 | 24000 => some 6 | 22050 => some 7
+  | 16000 => some 8 | 12000 => some 9 | 11025 => some 10 | 8000 => some 11
+  | 7350  => some 12 | _ => none
+
+/-- Build a `SynthMp4Track` containing AAC-LC frames for `af` (1 or 2 channels). -/
+def muxLavfiAudioAacTrack (af : AudioFrame) : Option SynthMp4Track := do
+  let afNorm :=
+    if af.channels.toNat > 2 then execAudioPanFormat af af.sampleRate.toNat 2 else af
+  let sr := if (aacSampleRateIdx? afNorm.sampleRate.toNat).isSome then afNorm.sampleRate else 48000
+  let afReady := if sr == afNorm.sampleRate then afNorm else resampleAudioFrame afNorm sr
+  let srIdx ← aacSampleRateIdx? sr.toNat
+  let chans := audioFrameToChannelArrays afReady
+  if chans.isEmpty || chans.size > 2 then none
+  else
+    let adts ← aacEncodeAdtsStream chans sr 16 128000 true
+    let (_, rawSlices) ← demuxAdtsStream (ByteSlice.ofByteArray adts) false
+    if rawSlices.isEmpty then none
+    else
+      let outSamples := rawSlices.map fun sl =>
+        ({ data := sl.toByteArray, dur := 1024, cttsOff := 0, isSync := true } : SynthMp4Sample)
+      let asc : AacLcAsc := {
+        audioObjectType := 2, samplingFrequencyIndex := srIdx,
+        channelConfiguration := chans.size.toUInt8,
+        frameLengthFlag := false, dependsOnCoreCoder := false, extensionFlag := false
+      }
+      let entry ← buildMp4aSampleEntryBox asc
+      some {
+        kind := .audio, timescale := sr.toNat, width := 0, height := 0,
+        stsdBox := buildMp4aStsdBoxFromEntry entry, samples := outSamples
+      }
+
+/-- Mux video and/or audio lavfi outputs into an ISO-BMFF `.mp4` ByteArray. -/
+def muxLavfiMp4Bytes (vFrames? : Option (Array VideoFrame × Nat)) (aFrame? : Option AudioFrame) :
+    Option ByteArray := do
+  let mut tracks : Array SynthMp4Track := #[]
+  if let some (vfs, fps) := vFrames? then
+    let vt ← muxLavfiVideoH264Track vfs fps
+    tracks := tracks.push vt
+  if let some af := aFrame? then
+    let atrk ← muxLavfiAudioAacTrack af
+    tracks := tracks.push atrk
+  if tracks.isEmpty then none
+  else muxSynthMp4Container tracks
+
+/-- Mux lavfi `yuv420p` video frames into a lossless FFV1 v3 `.mkv` or `.avi` ByteArray. -/
+def muxLavfiFfv1Bytes (outFmt : String) (vfs : Array VideoFrame) (fps : Nat) : Option ByteArray :=
+  if vfs.isEmpty then none
+  else
+    let vf0 := vfs[0]!
+    let rawFrames := vfs.map (fun vf => packVideoFramesYuv420pRaw #[vf])
+    match LeanAV.Ffv1.makeEncoderConfiguration .yuv420p 1 4 1 1 with
+    | .error _ => none
+    | .ok encCfg =>
+      let cfgRec := LeanAV.Ffv1.encodeConfiguration encCfg
+      Id.run do
+        let mut gop : LeanAV.Ffv1.GopState := #[]
+        let mut pkts : Array ByteArray := #[]
+        let mut kfs : Array Bool := #[]
+        for raw in rawFrames do
+          match LeanAV.Ffv1.encodeFrameV3 encCfg vf0.width vf0.height .yuv420p raw 0 true gop with
+          | .error _ => return none
+          | .ok (pkt, nextGop) =>
+            pkts := pkts.push pkt
+            kfs := kfs.push true
+            gop := nextGop
+        let st : LeanAV.Ffv1Container.Stream := {
+          width := vf0.width, height := vf0.height,
+          timeNum := 1, timeDen := Nat.max 1 fps,
+          sarNum := 0, sarDen := 1,
+          config := cfgRec, packets := pkts, keyframes := kfs
+        }
+        match LeanAV.Ffv1Container.mux outFmt st with
+        | .ok b => return some b
+        | .error _ => return none
+
+/-- Format `md5` muxer output over raw video or audio lavfi bytes. -/
+def muxLavfiMd5Bytes (rawPayload : ByteArray) : ByteArray :=
+  (LeanAV.Md5.formatMd5Muxer rawPayload).toUTF8
+
+/-- Format `framemd5` muxer output over `yuv420p` lavfi video frames. -/
+def muxLavfiFrameMd5Bytes (vfs : Array VideoFrame) (fps : Nat) : Option ByteArray :=
+  if vfs.isEmpty then none
+  else
+    let vf0 := vfs[0]!
+    let rawFrames := vfs.map (fun vf => packVideoFramesYuv420pRaw #[vf])
+    some (LeanAV.Md5.formatFrameMd5Muxer vf0.width vf0.height 1 (Nat.max 1 fps) 0 1 rawFrames).toUTF8
 
 end LeanAV.LavfiGraph
 
