@@ -8,6 +8,7 @@
 -/
 import LeanSys.Posix
 import LeanAV.Spec
+import LeanAV.Core
 import LeanAV.Bitstream
 import LeanAV.Video
 import LeanAV.H264Entropy
@@ -17,6 +18,7 @@ namespace LeanAV.HevcMain
 
 open LeanSys.Posix
 open LeanAV.Spec
+open LeanAV.Core
 open LeanAV.Bitstream
 open LeanAV.Video
 open LeanAV.H264Entropy
@@ -3835,7 +3837,7 @@ def encMergeIdx (w0 : HevcCabacWriter) (st0 : Array Nat) (idx maxCand : Nat) :
     i := i + 1
   return (w, st1)
 
-def pfIntra : Nat := 0
+def pfIntra : Nat := 4
 def pfL0 : Nat := 1
 def pfL1 : Nat := 2
 def pfBi : Nat := 3
@@ -4113,6 +4115,7 @@ structure HevcNeighAvail where
   candUp         : Bool := false
   candLeft       : Bool := false
   candUpLeft     : Bool := false
+  candUpRightSap : Bool := false
   candUpRight    : Bool := false
   candBottomLeft : Bool := false
   deriving Repr, DecidableEq, Inhabited
@@ -4705,11 +4708,13 @@ def mcBiWrite (dst0 : ByteArray) (stride dx dy bw bh : Nat) (s0 s1 : Array Int)
   return dst
 
 structure HevcRefPlanes where
-  planes : Array ByteArray
-  poc    : Int
-  tabMvf : Array HevcMvf
-  rplPoc : Array (Array Int)
-  rplLt  : Array (Array Bool)
+  planes     : Array ByteArray := #[]
+  poc        : Int := 0
+  tabMvf     : Array HevcMvf := #[]
+  rplPoc     : Array (Array Int) := #[#[], #[]]
+  rplLt      : Array (Array Bool) := #[#[], #[]]
+  rplTabPoc  : Array (Option (Array (Array Int))) := #[]
+  rplTabLt   : Array (Option (Array (Array Bool))) := #[]
   deriving Inhabited
 
 structure HevcRpl where
@@ -5231,5 +5236,1770 @@ def saoFrame8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps)
                       dst := dst.set! (roff + nx) (baGetD src (roff + nx) 0)
           planes := planes.set! cIdx dst
   return planes
+
+def intraDc : Nat := 1
+
+def hevcIntraChromaModes : Array Nat := #[0, 26, 10, 1]
+
+def hevcL0L1CandIdx : Array (Nat × Nat) := #[
+  (0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1),
+  (0, 3), (3, 0), (1, 3), (3, 1), (2, 3), (3, 2)
+]
+
+def mvScale (mv : Int × Int) (td0 tb0 : Int) : Int × Int :=
+  let td := clipInt td0 (-128) 127
+  let tb := clipInt tb0 (-128) 127
+  if td == 0 then mv
+  else
+    let absHalf := Int.ofNat (td.natAbs >>> 1)
+    let num := 16384 + absHalf
+    let tx : Int :=
+      if td > 0 then Int.ofNat (num.toNat / td.toNat)
+      else -Int.ofNat (num.toNat / td.natAbs)
+    let scale := clipInt (asrInt (tb * tx + 32) 6) (-4096) 4095
+    let p0 := scale * mv.1
+    let p1 := scale * mv.2
+    let sx := clipInt (asrInt (p0 + 127 + (if p0 < 0 then 1 else 0)) 8) (-32768) 32767
+    let sy := clipInt (asrInt (p1 + 127 + (if p1 < 0 then 1 else 0)) 8) (-32768) 32767
+    (sx, sy)
+
+def sameMvRef (a b : HevcMvf) : Bool :=
+  if a.predFlag != b.predFlag then false
+  else if a.predFlag == pfBi then
+    a.refIdx0 == b.refIdx0 && a.refIdx1 == b.refIdx1 && a.mv0 == b.mv0 && a.mv1 == b.mv1
+  else if a.predFlag == pfL0 then
+    a.refIdx0 == b.refIdx0 && a.mv0 == b.mv0
+  else if a.predFlag == pfL1 then
+    a.refIdx1 == b.refIdx1 && a.mv1 == b.mv1
+  else false
+
+structure HevcDecodedFrame where
+  poc        : Int := 0
+  planes     : Array ByteArray := #[]
+  tabMvf     : Array HevcMvf := #[]
+  rpl        : Array HevcRpl := #[{}, {}]
+  rplTab     : Array (Option (Array HevcRpl)) := #[]
+  qpY        : Array Int := #[]
+  isPcm      : Array Nat := #[]
+  sao        : Array HevcSaoCtb := #[]
+  deblock    : Array HevcDeblockCtb := #[]
+  vbs        : Array Nat := #[]
+  hbs        : Array Nat := #[]
+  bsW        : Nat := 1
+  sliceAddr  : Array Int := #[]
+  lfase      : Array Bool := #[]
+  cbfLuma    : Array Nat := #[]
+  ipm        : Array Nat := #[]
+  ctDepth    : Array Nat := #[]
+  skipFlag   : Array Nat := #[]
+  outputFlag : Bool := true
+  outputted  : Bool := false
+  referenced : Bool := true
+  tid        : Nat := 0
+  nalType    : Nat := 0
+  spsId      : Nat := 0
+  deriving Inhabited
+
+def frameToRefPlanes (f : HevcDecodedFrame) : HevcRefPlanes :=
+  let r0 := f.rpl.getD 0 {}
+  let r1 := f.rpl.getD 1 {}
+  let tabPoc := f.rplTab.map fun opt =>
+    match opt with
+    | none => none
+    | some rs => some #[(rs.getD 0 {}).poc, (rs.getD 1 {}).poc]
+  let tabLt := f.rplTab.map fun opt =>
+    match opt with
+    | none => none
+    | some rs => some #[(rs.getD 0 {}).lt, (rs.getD 1 {}).lt]
+  { planes := f.planes
+    poc := f.poc
+    tabMvf := f.tabMvf
+    rplPoc := #[r0.poc, r1.poc]
+    rplLt := #[r0.lt, r1.lt]
+    rplTabPoc := tabPoc
+    rplTabLt := tabLt }
+
+def newDecodedFrame (sps : HevcSps) (sh : HevcSliceHeader) : HevcDecodedFrame :=
+  let w := sps.width
+  let h := sps.height
+  let cw := w >>> 1
+  let ch := h >>> 1
+  let puN := sps.minPuWidth * sps.minPuHeight
+  let cbN := sps.minCbWidth * sps.minCbHeight
+  let bsW := (w >>> 2) + 1
+  let bsN := ((w + bsW * h) >>> 2) + 4
+  let yPlane := ByteArray.mk (Array.replicate (w * h) (128 : UInt8))
+  let cPlane := ByteArray.mk (Array.replicate (cw * ch) (128 : UInt8))
+  { poc := sh.poc
+    planes := #[yPlane, cPlane, cPlane]
+    tabMvf := Array.replicate puN mvfZero
+    rpl := #[{}, {}]
+    rplTab := Array.replicate sps.ctbSize none
+    qpY := Array.replicate cbN sh.sliceQp
+    isPcm := Array.replicate puN 0
+    sao := Array.replicate sps.ctbSize {}
+    deblock := Array.replicate sps.ctbSize { betaOffset := sh.betaOffset, tcOffset := sh.tcOffset }
+    vbs := Array.replicate bsN 0
+    hbs := Array.replicate bsN 0
+    bsW := bsW
+    sliceAddr := Array.replicate sps.ctbSize (-1)
+    lfase := Array.replicate sps.ctbSize true
+    cbfLuma := Array.replicate (sps.minTbWidth * sps.minTbHeight) 0
+    ipm := Array.replicate puN intraDc
+    ctDepth := Array.replicate cbN 0
+    skipFlag := Array.replicate cbN 0
+    outputFlag := sh.picOutputFlag
+    outputted := false
+    referenced := true
+    tid := sh.tid
+    nalType := sh.nalType
+    spsId := sh.spsId }
+
+structure HevcCtbCtx where
+  ctbLeft            : Bool := false
+  ctbUp              : Bool := false
+  ctbUpRight         : Bool := false
+  ctbUpLeft          : Bool := false
+  endOfTilesX        : Nat := 0
+  endOfTilesY        : Nat := 0
+  boundaryLeftSlice  : Bool := false
+  boundaryUpperSlice : Bool := false
+  boundaryLeftTile   : Bool := false
+  boundaryUpperTile  : Bool := false
+  firstQpGroup       : Bool := true
+  qpyPred            : Int := 26
+  qpY                : Int := 26
+  cuQpDeltaCoded     : Bool := false
+  cuQpDelta          : Int := 0
+  ctDepth            : Nat := 0
+  mergeFlag          : Nat := 0
+  cuX                : Nat := 0
+  cuY                : Nat := 0
+  chromaPredMode     : Nat := 0
+  intraLumaModes     : Array Nat := #[1]
+  tuLumaMode         : Nat := 1
+  deriving Inhabited
+
+def sortFramesByPoc (arr : Array HevcDecodedFrame) : Array HevcDecodedFrame := Id.run do
+  let mut a := arr
+  for i in [:a.size] do
+    let mut j := i
+    while j > 0 && (a[j]!).poc < (a[j - 1]!).poc do
+      let tmp := a[j - 1]!
+      a := a.set! (j - 1) (a[j]!)
+      a := a.set! j tmp
+      j := j - 1
+  return a
+
+def findDpbRefIdx (dpb : Array HevcDecodedFrame) (poc : Int) (lt msb : Bool) (sps : HevcSps) :
+    Option Nat := Id.run do
+  let modN := Int.ofNat (1 <<< sps.log2MaxPocLsb)
+  let mut k := dpb.size
+  while k > 0 do
+    k := k - 1
+    let f := dpb[k]!
+    if msb || !lt then
+      if f.poc == poc then return some k
+    else
+      if f.poc % modN == poc % modN then return some k
+  return none
+
+def markDpbRps (dpb0 : Array HevcDecodedFrame) (sps : HevcSps) (sh : HevcSliceHeader) :
+    Array HevcDecodedFrame := Id.run do
+  if isIdr sh.nalType || isBla sh.nalType then
+    let mut out : Array HevcDecodedFrame := #[]
+    for f in dpb0 do
+      if f.outputFlag && !f.outputted then
+        out := out.push { f with referenced := false }
+    return out
+  let mut dpb : Array HevcDecodedFrame := dpb0.map (fun f => { f with referenced := false })
+  let st := sh.shortTermRps
+  for d in st.deltaPoc do
+    if let some idx := findDpbRefIdx dpb (sh.poc + d) false true sps then
+      dpb := dpb.set! idx { dpb[idx]! with referenced := true }
+  let lt := sh.ltRps
+  for i in [:lt.poc.size] do
+    let lp := lt.poc.getD i 0
+    let msb := lt.pocMsbPresent.getD i 0 != 0
+    if let some idx := findDpbRefIdx dpb lp true msb sps then
+      dpb := dpb.set! idx { dpb[idx]! with referenced := true }
+  let mut pruned : Array HevcDecodedFrame := #[]
+  for f in dpb do
+    if f.referenced || (f.outputFlag && !f.outputted) then
+      pruned := pruned.push f
+  return pruned
+
+def buildSliceRpl (dpb : Array HevcDecodedFrame) (sps : HevcSps) (sh : HevcSliceHeader) :
+    Array HevcRpl := Id.run do
+  let poc := sh.poc
+  let st := sh.shortTermRps
+  let lt := sh.ltRps
+  let mut bef : Array (Int × Bool × Bool) := #[]
+  let mut aft : Array (Int × Bool × Bool) := #[]
+  let mut ltc : Array (Int × Bool × Bool) := #[]
+  for i in [:st.deltaPoc.size] do
+    if st.used.getD i 0 != 0 then
+      let entry := (poc + st.deltaPoc.getD i 0, false, true)
+      if i < st.numNegativePics then bef := bef.push entry else aft := aft.push entry
+  for i in [:lt.poc.size] do
+    if lt.used.getD i 0 != 0 then
+      ltc := ltc.push (lt.poc.getD i 0, true, lt.pocMsbPresent.getD i 0 != 0)
+  let cands : Array (Array (Int × Bool × Bool)) := #[bef ++ aft ++ ltc, aft ++ bef ++ ltc]
+  let mut outRpl : Array HevcRpl := #[{}, {}]
+  for lx in [:2] do
+    let nb := sh.nbRefs.getD lx 0
+    let candLx := cands.getD lx #[]
+    let mut tmp : Array (Int × Bool × Bool) := #[]
+    let mut guard := 0
+    while tmp.size < nb && !candLx.isEmpty && guard < 16 do
+      tmp := tmp ++ candLx
+      guard := guard + 1
+    let mut refs : Array (Option HevcRefPlanes) := Array.mkEmpty nb
+    let mut pocs : Array Int := Array.mkEmpty nb
+    let mut isLt : Array Bool := Array.mkEmpty nb
+    let modFlag := sh.rplModFlag.getD lx 0 != 0
+    let entries := sh.listEntryLx.getD lx #[]
+    for i in [:nb] do
+      let idx := if modFlag then entries.getD i i else i
+      if idx >= tmp.size then
+        refs := refs.push none
+        pocs := pocs.push 0
+        isLt := isLt.push false
+      else
+        let c := tmp[idx]!
+        let cPoc := c.1
+        let cLt := c.2.1
+        let cMsb := c.2.2
+        match findDpbRefIdx dpb cPoc cLt cMsb sps with
+        | some fIdx =>
+          let rf := dpb[fIdx]!
+          refs := refs.push (some (frameToRefPlanes rf))
+          pocs := pocs.push rf.poc
+          isLt := isLt.push cLt
+        | none =>
+          refs := refs.push none
+          pocs := pocs.push cPoc
+          isLt := isLt.push cLt
+    outRpl := outRpl.set! lx { refs := refs, poc := pocs, lt := isLt }
+  return outRpl
+
+def ctDepthAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Nat :=
+  if x < 0 || y < 0 then 0
+  else
+    let cx := x.toNat >>> sps.log2MinCbSize
+    let cy := y.toNat >>> sps.log2MinCbSize
+    pic.ctDepth.getD (cy * sps.minCbWidth + cx) 0
+
+def setCtDepthBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Cb depth : Nat) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinCbSize
+  let yEnd := Nat.min (y0 + (1 <<< log2Cb)) sps.height
+  let xEnd := Nat.min (x0 + (1 <<< log2Cb)) sps.width
+  let mut tab := pic0.ctDepth
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinCbSize) * sps.minCbWidth + (x >>> sps.log2MinCbSize)
+      tab := tab.set! idx depth
+      x := x + step
+    y := y + step
+  return { pic0 with ctDepth := tab }
+
+def skipAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Nat :=
+  if x < 0 || y < 0 then 0
+  else
+    let cx := x.toNat >>> sps.log2MinCbSize
+    let cy := y.toNat >>> sps.log2MinCbSize
+    pic.skipFlag.getD (cy * sps.minCbWidth + cx) 0
+
+def fillSkipBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Cb skip : Nat) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinCbSize
+  let yEnd := Nat.min (y0 + (1 <<< log2Cb)) sps.height
+  let xEnd := Nat.min (x0 + (1 <<< log2Cb)) sps.width
+  let mut tab := pic0.skipFlag
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinCbSize) * sps.minCbWidth + (x >>> sps.log2MinCbSize)
+      tab := tab.set! idx skip
+      x := x + step
+    y := y + step
+  return { pic0 with skipFlag := tab }
+
+def setQpCbBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Cb : Nat) (qp : Int) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinCbSize
+  let yEnd := Nat.min (y0 + (1 <<< log2Cb)) sps.height
+  let xEnd := Nat.min (x0 + (1 <<< log2Cb)) sps.width
+  let mut tab := pic0.qpY
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinCbSize) * sps.minCbWidth + (x >>> sps.log2MinCbSize)
+      tab := tab.set! idx qp
+      x := x + step
+    y := y + step
+  return { pic0 with qpY := tab }
+
+def fillPcmFlagBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Cb v : Nat) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinPuSize
+  let yEnd := Nat.min (y0 + (1 <<< log2Cb)) sps.height
+  let xEnd := Nat.min (x0 + (1 <<< log2Cb)) sps.width
+  let mut tab := pic0.isPcm
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinPuSize) * sps.minPuWidth + (x >>> sps.log2MinPuSize)
+      tab := tab.set! idx v
+      x := x + step
+    y := y + step
+  return { pic0 with isPcm := tab }
+
+def ipmAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Option Nat :=
+  if x < 0 || y < 0 || x.toNat >= sps.width || y.toNat >= sps.height then none
+  else
+    let px := x.toNat >>> sps.log2MinPuSize
+    let py := y.toNat >>> sps.log2MinPuSize
+    some (pic.ipm.getD (py * sps.minPuWidth + px) intraDc)
+
+def fillIpmBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 w h mode : Nat) (intra : Bool) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinPuSize
+  let yEnd := Nat.min (y0 + h) sps.height
+  let xEnd := Nat.min (x0 + w) sps.width
+  let mut ipm := pic0.ipm
+  let mut tabMvf := pic0.tabMvf
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinPuSize) * sps.minPuWidth + (x >>> sps.log2MinPuSize)
+      ipm := ipm.set! idx mode
+      if intra then tabMvf := tabMvf.set! idx mvfIntra
+      x := x + step
+    y := y + step
+  return { pic0 with ipm := ipm, tabMvf := tabMvf }
+
+def storeMvfBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 pw ph : Nat) (mvf : HevcMvf) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinPuSize
+  let yEnd := Nat.min (y0 + ph) sps.height
+  let xEnd := Nat.min (x0 + pw) sps.width
+  let mut tabMvf := pic0.tabMvf
+  let mut y := y0
+  while y < yEnd do
+    let mut x := x0
+    while x < xEnd do
+      let idx := (y >>> sps.log2MinPuSize) * sps.minPuWidth + (x >>> sps.log2MinPuSize)
+      tabMvf := tabMvf.set! idx mvf
+      x := x + step
+    y := y + step
+  return { pic0 with tabMvf := tabMvf }
+
+def mvfAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Option HevcMvf :=
+  if x < 0 || y < 0 || x.toNat >= sps.width || y.toNat >= sps.height then none
+  else
+    let px := x.toNat >>> sps.log2MinPuSize
+    let py := y.toNat >>> sps.log2MinPuSize
+    some (pic.tabMvf.getD (py * sps.minPuWidth + px) mvfZero)
+
+def mvfAtRef (rf : HevcRefPlanes) (sps : HevcSps) (x y : Int) : Option HevcMvf :=
+  if x < 0 || y < 0 || x.toNat >= sps.width || y.toNat >= sps.height then none
+  else
+    let px := x.toNat >>> sps.log2MinPuSize
+    let py := y.toNat >>> sps.log2MinPuSize
+    some (rf.tabMvf.getD (py * sps.minPuWidth + px) mvfZero)
+
+def mvfInterAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Option HevcMvf :=
+  match mvfAt pic sps x y with
+  | none => none
+  | some m =>
+    if m.predFlag == pfIntra || m.predFlag == 0 then none else some m
+
+def computeNeighAvail (ctx : HevcCtbCtx) (sps : HevcSps) (x0 y0 w h : Nat) : HevcNeighAvail :=
+  let log2Ctb := sps.log2CtbSize
+  let ctbMask := (1 <<< log2Ctb) - 1
+  let x0b := x0 &&& ctbMask
+  let y0b := y0 &&& ctbMask
+  let candUp := ctx.ctbUp || y0b != 0
+  let candLeft := ctx.ctbLeft || x0b != 0
+  let candUpLeft := if x0b != 0 || y0b != 0 then candLeft && candUp else ctx.ctbUpLeft
+  let candUpRightSap :=
+    if x0b + w == (1 <<< log2Ctb) then ctx.ctbUpRight && y0b == 0 else candUp
+  let candUpRight := candUpRightSap && (x0 + w) < ctx.endOfTilesX
+  let candBottomLeft := if (y0 + h) >= ctx.endOfTilesY then false else candLeft
+  { candUp := candUp
+    candLeft := candLeft
+    candUpLeft := candUpLeft
+    candUpRightSap := candUpRightSap
+    candUpRight := candUpRight
+    candBottomLeft := candBottomLeft }
+
+def zscanAvail (sps : HevcSps) (pps : HevcPps) (xCurr yCurr : Nat) (xN yN : Int) : Bool :=
+  if xN < 0 || yN < 0 then false
+  else
+    let log2Ctb := sps.log2CtbSize
+    let xn := xN.toNat
+    let yn := yN.toNat
+    if (yn >>> log2Ctb) < (yCurr >>> log2Ctb) || (xn >>> log2Ctb) < (xCurr >>> log2Ctb) then true
+    else
+      let mask := sps.tbMask
+      let log2Tb := sps.log2MinTbSize
+      let curr := minTbAddrZs pps (Int.ofNat ((xCurr >>> log2Tb) &&& mask)) (Int.ofNat ((yCurr >>> log2Tb) &&& mask))
+      let naddr := minTbAddrZs pps (Int.ofNat ((xn >>> log2Tb) &&& mask)) (Int.ofNat ((yn >>> log2Tb) &&& mask))
+      naddr <= curr
+
+def diffMer (pps : HevcPps) (xN yN : Int) (xP yP : Nat) : Bool :=
+  let p := pps.log2ParallelMergeLevel
+  asrInt xN p == Int.ofNat (xP >>> p) && asrInt yN p == Int.ofNat (yP >>> p)
+
+def deriveLumaIntraMode (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps)
+    (x0 y0 : Nat) (prevFlag : Bool) (mpmIdx rem0 : Nat) : Nat := Id.run do
+  let ctbMask := (1 <<< sps.log2CtbSize) - 1
+  let leftOpt :=
+    if ctx.ctbLeft || (x0 &&& ctbMask) != 0 then ipmAt pic sps (Int.ofNat x0 - 1) (Int.ofNat y0)
+    else none
+  let upOpt :=
+    if ctx.ctbUp || (y0 &&& ctbMask) != 0 then ipmAt pic sps (Int.ofNat x0) (Int.ofNat y0 - 1)
+    else none
+  let c0 := leftOpt.getD intraDc
+  let mut c1 := upOpt.getD intraDc
+  if (y0 &&& ctbMask) == 0 then c1 := intraDc
+  let mpm : Array Nat :=
+    if c0 == c1 then
+      if c0 < 2 then #[0, intraDc, 26]
+      else #[c0, 2 + ((c0 + 29) &&& 31), 2 + ((c0 - 1) &&& 31)]
+    else
+      let c2 := if c0 != 0 && c1 != 0 then 0 else if c0 != intraDc && c1 != intraDc then intraDc else 26
+      #[c0, c1, c2]
+  if prevFlag then return mpm.getD mpmIdx intraDc
+  let mut a := mpm.getD 0 0
+  let mut b := mpm.getD 1 0
+  let mut c := mpm.getD 2 0
+  if a > b then let t := a; a := b; b := t
+  if b > c then let t := b; b := c; c := t
+  if a > b then let t := a; a := b; b := t
+  let mut rem := rem0
+  if rem >= a then rem := rem + 1
+  if rem >= b then rem := rem + 1
+  if rem >= c then rem := rem + 1
+  return rem
+
+def rplAt (pic : HevcDecodedFrame) (sps : HevcSps) (x y : Int) : Array HevcRpl :=
+  if x < 0 || y < 0 then pic.rpl
+  else
+    let rs := (y.toNat >>> sps.log2CtbSize) * sps.ctbWidth + (x.toNat >>> sps.log2CtbSize)
+    match pic.rplTab.getD rs none with
+    | some r => r
+    | none => pic.rpl
+
+def refPocOpt (rpl : Array HevcRpl) (lx : Nat) (refIdx : Int) : Option Int :=
+  let pocs := (rpl.getD lx {}).poc
+  if refIdx < 0 || refIdx.toNat >= pocs.size then none
+  else some (pocs[refIdx.toNat]!)
+
+def calcBoundaryStrength (curr neigh : HevcMvf) (rplCurr rplNeigh : Array HevcRpl) : Nat :=
+  if curr.predFlag == pfBi && neigh.predFlag == pfBi then
+    let c0 := refPocOpt rplCurr 0 curr.refIdx0
+    let c1 := refPocOpt rplCurr 1 curr.refIdx1
+    let n0 := refPocOpt rplNeigh 0 neigh.refIdx0
+    let n1 := refPocOpt rplNeigh 1 neigh.refIdx1
+    if c0 == n0 && c0 == c1 && n0 == n1 then
+      let dSame :=
+        (neigh.mv0.1 - curr.mv0.1).natAbs >= 4 || (neigh.mv0.2 - curr.mv0.2).natAbs >= 4 ||
+        (neigh.mv1.1 - curr.mv1.1).natAbs >= 4 || (neigh.mv1.2 - curr.mv1.2).natAbs >= 4
+      let dSwap :=
+        (neigh.mv1.1 - curr.mv0.1).natAbs >= 4 || (neigh.mv1.2 - curr.mv0.2).natAbs >= 4 ||
+        (neigh.mv0.1 - curr.mv1.1).natAbs >= 4 || (neigh.mv0.2 - curr.mv1.2).natAbs >= 4
+      if dSame && dSwap then 1 else 0
+    else if n0 == c0 && n1 == c1 then
+      if (neigh.mv0.1 - curr.mv0.1).natAbs >= 4 || (neigh.mv0.2 - curr.mv0.2).natAbs >= 4 ||
+          (neigh.mv1.1 - curr.mv1.1).natAbs >= 4 || (neigh.mv1.2 - curr.mv1.2).natAbs >= 4 then 1
+      else 0
+    else if n1 == c0 && n0 == c1 then
+      if (neigh.mv1.1 - curr.mv0.1).natAbs >= 4 || (neigh.mv1.2 - curr.mv0.2).natAbs >= 4 ||
+          (neigh.mv0.1 - curr.mv1.1).natAbs >= 4 || (neigh.mv0.2 - curr.mv1.2).natAbs >= 4 then 1
+      else 0
+    else 1
+  else if curr.predFlag != pfBi && neigh.predFlag != pfBi then
+    let (aMv, aPoc) :=
+      if (curr.predFlag &&& pfL0) != 0 then (curr.mv0, refPocOpt rplCurr 0 curr.refIdx0)
+      else (curr.mv1, refPocOpt rplCurr 1 curr.refIdx1)
+    let (bMv, bPoc) :=
+      if (neigh.predFlag &&& pfL0) != 0 then (neigh.mv0, refPocOpt rplNeigh 0 neigh.refIdx0)
+      else (neigh.mv1, refPocOpt rplNeigh 1 neigh.refIdx1)
+    if aPoc == bPoc then
+      if (aMv.1 - bMv.1).natAbs >= 4 || (aMv.2 - bMv.2).natAbs >= 4 then 1 else 0
+    else 1
+  else 1
+
+def updateDeblockBs (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
+    (pps : HevcPps) (sh : HevcSliceHeader) (x0 y0 log2Size : Nat) : HevcDecodedFrame := Id.run do
+  let size := 1 <<< log2Size
+  let bsW := pic0.bsW
+  let log2Pu := sps.log2MinPuSize
+  let log2Tu := sps.log2MinTbSize
+  let minPuW := sps.minPuWidth
+  let minTuW := sps.minTbWidth
+  let ctb := 1 <<< sps.log2CtbSize
+  let isIntra := ((mvfAt pic0 sps (Int.ofNat x0) (Int.ofNat y0)).getD mvfZero).predFlag == pfIntra
+  let mut vbs := pic0.vbs
+  let mut hbs := pic0.hbs
+  let mut boundaryUpper := y0 > 0 && (y0 &&& 7) == 0
+  if boundaryUpper && y0 % ctb == 0 then
+    if (!sh.sliceLoopFilterAcrossSlicesEnabledFlag && ctx.boundaryUpperSlice) ||
+        (!pps.loopFilterAcrossTilesEnabledFlag && ctx.boundaryUpperTile) then
+      boundaryUpper := false
+  if boundaryUpper then
+    let rplTop := if ctx.boundaryUpperSlice then rplAt pic0 sps (Int.ofNat x0) (Int.ofNat y0 - 1) else pic0.rpl
+    let mut i := 0
+    while i < size do
+      let xPu := (x0 + i) >>> log2Pu
+      let xTu := (x0 + i) >>> log2Tu
+      let top := pic0.tabMvf.getD (((y0 - 1) >>> log2Pu) * minPuW + xPu) mvfZero
+      let curr := pic0.tabMvf.getD ((y0 >>> log2Pu) * minPuW + xPu) mvfZero
+      let topCbf := pic0.cbfLuma.getD (((y0 - 1) >>> log2Tu) * minTuW + xTu) 0
+      let currCbf := pic0.cbfLuma.getD ((y0 >>> log2Tu) * minTuW + xTu) 0
+      let bs :=
+        if curr.predFlag == pfIntra || top.predFlag == pfIntra then 2
+        else if currCbf != 0 || topCbf != 0 then 1
+        else calcBoundaryStrength curr top pic0.rpl rplTop
+      hbs := hbs.set! (((x0 + i) + y0 * bsW) >>> 2) bs
+      i := i + 4
+  let mut boundaryLeft := x0 > 0 && (x0 &&& 7) == 0
+  if boundaryLeft && x0 % ctb == 0 then
+    if (!sh.sliceLoopFilterAcrossSlicesEnabledFlag && ctx.boundaryLeftSlice) ||
+        (!pps.loopFilterAcrossTilesEnabledFlag && ctx.boundaryLeftTile) then
+      boundaryLeft := false
+  if boundaryLeft then
+    let rplLeft := if ctx.boundaryLeftSlice then rplAt pic0 sps (Int.ofNat x0 - 1) (Int.ofNat y0) else pic0.rpl
+    let mut i := 0
+    while i < size do
+      let yPu := (y0 + i) >>> log2Pu
+      let yTu := (y0 + i) >>> log2Tu
+      let left := pic0.tabMvf.getD (yPu * minPuW + ((x0 - 1) >>> log2Pu)) mvfZero
+      let curr := pic0.tabMvf.getD (yPu * minPuW + (x0 >>> log2Pu)) mvfZero
+      let leftCbf := pic0.cbfLuma.getD (yTu * minTuW + ((x0 - 1) >>> log2Tu)) 0
+      let currCbf := pic0.cbfLuma.getD (yTu * minTuW + (x0 >>> log2Tu)) 0
+      let bs :=
+        if curr.predFlag == pfIntra || left.predFlag == pfIntra then 2
+        else if currCbf != 0 || leftCbf != 0 then 1
+        else calcBoundaryStrength curr left pic0.rpl rplLeft
+      vbs := vbs.set! ((x0 + (y0 + i) * bsW) >>> 2) bs
+      i := i + 4
+  if log2Size > log2Pu && !isIntra then
+    let mut j := 8
+    while j < size do
+      let mut i := 0
+      while i < size do
+        let xPu := (x0 + i) >>> log2Pu
+        let top := pic0.tabMvf.getD (((y0 + j - 1) >>> log2Pu) * minPuW + xPu) mvfZero
+        let curr := pic0.tabMvf.getD (((y0 + j) >>> log2Pu) * minPuW + xPu) mvfZero
+        hbs := hbs.set! (((x0 + i) + (y0 + j) * bsW) >>> 2)
+          (calcBoundaryStrength curr top pic0.rpl pic0.rpl)
+        i := i + 4
+      j := j + 8
+    let mut j2 := 0
+    while j2 < size do
+      let yPu := (y0 + j2) >>> log2Pu
+      let mut i2 := 8
+      while i2 < size do
+        let left := pic0.tabMvf.getD (yPu * minPuW + ((x0 + i2 - 1) >>> log2Pu)) mvfZero
+        let curr := pic0.tabMvf.getD (yPu * minPuW + ((x0 + i2) >>> log2Pu)) mvfZero
+        vbs := vbs.set! (((x0 + i2) + (y0 + j2) * bsW) >>> 2)
+          (calcBoundaryStrength curr left pic0.rpl pic0.rpl)
+        i2 := i2 + 8
+      j2 := j2 + 4
+  return { pic0 with vbs := vbs, hbs := hbs }
+
+def align16Down (n : Nat) : Nat :=
+  (n >>> 4) <<< 4
+
+def rplTabAtRef (rf : HevcRefPlanes) (sps : HevcSps) (cx cy : Nat) :
+    Array (Array Int) × Array (Array Bool) :=
+  let rs := (cy >>> sps.log2CtbSize) * sps.ctbWidth + (cx >>> sps.log2CtbSize)
+  match rf.rplTabPoc.getD rs none with
+  | none => (rf.rplPoc, rf.rplLt)
+  | some tabPoc =>
+    match rf.rplTabLt.getD rs none with
+    | none => (rf.rplPoc, rf.rplLt)
+    | some tabLt => (tabPoc, tabLt)
+
+def tmvpOne (pic : HevcDecodedFrame) (sps : HevcSps) (sh : HevcSliceHeader)
+    (colPic : HevcRefPlanes) (colPoc : Int) (cx cy lxTarget refIdx : Nat) : Option (Int × Int) :=
+  match mvfAtRef colPic sps (Int.ofNat cx) (Int.ofNat cy) with
+  | none => none
+  | some col =>
+    if col.predFlag == pfIntra || col.predFlag == 0 then none
+    else
+      let (tabPoc, tabLt) := rplTabAtRef colPic sps cx cy
+      let listCol :=
+        if (col.predFlag &&& pfL0) == 0 then 1
+        else if col.predFlag == pfL0 then 0
+        else
+          let future :=
+            ((pic.rpl.getD 0 {}).poc.any (fun p => p > pic.poc)) ||
+            ((pic.rpl.getD 1 {}).poc.any (fun p => p > pic.poc))
+          if !future then lxTarget else if sh.collocatedList == 1 then 0 else 1
+      let ri := mvfRefIdx col listCol
+      let pocs := tabPoc.getD listCol #[]
+      if ri < 0 || ri.toNat >= pocs.size then none
+      else
+        let curLtArr := (pic.rpl.getD lxTarget {}).lt
+        let colLtArr := tabLt.getD listCol #[]
+        let curLt := curLtArr.getD refIdx false
+        let colLt := colLtArr.getD ri.toNat false
+        if curLt != colLt then some (0, 0)
+        else
+          let colPocDiff := colPoc - pocs[ri.toNat]!
+          let curPocDiff := pic.poc - ((pic.rpl.getD lxTarget {}).poc.getD refIdx 0)
+          let mv := mvfMv col listCol
+          if curLt || colPocDiff == curPocDiff || colPocDiff == 0 then some mv
+          else some (mvScale mv colPocDiff curPocDiff)
+
+def tmvpLx (pic : HevcDecodedFrame) (sps : HevcSps) (sh : HevcSliceHeader)
+    (x0 y0 pw ph refIdx lxTarget : Nat) : Option (Int × Int) :=
+  let cl := sh.collocatedList
+  let cr := sh.collocatedRefIdx
+  let rplCl := pic.rpl.getD cl {}
+  if cr >= rplCl.refs.size then none
+  else
+    match rplCl.refs[cr]! with
+    | none => none
+    | some colPic =>
+      let colPoc := rplCl.poc.getD cr 0
+      let xBr := x0 + pw
+      let yBr := y0 + ph
+      let brOk := (y0 >>> sps.log2CtbSize) == (yBr >>> sps.log2CtbSize) &&
+        xBr < sps.width && yBr < sps.height
+      if brOk then
+        match tmvpOne pic sps sh colPic colPoc (align16Down xBr) (align16Down yBr) lxTarget refIdx with
+        | some mv => some mv
+        | none => tmvpOne pic sps sh colPic colPoc (align16Down (x0 + (pw >>> 1))) (align16Down (y0 + (ph >>> 1))) lxTarget refIdx
+      else
+        tmvpOne pic sps sh colPic colPoc (align16Down (x0 + (pw >>> 1))) (align16Down (y0 + (ph >>> 1))) lxTarget refIdx
+
+def tmvpMerge (pic : HevcDecodedFrame) (sps : HevcSps) (sh : HevcSliceHeader)
+    (x0 y0 pw ph : Nat) : Option HevcMvf :=
+  let l0? := tmvpLx pic sps sh x0 y0 pw ph 0 0
+  let l1? := if sh.sliceType == sliceB then tmvpLx pic sps sh x0 y0 pw ph 0 1 else none
+  if l0?.isNone && l1?.isNone then none
+  else
+    let pf := (if l0?.isSome then pfL0 else 0) + (if l1?.isSome then pfL1 else 0)
+    some { predFlag := pf, refIdx0 := 0, refIdx1 := 0, mv0 := l0?.getD (0, 0), mv1 := l1?.getD (0, 0) }
+
+def mergeCandidates (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (x0 y0 pw ph log2Cb part partIdx : Nat) : Array HevcMvf := Id.run do
+  let pw2 := pw
+  let ph2 := ph
+  let mut x0 := x0
+  let mut y0 := y0
+  let mut pw := pw
+  let mut ph := ph
+  let mut partIdx := partIdx
+  let single := pps.log2ParallelMergeLevel > 2 && (1 <<< log2Cb) == 8
+  if single then
+    x0 := ctx.cuX
+    y0 := ctx.cuY
+    pw := 1 <<< log2Cb
+    ph := 1 <<< log2Cb
+    partIdx := 0
+  let na := computeNeighAvail ctx sps x0 y0 pw ph
+  let xA1 : Int := Int.ofNat x0 - 1
+  let yA1 : Int := Int.ofNat (y0 + ph) - 1
+  let xB1 : Int := Int.ofNat (x0 + pw) - 1
+  let yB1 : Int := Int.ofNat y0 - 1
+  let xB0 : Int := Int.ofNat (x0 + pw)
+  let yB0 : Int := Int.ofNat y0 - 1
+  let xA0 : Int := Int.ofNat x0 - 1
+  let yA0 : Int := Int.ofNat (y0 + ph)
+  let xB2 : Int := Int.ofNat x0 - 1
+  let yB2 : Int := Int.ofNat y0 - 1
+  let mut cands : Array HevcMvf := #[]
+  let mut availA1 := false
+  let mut availB1 := false
+  let a1Blocked := (!single && partIdx == 1 && (part == partNx2N || part == partNLx2N || part == partNRx2N)) ||
+    diffMer pps xA1 yA1 x0 y0
+  if !a1Blocked && na.candLeft then
+    match mvfInterAt pic sps xA1 yA1 with
+    | some m =>
+      availA1 := true
+      cands := cands.push m
+    | none => pure ()
+  let b1Blocked := (!single && partIdx == 1 && (part == part2NxN || part == part2NxnU || part == part2NxnD)) ||
+    diffMer pps xB1 yB1 x0 y0
+  if !b1Blocked && na.candUp then
+    match mvfInterAt pic sps xB1 yB1 with
+    | some m =>
+      availB1 := true
+      let dup := availA1 && sameMvRef m ((mvfAt pic sps xA1 yA1).getD mvfZero)
+      if !dup then cands := cands.push m
+    | none => pure ()
+  let b0Ok := na.candUpRightSap && xB0.toNat < sps.width &&
+    zscanAvail sps pps x0 y0 xB0 yB0 &&
+    !diffMer pps xB0 yB0 x0 y0
+  if b0Ok then
+    match mvfInterAt pic sps xB0 yB0 with
+    | some m =>
+      let dup := availB1 && sameMvRef m ((mvfAt pic sps xB1 yB1).getD mvfZero)
+      if !dup then cands := cands.push m
+    | none => pure ()
+  let a0Ok := na.candBottomLeft && yA0.toNat < sps.height &&
+    zscanAvail sps pps x0 y0 xA0 yA0 &&
+    !diffMer pps xA0 yA0 x0 y0
+  if a0Ok then
+    match mvfInterAt pic sps xA0 yA0 with
+    | some m =>
+      let dup := availA1 && sameMvRef m ((mvfAt pic sps xA1 yA1).getD mvfZero)
+      if !dup then cands := cands.push m
+    | none => pure ()
+  let b2Ok := na.candUpLeft && !diffMer pps xB2 yB2 x0 y0
+  if b2Ok && cands.size != 4 then
+    match mvfInterAt pic sps xB2 yB2 with
+    | some m =>
+      let dupA := availA1 && sameMvRef m ((mvfAt pic sps xA1 yA1).getD mvfZero)
+      let dupB := availB1 && sameMvRef m ((mvfAt pic sps xB1 yB1).getD mvfZero)
+      if !dupA && !dupB then cands := cands.push m
+    | none => pure ()
+  if sh.sliceTemporalMvpEnabledFlag && cands.size < sh.maxNumMergeCand then
+    if let some col := tmvpMerge pic sps sh x0 y0 pw ph then
+      cands := cands.push col
+  let nbOrig := cands.size
+  if sh.sliceType == sliceB && 1 < nbOrig && nbOrig < sh.maxNumMergeCand then
+    let mut comb := 0
+    let lim := nbOrig * (nbOrig - 1)
+    while cands.size < sh.maxNumMergeCand && comb < lim && comb < hevcL0L1CandIdx.size do
+      let (i0, i1) := hevcL0L1CandIdx[comb]!
+      comb := comb + 1
+      let l0 := cands.getD i0 mvfZero
+      let l1 := cands.getD i1 mvfZero
+      if (l0.predFlag &&& pfL0) != 0 && (l1.predFlag &&& pfL1) != 0 then
+        let p0 := refPocOpt pic.rpl 0 l0.refIdx0
+        let p1 := refPocOpt pic.rpl 1 l1.refIdx1
+        if !(p0 == p1 && l0.mv0 == l1.mv1) then
+          cands := cands.push { predFlag := pfBi, refIdx0 := l0.refIdx0, refIdx1 := l1.refIdx1, mv0 := l0.mv0, mv1 := l1.mv1 }
+  let nbRefs := if sh.sliceType == sliceP then sh.nbRefs.getD 0 0
+    else Nat.min (sh.nbRefs.getD 0 0) (sh.nbRefs.getD 1 0)
+  let mut zeroIdx := 0
+  while cands.size < sh.maxNumMergeCand do
+    let r := if zeroIdx < nbRefs then zeroIdx else 0
+    let pfZ := if sh.sliceType == sliceB then pfBi else pfL0
+    cands := cands.push { predFlag := pfZ, refIdx0 := Int.ofNat r, refIdx1 := Int.ofNat r, mv0 := (0, 0), mv1 := (0, 0) }
+    zeroIdx := zeroIdx + 1
+  if pw2 + ph2 == 12 then
+    for i in [:cands.size] do
+      let c := cands[i]!
+      if c.predFlag == pfBi then cands := cands.set! i { c with predFlag := pfL0 }
+  return cands
+
+def mvpList (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (x0 y0 pw ph lx ridx mvpFlag : Nat) : Int × Int := Id.run do
+  let na := computeNeighAvail ctx sps x0 y0 pw ph
+  let targetPoc := (pic.rpl.getD lx {}).poc.getD ridx 0
+  let targetLt := (pic.rpl.getD lx {}).lt.getD ridx false
+  let pocOf (m : HevcMvf) (ll : Nat) : Option (Int × Bool) :=
+    let ri := mvfRefIdx m ll
+    let pocs := (pic.rpl.getD ll {}).poc
+    if ri < 0 || ri.toNat >= pocs.size then none
+    else some (pocs[ri.toNat]!, (pic.rpl.getD ll {}).lt.getD ri.toNat false)
+  let matchUnscaled (m : HevcMvf) (ll : Nat) : Option (Int × Int) :=
+    let bit := if ll == 0 then pfL0 else pfL1
+    if (m.predFlag &&& bit) == 0 then none
+    else
+      match pocOf m ll with
+      | some (poc, _) => if poc == targetPoc then some (mvfMv m ll) else none
+      | none => none
+  let matchScaled (m : HevcMvf) (ll : Nat) : Option (Int × Int) :=
+    let bit := if ll == 0 then pfL0 else pfL1
+    if (m.predFlag &&& bit) == 0 then none
+    else
+      match pocOf m ll with
+      | none => none
+      | some (poc, lt) =>
+        if lt != targetLt then none
+        else
+          let mv := mvfMv m ll
+          if !targetLt && poc != targetPoc then
+            let td0 := pic.poc - poc
+            let td := if td0 == 0 then 1 else td0
+            some (mvScale mv td (pic.poc - targetPoc))
+          else some mv
+  let firstMatch (candsXy : Array (Int × Int × Bool))
+      (fn : HevcMvf → Nat → Option (Int × Int)) : Option (Int × Int) := Id.run do
+    for (px, py, ok) in candsXy do
+      if ok then
+        if let some m := mvfInterAt pic sps px py then
+          for ll in [lx, 1 - lx] do
+            if let some got := fn m ll then return some got
+    return none
+  let xA0 : Int := Int.ofNat x0 - 1
+  let yA0 : Int := Int.ofNat (y0 + ph)
+  let xA1 : Int := Int.ofNat x0 - 1
+  let yA1 : Int := Int.ofNat (y0 + ph) - 1
+  let a0Ok := na.candBottomLeft && yA0.toNat < sps.height &&
+    zscanAvail sps pps x0 y0 xA0 yA0
+  let left : Array (Int × Int × Bool) := #[(xA0, yA0, a0Ok), (xA1, yA1, na.candLeft)]
+  let mut scaledFromLeft := false
+  for (px, py, ok) in left do
+    if ok && (mvfInterAt pic sps px py).isSome then scaledFromLeft := true
+  let mxA0? := firstMatch left matchUnscaled
+  let (mxA?, aOk) :=
+    match mxA0? with
+    | some v => (some v, true)
+    | none =>
+      match firstMatch left matchScaled with
+      | some v => (some v, true)
+      | none => (none, false)
+  let xB0 : Int := Int.ofNat (x0 + pw)
+  let yB0 : Int := Int.ofNat y0 - 1
+  let xB1 : Int := Int.ofNat (x0 + pw) - 1
+  let yB1 : Int := Int.ofNat y0 - 1
+  let xB2 : Int := Int.ofNat x0 - 1
+  let yB2 : Int := Int.ofNat y0 - 1
+  let b0Ok := na.candUpRightSap && xB0.toNat < sps.width &&
+    zscanAvail sps pps x0 y0 xB0 yB0
+  let above : Array (Int × Int × Bool) :=
+    #[(xB0, yB0, b0Ok), (xB1, yB1, na.candUp), (xB2, yB2, na.candUpLeft)]
+  let mut mxA? := mxA?
+  let mut aOk := aOk
+  let mut mxB? := firstMatch above matchUnscaled
+  let mut bOk := mxB?.isSome
+  if !scaledFromLeft then
+    if bOk then
+      mxA? := mxB?
+      aOk := true
+    mxB? := firstMatch above matchScaled
+    bOk := mxB?.isSome
+  let mut cands : Array (Int × Int) := #[]
+  if aOk then if let some v := mxA? then cands := cands.push v
+  if bOk then
+    if let some vb := mxB? then
+      if !aOk || vb != mxA?.getD (0, 0) then cands := cands.push vb
+  if cands.size < 2 && sh.sliceTemporalMvpEnabledFlag && mvpFlag == cands.size then
+    if let some col := tmvpLx pic sps sh x0 y0 pw ph ridx lx then
+      cands := cands.push col
+  while cands.size < 2 do
+    cands := cands.push (0, 0)
+  return cands[Nat.min mvpFlag (cands.size - 1)]!
+
+def decodeAmvp (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 pw ph log2Cb : Nat) : Option (HevcMvf × HevcCabacReader × Array Nat) := do
+  let ctDepth := sps.log2CtbSize - log2Cb
+  let (inter0, c1, st1) :=
+    if sh.sliceType == sliceB then decInterPredIdc c0 st0 pw ph ctDepth else (predL0, c0, st0)
+  let inter := if pw + ph == 12 && inter0 == predBi then predL0 else inter0
+  let pf := if inter == predL1 then pfL1 else if inter == predBi then pfBi else pfL0
+  let mut mvf : HevcMvf := { predFlag := pf }
+  let mut c := c1
+  let mut st := st1
+  let lxs : Array Nat := if inter == predL1 then #[1] else if inter == predL0 then #[0] else #[0, 1]
+  for lx in lxs do
+    let nb := sh.nbRefs.getD lx 0
+    let (ridx, c', st') := if nb > 1 then decRefIdx c st nb else (0, c, st)
+    c := c'
+    st := st'
+    mvf := mvfSet mvf lx (Int.ofNat ridx) (0, 0)
+    let (mvd, c2, st2) ←
+      if lx == 1 && sh.mvdL1ZeroFlag && inter == predBi then some ((0, 0), c, st)
+      else
+        match decMvd c st with
+        | some (mx, my, c2, st2) => some ((mx, my), c2, st2)
+        | none => none
+    c := c2
+    st := st2
+    let (mvpFlag, c3, st3) := decMvpLxFlag c st
+    c := c3
+    st := st3
+    let mvp := mvpList ctx pic sps pps sh x0 y0 pw ph lx ridx mvpFlag
+    mvf := mvfSet mvf lx (Int.ofNat ridx) (mvp.1 + mvd.1, mvp.2 + mvd.2)
+  some (mvf, c, st)
+
+def decodePredictionUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
+    (pps : HevcPps) (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 pw ph log2Cb predMode part partIdx : Nat) :
+    Option (HevcCtbCtx × HevcDecodedFrame × Array ByteArray × HevcCabacReader × Array Nat) := do
+  let (ctx, mvf, c, st) ←
+    if predMode == modeSkip then
+      let (idx, c1, st1) := decMergeIdx c0 st0 sh.maxNumMergeCand
+      let mvf := (mergeCandidates ctx0 pic0 sps pps sh x0 y0 pw ph log2Cb part partIdx).getD idx mvfZero
+      some (ctx0, mvf, c1, st1)
+    else
+      let (mf, c1, st1) := decMergeFlag c0 st0
+      if mf != 0 then
+        let (idx, c2, st2) := decMergeIdx c1 st1 sh.maxNumMergeCand
+        let mvf := (mergeCandidates ctx0 pic0 sps pps sh x0 y0 pw ph log2Cb part partIdx).getD idx mvfZero
+        some ({ ctx0 with mergeFlag := 1 }, mvf, c2, st2)
+      else
+        let (mvf, c2, st2) ← decodeAmvp ctx0 pic0 sps pps sh c1 st1 x0 y0 pw ph log2Cb
+        some ({ ctx0 with mergeFlag := 0 }, mvf, c2, st2)
+  let pic1 := storeMvfBlock pic0 sps x0 y0 pw ph mvf
+  let planes := mcPu8 pic1.planes sps pps sh mvf pic1.rpl x0 y0 pw ph
+  some (ctx, { pic1 with planes := planes }, planes, c, st)
+
+def decodeInterPus (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 log2Cb part : Nat) :
+    Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
+  let cb := 1 <<< log2Cb
+  let parts : Array (Nat × Nat × Nat × Nat) :=
+    if part == part2Nx2N then #[(0, 0, cb, cb)]
+    else if part == part2NxN then #[(0, 0, cb, cb >>> 1), (0, cb >>> 1, cb, cb >>> 1)]
+    else if part == partNx2N then #[(0, 0, cb >>> 1, cb), (cb >>> 1, 0, cb >>> 1, cb)]
+    else if part == partNxN then
+      #[(0, 0, cb >>> 1, cb >>> 1), (cb >>> 1, 0, cb >>> 1, cb >>> 1),
+        (0, cb >>> 1, cb >>> 1, cb >>> 1), (cb >>> 1, cb >>> 1, cb >>> 1, cb >>> 1)]
+    else if part == part2NxnU then #[(0, 0, cb, cb >>> 2), (0, cb >>> 2, cb, (cb * 3) >>> 2)]
+    else if part == part2NxnD then #[(0, 0, cb, (cb * 3) >>> 2), (0, (cb * 3) >>> 2, cb, cb >>> 2)]
+    else if part == partNLx2N then #[(0, 0, cb >>> 2, cb), (cb >>> 2, 0, (cb * 3) >>> 2, cb)]
+    else #[(0, 0, (cb * 3) >>> 2, cb), ((cb * 3) >>> 2, 0, cb >>> 2, cb)]
+  let mut ctx := { ctx0 with mergeFlag := 0, cuX := x0, cuY := y0 }
+  let mut pic := pic0
+  let mut c := c0
+  let mut st := st0
+  for partIdx in [:parts.size] do
+    let (ox, oy, pw, ph) := parts[partIdx]!
+    let (ctx', pic', _, c', st') ←
+      decodePredictionUnit ctx pic sps pps sh c st (x0 + ox) (y0 + oy) pw ph log2Cb modeInter part partIdx
+    ctx := ctx'
+    pic := pic'
+    c := c'
+    st := st'
+  some (ctx, pic, c, st)
+
+def decodePcmSamples (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (x0 y0 log2Cb : Nat) :
+    Option (HevcDecodedFrame × HevcCabacReader) := do
+  let cb := 1 <<< log2Cb
+  let pcmInfo ← sps.pcm?
+  let nbytes := (cb * cb * pcmInfo.bitDepth + 2 * ((cb >>> 1) * (cb >>> 1)) * pcmInfo.bitDepthChroma + 7) >>> 3
+  let (pcm, c1) ← c0.readPcmAndReinit nbytes
+  let mut pic := fillIpmBlock pic0 sps x0 y0 cb cb intraDc true
+  if !sh.disableDeblockingFilterFlag then
+    pic := updateDeblockBs ctx pic sps pps sh x0 y0 log2Cb
+  if pcmInfo.loopFilterDisableFlag then
+    pic := fillPcmFlagBlock pic sps x0 y0 log2Cb 1
+  let mut gb := HevcBitReader.ofBytes pcm
+  let bd := pcmInfo.bitDepth
+  let bdc := pcmInfo.bitDepthChroma
+  let mut yPlane := pic.planes.getD 0 ByteArray.empty
+  for yy in [:cb] do
+    let row := (y0 + yy) * sps.width + x0
+    for xx in [:cb] do
+      let (v, gb') ← gb.getBits bd
+      gb := gb'
+      yPlane := yPlane.set! (row + xx) (v <<< (8 - bd)).toUInt8
+  let mut planes := pic.planes.set! 0 yPlane
+  for cIdx in [1, 2] do
+    let mut p := planes.getD cIdx ByteArray.empty
+    for yy in [:(cb >>> 1)] do
+      let row := ((y0 >>> 1) + yy) * (sps.width >>> 1) + (x0 >>> 1)
+      for xx in [:(cb >>> 1)] do
+        let (v, gb') ← gb.getBits bdc
+        gb := gb'
+        p := p.set! (row + xx) (v <<< (8 - bdc)).toUInt8
+    planes := planes.set! cIdx p
+  some ({ pic with planes := planes }, c1)
+
+def decodeIntraModes (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
+    (c0 : HevcCabacReader) (st0 : Array Nat) (x0 y0 log2Cb part : Nat) :
+    HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat := Id.run do
+  let split := part == partNxN
+  let pb := (1 <<< log2Cb) >>> (if split then 1 else 0)
+  let side := if split then 2 else 1
+  let n := side * side
+  let mut flags : Array Nat := Array.mkEmpty n
+  let mut c := c0
+  let mut st := st0
+  for _ in [:n] do
+    let (f, c', st') := decPrevIntraLumaPredFlag c st
+    c := c'
+    st := st'
+    flags := flags.push f
+  let mut modes : Array Nat := Array.mkEmpty n
+  let mut pic := pic0
+  for i in [:side] do
+    for j in [:side] do
+      let px := x0 + pb * j
+      let py := y0 + pb * i
+      let idx := modes.size
+      let (m, c', st') :=
+        if flags.getD idx 0 != 0 then
+          let (mpmIdx, c') := decMpmIdx c
+          (deriveLumaIntraMode ctx0 pic sps px py true mpmIdx 0, c', st)
+        else
+          let (rem, c') := decRemIntraLumaPredMode c
+          (deriveLumaIntraMode ctx0 pic sps px py false 0 rem, c', st)
+      c := c'
+      st := st'
+      modes := modes.push m
+      pic := fillIpmBlock pic sps px py pb pb m true
+  let (chromaMode, c2, st2) := decIntraChromaPredMode c st
+  let luma0 := modes.getD 0 intraDc
+  let chromaPred :=
+    if chromaMode == 4 then luma0
+    else
+      let mapped := hevcIntraChromaModes.getD chromaMode 0
+      if luma0 == mapped then 34 else mapped
+  return ({ ctx0 with chromaPredMode := chromaPred, intraLumaModes := modes }, pic, c2, st2)
+
+def qpyPredAt (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (x0 y0 : Nat) : Int × Bool :=
+  let ctbMask := (1 <<< sps.log2CtbSize) - 1
+  let qgMask := (1 <<< (sps.log2CtbSize - pps.diffCuQpDeltaDepth)) - 1
+  let xQg := x0 - (x0 &&& qgMask)
+  let yQg := y0 - (y0 &&& qgMask)
+  let pred0 := if ctx.firstQpGroup || (xQg == 0 && yQg == 0) then sh.sliceQp else ctx.qpyPred
+  let firstNext := if ctx.firstQpGroup || (xQg == 0 && yQg == 0) then !ctx.cuQpDeltaCoded else ctx.firstQpGroup
+  let availA := (x0 &&& ctbMask) != 0 && (xQg &&& ctbMask) != 0
+  let availB := (y0 &&& ctbMask) != 0 && (yQg &&& ctbMask) != 0
+  let qa :=
+    if availA then
+      pic.qpY.getD ((yQg >>> sps.log2MinCbSize) * sps.minCbWidth + ((xQg >>> sps.log2MinCbSize) - 1)) pred0
+    else pred0
+  let qb :=
+    if availB then
+      pic.qpY.getD (((yQg >>> sps.log2MinCbSize) - 1) * sps.minCbWidth + (xQg >>> sps.log2MinCbSize)) pred0
+    else pred0
+  (asrInt (qa + qb + 1) 1, firstNext)
+
+def setCbfLumaBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Size : Nat) :
+    HevcDecodedFrame := Id.run do
+  let step := 1 <<< sps.log2MinTbSize
+  let mut tab := pic0.cbfLuma
+  let mut yy := y0
+  while yy < y0 + (1 <<< log2Size) do
+    let mut xx := x0
+    while xx < x0 + (1 <<< log2Size) do
+      tab := tab.set! ((yy >>> sps.log2MinTbSize) * sps.minTbWidth + (xx >>> sps.log2MinTbSize)) 1
+      xx := xx + step
+    yy := yy + step
+  return { pic0 with cbfLuma := tab }
+
+def applyResidualBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (c0 : HevcCabacReader) (st0 : Array Nat) (x0 y0 log2Size scanIdx cIdx predMode tqb : Nat)
+    (qpY qpCb qpCr : Int) (isIntra : Bool) :
+    Option (HevcDecodedFrame × HevcCabacReader × Array Nat) := do
+  let (res, c1, st1) ← decodeResidualCoding c0 st0 sps pps log2Size scanIdx cIdx predMode tqb qpY qpCb qpCr
+  let planeIdx := cIdx
+  let (stride, dstX, dstY, lg) :=
+    if cIdx == 0 then (sps.width, x0, y0, log2Size)
+    else (sps.width >>> 1, x0 >>> 1, y0 >>> 1, log2Size)
+  let plane := pic0.planes.getD planeIdx ByteArray.empty
+  let plane' := inverseTransformAndAdd plane stride dstX dstY res.coeffs lg cIdx isIntra
+    res.transformSkipFlag tqb (if res.dcOnly then 0 else res.colLimit)
+  some ({ pic0 with planes := pic0.planes.set! planeIdx plane' }, c1, st1)
+
+def decodeTransformUnit (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 xBase yBase cbX cbY _log2Cb log2Size blkIdx cbfLuma0 : Nat)
+    (cbfCb cbfCr : Array Nat) (predMode tqb : Nat) :
+    Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
+  let mode := if predMode == modeIntra then ctx.tuLumaMode else intraDc
+  let mut pic := pic0
+  if predMode == modeIntra then
+    let na := computeNeighAvail ctx sps x0 y0 (1 <<< log2Size) (1 <<< log2Size)
+    let plane := intraPred8 (pic.planes.getD 0 ByteArray.empty) sps.width sps pps pic.tabMvf na
+      x0 y0 log2Size 0 mode
+    pic := { pic with planes := pic.planes.set! 0 plane }
+  let cbfChroma := cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0
+  let mut ctx := ctx
+  let mut c := c0
+  let mut st := st0
+  if cbfLuma0 != 0 || cbfChroma then
+    if pps.cuQpDeltaEnabledFlag && !ctx.cuQpDeltaCoded then
+      let (delta, c', st') ← decCuQpDelta c st
+      c := c'
+      st := st'
+      let (qpPred, firstNext) := qpyPredAt ctx pic sps pps sh cbX cbY
+      let qpY := if delta != 0 then (qpPred + delta + 52) % 52 else qpPred
+      ctx := { ctx with cuQpDelta := delta, cuQpDeltaCoded := true, qpY := qpY, firstQpGroup := firstNext }
+  let (scan, scanC) :=
+    if predMode == modeIntra && log2Size < 4 then
+      let s := if 6 <= mode && mode <= 14 then scanVert else if 22 <= mode && mode <= 30 then scanHoriz else scanDiag
+      let cm := ctx.chromaPredMode
+      let sc := if 6 <= cm && cm <= 14 then scanVert else if 22 <= cm && cm <= 30 then scanHoriz else scanDiag
+      (s, sc)
+    else (scanDiag, scanDiag)
+  let qpCb := mapQpC (clipInt (ctx.qpY + pps.cbQpOffset + sh.cbQpOffset) 0 57)
+  let qpCr := mapQpC (clipInt (ctx.qpY + pps.crQpOffset + sh.crQpOffset) 0 57)
+  if cbfLuma0 != 0 then
+    let (pic', c', st') ← applyResidualBlock pic sps pps c st x0 y0 log2Size scan 0 predMode tqb
+      ctx.qpY qpCb qpCr (predMode == modeIntra)
+    pic := pic'
+    c := c'
+    st := st'
+  if log2Size > 2 then
+    if predMode == modeIntra then
+      let na := computeNeighAvail ctx sps x0 y0 (1 <<< log2Size) (1 <<< log2Size)
+      for cIdx in [1, 2] do
+        let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) (sps.width >>> 1) sps pps pic.tabMvf na
+          x0 y0 (log2Size - 1) cIdx ctx.chromaPredMode
+        pic := { pic with planes := pic.planes.set! cIdx plane }
+    for (cIdx, cbf) in [1, 2].zip [cbfCb.getD 0 0, cbfCr.getD 0 0] do
+      if cbf != 0 then
+        let (pic', c', st') ← applyResidualBlock pic sps pps c st x0 y0 (log2Size - 1) scanC cIdx predMode tqb
+          ctx.qpY qpCb qpCr (predMode == modeIntra)
+        pic := pic'
+        c := c'
+        st := st'
+  else if blkIdx == 3 then
+    if predMode == modeIntra then
+      let na := computeNeighAvail ctx sps xBase yBase 8 8
+      for cIdx in [1, 2] do
+        let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) (sps.width >>> 1) sps pps pic.tabMvf na
+          xBase yBase 2 cIdx ctx.chromaPredMode
+        pic := { pic with planes := pic.planes.set! cIdx plane }
+    for (cIdx, cbf) in [1, 2].zip [cbfCb.getD 0 0, cbfCr.getD 0 0] do
+      if cbf != 0 then
+        let (pic', c', st') ← applyResidualBlock pic sps pps c st xBase yBase 2 scanC cIdx predMode tqb
+          ctx.qpY qpCb qpCr (predMode == modeIntra)
+        pic := pic'
+        c := c'
+        st := st'
+  some (ctx, pic, c, st)
+
+def decodeTransformTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 xBase yBase cbX cbY log2Cb log2Size trafoDepth blkIdx predMode part tqb : Nat)
+    (cbfCb0 cbfCr0 : Array Nat) (maxDepth : Nat) :
+    Nat → Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat)
+  | 0 => none
+  | fuel + 1 => do
+    let tuMode :=
+      if predMode == modeIntra && part == partNxN && trafoDepth == 1 then
+        ctx0.intraLumaModes.getD blkIdx intraDc
+      else if trafoDepth == 0 && predMode == modeIntra then
+        ctx0.intraLumaModes.getD 0 intraDc
+      else ctx0.tuLumaMode
+    let ctx1 := { ctx0 with tuLumaMode := tuMode }
+    let intraSplit := predMode == modeIntra && part == partNxN
+    let mut c := c0
+    let mut st := st0
+    let mut split := false
+    if log2Size <= sps.log2MaxTrafoSize && log2Size > sps.log2MinTbSize &&
+        trafoDepth < maxDepth && !(intraSplit && trafoDepth == 0) then
+      let (sp, c', st') := decSplitTransformFlag c st log2Size
+      c := c'
+      st := st'
+      split := sp != 0
+    else
+      let interSplit := sps.maxTrafoDepthInter == 0 && predMode != modeIntra &&
+        part != part2Nx2N && trafoDepth == 0
+      split := log2Size > sps.log2MaxTrafoSize || (intraSplit && trafoDepth == 0) || interSplit
+    let mut cbfCb := cbfCb0
+    let mut cbfCr := cbfCr0
+    if log2Size > 2 then
+      if trafoDepth == 0 || cbfCb.getD 0 0 != 0 then
+        let (v, c', st') := decCbfCbCr c st trafoDepth
+        c := c'
+        st := st'
+        cbfCb := #[v, 0]
+      if trafoDepth == 0 || cbfCr.getD 0 0 != 0 then
+        let (v, c', st') := decCbfCbCr c st trafoDepth
+        c := c'
+        st := st'
+        cbfCr := #[v, 0]
+    if split then
+      let off := 1 <<< (log2Size - 1)
+      let offs : Array (Nat × Nat) := #[(0, 0), (off, 0), (0, off), (off, off)]
+      let mut ctx := ctx1
+      let mut pic := pic0
+      for i in [:4] do
+        let (ox, oy) := offs[i]!
+        let (ctx', pic', c', st') ← decodeTransformTree ctx pic sps pps sh c st
+          (x0 + ox) (y0 + oy) x0 y0 cbX cbY log2Cb (log2Size - 1) (trafoDepth + 1) i
+          predMode part tqb cbfCb cbfCr maxDepth fuel
+        ctx := ctx'
+        pic := pic'
+        c := c'
+        st := st'
+      some (ctx, pic, c, st)
+    else
+      let mut cbfLuma := 1
+      if predMode == modeIntra || trafoDepth != 0 || cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0 then
+        let (v, c', st') := decCbfLuma c st trafoDepth
+        c := c'
+        st := st'
+        cbfLuma := v
+      let (ctx2, pic1, c2, st2) ← decodeTransformUnit ctx1 pic0 sps pps sh c st
+        x0 y0 xBase yBase cbX cbY log2Cb log2Size blkIdx cbfLuma cbfCb cbfCr predMode tqb
+      let mut pic2 := if cbfLuma != 0 then setCbfLumaBlock pic1 sps x0 y0 log2Size else pic1
+      if !sh.disableDeblockingFilterFlag then
+        pic2 := updateDeblockBs ctx2 pic2 sps pps sh x0 y0 log2Size
+        if tqb != 0 then pic2 := fillPcmFlagBlock pic2 sps x0 y0 log2Size 2
+      some (ctx2, pic2, c2, st2)
+
+def updateQpyPredAtEdge (ctx : HevcCtbCtx) (sps : HevcSps) (pps : HevcPps)
+    (x0 y0 log2Cb : Nat) : HevcCtbCtx :=
+  let qpMask := (1 <<< (sps.log2CtbSize - pps.diffCuQpDeltaDepth)) - 1
+  let cb := 1 <<< log2Cb
+  if ((x0 + cb) &&& qpMask) == 0 && ((y0 + cb) &&& qpMask) == 0 then
+    { ctx with qpyPred := ctx.qpY }
+  else ctx
+
+def decodeCodingUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 log2Cb depth : Nat) :
+    Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
+  let cb := 1 <<< log2Cb
+  let ctbMask := (1 <<< sps.log2CtbSize) - 1
+  let mut ctx := { ctx0 with ctDepth := depth }
+  if !pps.cuQpDeltaEnabledFlag then ctx := { ctx with qpY := sh.sliceQp }
+  let mut pic := setCtDepthBlock pic0 sps x0 y0 log2Cb depth
+  let mut c := c0
+  let mut st := st0
+  let mut tqb := 0
+  if pps.transquantBypassEnableFlag then
+    let (v, c', st') := decCuTransquantBypass c st
+    c := c'
+    st := st'
+    tqb := v
+    if tqb != 0 then pic := fillPcmFlagBlock pic sps x0 y0 log2Cb 2
+  let mut skip := 0
+  if sh.sliceType != sliceI then
+    let sl := if ctx.ctbLeft || (x0 &&& ctbMask) != 0 then skipAt pic sps (Int.ofNat x0 - 1) (Int.ofNat y0) else 0
+    let su := if ctx.ctbUp || (y0 &&& ctbMask) != 0 then skipAt pic sps (Int.ofNat x0) (Int.ofNat y0 - 1) else 0
+    let (sk, c', st') := decSkipFlag c st sl su
+    c := c'
+    st := st'
+    skip := sk
+  pic := fillSkipBlock pic sps x0 y0 log2Cb skip
+  if skip != 0 then
+    let (ctx1, pic1, _, c1, st1) ← decodePredictionUnit ctx pic sps pps sh c st
+      x0 y0 cb cb log2Cb modeSkip part2Nx2N 0
+    ctx := ctx1
+    pic := fillIpmBlock pic1 sps x0 y0 cb cb intraDc false
+    if !sh.disableDeblockingFilterFlag then
+      pic := updateDeblockBs ctx pic sps pps sh x0 y0 log2Cb
+    if pps.cuQpDeltaEnabledFlag && !ctx.cuQpDeltaCoded then
+      let (qpPred, firstNext) := qpyPredAt ctx pic sps pps sh x0 y0
+      ctx := { ctx with qpY := qpPred, firstQpGroup := firstNext }
+    pic := setQpCbBlock pic sps x0 y0 log2Cb ctx.qpY
+    ctx := updateQpyPredAtEdge ctx sps pps x0 y0 log2Cb
+    some (ctx, pic, c1, st1)
+  else
+    let mut predMode := modeIntra
+    if sh.sliceType != sliceI then
+      let (pm, c', st') := decPredMode c st
+      c := c'
+      st := st'
+      predMode := pm
+    let mut part := part2Nx2N
+    if predMode != modeIntra || log2Cb == sps.log2MinCbSize then
+      let (pt, c', st') := decPartMode c st log2Cb sps.log2MinCbSize predMode (if sps.ampEnabledFlag then 1 else 0)
+      c := c'
+      st := st'
+      part := pt
+    let mut pcm := false
+    if predMode == modeIntra then
+      if part == part2Nx2N && sps.pcmEnabledFlag then
+        if let some pcmInfo := sps.pcm? then
+          if pcmInfo.log2MinPcmCbSize <= log2Cb && log2Cb <= pcmInfo.log2MaxPcmCbSize then
+            let (pf, c') := decPcmFlag c
+            c := c'
+            pcm := pf != 0
+      if pcm then
+        let (picPcm, cPcm) ← decodePcmSamples ctx pic sps pps sh c x0 y0 log2Cb
+        pic := picPcm
+        c := cPcm
+      else
+        let (ctxI, picI, cI, stI) := decodeIntraModes ctx pic sps c st x0 y0 log2Cb part
+        ctx := ctxI
+        pic := picI
+        c := cI
+        st := stI
+    else
+      pic := fillIpmBlock pic sps x0 y0 cb cb intraDc false
+      let (ctxP, picP, cP, stP) ← decodeInterPus ctx pic sps pps sh c st x0 y0 log2Cb part
+      ctx := ctxP
+      pic := picP
+      c := cP
+      st := stP
+    if !pcm then
+      let mut rqtRootCbf := 1
+      if predMode != modeIntra && !(part == part2Nx2N && ctx.mergeFlag != 0) then
+        let (rc, c', st') := decNoResidualDataFlag c st
+        c := c'
+        st := st'
+        rqtRootCbf := rc
+      if rqtRootCbf != 0 then
+        let intraSplit := predMode == modeIntra && part == partNxN
+        let maxDepth :=
+          if predMode == modeIntra then sps.maxTrafoDepthIntra + (if intraSplit then 1 else 0)
+          else sps.maxTrafoDepthInter
+        let (ctxT, picT, cT, stT) ← decodeTransformTree ctx pic sps pps sh c st
+          x0 y0 x0 y0 x0 y0 log2Cb log2Cb 0 0 predMode part tqb #[0, 0] #[0, 0] maxDepth 8
+        ctx := ctxT
+        pic := picT
+        c := cT
+        st := stT
+      else if !sh.disableDeblockingFilterFlag then
+        pic := updateDeblockBs ctx pic sps pps sh x0 y0 log2Cb
+    if pps.cuQpDeltaEnabledFlag && !ctx.cuQpDeltaCoded then
+      let (qpPred, firstNext) := qpyPredAt ctx pic sps pps sh x0 y0
+      ctx := { ctx with qpY := qpPred, firstQpGroup := firstNext }
+    pic := setQpCbBlock pic sps x0 y0 log2Cb ctx.qpY
+    ctx := updateQpyPredAtEdge ctx sps pps x0 y0 log2Cb
+    some (ctx, pic, c, st)
+
+def decodeCodingTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (x0 y0 log2Cb depth : Nat) :
+    Nat → Option (Bool × HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat)
+  | 0 => none
+  | fuel + 1 => do
+    let w := sps.width
+    let h := sps.height
+    let cb := 1 <<< log2Cb
+    let ctbMask := (1 <<< sps.log2CtbSize) - 1
+    let mut ctx := { ctx0 with ctDepth := depth }
+    let mut c := c0
+    let mut st := st0
+    let mut split := false
+    if x0 + cb <= w && y0 + cb <= h && log2Cb > sps.log2MinCbSize then
+      let dl := if ctx.ctbLeft || (x0 &&& ctbMask) != 0 then ctDepthAt pic0 sps (Int.ofNat x0 - 1) (Int.ofNat y0) else 0
+      let dt := if ctx.ctbUp || (y0 &&& ctbMask) != 0 then ctDepthAt pic0 sps (Int.ofNat x0) (Int.ofNat y0 - 1) else 0
+      let (sp, c', st') := decSplitCuFlag c st dl dt depth
+      c := c'
+      st := st'
+      split := sp != 0
+    else
+      split := log2Cb > sps.log2MinCbSize
+    if pps.cuQpDeltaEnabledFlag && log2Cb >= sps.log2CtbSize - pps.diffCuQpDeltaDepth then
+      ctx := { ctx with cuQpDeltaCoded := false, cuQpDelta := 0 }
+    if split then
+      let half := log2Cb - 1
+      let off := 1 <<< half
+      let offs : Array (Nat × Nat) := #[(0, 0), (off, 0), (0, off), (off, off)]
+      let mut more := true
+      let mut pic := pic0
+      for i in [:4] do
+        let (ox, oy) := offs[i]!
+        if more && x0 + ox < w && y0 + oy < h then
+          let (m', ctx', pic', c', st') ← decodeCodingTree ctx pic sps pps sh c st
+            (x0 + ox) (y0 + oy) half (depth + 1) fuel
+          more := m'
+          ctx := ctx'
+          pic := pic'
+          c := c'
+          st := st'
+      ctx := updateQpyPredAtEdge ctx sps pps x0 y0 log2Cb
+      some (more, ctx, pic, c, st)
+    else
+      let (ctx1, pic1, c1, st1) ← decodeCodingUnit ctx pic0 sps pps sh c st x0 y0 log2Cb depth
+      let atCtbEdge := (((x0 + cb) &&& ctbMask) == 0 || x0 + cb >= w) &&
+        (((y0 + cb) &&& ctbMask) == 0 || y0 + cb >= h)
+      if atCtbEdge then
+        let (term, c2) := c1.decodeTerminate
+        some (term == 0, ctx1, pic1, c2, st1)
+      else some (true, ctx1, pic1, c1, st1)
+
+def decodeSaoCtb (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat) (rs : Nat) :
+    HevcDecodedFrame × HevcCabacReader × Array Nat := Id.run do
+  if !sps.saoEnabled || (!sh.saoLumaFlag && !sh.saoChromaFlag) then
+    return (pic0, c0, st0)
+  let mut c := c0
+  let mut st := st0
+  let mut mergeLeft := false
+  if ctx.ctbLeft then
+    let (f, c', st') := decSaoMergeFlag c st
+    c := c'
+    st := st'
+    mergeLeft := f != 0
+  if mergeLeft then
+    let prev := pic0.sao.getD (rs - 1) {}
+    return ({ pic0 with sao := pic0.sao.set! rs prev }, c, st)
+  let mut mergeUp := false
+  if ctx.ctbUp then
+    let (f, c', st') := decSaoMergeFlag c st
+    c := c'
+    st := st'
+    mergeUp := f != 0
+  if mergeUp then
+    let prev := pic0.sao.getD (rs - sps.ctbWidth) {}
+    return ({ pic0 with sao := pic0.sao.set! rs prev }, c, st)
+  let mut sao := pic0.sao.getD rs {}
+  for cIdx in [:3] do
+    let active := if cIdx == 0 then sh.saoLumaFlag else sh.saoChromaFlag
+    if active then
+      if cIdx == 2 then
+        sao := { sao with
+          typeIdx := sao.typeIdx.set! 2 (sao.typeIdx.getD 1 0)
+          eoClass := sao.eoClass.set! 2 (sao.eoClass.getD 1 0) }
+      else
+        let (ti, c', st') := decSaoTypeIdx c st
+        c := c'
+        st := st'
+        sao := { sao with typeIdx := sao.typeIdx.set! cIdx ti }
+      let ti := sao.typeIdx.getD cIdx 0
+      if ti != 0 then
+        let mut offs : Array Int := Array.mkEmpty 4
+        for _ in [:4] do
+          let (ov, c') := decSaoOffsetAbs c 8
+          c := c'
+          offs := offs.push (Int.ofNat ov)
+        let mut row := sao.offsetVal.getD cIdx #[0, 0, 0, 0, 0]
+        if ti == saoBand then
+          for i in [:4] do
+            let mut v := offs[i]!
+            if v != 0 then
+              let (sg, c') := c.decodeBypass
+              c := c'
+              if sg != 0 then v := -v
+            row := row.set! (i + 1) v
+          let (bp, c') := decSaoBandPosition c
+          c := c'
+          sao := { sao with
+            offsetVal := sao.offsetVal.set! cIdx row
+            bandPosition := sao.bandPosition.set! cIdx bp }
+        else
+          if cIdx != 2 then
+            let (eo, c') := decSaoEoClass c
+            c := c'
+            sao := { sao with eoClass := sao.eoClass.set! cIdx eo }
+          row := (((row.set! 1 (offs[0]!)).set! 2 (offs[1]!)).set! 3 (-offs[2]!)).set! 4 (-offs[3]!)
+          sao := { sao with offsetVal := sao.offsetVal.set! cIdx row }
+  return ({ pic0 with sao := pic0.sao.set! rs sao }, c, st)
+
+def decodeCtb (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+    (rs xCtb yCtb : Nat) :
+    Option (Bool × HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
+  let x0 := xCtb <<< sps.log2CtbSize
+  let y0 := yCtb <<< sps.log2CtbSize
+  let ctbSize := 1 <<< sps.log2CtbSize
+  let inSlice : Int := Int.ofNat rs - Int.ofNat sh.sliceAddrRs
+  let ts := pps.ctbAddrRsToTs.getD rs 0
+  let leftTile := xCtb > 0 && pps.tilesEnabledFlag &&
+    pps.tileId.getD ts 0 != pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - 1) 0) 0
+  let upTile := yCtb > 0 && pps.tilesEnabledFlag &&
+    pps.tileId.getD ts 0 != pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - sps.ctbWidth) 0) 0
+  let ctbLeft := xCtb > 0 && inSlice > 0 && !leftTile
+  let ctbUp := yCtb > 0 && inSlice >= Int.ofNat sps.ctbWidth && !upTile
+  let ctbUpRight := yCtb > 0 && inSlice + 1 >= Int.ofNat sps.ctbWidth && xCtb + 1 < sps.ctbWidth &&
+    pps.tileId.getD ts 0 == pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs + 1 - sps.ctbWidth) 0) 0
+  let ctbUpLeft := xCtb > 0 && yCtb > 0 && inSlice - 1 >= Int.ofNat sps.ctbWidth &&
+    pps.tileId.getD ts 0 == pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - 1 - sps.ctbWidth) 0) 0
+  let endY := Nat.min (yCtb * ctbSize + ctbSize) sps.height
+  let bndLeftSlice :=
+    if !pps.tilesEnabledFlag then inSlice <= 0
+    else xCtb > 0 && pic0.sliceAddr.getD (rs - 1) (-1) != Int.ofNat sh.sliceAddrRs
+  let bndUpperSlice :=
+    if !pps.tilesEnabledFlag then inSlice < Int.ofNat sps.ctbWidth
+    else yCtb > 0 && pic0.sliceAddr.getD (rs - sps.ctbWidth) (-1) != Int.ofNat sh.sliceAddrRs
+  let ctx1 : HevcCtbCtx := { ctx0 with
+    ctbLeft := ctbLeft
+    ctbUp := ctbUp
+    ctbUpRight := ctbUpRight
+    ctbUpLeft := ctbUpLeft
+    endOfTilesY := endY
+    boundaryLeftSlice := bndLeftSlice
+    boundaryUpperSlice := bndUpperSlice
+    boundaryLeftTile := leftTile
+    boundaryUpperTile := upTile }
+  let (pic1, c1, st1) := decodeSaoCtb ctx1 pic0 sps sh c0 st0 rs
+  decodeCodingTree ctx1 pic1 sps pps sh c1 st1 x0 y0 sps.log2CtbSize 0 8
+
+def decodeSlices (dpb : Array HevcDecodedFrame) (pic0 : HevcDecodedFrame)
+    (sps : HevcSps) (pps : HevcPps) (headers : Array HevcSliceHeader) :
+    Option HevcDecodedFrame := do
+  let mut pic := pic0
+  let mut ctx : HevcCtbCtx := {}
+  let mut sliceRpl : Array HevcRpl := #[{}, {}]
+  let mut wppSaved? : Option (Array Nat) := none
+  for sh in headers do
+    if !sh.dependentSliceSegmentFlag then
+      let rpl := buildSliceRpl dpb sps sh
+      pic := { pic with rpl := rpl }
+      sliceRpl := rpl
+      ctx := { ctx with firstQpGroup := true, qpyPred := sh.sliceQp, qpY := sh.sliceQp }
+    let cabacInit := if sh.cabacInitFlag then 1 else 0
+    let mut cabacState := initCabacStates sh.sliceType cabacInit sh.sliceQp
+    let mut subIdx := 0
+    if sh.substreams.isEmpty then none
+    let mut cabac ← HevcCabacReader.init? (sh.substreams.getD 0 ByteArray.empty) 0
+    let addr0 := sh.sliceCtbAddrRs
+    if addr0 >= pps.ctbAddrRsToTs.size then none
+    let ts0 := pps.ctbAddrRsToTs[addr0]!
+    let mut endTilesX := sps.width
+    if pps.tilesEnabledFlag && !pps.entropyCodingSyncEnabledFlag then
+      let xCtb0 := addr0 % sps.ctbWidth
+      let idxX := pps.colIdxX.getD xCtb0 0
+      endTilesX := (xCtb0 + pps.columnWidth.getD idxX 1) <<< sps.log2CtbSize
+    ctx := { ctx with endOfTilesX := endTilesX }
+    let mut ts := ts0
+    let mut keepGoing := true
+    while ts < sps.ctbSize && keepGoing do
+      let rs := pps.ctbAddrTsToRs.getD ts 0
+      let xCtb := rs % sps.ctbWidth
+      let yCtb := rs / sps.ctbWidth
+      let newTile := pps.tilesEnabledFlag && ts > ts0 &&
+        pps.tileId.getD ts 0 != pps.tileId.getD (ts - 1) 0
+      let newRow := pps.entropyCodingSyncEnabledFlag && xCtb == 0 && ts > ts0
+      if newTile && !pps.entropyCodingSyncEnabledFlag then
+        let idxX := pps.colIdxX.getD xCtb 0
+        ctx := { ctx with endOfTilesX := (xCtb + pps.columnWidth.getD idxX 1) <<< sps.log2CtbSize }
+      if newTile || newRow then
+        if sh.numEntryPointOffsets > 0 then
+          subIdx := subIdx + 1
+          if subIdx >= sh.substreams.size then none
+          let cNext ← HevcCabacReader.init? (sh.substreams[subIdx]!) 0
+          cabac := cNext
+        else
+          let (_, cTerm) := cabac.decodeTerminate
+          let cRe ← cTerm.reinit
+          cabac := cRe
+        cabacState :=
+          if newTile || sps.ctbWidth == 1 then initCabacStates sh.sliceType cabacInit sh.sliceQp
+          else
+            match wppSaved? with
+            | some saved => saved
+            | none => initCabacStates sh.sliceType cabacInit sh.sliceQp
+        ctx := { ctx with qpyPred := sh.sliceQp, firstQpGroup := true }
+      pic := { pic with
+        sliceAddr := pic.sliceAddr.set! rs (Int.ofNat sh.sliceAddrRs)
+        lfase := pic.lfase.set! rs sh.sliceLoopFilterAcrossSlicesEnabledFlag
+        deblock := pic.deblock.set! rs { betaOffset := sh.betaOffset, tcOffset := sh.tcOffset }
+        rplTab := pic.rplTab.set! rs (some sliceRpl) }
+      let (more, ctx', pic', cabac', st') ← decodeCtb ctx pic sps pps sh cabac cabacState rs xCtb yCtb
+      ctx := ctx'
+      pic := pic'
+      cabac := cabac'
+      cabacState := st'
+      if !more then
+        keepGoing := false
+      else
+        if pps.entropyCodingSyncEnabledFlag && (xCtb == 1 || (sps.ctbWidth == 1 && xCtb == 0)) then
+          wppSaved? := some cabacState
+      ts := ts + 1
+  some pic
+
+structure HevcDecoderState where
+  vpsMap       : Array (Option HevcVps) := Array.replicate 16 none
+  spsMap       : Array (Option HevcSps) := Array.replicate 16 none
+  ppsMap       : Array (Option HevcPps) := Array.replicate 64 none
+  dpb          : Array HevcDecodedFrame := #[]
+  pocTid0      : Int := 0
+  prevIndepSh? : Option HevcSliceHeader := none
+  output       : Array HevcDecodedFrame := #[]
+  deriving Inhabited
+
+def bumpDpb (dpb0 output0 : Array HevcDecodedFrame) (sps : HevcSps) (pic : HevcDecodedFrame)
+    (sh : HevcSliceHeader) (pocTid0 : Int) :
+    Array HevcDecodedFrame × Array HevcDecodedFrame × Int := Id.run do
+  let mut dpb := sortFramesByPoc (dpb0.push pic)
+  let mut output := output0
+  let maxSub := if sps.maxDecPicBuffering.isEmpty then 0 else sps.maxDecPicBuffering.size - 1
+  let maxBuf := sps.maxDecPicBuffering.getD maxSub 1
+  let reorder := sps.numReorderPics.getD maxSub 0
+  let mut fuel := dpb.size + 2
+  while fuel > 0 do
+    fuel := fuel - 1
+    let mut pendingCnt := 0
+    let mut oldestIdx? : Option Nat := none
+    for idx in [:dpb.size] do
+      let f := dpb[idx]!
+      if f.outputFlag && !f.outputted then
+        pendingCnt := pendingCnt + 1
+        match oldestIdx? with
+        | none => oldestIdx? := some idx
+        | some oi => if f.poc < (dpb[oi]!).poc then oldestIdx? := some idx
+    match oldestIdx? with
+    | none => fuel := 0
+    | some oi =>
+      if pendingCnt > reorder || dpb.size > maxBuf then
+        let f := { dpb[oi]! with outputted := true }
+        output := output.push f
+        dpb := dpb.set! oi f
+        let mut nextDpb : Array HevcDecodedFrame := #[]
+        for g in dpb do
+          if g.referenced || (g.outputFlag && !g.outputted) then nextDpb := nextDpb.push g
+        dpb := nextDpb
+      else
+        fuel := 0
+  let nextPocTid0 :=
+    if sh.tid == 0 && sh.nalType != 0 && sh.nalType != 2 && sh.nalType != 4 &&
+        sh.nalType != 6 && sh.nalType != 7 && sh.nalType != 8 && sh.nalType != 9 then
+      sh.poc
+    else pocTid0
+  return (dpb, output, nextPocTid0)
+
+def flushDpb (st : HevcDecoderState) : HevcDecoderState := Id.run do
+  let sorted := sortFramesByPoc st.dpb
+  let mut out := st.output
+  let mut dpbNext : Array HevcDecodedFrame := #[]
+  for f in sorted do
+    if f.outputFlag && !f.outputted then
+      let f' := { f with outputted := true }
+      out := out.push f'
+      dpbNext := dpbNext.push f'
+    else
+      dpbNext := dpbNext.push f
+  return { st with dpb := dpbNext, output := out }
+
+def decodePictureSlices (st0 : HevcDecoderState) (slices : Array (Nat × Nat × ByteArray)) :
+    Option HevcDecoderState := do
+  if slices.isEmpty then some st0
+  else
+    let mut prevSh? := st0.prevIndepSh?
+    let mut headers : Array HevcSliceHeader := Array.mkEmpty slices.size
+    for (nalType, tid, payload) in slices do
+      let sh ← parseSliceHeader payload nalType tid st0.spsMap st0.ppsMap prevSh? st0.pocTid0
+      if !sh.dependentSliceSegmentFlag then prevSh? := some sh
+      headers := headers.push sh
+    let sh0 := headers[0]!
+    if sh0.spsId >= st0.spsMap.size || sh0.ppsId >= st0.ppsMap.size then none
+    let sps ← st0.spsMap[sh0.spsId]!
+    let pps ← st0.ppsMap[sh0.ppsId]!
+    let mut dpb := st0.dpb
+    if isIrap sh0.nalType && sh0.noOutputOfPriorPicsFlag then
+      if isBla sh0.nalType || isIdr sh0.nalType then dpb := #[]
+    dpb := markDpbRps dpb sps sh0
+    let pic0 := newDecodedFrame sps sh0
+    let mut pic ← decodeSlices dpb pic0 sps pps headers
+    if !sh0.disableDeblockingFilterFlag then
+      let planes := deblockFrame8 pic.planes sps pps pic.qpY pic.isPcm pic.deblock
+        pic.vbs pic.hbs pic.bsW
+      pic := { pic with planes := planes }
+    if sps.saoEnabled then
+      let planes := saoFrame8 pic.planes sps pps pic.sao pic.sliceAddr pic.lfase pic.isPcm
+      pic := { pic with planes := planes }
+    let (dpbNext, outNext, pocTid0Next) := bumpDpb dpb st0.output sps pic sh0 st0.pocTid0
+    some { st0 with dpb := dpbNext, output := outNext, pocTid0 := pocTid0Next, prevIndepSh? := prevSh? }
+
+def decodeHevcStreamState (data : ByteArray) : Option (HevcDecoderState × String) := do
+  let (nals, container) ← extractHevcNals data
+  if nals.isEmpty then none
+  let mut st : HevcDecoderState := {}
+  let mut picSlices : Array (Nat × Nat × ByteArray) := #[]
+  let mut sawVcl := false
+  for nal in nals do
+    let (nalType, _, tid) ← parseNalHeader nal
+    let payload := nal.extract 2 nal.size
+    if nalType == nalVps then
+      let rm ← stripRbspWithMap payload
+      let v ← parseVps rm.rbsp
+      if v.vpsId >= st.vpsMap.size then none
+      st := { st with vpsMap := st.vpsMap.set! v.vpsId (some v) }
+    else if nalType == nalSps then
+      let rm ← stripRbspWithMap payload
+      let s ← parseSps rm.rbsp
+      if s.spsId >= st.spsMap.size then none
+      st := { st with spsMap := st.spsMap.set! s.spsId (some s) }
+    else if nalType == nalPps then
+      let rm ← stripRbspWithMap payload
+      let p ← parsePps rm.rbsp st.spsMap
+      if p.ppsId >= st.ppsMap.size then none
+      st := { st with ppsMap := st.ppsMap.set! p.ppsId (some p) }
+    else if nalType <= 21 then
+      sawVcl := true
+      if picSlices.isEmpty then
+        picSlices := #[(nalType, tid, payload)]
+      else
+        let shProbe ← parseSliceHeader payload nalType tid st.spsMap st.ppsMap st.prevIndepSh? st.pocTid0
+        if shProbe.firstSliceInPicFlag then
+          st ← decodePictureSlices st picSlices
+          picSlices := #[(nalType, tid, payload)]
+        else
+          picSlices := picSlices.push (nalType, tid, payload)
+  if !sawVcl then none
+  if !picSlices.isEmpty then
+    st ← decodePictureSlices st picSlices
+  some (flushDpb st, container)
+
+def cropFrameYuv420p (f : HevcDecodedFrame) (sps : HevcSps) : ByteArray := Id.run do
+  let cl := sps.confLeft
+  let cr := sps.confRight
+  let ct := sps.confTop
+  let cb := sps.confBottom
+  let w := sps.width
+  let h := sps.height
+  let cw := w >>> 1
+  let yPlane := f.planes.getD 0 ByteArray.empty
+  let mut out := ByteArray.empty
+  for row in [ct:(h - cb)] do
+    out := out ++ yPlane.extract (row * w + cl) (row * w + (w - cr))
+  for cIdx in [1, 2] do
+    let p := f.planes.getD cIdx ByteArray.empty
+    for row in [(ct >>> 1):((h - cb) >>> 1)] do
+      out := out ++ p.extract (row * cw + (cl >>> 1)) (row * cw + ((w - cr) >>> 1))
+  return out
+
+def decodeHevcToYuv420p (data : ByteArray) : Option (Nat × Nat × Nat × ByteArray) := do
+  let (st, _) ← decodeHevcStreamState data
+  if st.output.isEmpty then none
+  let f0 := st.output[0]!
+  let sps0 ← st.spsMap.getD f0.spsId none
+  let mut out := ByteArray.empty
+  for f in st.output do
+    let sps ← st.spsMap.getD f.spsId none
+    out := out ++ cropFrameYuv420p f sps
+  some (sps0.croppedWidth, sps0.croppedHeight, st.output.size, out)
+
+def probeHevcStreamJson (data : ByteArray) : Option String := do
+  let (nals, container) ← extractHevcNals data
+  if nals.isEmpty then none
+  let mut vpsMap : Array (Option HevcVps) := Array.replicate 16 none
+  let mut spsMap : Array (Option HevcSps) := Array.replicate 16 none
+  let mut ppsMap : Array (Option HevcPps) := Array.replicate 64 none
+  let mut firstSps? : Option HevcSps := none
+  let mut firstPps? : Option HevcPps := none
+  let mut prevSh? : Option HevcSliceHeader := none
+  let mut pocTid0 : Int := 0
+  let mut frameCount := 0
+  let mut sliceJsons : Array String := #[]
+  for nal in nals do
+    let (nalType, _, tid) ← parseNalHeader nal
+    let payload := nal.extract 2 nal.size
+    if nalType == nalVps then
+      let rm ← stripRbspWithMap payload
+      let v ← parseVps rm.rbsp
+      if v.vpsId >= vpsMap.size then none
+      vpsMap := vpsMap.set! v.vpsId (some v)
+    else if nalType == nalSps then
+      let rm ← stripRbspWithMap payload
+      let s ← parseSps rm.rbsp
+      if s.spsId >= spsMap.size then none
+      spsMap := spsMap.set! s.spsId (some s)
+      if firstSps?.isNone then firstSps? := some s
+    else if nalType == nalPps then
+      let rm ← stripRbspWithMap payload
+      let p ← parsePps rm.rbsp spsMap
+      if p.ppsId >= ppsMap.size then none
+      ppsMap := ppsMap.set! p.ppsId (some p)
+      if firstPps?.isNone then firstPps? := some p
+    else if nalType <= 21 then
+      let sh ← parseSliceHeader payload nalType tid spsMap ppsMap prevSh? pocTid0
+      if !sh.dependentSliceSegmentFlag then prevSh? := some sh
+      if sh.firstSliceInPicFlag then
+        frameCount := frameCount + 1
+        if sh.tid == 0 && sh.nalType != 0 && sh.nalType != 2 && sh.nalType != 4 &&
+            sh.nalType != 6 && sh.nalType != 7 && sh.nalType != 8 && sh.nalType != 9 then
+          pocTid0 := sh.poc
+        let stName := if sh.sliceType == sliceI then "I" else if sh.sliceType == sliceP then "P" else "B"
+        sliceJsons := sliceJsons.push
+          s!"\{\"nal_type\":{sh.nalType},\"slice_type\":\"{stName}\",\"poc\":{sh.poc},\"qp\":{sh.sliceQp}}"
+  let sps ← firstSps?
+  let pps ← firstPps?
+  if frameCount == 0 then none
+  let slicesStr := String.intercalate "," sliceJsons.toList
+  let p0 := s!"\{\"ok\":true,\"codec\":\"hevc\",\"container\":\"{container}\","
+  let p1 := s!"\"profile_idc\":{sps.ptl.profileIdc},\"level_idc\":{sps.ptl.levelIdc},"
+  let p2 := s!"\"width\":{sps.croppedWidth},\"height\":{sps.croppedHeight},"
+  let p3 := s!"\"coded_width\":{sps.width},\"coded_height\":{sps.height},"
+  let p4 := s!"\"bit_depth_luma\":{sps.bitDepth},\"bit_depth_chroma\":{sps.bitDepthChroma},"
+  let p5 := s!"\"chroma_format_idc\":{sps.chromaFormatIdc},\"ctb_size\":{1 <<< sps.log2CtbSize},"
+  let p6 := s!"\"tiles\":{pps.tilesEnabledFlag},\"wpp\":{pps.entropyCodingSyncEnabledFlag},"
+  let p7 := s!"\"sao\":{sps.saoEnabled},\"weighted_pred\":{pps.weightedPredFlag || pps.weightedBipredFlag},"
+  let p8 := s!"\"frames\":{frameCount},\"slices\":[{slicesStr}]}"
+  some (p0 ++ p1 ++ p2 ++ p3 ++ p4 ++ p5 ++ p6 ++ p7 ++ p8)
 
 end LeanAV.HevcMain
