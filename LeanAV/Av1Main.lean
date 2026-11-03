@@ -129,7 +129,7 @@ def av1MaxTxfmForBs : Array Nat := #[
 ]
 
 def av1TxtpFromUvmode : Array Nat := #[
-  0, 1, 2, 0, 3, 1, 2, 2, 1, 0, 1, 2, 0, 0
+  0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 1, 2, 3, 0
 ]
 
 def av1CompInterPredModes : Array Nat := #[
@@ -7428,8 +7428,8 @@ def av1CalcLfValues (hdr : Av1FrameHdr) (lfDelta : Array Int) : Array Nat := Id.
   let multi := hdr.delta.lfMulti
   let baseOf (baseLvl : Nat) (dlt segD : Int) : Nat :=
     av1LfClip63 (Int.ofNat (av1LfClip63 (Int.ofNat baseLvl + dlt)) + segD)
-  let fill (baseOff base : Nat) : Array Nat := Id.run do
-    let mut dst := out
+  let fill (dst0 : Array Nat) (baseOff base : Nat) : Array Nat := Id.run do
+    let mut dst := dst0
     if !mr then
       for r in [:8] do
         dst := dst.set! (baseOff + r * 2) base
@@ -7449,16 +7449,16 @@ def av1CalcLfValues (hdr : Av1FrameHdr) (lfDelta : Array Int) : Array Nat := Id.
     let sd := if seg.enabled then seg.d.getD s {} else {}
     let segOn := seg.enabled
     let b0 := baseOf (lf.levelY.getD 0 0) (lfDelta.getD 0 0) (if segOn then sd.deltaLfYV else 0)
-    out := fill (s * 64 + 0 * 16) b0
+    out := fill out (s * 64 + 0 * 16) b0
     let d1 := if multi then lfDelta.getD 1 0 else lfDelta.getD 0 0
     let b1 := baseOf (lf.levelY.getD 1 0) d1 (if segOn then sd.deltaLfYH else 0)
-    out := fill (s * 64 + 1 * 16) b1
+    out := fill out (s * 64 + 1 * 16) b1
     let du := if multi then lfDelta.getD 2 0 else lfDelta.getD 0 0
     let dv := if multi then lfDelta.getD 3 0 else lfDelta.getD 0 0
     if lf.levelU != 0 then
-      out := fill (s * 64 + 2 * 16) (baseOf lf.levelU du (if segOn then sd.deltaLfU else 0))
+      out := fill out (s * 64 + 2 * 16) (baseOf lf.levelU du (if segOn then sd.deltaLfU else 0))
     if lf.levelV != 0 then
-      out := fill (s * 64 + 3 * 16) (baseOf lf.levelV dv (if segOn then sd.deltaLfV else 0))
+      out := fill out (s * 64 + 3 * 16) (baseOf lf.levelV dv (if segOn then sd.deltaLfV else 0))
   return out
 
 @[inline] def av1LfAt (lvl : Array Nat) (seg pl refIdx mode : Nat) : Nat :=
@@ -11323,7 +11323,7 @@ def av1DecodeInterB (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 bwLog2 bhLog2 w
       ref0 := Int.ofNat r0Nat
       ref1 := Int.ofNat r1Nat
       let (mvstack, nMvs, mctx) := av1FindRefMvs rf (ref0 + 1) (ref1 + 1) bs edgeFlags by4 bx ctx.col0 (Int.ofNat ctx.col1) ctx.row0 (Int.ofNat ctx.row1)
-      let (cmSym, d5, c5) := dec.decodeSymbolAdapt cdf (cdfOff_m_comp_inter_mode + av1CompModeCtx mctx * 8) 7
+      let (cmSym, d5, c5) := dec.decodeSymbolAdapt cdf (cdfOff_m_comp_inter_mode + mctx * 8) 7
       dec := d5; cdf := c5
       ymode := av1NearestNearestMv + cmSym
       let g0 := av1GetGmv2d (fh.gmv.getD r0Nat {}) bx by4 bw4 bh4 fh
