@@ -5917,7 +5917,7 @@ def av1EncodeCoefs (enc0 : Av1MsacEncoder) (cdf0 : Array Nat) (qcoeff : Array In
     (tx bs : Nat) (intra : Bool) (plane yMode uvMode : Nat)
     (reduced : Bool) (qidx : Nat) (lossless : Bool)
     (aArr : Array Nat) (aOff : Nat) (lArr : Array Nat) (lOff : Nat)
-    (dqDc dqAc : Nat) :
+    (dqDc dqAc : Nat) (txtpIn : Nat := 0) :
     Int × Nat × Nat × Array Int × Av1MsacEncoder × Array Nat := Id.run do
   let mut enc := enc0
   let mut cdf := cdf0
@@ -5943,7 +5943,7 @@ def av1EncodeCoefs (enc0 : Av1MsacEncoder) (cdf0 : Array Nat) (qcoeff : Array In
   else if av1TxfmDim.getD (tx * 8 + 5) 0 + (if intra then 1 else 0) >= 4 then
     txtp := av1DctDct
   else if chroma != 0 then
-    txtp := if intra then av1TxtpFromUvmode.getD uvMode 0 else av1DctDct
+    txtp := if intra then av1TxtpFromUvmode.getD uvMode 0 else av1GetUvInterTxtp tx txtpIn
   else if qidx == 0 then
     txtp := av1DctDct
   else if intra then
@@ -12662,5 +12662,1420 @@ def probeAv1StreamJson (data : ByteArray) : Option String := Id.run do
   let p7 := s!"\"tiles\":{tilesEnabled},\"tile_cols\":{fh0.tiling.cols},\"tile_rows\":{fh0.tiling.rows},"
   let p8 := s!"\"frames\":{shownFrames},\"coded_frames\":{codedFrames},\"frame_headers\":[{framesStr}]}"
   return some (p0 ++ p1 ++ p2 ++ p3 ++ p4 ++ p5 ++ p6 ++ p7 ++ p8)
+
+private def av1FwdDct4_1d (s : Array Int) : Array Int :=
+  let s0 := s.getD 0 0 + s.getD 3 0
+  let s1 := s.getD 1 0 + s.getD 2 0
+  let s2 := s.getD 1 0 - s.getD 2 0
+  let s3 := s.getD 0 0 - s.getD 3 0
+  let x0 := av1HalfSqrt2 (s0 + s1)
+  let x2 := av1HalfSqrt2 (s0 - s1)
+  let x1 := av1ArithShiftRight (s3 * 3784 + s2 * 1567 + 2048) 12
+  let x3 := av1ArithShiftRight (s3 * 1567 - s2 * 3784 + 2048) 12
+  #[x0, x1, x2, x3]
+
+private def av1FwdDct8_1d (s : Array Int) : Array Int :=
+  let ev4 := av1FwdDct4_1d #[
+    s.getD 0 0 + s.getD 7 0,
+    s.getD 1 0 + s.getD 6 0,
+    s.getD 2 0 + s.getD 5 0,
+    s.getD 3 0 + s.getD 4 0
+  ]
+  let e0 := av1HalfSqrt2 (ev4.getD 0 0)
+  let e1 := av1HalfSqrt2 (ev4.getD 1 0)
+  let e2 := av1HalfSqrt2 (ev4.getD 2 0)
+  let e3 := av1HalfSqrt2 (ev4.getD 3 0)
+  let d0 := s.getD 0 0 - s.getD 7 0
+  let d1 := s.getD 1 0 - s.getD 6 0
+  let d2 := s.getD 2 0 - s.getD 5 0
+  let d3 := s.getD 3 0 - s.getD 4 0
+  let u5 := av1HalfSqrt2 (d1 - d2)
+  let u6 := av1HalfSqrt2 (d1 + d2)
+  let b4 := d3 - u5
+  let b5 := d3 + u5
+  let b7 := d0 + u6
+  let b6 := d0 - u6
+  let x1 := av1HalfSqrt2 (av1ArithShiftRight (b7 * 4017 + b5 * 799 + 2048) 12)
+  let x7 := av1HalfSqrt2 (av1ArithShiftRight (b7 * 799 - b5 * 4017 + 2048) 12)
+  let x5 := av1HalfSqrt2 (av1ArithShiftRight (b6 * 1138 + b4 * 1703 + 1024) 11)
+  let x3 := av1HalfSqrt2 (av1ArithShiftRight (b6 * 1703 - b4 * 1138 + 1024) 11)
+  #[e0, x1, e1, x3, e2, x5, e3, x7]
+
+def av1FwdTxfm2d (res : Array Int) (sz : Nat) (lossless : Bool) : Array Int := Id.run do
+  if lossless then
+    return av1Fwht4x4 res
+  let mut tmp : Array Int := Array.replicate (sz * sz) 0
+  for x in [:sz] do
+    let mut colIn : Array Int := Array.mkEmpty sz
+    for y in [:sz] do
+      colIn := colIn.push (res.getD (y * sz + x) 0 * 8)
+    let colOut := if sz == 4 then av1FwdDct4_1d colIn else av1FwdDct8_1d colIn
+    for y in [:sz] do
+      tmp := tmp.set! (y * sz + x) (colOut.getD y 0)
+  let mut cf : Array Int := Array.replicate (sz * sz) 0
+  for y in [:sz] do
+    let mut rowIn : Array Int := Array.mkEmpty sz
+    for x in [:sz] do
+      rowIn := rowIn.push (tmp.getD (y * sz + x) 0)
+    let rowOut := if sz == 4 then av1FwdDct4_1d rowIn else av1FwdDct8_1d rowIn
+    for x in [:sz] do
+      cf := cf.set! (y + x * sz) (av1ArithShiftRight (rowOut.getD x 0 + 1) 1)
+  return cf
+
+def av1QuantLevels (cf : Array Int) (dcDq acDq : Nat) (lossless : Bool) : Array Int := Id.run do
+  if lossless then
+    return cf
+  let mut out : Array Int := Array.mkEmpty cf.size
+  for idx in [:cf.size] do
+    let v := cf.getD idx 0
+    let dq := Nat.max 1 (if idx == 0 then dcDq else acDq)
+    let mag := v.natAbs
+    let q := (mag + (dq >>> 1)) / dq
+    out := out.push (if v < 0 then -(Int.ofNat q) else Int.ofNat q)
+  return out
+
+private def av1EncodeMvComp (enc0 : Av1MsacEncoder) (cdf0 : Array Nat)
+    (diff : Int) (comp : Nat) (mvPrec : Int) : Av1MsacEncoder × Array Nat := Id.run do
+  let mut enc := enc0
+  let mut cdf := cdf0
+  let offClasses := if comp == 0 then cdfOff_mv_comp0_classes else cdfOff_mv_comp1_classes
+  let offSign := if comp == 0 then cdfOff_mv_comp0_sign else cdfOff_mv_comp1_sign
+  let offClass0 := if comp == 0 then cdfOff_mv_comp0_class0 else cdfOff_mv_comp1_class0
+  let offClass0Fp := if comp == 0 then cdfOff_mv_comp0_class0_fp else cdfOff_mv_comp1_class0_fp
+  let offClass0Hp := if comp == 0 then cdfOff_mv_comp0_class0_hp else cdfOff_mv_comp1_class0_hp
+  let offClassN := if comp == 0 then cdfOff_mv_comp0_classN else cdfOff_mv_comp1_classN
+  let offClassNFp := if comp == 0 then cdfOff_mv_comp0_classN_fp else cdfOff_mv_comp1_classN_fp
+  let offClassNHp := if comp == 0 then cdfOff_mv_comp0_classN_hp else cdfOff_mv_comp1_classN_hp
+  let sign : Nat := if diff < 0 then 1 else 0
+  let (e1, c1) := enc.encodeBoolAdapt sign cdf offSign
+  enc := e1; cdf := c1
+  let mag : Nat := diff.natAbs - 1
+  let up : Nat := mag >>> 3
+  let fp : Nat := (mag >>> 1) &&& 3
+  let hp : Nat := mag &&& 1
+  if up <= 1 then
+    let (e2, c2) := enc.encodeSymbolAdapt 0 cdf offClasses 10
+    enc := e2; cdf := c2
+    let (e3, c3) := enc.encodeBoolAdapt up cdf offClass0
+    enc := e3; cdf := c3
+    if mvPrec >= 0 then
+      let (e4, c4) := enc.encodeSymbolAdapt fp cdf (offClass0Fp + up * 4) 3
+      enc := e4; cdf := c4
+      if mvPrec > 0 then
+        let (e5, c5) := enc.encodeBoolAdapt hp cdf offClass0Hp
+        enc := e5; cdf := c5
+  else
+    let cl := av1Ulog2 up
+    let (e2, c2) := enc.encodeSymbolAdapt cl cdf offClasses 10
+    enc := e2; cdf := c2
+    for i in [:cl] do
+      let (ei, ci) := enc.encodeBoolAdapt ((up >>> i) &&& 1) cdf (offClassN + i * 2)
+      enc := ei; cdf := ci
+    if mvPrec >= 0 then
+      let (e4, c4) := enc.encodeSymbolAdapt fp cdf offClassNFp 3
+      enc := e4; cdf := c4
+      if mvPrec > 0 then
+        let (e5, c5) := enc.encodeBoolAdapt hp cdf offClassNHp
+        enc := e5; cdf := c5
+  return (enc, cdf)
+
+def av1WriteMvResidual (enc0 : Av1MsacEncoder) (cdf0 : Array Nat)
+    (curY curX predY predX mvPrec : Int) : Av1MsacEncoder × Array Nat := Id.run do
+  let mut enc := enc0
+  let mut cdf := cdf0
+  let dy := curY - predY
+  let dx := curX - predX
+  let joint : Nat := ((if dy != 0 then 1 else 0) <<< 1) ||| (if dx != 0 then 1 else 0)
+  let (e1, c1) := enc.encodeSymbolAdapt joint cdf cdfOff_mv_joint 3
+  enc := e1; cdf := c1
+  if dy != 0 then
+    let (e2, c2) := av1EncodeMvComp enc cdf dy 0 mvPrec
+    enc := e2; cdf := c2
+  if dx != 0 then
+    let (e3, c3) := av1EncodeMvComp enc cdf dx 1 mvPrec
+    enc := e3; cdf := c3
+  return (enc, cdf)
+
+private def av1EncodeSingleRefZero (enc0 : Av1MsacEncoder) (cdf0 : Array Nat)
+    (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Av1MsacEncoder × Array Nat := Id.run do
+  let mut enc := enc0
+  let mut cdf := cdf0
+  let rc0 := av1GetRefCtx a l yb4 xb4 haveTop haveLeft
+  let (e1, c1) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_ref + rc0 * 2)
+  enc := e1; cdf := c1
+  let fc0 := av1GetFwdRefCtx a l yb4 xb4 haveTop haveLeft
+  let (e2, c2) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_ref + 12 + fc0 * 2)
+  enc := e2; cdf := c2
+  let fc1 := av1GetFwdRef1Ctx a l yb4 xb4 haveTop haveLeft
+  let (e3, c3) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_ref + 18 + fc1 * 2)
+  enc := e3; cdf := c3
+  return (enc, cdf)
+
+structure Av1EncoderCfg where
+  width         : Nat := 16
+  height        : Nat := 16
+  qidx          : Nat := 60
+  lossless      : Bool := false
+  tilesLog2Cols : Nat := 0
+  tilesLog2Rows : Nat := 0
+  enableCdef    : Bool := true
+  lfLevel       : Nat := 8
+  seqHdrObu     : ByteArray := ByteArray.empty
+  seq           : Av1SeqHdr := {}
+  deriving Inhabited
+
+structure Av1TileEncodeCtx where
+  cfg         : Av1EncoderCfg := {}
+  fh          : Av1FrameHdr := {}
+  enc         : Av1MsacEncoder := Av1MsacEncoder.init false
+  cdf         : Array Nat := #[]
+  flatY       : Array Nat := #[]
+  flatU       : Array Nat := #[]
+  flatV       : Array Nat := #[]
+  srcY        : Array Nat := #[]
+  srcU        : Array Nat := #[]
+  srcV        : Array Nat := #[]
+  yStride     : Nat := 0
+  uvStride    : Nat := 0
+  w           : Nat := 0
+  h           : Nat := 0
+  w4          : Nat := 0
+  h4          : Nat := 0
+  bw          : Nat := 0
+  bh          : Nat := 0
+  sb128w      : Nat := 0
+  b4Stride    : Nat := 0
+  above       : Array Av1BlockContext := #[]
+  left        : Av1BlockContext := {}
+  rf          : Option Av1RefMvFrame := none
+  lfMasks     : Array Av1LfMask := #[]
+  level       : Array Nat := #[]
+  levelY      : Array Nat := #[]
+  levelUv     : Array Nat := #[]
+  dcDq        : Nat := 4
+  acDq        : Nat := 4
+  col0        : Nat := 0
+  col1        : Nat := 0
+  row0        : Nat := 0
+  row1        : Nat := 0
+  sby         : Nat := 0
+  sbyBy       : Nat := 0
+  ipredEdgeY  : Array Nat := #[]
+  ipredEdgeU  : Array Nat := #[]
+  ipredEdgeV  : Array Nat := #[]
+  tl4x4Filter : Nat := 0
+  refs        : Array (Option Av1RefSlot) := #[]
+  deriving Inhabited
+
+private def av1EncWriteTiling (cfg : Av1EncoderCfg) (bw0 : Av1BitWriter) (tileSizeBytes : Nat) : Av1BitWriter := Id.run do
+  let mut bw := bw0
+  let sbszLog2 : Nat := 6
+  let sbw := (cfg.width + 63) >>> sbszLog2
+  let sbh := (cfg.height + 63) >>> sbszLog2
+  let maxTileWidthSb := 4096 >>> sbszLog2
+  let maxTileAreaSb := (4096 * 2304) >>> (2 * sbszLog2)
+  let minLog2Cols := av1TileLog2 maxTileWidthSb sbw
+  let maxLog2Cols := av1TileLog2 1 (Nat.min sbw 64)
+  let maxLog2Rows := av1TileLog2 1 (Nat.min sbh 64)
+  let minLog2Tiles := Nat.max (av1TileLog2 maxTileAreaSb (sbw * sbh)) minLog2Cols
+  bw := bw.putBit 1
+  let mut log2Cols := minLog2Cols
+  let targetCols := Nat.min maxLog2Cols (Nat.max minLog2Cols cfg.tilesLog2Cols)
+  while log2Cols < targetCols do
+    bw := bw.putBit 1
+    log2Cols := log2Cols + 1
+  if log2Cols < maxLog2Cols then
+    bw := bw.putBit 0
+  let minLog2Rows := if minLog2Tiles > log2Cols then minLog2Tiles - log2Cols else 0
+  let targetRows := Nat.min maxLog2Rows (Nat.max minLog2Rows cfg.tilesLog2Rows)
+  let mut log2Rows := minLog2Rows
+  while log2Rows < targetRows do
+    bw := bw.putBit 1
+    log2Rows := log2Rows + 1
+  if log2Rows < maxLog2Rows then
+    bw := bw.putBit 0
+  if log2Cols != 0 || log2Rows != 0 then
+    bw := bw.putBits 0 (log2Cols + log2Rows)
+    bw := bw.putBits (tileSizeBytes - 1) 2
+  return bw
+
+private def av1EncBuildFrameHdrBits (cfg : Av1EncoderCfg) (frameNum : Nat) (inter : Bool) (tileSizeBytes : Nat) : Av1BitWriter := Id.run do
+  let mut bw := Av1BitWriter.empty
+  bw := bw.putBit 0
+  bw := bw.putBits (if inter then 1 else 0) 2
+  bw := bw.putBit 1
+  if inter then
+    bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBits (frameNum &&& 0x7F) 7
+  if inter then
+    bw := bw.putBits 0 3
+    bw := bw.putBits 0xFF 8
+    bw := bw.putBit 0
+    for _ in [:7] do
+      bw := bw.putBits 0 3
+  bw := bw.putBit 0
+  if inter then
+    bw := bw.putBit 0
+    bw := bw.putBit 0
+    bw := bw.putBits 0 2
+    bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := av1EncWriteTiling cfg bw tileSizeBytes
+  bw := bw.putBits cfg.qidx 8
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  bw := bw.putBit 0
+  if cfg.qidx > 0 then
+    bw := bw.putBit 0
+  if !cfg.lossless then
+    bw := bw.putBits cfg.lfLevel 6
+    bw := bw.putBits cfg.lfLevel 6
+    if cfg.lfLevel > 0 then
+      bw := bw.putBits cfg.lfLevel 6
+      bw := bw.putBits cfg.lfLevel 6
+    bw := bw.putBits 0 3
+    bw := bw.putBit 1
+    bw := bw.putBit 0
+    if cfg.enableCdef then
+      bw := bw.putBits 2 2
+      bw := bw.putBits 1 2
+      bw := bw.putBits 0 6
+      bw := bw.putBits 0 6
+      bw := bw.putBits ((2 <<< 2) ||| 1) 6
+      bw := bw.putBits ((2 <<< 2) ||| 1) 6
+    bw := bw.putBit 1
+  if inter then
+    bw := bw.putBit 0
+  bw := bw.putBit 0
+  if inter then
+    for _ in [:7] do
+      bw := bw.putBit 0
+  return bw
+
+private def av1EncFillLfLevel (ctx0 : Av1TileEncodeCtx) (bx by4 bw4 bh4 cbw4 cbh4 : Nat)
+    (hasChroma : Bool) (rLf mLf : Nat) : Av1TileEncodeCtx := Id.run do
+  let lvl := ctx0.level
+  let stS := ctx0.b4Stride
+  let mut levelY := ctx0.levelY
+  let mut levelUv := ctx0.levelUv
+  let lfw4 := if bx < ctx0.w4 then Nat.min bw4 (ctx0.w4 - bx) else 0
+  let lfh4 := if by4 < ctx0.h4 then Nat.min bh4 (ctx0.h4 - by4) else 0
+  if lfw4 > 0 && lfh4 > 0 then
+    let lv0 := av1LfAt lvl 0 0 rLf mLf
+    let lv1 := av1LfAt lvl 0 1 rLf mLf
+    for yy in [:lfh4] do
+      let base := (by4 + yy) * stS + bx
+      for xx in [:lfw4] do
+        let o := (base + xx) * 2
+        levelY := levelY.set! o lv0
+        levelY := levelY.set! (o + 1) lv1
+  if hasChroma then
+    let cw4Tot := (ctx0.w4 + 1) >>> 1
+    let ch4Tot := (ctx0.h4 + 1) >>> 1
+    let cbx := bx >>> 1
+    let cby := by4 >>> 1
+    let lfcw4 := if cbx < cw4Tot then Nat.min (cw4Tot - cbx) cbw4 else 0
+    let lfch4 := if cby < ch4Tot then Nat.min (ch4Tot - cby) cbh4 else 0
+    if lfcw4 > 0 && lfch4 > 0 then
+      let lu := av1LfAt lvl 0 2 rLf mLf
+      let lv := av1LfAt lvl 0 3 rLf mLf
+      for yy in [:lfch4] do
+        let base := (cby + yy) * stS + cbx
+        for xx in [:lfcw4] do
+          let o := (base + xx) * 2
+          levelUv := levelUv.set! o lu
+          levelUv := levelUv.set! (o + 1) lv
+  return { ctx0 with levelY := levelY, levelUv := levelUv }
+
+private def av1EncodeResidualPlane (cfg : Av1EncoderCfg) (bs : Nat) (intra : Bool)
+    (enc0 : Av1MsacEncoder) (cdf0 : Array Nat) (plane : Nat) (pbuf0 : Array Nat)
+    (srcPlane : Array Nat) (srcW srcH px py doff stride tx sz yMode uvMode : Nat)
+    (aArr : Array Nat) (aOff : Nat) (lArr : Array Nat) (lOff : Nat)
+    (dcDq acDq : Nat) (txtpIn : Nat := 0) :
+    Nat × Nat × Array Nat × Av1MsacEncoder × Array Nat := Id.run do
+  let mut res : Array Int := Array.mkEmpty (sz * sz)
+  for ry in [:sz] do
+    for rx in [:sz] do
+      let sy := py + ry
+      let sx := px + rx
+      let orig : Nat := if sy < srcH && sx < srcW then srcPlane.getD (sy * srcW + sx) 128 else 128
+      let pred : Nat := pbuf0.getD (doff + ry * stride + rx) 128
+      res := res.push (Int.ofNat orig - Int.ofNat pred)
+  let raw := av1FwdTxfm2d res sz cfg.lossless
+  let levels := av1QuantLevels raw dcDq acDq cfg.lossless
+  let (eob, txtp, rctx, cfOut, enc1, cdf1) := av1EncodeCoefs
+    enc0 cdf0 levels tx bs intra plane yMode uvMode false cfg.qidx cfg.lossless
+    aArr aOff lArr lOff dcDq acDq txtpIn
+  let mut pbuf := pbuf0
+  if eob >= 0 then
+    let (_, _, lw, lh, _) := av1TxDim tx
+    let (pNext, _) := av1InvTxfmAdd pbuf stride cfOut eob tx (av1TxShift lw lh) txtp doff
+    pbuf := pNext
+  return (txtp, rctx, pbuf, enc1, cdf1)
+
+private def av1EncReconIntra (ctx0 : Av1TileEncodeCtx) (bs bx by4 _bw4 _bh4 w4 h4 _cbw4 _cbh4 cw4 ch4 : Nat)
+    (haveTop haveLeft hasChroma : Bool) (edgeFlags : Nat)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 tx uvTx yMode uvMode : Nat) :
+    Av1TileEncodeCtx × Av1BlockContext × Av1BlockContext := Id.run do
+  let cfg := ctx0.cfg
+  let mut ctx := ctx0
+  let mut a := a0
+  let mut l := l0
+  let mut enc := ctx.enc
+  let mut cdf := ctx.cdf
+  let mut flatY := ctx.flatY
+  let mut flatU := ctx.flatU
+  let mut flatV := ctx.flatV
+  let ys := ctx.yStride
+  let uvs := ctx.uvStride
+  let (tw4, th4, _, _, _) := av1TxDim tx
+  let (utw4, uth4, _, _, _) := av1TxDim uvTx
+  let sz := tw4 * 4
+  let mut yy : Nat := 0
+  while yy < h4 do
+    let mut xx : Nat := 0
+    while xx < w4 do
+      let px := (bx + xx) * 4
+      let py := (by4 + yy) * 4
+      let doff := py * ys + px
+      let ht : Bool := decide (by4 + yy > ctx.row0)
+      let hl : Bool := decide (bx + xx > ctx.col0)
+      let mut ef : Nat := 0
+      let noTr : Bool := (yy > 0 || (edgeFlags &&& av1EdgeI444TopHasRight) == 0) && decide (xx + tw4 >= w4)
+      if !noTr then ef := ef ||| av1EdgeI444TopHasRight
+      let noBl : Bool := xx > 0 || ((edgeFlags &&& av1EdgeI444LeftHasBottom) == 0 && decide (yy + th4 >= h4))
+      if !noBl then ef := ef ||| av1EdgeI444LeftHasBottom
+      let topSb : Option (Array Nat) :=
+        if ctx.sby > 0 && by4 + yy == ctx.sbyBy then some ctx.ipredEdgeY else none
+      let (m, ang, ebuf, tl) := av1PrepareIntraEdges
+        (bx + xx) hl (by4 + yy) ht ctx.col1 ctx.row1 ef
+        flatY doff ys topSb 0 yMode 0 tw4 th4 0
+      let smFlag : Nat :=
+        if (haveTop && av1IsSmoothMode (a.mode.getD xb4 0)) ||
+           (haveLeft && av1IsSmoothMode (l.mode.getD yb4 0)) then 512 else 0
+      let aArg := ang.toNat ||| smFlag
+      let mw := (ctx.bw - (bx + xx)) * 4
+      let mh := (ctx.bh - (by4 + yy)) * 4
+      flatY := av1IntraPred flatY doff ys ebuf tl m (tw4 * 4) (th4 * 4) aArg mw mh
+      let laSlice := a.lcoef.extract (xb4 + xx) (xb4 + xx + tw4)
+      let llSlice := l.lcoef.extract (yb4 + yy) (yb4 + yy + th4)
+      let (_, rctx, fy1, e1, c1) := av1EncodeResidualPlane
+        cfg bs true enc cdf 0 flatY ctx.srcY cfg.width cfg.height
+        px py doff ys tx sz yMode uvMode laSlice 0 llSlice 0 ctx.dcDq ctx.acDq
+      flatY := fy1; enc := e1; cdf := c1
+      let wFill := Nat.min tw4 (ctx.bw - (bx + xx))
+      let hFill := Nat.min th4 (ctx.bh - (by4 + yy))
+      let mut alc := a.lcoef
+      for k in [:wFill] do alc := alc.set! (xb4 + xx + k) rctx
+      a := { a with lcoef := alc }
+      let mut llc := l.lcoef
+      for k in [:hFill] do llc := llc.set! (yb4 + yy + k) rctx
+      l := { l with lcoef := llc }
+      xx := xx + tw4
+    yy := yy + th4
+  if hasChroma then
+    let csz := utw4 * 4
+    let cwSrc := (cfg.width + 1) >>> 1
+    let chSrc := (cfg.height + 1) >>> 1
+    for pl in [:2] do
+      let mut pbuf := if pl == 0 then flatU else flatV
+      let srcC := if pl == 0 then ctx.srcU else ctx.srcV
+      let topEdge := if pl == 0 then ctx.ipredEdgeU else ctx.ipredEdgeV
+      let mut cyy : Nat := 0
+      while cyy < ch4 do
+        let mut cxx : Nat := 0
+        while cxx < cw4 do
+          let tBx := bx + (cxx <<< 1)
+          let tBy := by4 + (cyy <<< 1)
+          let xpos := tBx >>> 1
+          let ypos := tBy >>> 1
+          let doff := ypos * 4 * uvs + xpos * 4
+          let mut ef : Nat := 0
+          let noTr : Bool := (cyy > 0 || (edgeFlags &&& av1EdgeI420TopHasRight) == 0) && decide (cxx + utw4 >= cw4)
+          if !noTr then ef := ef ||| av1EdgeI444TopHasRight
+          let noBl : Bool := cxx > 0 || ((edgeFlags &&& av1EdgeI420LeftHasBottom) == 0 && decide (cyy + uth4 >= ch4))
+          if !noBl then ef := ef ||| av1EdgeI444LeftHasBottom
+          let tByEven := tBy - (tBy &&& 1)
+          let tBxEven := tBx - (tBx &&& 1)
+          let topSb : Option (Array Nat) :=
+            if ctx.sby > 0 && tByEven == ctx.sbyBy then some topEdge else none
+          let hlC : Bool := decide (xpos > (ctx.col0 >>> 1))
+          let htC : Bool := decide (ypos > (ctx.row0 >>> 1))
+          let (m, ang, ebuf, tl) := av1PrepareIntraEdges
+            xpos hlC ypos htC (ctx.col1 >>> 1) (ctx.row1 >>> 1) ef
+            pbuf doff uvs topSb 0 uvMode 0 utw4 uth4 0
+          let smUv : Nat :=
+            if (htC && av1IsSmoothMode (a.uvmode.getD cxb4 0)) ||
+               (hlC && av1IsSmoothMode (l.uvmode.getD cyb4 0)) then 512 else 0
+          let aArg := ang.toNat ||| smUv
+          let mw := (4 * ctx.bw + 1 - 4 * tBxEven) >>> 1
+          let mh := (4 * ctx.bh + 1 - 4 * tByEven) >>> 1
+          pbuf := av1IntraPred pbuf doff uvs ebuf tl m (utw4 * 4) (uth4 * 4) aArg mw mh
+          let caArr := a.ccoef.getD pl #[]
+          let clArr := l.ccoef.getD pl #[]
+          let caSlice := caArr.extract (cxb4 + cxx) (cxb4 + cxx + utw4)
+          let clSlice := clArr.extract (cyb4 + cyy) (cyb4 + cyy + uth4)
+          let (_, rctx, pb1, e1, c1) := av1EncodeResidualPlane
+            cfg bs true enc cdf (1 + pl) pbuf srcC cwSrc chSrc
+            (xpos * 4) (ypos * 4) doff uvs uvTx csz yMode uvMode caSlice 0 clSlice 0 ctx.dcDq ctx.acDq
+          pbuf := pb1; enc := e1; cdf := c1
+          let wFill := Nat.min utw4 ((ctx.bw - tBx + 1) >>> 1)
+          let hFill := Nat.min uth4 ((ctx.bh - tBy + 1) >>> 1)
+          let mut caUpd := a.ccoef.getD pl #[]
+          for k in [:wFill] do caUpd := caUpd.set! (cxb4 + cxx + k) rctx
+          a := { a with ccoef := a.ccoef.set! pl caUpd }
+          let mut clUpd := l.ccoef.getD pl #[]
+          for k in [:hFill] do clUpd := clUpd.set! (cyb4 + cyy + k) rctx
+          l := { l with ccoef := l.ccoef.set! pl clUpd }
+          cxx := cxx + utw4
+        cyy := cyy + uth4
+      if pl == 0 then flatU := pbuf else flatV := pbuf
+  ctx := { ctx with enc := enc, cdf := cdf, flatY := flatY, flatU := flatU, flatV := flatV }
+  return (ctx, a, l)
+
+private def av1EncIntraB (ctx0 : Av1TileEncodeCtx)
+    (bs bx by4 bw4 bh4 _bwLog2 _bhLog2 w4 h4 cbw4 cbh4 cw4 ch4 : Nat)
+    (haveTop haveLeft hasChroma : Bool) (edgeFlags : Nat)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 : Nat) (lfm0 : Av1LfMask) :
+    Av1TileEncodeCtx × Av1BlockContext × Av1BlockContext × Av1LfMask := Id.run do
+  let cfg := ctx0.cfg
+  let fh := ctx0.fh
+  let mut ctx := ctx0
+  let mut a := a0
+  let mut l := l0
+  let mut lfm := lfm0
+  let mut enc := ctx.enc
+  let mut cdf := ctx.cdf
+  let keyOrIntra : Bool := fh.frameType == av1FrameKey || fh.frameType == av1FrameIntra
+  let yMode := av1DcPred
+  if keyOrIntra then
+    let am := av1IntraModeCtx.getD (a.mode.getD xb4 0) 0
+    let lm := av1IntraModeCtx.getD (l.mode.getD yb4 0) 0
+    let (e1, c1) := enc.encodeSymbolAdapt yMode cdf (cdfOff_kfym + (am * 5 + lm) * 16) 12
+    enc := e1; cdf := c1
+  else
+    let (e1, c1) := enc.encodeSymbolAdapt yMode cdf (cdfOff_m_y_mode + (av1YmodeSizeCtx.getD bs 0) * 16) 12
+    enc := e1; cdf := c1
+  let uvMode := av1DcPred
+  if hasChroma then
+    let cflOk : Bool := if cfg.lossless then (cbw4 == 1 && cbh4 == 1) else (cbw4 <= 8 && cbh4 <= 8)
+    let ubase := cdfOff_m_uv_mode + ((if cflOk then 13 else 0) + yMode) * 16
+    let (e2, c2) := enc.encodeSymbolAdapt uvMode cdf ubase (if cflOk then 13 else 12)
+    enc := e2; cdf := c2
+  if cfg.seq.filterIntra && yMode == av1DcPred && Nat.max bw4 bh4 <= 8 then
+    let (e3, c3) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_use_filter_intra + bs * 2)
+    enc := e3; cdf := c3
+  let tx : Nat := if cfg.lossless then 0 else av1MaxTxfmForBs.getD (bs * 4) 0
+  let uvTx : Nat := if cfg.lossless then 0 else av1MaxTxfmForBs.getD (bs * 4 + 1) 0
+  let tmax := av1TxfmDim.getD (tx * 8 + 5) 0
+  if !cfg.lossless && fh.txfmMode == 2 && tmax > 0 then
+    let (_, _, mlw, mlh, _) := av1TxDim tx
+    let tctx := av1GetTxCtx a l mlw mlh yb4 xb4
+    let (e4, c4) := enc.encodeSymbolAdapt 0 cdf (cdfOff_m_txsz + ((tmax - 1) * 3 + tctx) * 4) (Nat.min tmax 2)
+    enc := e4; cdf := c4
+  ctx := { ctx with enc := enc, cdf := cdf }
+  let (ctx1, a1, l1) := av1EncReconIntra
+    ctx bs bx by4 bw4 bh4 w4 h4 cbw4 cbh4 cw4 ch4
+    haveTop haveLeft hasChroma edgeFlags a l xb4 yb4 cxb4 cyb4 tx uvTx yMode uvMode
+  ctx := ctx1; a := a1; l := l1
+  let (_, _, lw, lh, _) := av1TxDim tx
+  let lfw4 := if bx < ctx.w4 then Nat.min bw4 (ctx.w4 - bx) else 0
+  let lfh4 := if by4 < ctx.h4 then Nat.min bh4 (ctx.h4 - by4) else 0
+  if lfw4 > 0 && lfh4 > 0 then
+    let aLpf := a.txLpfY.extract xb4 a.txLpfY.size
+    let lLpf := l.txLpfY.extract yb4 l.txLpfY.size
+    let (fyNew, _, _) := av1MaskEdgesIntra lfm.filterY yb4 xb4 lfw4 lfh4 tx aLpf lLpf
+    lfm := { lfm with filterY := fyNew }
+    let mut aty := a.txLpfY
+    for k in [:lfw4] do aty := aty.set! (xb4 + k) (Nat.min 2 lh)
+    a := { a with txLpfY := aty }
+    let mut lty := l.txLpfY
+    for k in [:lfh4] do lty := lty.set! (yb4 + k) (Nat.min 2 lw)
+    l := { l with txLpfY := lty }
+  if hasChroma then
+    let cw4Tot := (ctx.w4 + 1) >>> 1
+    let ch4Tot := (ctx.h4 + 1) >>> 1
+    let cbx := bx >>> 1
+    let cby := by4 >>> 1
+    let lfcw4 := if cbx < cw4Tot then Nat.min (cw4Tot - cbx) cbw4 else 0
+    let lfch4 := if cby < ch4Tot then Nat.min (ch4Tot - cby) cbh4 else 0
+    if lfcw4 > 0 && lfch4 > 0 then
+      let (_, _, ulw, ulh, _) := av1TxDim uvTx
+      let caLpf := a.txLpfUv.extract cxb4 a.txLpfUv.size
+      let clLpf := l.txLpfUv.extract cyb4 l.txLpfUv.size
+      let (fuvNew, _, _) := av1MaskEdgesChroma lfm.filterUv cyb4 cxb4 lfcw4 lfch4 false uvTx caLpf clLpf
+      lfm := { lfm with filterUv := fuvNew }
+      let mut atuv := a.txLpfUv
+      for k in [:lfcw4] do atuv := atuv.set! (cxb4 + k) (if ulh != 0 then 1 else 0)
+      a := { a with txLpfUv := atuv }
+      let mut ltuv := l.txLpfUv
+      for k in [:lfch4] do ltuv := ltuv.set! (cyb4 + k) (if ulw != 0 then 1 else 0)
+      l := { l with txLpfUv := ltuv }
+  for i in [:Nat.min bw4 (32 - xb4)] do
+    let xi := xb4 + i
+    a := { a with
+      txIntra := a.txIntra.set! xi (Int.ofNat lw)
+      tx := a.tx.set! xi lw
+      mode := a.mode.set! xi yMode
+      palSz := a.palSz.set! xi 0
+      palSzUv := a.palSzUv.set! xi 0
+    }
+    if !keyOrIntra then
+      a := { a with
+        compType := a.compType.set! xi av1CompInterNone
+        ref := (a.ref.set! 0 ((a.ref.getD 0 #[]).set! xi (-1))).set! 1 ((a.ref.getD 1 #[]).set! xi (-1))
+        filter := (a.filter.set! 0 ((a.filter.getD 0 #[]).set! xi 3)).set! 1 ((a.filter.getD 1 #[]).set! xi 3)
+      }
+  for i in [:Nat.min bh4 (32 - yb4)] do
+    let yi := yb4 + i
+    l := { l with
+      txIntra := l.txIntra.set! yi (Int.ofNat lh)
+      tx := l.tx.set! yi lh
+      mode := l.mode.set! yi yMode
+      palSz := l.palSz.set! yi 0
+      palSzUv := l.palSzUv.set! yi 0
+    }
+    if !keyOrIntra then
+      l := { l with
+        compType := l.compType.set! yi av1CompInterNone
+        ref := (l.ref.set! 0 ((l.ref.getD 0 #[]).set! yi (-1))).set! 1 ((l.ref.getD 1 #[]).set! yi (-1))
+        filter := (l.filter.set! 0 ((l.filter.getD 0 #[]).set! yi 3)).set! 1 ((l.filter.getD 1 #[]).set! yi 3)
+      }
+  if hasChroma then
+    let mut auvm := a.uvmode
+    for i in [:Nat.min cbw4 (32 - cxb4)] do auvm := auvm.set! (cxb4 + i) uvMode
+    a := { a with uvmode := auvm }
+    let mut luvm := l.uvmode
+    for i in [:Nat.min cbh4 (32 - cyb4)] do luvm := luvm.set! (cyb4 + i) uvMode
+    l := { l with uvmode := luvm }
+  ctx := av1EncFillLfLevel ctx bx by4 bw4 bh4 cbw4 cbh4 hasChroma 0 0
+  if let some rfVal := ctx.rf then
+    let sw := if bx < rfVal.iw4 then Nat.min bw4 (rfVal.iw4 - bx) else 0
+    let sh := if by4 < rfVal.ih4 then Nat.min bh4 (rfVal.ih4 - by4) else 0
+    let rf1 := av1SplatMv rfVal bs by4 bx sw sh 0 (-1) (av1InvalidMv, 0) (0, 0) 0
+    ctx := { ctx with rf := some rf1 }
+  return (ctx, a, l, lfm)
+
+private def av1EncLumaSad (predBuf : Array Nat) (predStride : Nat)
+    (srcY : Array Nat) (srcW srcH px py w h : Nat) : Nat := Id.run do
+  let mut sad : Nat := 0
+  for ry in [:h] do
+    let sy := py + ry
+    if sy < srcH then
+      let srow := sy * srcW
+      let prow := ry * predStride
+      for rx in [:w] do
+        let sx := px + rx
+        if sx < srcW then
+          let sv := Int.ofNat (srcY.getD (srow + sx) 128)
+          let pv := Int.ofNat (predBuf.getD (prow + rx) 128)
+          sad := sad + (sv - pv).natAbs
+  return sad
+
+private def av1EncChooseInterOrIntra (ctx : Av1TileEncodeCtx) (bs bx by4 bw4 bh4 w4 h4 : Nat)
+    (haveTop haveLeft : Bool) (edgeFlags : Nat) : Bool × (Int × Int) × Nat := Id.run do
+  let cfg := ctx.cfg
+  let fh := ctx.fh
+  let some rf := ctx.rf | return (true, (0, 0), av1NearestMv)
+  let ridx0 := fh.refidx.getD 0 0
+  let some slot := ctx.refs.getD ridx0 none | return (true, (0, 0), av1NearestMv)
+  let refY := slot.planes.getD 0 #[]
+  let refYs := slot.stride
+  let rw := slot.w
+  let rh := slot.h
+  let f2d := av1Filter2d.getD 0 0
+  let bwPx := bw4 * 4
+  let bhPx := bh4 * 4
+  let wPx := w4 * 4
+  let hPx := h4 * 4
+  let px := bx * 4
+  let py := by4 * 4
+  let (mvstack, nMvs, _) := av1FindRefMvs rf 1 (-1) bs edgeFlags by4 bx
+    ctx.col0 (Int.ofNat ctx.col1) ctx.row0 (Int.ofNat ctx.row1)
+  let predRaw := (mvstack.getD 0 {}).mv0
+  let nearestMv := av1FixMvPrecision fh predRaw.1 predRaw.2
+  let predNew := if nMvs <= 1 then nearestMv else predRaw
+  let tmpZero : Array Nat := Array.replicate (bwPx * bhPx) 128
+  let tmpNear := av1McBlockPut tmpZero 0 bwPx bw4 bh4 bx by4 0 nearestMv refY rw rh refYs f2d false bw4 bh4
+  let mut bestSad := av1EncLumaSad tmpNear bwPx ctx.srcY cfg.width cfg.height px py wPx hPx
+  let mut bestMv := nearestMv
+  let mut bestMode := av1NearestMv
+  let tmpGlob := av1McBlockPut tmpZero 0 bwPx bw4 bh4 bx by4 0 (0, 0) refY rw rh refYs f2d false bw4 bh4
+  let gSad := av1EncLumaSad tmpGlob bwPx ctx.srcY cfg.width cfg.height px py wPx hPx
+  if gSad < bestSad then
+    bestSad := gSad
+    bestMv := (0, 0)
+    bestMode := av1GlobalMv
+  let baseDy : Int := av1ArithShiftRight predNew.1 3 * 8
+  let baseDx : Int := av1ArithShiftRight predNew.2 3 * 8
+  let mut bestNewMv := nearestMv
+  let mut bestNewSad := bestSad
+  let dSteps : Array Int := #[-4, -2, -1, 0, 1, 2, 4]
+  for dyPx in dSteps do
+    for dxPx in dSteps do
+      let cand : Int × Int := (baseDy + dyPx * 8, baseDx + dxPx * 8)
+      let tmpC := av1McBlockPut tmpZero 0 bwPx bw4 bh4 bx by4 0 cand refY rw rh refYs f2d false bw4 bh4
+      let csad := av1EncLumaSad tmpC bwPx ctx.srcY cfg.width cfg.height px py wPx hPx
+      if csad + 16 < bestNewSad then
+        bestNewSad := csad
+        bestNewMv := cand
+  let qSteps : Array Int := #[-2, 0, 2]
+  for qy in qSteps do
+    for qx in qSteps do
+      if qy != 0 || qx != 0 then
+        let cand : Int × Int := (bestNewMv.1 + qy, bestNewMv.2 + qx)
+        let tmpC := av1McBlockPut tmpZero 0 bwPx bw4 bh4 bx by4 0 cand refY rw rh refYs f2d false bw4 bh4
+        let csad := av1EncLumaSad tmpC bwPx ctx.srcY cfg.width cfg.height px py wPx hPx
+        if csad + 8 < bestNewSad then
+          bestNewSad := csad
+          bestNewMv := cand
+  if bestNewSad + 24 < bestSad && bestNewMv != predNew then
+    bestSad := bestNewSad
+    bestMv := bestNewMv
+    bestMode := av1NewMv
+  let topSb : Option (Array Nat) :=
+    if ctx.sby > 0 && by4 == ctx.sbyBy then some ctx.ipredEdgeY else none
+  let ys := ctx.yStride
+  let doff := py * ys + px
+  let (m, ang, ebuf, tl) := av1PrepareIntraEdges
+    bx haveLeft by4 haveTop ctx.col1 ctx.row1 0
+    ctx.flatY doff ys topSb 0 av1DcPred 0 bw4 bh4 0
+  let itmp := av1IntraPred tmpZero 0 bwPx ebuf tl m bwPx bhPx ang.toNat
+    ((ctx.bw - bx) * 4) ((ctx.bh - by4) * 4)
+  let isad := av1EncLumaSad itmp bwPx ctx.srcY cfg.width cfg.height px py wPx hPx
+  if isad + 32 < bestSad then
+    return (true, (0, 0), av1NearestMv)
+  return (false, bestMv, bestMode)
+
+private def av1EncReconInter (ctx0 : Av1TileEncodeCtx)
+    (bs bx by4 bw4 bh4 w4 h4 _cbw4 _cbh4 cw4 ch4 : Nat)
+    (hasChroma : Bool) (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 : Nat)
+    (mv0 : Int × Int) (ymode filter2d maxYtx uvTx : Nat) :
+    Av1TileEncodeCtx × Av1BlockContext × Av1BlockContext := Id.run do
+  let cfg := ctx0.cfg
+  let fh := ctx0.fh
+  let mut ctx := ctx0
+  let mut a := a0
+  let mut l := l0
+  let mut enc := ctx.enc
+  let mut cdf := ctx.cdf
+  let mut flatY := ctx.flatY
+  let mut flatU := ctx.flatU
+  let mut flatV := ctx.flatV
+  let ys := ctx.yStride
+  let uvs := ctx.uvStride
+  let doff := by4 * 4 * ys + bx * 4
+  let predMc (pl r : Nat) (mvv : Int × Int) (dst : Array Nat) (off stride w4b h4b bx4 by4b f2d : Nat) : Array Nat :=
+    let ridx := fh.refidx.getD r 0
+    match ctx.refs.getD ridx none with
+    | none => dst
+    | some slot =>
+      let sbuf := slot.planes.getD pl #[]
+      let ss := if pl == 0 then slot.stride else slot.stride >>> 1
+      av1McBlockPut dst off stride w4b h4b bx4 by4b pl mvv sbuf slot.w slot.h ss f2d false bw4 bh4
+  flatY := predMc 0 0 mv0 flatY doff ys bw4 bh4 bx by4 filter2d
+  if hasChroma then
+    let cdoff := (by4 >>> 1) * 4 * uvs + (bx >>> 1) * 4
+    let mut isSub8x8 : Bool := bw4 == 1 || bh4 == 1
+    if let some rf := ctx.rf then
+      if isSub8x8 then
+        if bw4 == 1 then
+          let cellL := rf.r.getD (by4 * rf.rStride + (bx - 1)) {}
+          isSub8x8 := isSub8x8 && decide (cellL.ref0 > 0)
+        if bh4 == 1 then
+          let cellT := rf.r.getD ((by4 - 1) * rf.rStride + bx) {}
+          isSub8x8 := isSub8x8 && decide (cellT.ref0 > 0)
+        if bw4 == 1 && bh4 == 1 then
+          let cellTl := rf.r.getD ((by4 - 1) * rf.rStride + (bx - 1)) {}
+          isSub8x8 := isSub8x8 && decide (cellTl.ref0 > 0)
+      if isSub8x8 then
+        let mut hOff : Nat := 0
+        let mut vOff : Nat := 0
+        if bw4 == 1 && bh4 == 1 then
+          let rbTl := rf.r.getD ((by4 - 1) * rf.rStride + (bx - 1)) {}
+          let rTl := (rbTl.ref0 - 1).toNat
+          flatU := predMc 1 rTl rbTl.mv0 flatU cdoff uvs bw4 bh4 (bx - 1) (by4 - 1) ctx.tl4x4Filter
+          flatV := predMc 2 rTl rbTl.mv0 flatV cdoff uvs bw4 bh4 (bx - 1) (by4 - 1) ctx.tl4x4Filter
+          vOff := 2 * uvs
+          hOff := 2
+        if bw4 == 1 then
+          let rbL := rf.r.getD (by4 * rf.rStride + (bx - 1)) {}
+          let rL := (rbL.ref0 - 1).toNat
+          let lf0 := (l.filter.getD 0 #[]).getD yb4 0
+          let lf1 := (l.filter.getD 1 #[]).getD yb4 0
+          let lf2d := av1Filter2d.getD (lf1 * 4 + lf0) 0
+          flatU := predMc 1 rL rbL.mv0 flatU (cdoff + vOff) uvs bw4 bh4 (bx - 1) by4 lf2d
+          flatV := predMc 2 rL rbL.mv0 flatV (cdoff + vOff) uvs bw4 bh4 (bx - 1) by4 lf2d
+          hOff := 2
+        if bh4 == 1 then
+          let rbT := rf.r.getD ((by4 - 1) * rf.rStride + bx) {}
+          let rT := (rbT.ref0 - 1).toNat
+          let tf0 := (a.filter.getD 0 #[]).getD xb4 0
+          let tf1 := (a.filter.getD 1 #[]).getD xb4 0
+          let tf2d := av1Filter2d.getD (tf1 * 4 + tf0) 0
+          flatU := predMc 1 rT rbT.mv0 flatU (cdoff + hOff) uvs bw4 bh4 bx (by4 - 1) tf2d
+          flatV := predMc 2 rT rbT.mv0 flatV (cdoff + hOff) uvs bw4 bh4 bx (by4 - 1) tf2d
+          vOff := 2 * uvs
+        flatU := predMc 1 0 mv0 flatU (cdoff + hOff + vOff) uvs bw4 bh4 bx by4 filter2d
+        flatV := predMc 2 0 mv0 flatV (cdoff + hOff + vOff) uvs bw4 bh4 bx by4 filter2d
+      else
+        let mcW4 := bw4 <<< (if bw4 == 1 then 1 else 0)
+        let mcH4 := bh4 <<< (if bh4 == 1 then 1 else 0)
+        let mcBx := bx - (bx &&& 1)
+        let mcBy := by4 - (by4 &&& 1)
+        flatU := predMc 1 0 mv0 flatU cdoff uvs mcW4 mcH4 mcBx mcBy filter2d
+        flatV := predMc 2 0 mv0 flatV cdoff uvs mcW4 mcH4 mcBx mcBy filter2d
+  ctx := { ctx with tl4x4Filter := filter2d }
+  let (ytw, yth, _, _, _) := av1TxDim maxYtx
+  let (utw, uth, _, _, _) := av1TxDim uvTx
+  let ysz := ytw * 4
+  let usz := utw * 4
+  let mut tmap : Array Nat := Array.replicate 1024 0
+  let mut aboveArr := ctx.above.set! (bx >>> 5) a
+  let mut yy : Nat := 0
+  while yy < h4 do
+    let mut xx : Nat := 0
+    while xx < w4 do
+      let curBx := bx + xx
+      let curBy := by4 + yy
+      let bx4C := curBx &&& 31
+      let by4C := curBy &&& 31
+      let sbIdxC := curBx >>> 5
+      let mut aC := aboveArr.getD sbIdxC {}
+      let px := curBx * 4
+      let py := curBy * 4
+      let subDoff := py * ys + px
+      let laSlice := aC.lcoef.extract bx4C (bx4C + ytw)
+      let llSlice := l.lcoef.extract by4C (by4C + yth)
+      let (txtp, rctx, fy1, e1, c1) := av1EncodeResidualPlane
+        cfg bs false enc cdf 0 flatY ctx.srcY cfg.width cfg.height
+        px py subDoff ys maxYtx ysz ymode av1DcPred laSlice 0 llSlice 0 ctx.dcDq ctx.acDq
+      flatY := fy1; enc := e1; cdf := c1
+      let wFill := Nat.min ytw (ctx.bw - curBx)
+      let hFill := Nat.min yth (ctx.bh - curBy)
+      let mut alc := aC.lcoef
+      for k in [:wFill] do alc := alc.set! (bx4C + k) rctx
+      aC := { aC with lcoef := alc }
+      aboveArr := aboveArr.set! sbIdxC aC
+      let mut llc := l.lcoef
+      for k in [:hFill] do llc := llc.set! (by4C + k) rctx
+      l := { l with lcoef := llc }
+      for yyT in [:yth] do
+        let baseT := ((by4C + yyT) &&& 31) * 32
+        for xxT in [:ytw] do
+          tmap := tmap.set! (baseT + ((bx4C + xxT) &&& 31)) txtp
+      xx := xx + ytw
+    yy := yy + yth
+  a := aboveArr.getD (bx >>> 5) {}
+  if hasChroma then
+    let cbx := if bw4 == 1 then bx - (bx &&& 1) else bx
+    let cby := if bh4 == 1 then by4 - (by4 &&& 1) else by4
+    let cwSrc := (cfg.width + 1) >>> 1
+    let chSrc := (cfg.height + 1) >>> 1
+    for pl in [:2] do
+      let mut pbuf := if pl == 0 then flatU else flatV
+      let srcC := if pl == 0 then ctx.srcU else ctx.srcV
+      let mut cyy : Nat := 0
+      while cyy < ch4 do
+        let mut cxx : Nat := 0
+        while cxx < cw4 do
+          let tBx := bx + (cxx <<< 1)
+          let tBy := by4 + (cyy <<< 1)
+          let px := ((cbx >>> 1) + cxx) * 4
+          let py := ((cby >>> 1) + cyy) * 4
+          let subDoff := py * uvs + px
+          let caArr := a.ccoef.getD pl #[]
+          let clArr := l.ccoef.getD pl #[]
+          let caSlice := caArr.extract (cxb4 + cxx) (cxb4 + cxx + utw)
+          let clSlice := clArr.extract (cyb4 + cyy) (cyb4 + cyy + uth)
+          let ytxtp := tmap.getD ((((yb4 + (cyy <<< 1)) &&& 31) * 32) + ((xb4 + (cxx <<< 1)) &&& 31)) 0
+          let (_, rctx, pb1, e1, c1) := av1EncodeResidualPlane
+            cfg bs false enc cdf (1 + pl) pbuf srcC cwSrc chSrc
+            px py subDoff uvs uvTx usz ymode av1DcPred caSlice 0 clSlice 0 ctx.dcDq ctx.acDq ytxtp
+          pbuf := pb1; enc := e1; cdf := c1
+          let ctw := Nat.min utw ((ctx.bw - tBx + 1) >>> 1)
+          let cth := Nat.min uth ((ctx.bh - tBy + 1) >>> 1)
+          let mut caUpd := a.ccoef.getD pl #[]
+          for k in [:ctw] do caUpd := caUpd.set! (cxb4 + cxx + k) rctx
+          a := { a with ccoef := a.ccoef.set! pl caUpd }
+          let mut clUpd := l.ccoef.getD pl #[]
+          for k in [:cth] do clUpd := clUpd.set! (cyb4 + cyy + k) rctx
+          l := { l with ccoef := l.ccoef.set! pl clUpd }
+          cxx := cxx + utw
+        cyy := cyy + uth
+      if pl == 0 then flatU := pbuf else flatV := pbuf
+  aboveArr := aboveArr.set! (bx >>> 5) a
+  ctx := { ctx with enc := enc, cdf := cdf, flatY := flatY, flatU := flatU, flatV := flatV, above := aboveArr }
+  return (ctx, a, l)
+
+private def av1EncInterB (ctx0 : Av1TileEncodeCtx)
+    (bs bx by4 bw4 bh4 bwLog2 bhLog2 w4 h4 cbw4 cbh4 cw4 ch4 : Nat)
+    (haveTop haveLeft hasChroma : Bool) (edgeFlags : Nat)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 : Nat)
+    (lfm0 : Av1LfMask) (mvIn : Int × Int) (ymodeIn : Nat) :
+    Av1TileEncodeCtx × Av1BlockContext × Av1BlockContext × Av1LfMask := Id.run do
+  let cfg := ctx0.cfg
+  let fh := ctx0.fh
+  let mut ctx := ctx0
+  let mut a := a0
+  let mut l := l0
+  let mut lfm := lfm0
+  let mut enc := ctx.enc
+  let mut cdf := ctx.cdf
+  let mut mv0 := mvIn
+  let mut ymode := ymodeIn
+  let mvPrec : Int := (if fh.hp then 1 else 0) - (if fh.forceIntegerMv then 1 else 0)
+  let (e0, c0) := av1EncodeSingleRefZero enc cdf a l yb4 xb4 haveTop haveLeft
+  enc := e0; cdf := c0
+  let rfVal := ctx.rf.getD {}
+  let (mvstack, nMvs, mctx) := av1FindRefMvs rfVal 1 (-1) bs edgeFlags by4 bx
+    ctx.col0 (Int.ofNat ctx.col1) ctx.row0 (Int.ofNat ctx.row1)
+  if ymode == av1NewMv then
+    let (e1, c1) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_newmv_mode + (mctx &&& 7) * 2)
+    enc := e1; cdf := c1
+    if nMvs > 1 then
+      let (e2, c2) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_drl_bit + av1GetDrlContext mvstack 0 * 2)
+      enc := e2; cdf := c2
+    let mut pred := (mvstack.getD 0 {}).mv0
+    if nMvs <= 1 then
+      pred := av1FixMvPrecision fh pred.1 pred.2
+    let (e3, c3) := av1WriteMvResidual enc cdf mv0.1 mv0.2 pred.1 pred.2 mvPrec
+    enc := e3; cdf := c3
+  else if ymode == av1GlobalMv then
+    let (e1, c1) := enc.encodeBoolAdapt 1 cdf (cdfOff_m_newmv_mode + (mctx &&& 7) * 2)
+    enc := e1; cdf := c1
+    let (e2, c2) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_globalmv_mode + ((mctx >>> 3) &&& 1) * 2)
+    enc := e2; cdf := c2
+    mv0 := (0, 0)
+  else
+    ymode := av1NearestMv
+    let (e1, c1) := enc.encodeBoolAdapt 1 cdf (cdfOff_m_newmv_mode + (mctx &&& 7) * 2)
+    enc := e1; cdf := c1
+    let (e2, c2) := enc.encodeBoolAdapt 1 cdf (cdfOff_m_globalmv_mode + ((mctx >>> 3) &&& 1) * 2)
+    enc := e2; cdf := c2
+    let (e3, c3) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_refmv_mode + ((mctx >>> 4) &&& 15) * 2)
+    enc := e3; cdf := c3
+    let cand0 := (mvstack.getD 0 {}).mv0
+    mv0 := av1FixMvPrecision fh cand0.1 cand0.2
+  let f0 := fh.subpelFilterMode
+  let f1 := fh.subpelFilterMode
+  let filter2d := av1Filter2d.getD (f1 * 4 + f0) 0
+  let maxYtx : Nat := if cfg.lossless then 0 else av1MaxTxfmForBs.getD (bs * 4) 0
+  let uvTx : Nat := if cfg.lossless then 0 else av1MaxTxfmForBs.getD (bs * 4 + 1) 0
+  let txMasks : Array Nat := #[0, 0]
+  if maxYtx == 0 then
+    if fh.txfmMode == 2 then
+      let mut atx := a.tx
+      for i in [:Nat.min bw4 (32 - xb4)] do atx := atx.set! (xb4 + i) 0
+      a := { a with tx := atx }
+      let mut ltx := l.tx
+      for i in [:Nat.min bh4 (32 - yb4)] do ltx := ltx.set! (yb4 + i) 0
+      l := { l with tx := ltx }
+  else if fh.txfmMode == 2 then
+    let txw := av1TxfmDim.getD (maxYtx * 8 + 2) 0
+    let txh := av1TxfmDim.getD (maxYtx * 8 + 3) 0
+    let tmax := av1TxfmDim.getD (maxYtx * 8 + 5) 0
+    let cat := 2 * (4 - tmax)
+    let actx : Nat := if a.tx.getD xb4 0 < txw then 1 else 0
+    let lctx : Nat := if l.tx.getD yb4 0 < txh then 1 else 0
+    let (et, ct) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_txpart + (cat * 3 + actx + lctx) * 2)
+    enc := et; cdf := ct
+    let mut atx := a.tx
+    for i in [:Nat.min (1 <<< txw) (32 - xb4)] do atx := atx.set! (xb4 + i) txw
+    a := { a with tx := atx }
+    let mut ltx := l.tx
+    for i in [:Nat.min (1 <<< txh) (32 - yb4)] do ltx := ltx.set! (yb4 + i) txh
+    l := { l with tx := ltx }
+  ctx := { ctx with enc := enc, cdf := cdf }
+  let (ctx1, a1, l1) := av1EncReconInter
+    ctx bs bx by4 bw4 bh4 w4 h4 cbw4 cbh4 cw4 ch4
+    hasChroma a l xb4 yb4 cxb4 cyb4 mv0 ymode filter2d maxYtx uvTx
+  ctx := ctx1; a := a1; l := l1
+  let ytxLpf : Nat := if cfg.lossless then 0 else maxYtx
+  let uvtxLpf : Nat := if cfg.lossless then 0 else uvTx
+  let lfw4 := if bx < ctx.w4 then Nat.min bw4 (ctx.w4 - bx) else 0
+  let lfh4 := if by4 < ctx.h4 then Nat.min bh4 (ctx.h4 - by4) else 0
+  if lfw4 > 0 && lfh4 > 0 then
+    let mut laLpf := Array.replicate 32 2
+    for k in [:Nat.min 32 (a.txLpfY.size - xb4)] do laLpf := laLpf.set! k (a.txLpfY.getD (xb4 + k) 2)
+    let mut llLpf := Array.replicate 32 2
+    for k in [:Nat.min 32 (l.txLpfY.size - yb4)] do llLpf := llLpf.set! k (l.txLpfY.getD (yb4 + k) 2)
+    let (fyNew, laOut, llOut) := av1MaskEdgesInter lfm.filterY yb4 xb4 lfw4 lfh4 false ytxLpf txMasks laLpf llLpf
+    lfm := { lfm with filterY := fyNew }
+    let mut aty := a.txLpfY
+    for k in [:lfw4] do aty := aty.set! (xb4 + k) (laOut.getD k 2)
+    a := { a with txLpfY := aty }
+    let mut lty := l.txLpfY
+    for k in [:lfh4] do lty := lty.set! (yb4 + k) (llOut.getD k 2)
+    l := { l with txLpfY := lty }
+  if hasChroma then
+    let cw4Tot := (ctx.w4 + 1) >>> 1
+    let ch4Tot := (ctx.h4 + 1) >>> 1
+    let cbx := bx >>> 1
+    let cby := by4 >>> 1
+    let lfcw4 := if cbx < cw4Tot then Nat.min (cw4Tot - cbx) cbw4 else 0
+    let lfch4 := if cby < ch4Tot then Nat.min (ch4Tot - cby) cbh4 else 0
+    if lfcw4 > 0 && lfch4 > 0 then
+      let (_, _, ulw, ulh, _) := av1TxDim uvtxLpf
+      let caLpf := a.txLpfUv.extract cxb4 a.txLpfUv.size
+      let clLpf := l.txLpfUv.extract cyb4 l.txLpfUv.size
+      let (fuvNew, _, _) := av1MaskEdgesChroma lfm.filterUv cyb4 cxb4 lfcw4 lfch4 false uvtxLpf caLpf clLpf
+      lfm := { lfm with filterUv := fuvNew }
+      let mut atuv := a.txLpfUv
+      for k in [:lfcw4] do atuv := atuv.set! (cxb4 + k) (if ulh != 0 then 1 else 0)
+      a := { a with txLpfUv := atuv }
+      let mut ltuv := l.txLpfUv
+      for k in [:lfch4] do ltuv := ltuv.set! (cyb4 + k) (if ulw != 0 then 1 else 0)
+      l := { l with txLpfUv := ltuv }
+  ctx := av1EncFillLfLevel ctx bx by4 bw4 bh4 cbw4 cbh4 hasChroma 1 (if ymode == av1GlobalMv then 0 else 1)
+  if let some rfCur := ctx.rf then
+    let mf : Nat := (if ymode == av1GlobalMv && Nat.min bw4 bh4 >= 2 then 1 else 0) |||
+                    (if ymode == av1NewMv then 2 else 0)
+    let sw := if bx < rfCur.iw4 then Nat.min bw4 (rfCur.iw4 - bx) else 0
+    let sh := if by4 < rfCur.ih4 then Nat.min bh4 (rfCur.ih4 - by4) else 0
+    let rf1 := av1SplatMv rfCur bs by4 bx sw sh 1 (-1) mv0 (0, 0) mf
+    ctx := { ctx with rf := some rf1 }
+  for i in [:Nat.min bw4 (32 - xb4)] do
+    let xi := xb4 + i
+    a := { a with
+      txIntra := a.txIntra.set! xi (Int.ofNat bwLog2)
+      mode := a.mode.set! xi ymode
+      compType := a.compType.set! xi av1CompInterNone
+      ref := (a.ref.set! 0 ((a.ref.getD 0 #[]).set! xi 0)).set! 1 ((a.ref.getD 1 #[]).set! xi (-1))
+      palSz := a.palSz.set! xi 0
+      palSzUv := a.palSzUv.set! xi 0
+      filter := (a.filter.set! 0 ((a.filter.getD 0 #[]).set! xi f0)).set! 1 ((a.filter.getD 1 #[]).set! xi f1)
+    }
+  for i in [:Nat.min bh4 (32 - yb4)] do
+    let yi := yb4 + i
+    l := { l with
+      txIntra := l.txIntra.set! yi (Int.ofNat bhLog2)
+      mode := l.mode.set! yi ymode
+      compType := l.compType.set! yi av1CompInterNone
+      ref := (l.ref.set! 0 ((l.ref.getD 0 #[]).set! yi 0)).set! 1 ((l.ref.getD 1 #[]).set! yi (-1))
+      palSz := l.palSz.set! yi 0
+      palSzUv := l.palSzUv.set! yi 0
+      filter := (l.filter.set! 0 ((l.filter.getD 0 #[]).set! yi f0)).set! 1 ((l.filter.getD 1 #[]).set! yi f1)
+    }
+  if hasChroma then
+    let mut auvm := a.uvmode
+    for i in [:Nat.min cbw4 (32 - cxb4)] do auvm := auvm.set! (cxb4 + i) av1DcPred
+    a := { a with uvmode := auvm }
+    let mut luvm := l.uvmode
+    for i in [:Nat.min cbh4 (32 - cyb4)] do luvm := luvm.set! (cyb4 + i) av1DcPred
+    l := { l with uvmode := luvm }
+  return (ctx, a, l, lfm)
+
+private def av1EncBlock (ctx0 : Av1TileEncodeCtx) (_bl bs _bp bx by4 edgeFlags : Nat) : Av1TileEncodeCtx := Id.run do
+  let fh := ctx0.fh
+  let (bw4, bh4, bwLog2, bhLog2) :=
+    let d := av1BlockDim
+    (d.getD (bs * 4) 0, d.getD (bs * 4 + 1) 0, d.getD (bs * 4 + 2) 0, d.getD (bs * 4 + 3) 0)
+  let w4 := Nat.min bw4 (ctx0.bw - bx)
+  let h4 := Nat.min bh4 (ctx0.bh - by4)
+  let cbw4 := (bw4 + 1) >>> 1
+  let cbh4 := (bh4 + 1) >>> 1
+  let cw4 := (w4 + 1) >>> 1
+  let ch4 := (h4 + 1) >>> 1
+  let haveLeft : Bool := decide (bx > ctx0.col0)
+  let haveTop : Bool := decide (by4 > ctx0.row0)
+  let hasChroma : Bool := (bw4 > 1 || (bx &&& 1) != 0) && (bh4 > 1 || (by4 &&& 1) != 0)
+  let mut ctx := ctx0
+  let mut a := ctx.above.getD (bx >>> 5) {}
+  let mut l := ctx.left
+  let mut enc := ctx.enc
+  let mut cdf := ctx.cdf
+  let xb4 := bx &&& 31
+  let yb4 := by4 &&& 31
+  let cxb4 := xb4 >>> 1
+  let cyb4 := yb4 >>> 1
+  let skCtx := a.skip.getD xb4 0 + l.skip.getD yb4 0
+  let (e0, c0) := enc.encodeBoolAdapt 0 cdf (cdfOff_m_skip + skCtx * 2)
+  enc := e0; cdf := c0
+  let lfmIdx := (by4 >>> 5) * ctx.sb128w + (bx >>> 5)
+  let mut lfm := ctx.lfMasks.getD lfmIdx {}
+  let cidx := ((by4 &&& 16) >>> 3) + ((bx &&& 16) >>> 4)
+  if (lfm.cdefIdx.getD cidx (-1)) == -1 then
+    let nCdef := fh.cdef.nBits
+    let vCdef : Nat := if nCdef > 0 then 1 else 0
+    if nCdef > 0 then
+      enc := enc.encodeBools vCdef nCdef
+    let mut ci := lfm.cdefIdx
+    ci := ci.set! cidx (Int.ofNat vCdef)
+    if bw4 > 16 then ci := ci.set! (cidx + 1) (Int.ofNat vCdef)
+    if bh4 > 16 then ci := ci.set! (cidx + 2) (Int.ofNat vCdef)
+    if bw4 == 32 && bh4 == 32 then ci := ci.set! 3 (Int.ofNat vCdef)
+    lfm := { lfm with cdefIdx := ci }
+  let keyOrIntra : Bool := fh.frameType == av1FrameKey || fh.frameType == av1FrameIntra
+  let mut useIntra := true
+  let mut bestMv : Int × Int := (0, 0)
+  let mut bestYmode := av1NearestMv
+  if !keyOrIntra then
+    let (ui, mv, ym) := av1EncChooseInterOrIntra ctx bs bx by4 bw4 bh4 w4 h4 haveTop haveLeft edgeFlags
+    useIntra := ui; bestMv := mv; bestYmode := ym
+    let ic := av1GetIntraCtx a l yb4 xb4 haveTop haveLeft
+    let (ei, ci) := enc.encodeBoolAdapt (if useIntra then 0 else 1) cdf (cdfOff_m_intra + ic * 2)
+    enc := ei; cdf := ci
+  ctx := { ctx with enc := enc, cdf := cdf }
+  let mut intraFlag : Nat := 0
+  if useIntra then
+    let (c1, a1, l1, lf1) := av1EncIntraB ctx
+      bs bx by4 bw4 bh4 bwLog2 bhLog2 w4 h4 cbw4 cbh4 cw4 ch4
+      haveTop haveLeft hasChroma edgeFlags a l xb4 yb4 cxb4 cyb4 lfm
+    ctx := c1; a := a1; l := l1; lfm := lf1
+    intraFlag := 1
+  else
+    let (c1, a1, l1, lf1) := av1EncInterB ctx
+      bs bx by4 bw4 bh4 bwLog2 bhLog2 w4 h4 cbw4 cbh4 cw4 ch4
+      haveTop haveLeft hasChroma edgeFlags a l xb4 yb4 cxb4 cyb4 lfm bestMv bestYmode
+    ctx := c1; a := a1; l := l1; lfm := lf1
+    intraFlag := 0
+  for i in [:Nat.min bw4 (32 - xb4)] do
+    let xi := xb4 + i
+    a := { a with skip := a.skip.set! xi 0, skipMode := a.skipMode.set! xi 0, intra := a.intra.set! xi intraFlag }
+  for i in [:Nat.min bh4 (32 - yb4)] do
+    let yi := yb4 + i
+    l := { l with skip := l.skip.set! yi 0, skipMode := l.skipMode.set! yi 0, intra := l.intra.set! yi intraFlag }
+  let mask := ((1 <<< bw4) - 1) <<< (bx &&& 15)
+  let bxIdx := (bx &&& 16) >>> 4
+  for yy in [:bh4 / 2] do
+    let rowIdx := (((by4 + yy * 2) &&& 31) >>> 1) * 2 + bxIdx
+    let mut ns := lfm.noskip
+    ns := ns.set! rowIdx ((ns.getD rowIdx 0) ||| (mask &&& 0xFFFF))
+    if bw4 == 32 then
+      ns := ns.set! (rowIdx + 1) ((ns.getD (rowIdx + 1) 0) ||| ((mask >>> 16) &&& 0xFFFF))
+    lfm := { lfm with noskip := ns }
+  ctx := { ctx with above := ctx.above.set! (bx >>> 5) a, left := l, lfMasks := ctx.lfMasks.set! lfmIdx lfm }
+  return ctx
+
+private def av1EncSb (fuel : Nat) (ctx0 : Av1TileEncodeCtx) (bl bx by4 : Nat) (edge : Av1EdgeNode) : Av1TileEncodeCtx :=
+  match fuel with
+  | 0 => ctx0
+  | fuel' + 1 =>
+    let bw := ctx0.bw
+    let bh := ctx0.bh
+    if bx >= bw || by4 >= bh then
+      ctx0
+    else
+      let hsz := 16 >>> bl
+      let haveH : Bool := decide (bw > bx + hsz)
+      let haveV : Bool := decide (bh > by4 + hsz)
+      if !haveH && !haveV then
+        av1EncSb fuel' ctx0 (bl + 1) bx by4 ((av1EdgeNodeChildren edge).getD 0 default)
+      else Id.run do
+        let mut ctx := ctx0
+        let a0 := ctx.above.getD (bx >>> 5) {}
+        let l0 := ctx.left
+        let mut enc := ctx.enc
+        let mut cdf := ctx.cdf
+        let pc := av1GetPartitionCtx a0 l0 bl ((by4 &&& 31) >>> 1) ((bx &&& 31) >>> 1)
+        let pbase := cdfOff_m_partition + bl * 64 + pc * 16
+        let mut bp : Nat := av1PartitionSplit
+        if haveH && haveV then
+          bp := if bl < 4 then av1PartitionSplit else av1PartitionNone
+          let (e1, c1) := enc.encodeSymbolAdapt bp cdf pbase (av1PartitionTypeCount.getD bl 0)
+          enc := e1; cdf := c1
+        else if haveH then
+          let prob := av1GatherTopPartitionProb cdf pbase bl
+          enc := enc.encodeBool 1 prob.toNat
+          bp := av1PartitionSplit
+        else
+          let prob := av1GatherLeftPartitionProb cdf pbase bl
+          enc := enc.encodeBool 1 prob.toNat
+          bp := av1PartitionSplit
+        ctx := { ctx with enc := enc, cdf := cdf }
+        let bs0 := av1BlockSizes.getD (bl * 20 + bp * 2) 0
+        let eSplit := av1EdgeNodeSplit edge
+        let eChild := av1EdgeNodeChildren edge
+        if bp == av1PartitionNone then
+          ctx := av1EncBlock ctx bl bs0 bp bx by4 (av1EdgeNodeO edge)
+        else if bp == av1PartitionSplit then
+          if bl == 4 then
+            ctx := av1EncBlock ctx bl bs0 bp bx by4 (eSplit.getD 0 0)
+            let tlF := ctx.tl4x4Filter
+            if bx + 1 < bw then
+              ctx := av1EncBlock ctx bl bs0 bp (bx + 1) by4 (eSplit.getD 1 0)
+            if by4 + 1 < bh then
+              ctx := av1EncBlock ctx bl bs0 bp bx (by4 + 1) (eSplit.getD 2 0)
+              if bx + 1 < bw then
+                ctx := { ctx with tl4x4Filter := tlF }
+                ctx := av1EncBlock ctx bl bs0 bp (bx + 1) (by4 + 1) (eSplit.getD 3 0)
+          else
+            if haveH && haveV then
+              ctx := av1EncSb fuel' ctx (bl + 1) bx by4 (eChild.getD 0 default)
+              ctx := av1EncSb fuel' ctx (bl + 1) (bx + hsz) by4 (eChild.getD 1 default)
+              ctx := av1EncSb fuel' ctx (bl + 1) bx (by4 + hsz) (eChild.getD 2 default)
+              ctx := av1EncSb fuel' ctx (bl + 1) (bx + hsz) (by4 + hsz) (eChild.getD 3 default)
+            else if haveH then
+              ctx := av1EncSb fuel' ctx (bl + 1) bx by4 (eChild.getD 0 default)
+              ctx := av1EncSb fuel' ctx (bl + 1) (bx + hsz) by4 (eChild.getD 1 default)
+            else
+              ctx := av1EncSb fuel' ctx (bl + 1) bx by4 (eChild.getD 0 default)
+              ctx := av1EncSb fuel' ctx (bl + 1) bx (by4 + hsz) (eChild.getD 2 default)
+            return ctx
+        let bx8 := (bx &&& 31) >>> 1
+        let by8 := (by4 &&& 31) >>> 1
+        let av := av1AlPartCtx.getD (bl * 10 + bp) 0
+        let lv := av1AlPartCtx.getD (50 + bl * 10 + bp) 0
+        let mut a := ctx.above.getD (bx >>> 5) {}
+        let mut l := ctx.left
+        let mut ap := a.partition
+        let mut lp := l.partition
+        for i in [:hsz] do
+          ap := ap.set! (bx8 + i) av
+          lp := lp.set! (by8 + i) lv
+        a := { a with partition := ap }
+        l := { l with partition := lp }
+        ctx := { ctx with above := ctx.above.set! (bx >>> 5) a, left := l }
+        return ctx
+
+private def av1EncTileSbrow (ctx0 : Av1TileEncodeCtx) : Av1TileEncodeCtx := Id.run do
+  let mut ctx := ctx0
+  let root := av1IntraEdgeTree.getD 1 default
+  for bx in [ctx.col0 : ctx.col1 : 16] do
+    ctx := av1EncSb 64 ctx 1 bx ctx.sbyBy root
+  return ctx
+
+private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Array (Option Av1RefSlot))
+    (frameNum : Nat) : Option (ByteArray × Array (Option Av1RefSlot)) := Id.run do
+  let inter : Bool := frameNum > 0
+  let cfg := cfg0
+  let mut bw := av1EncBuildFrameHdrBits cfg frameNum inter 4
+  bw := bw.byteAlignZero
+  let gb := Av1BitReader.mk bw.toBytes 0 0 false
+  let some (fh0, _) := av1ParseFrameHdr cfg.seq gb refs0 | return none
+  let fh := fh0
+  let w := cfg.width
+  let h := cfg.height
+  let cw := (w + 1) >>> 1
+  let ch := (h + 1) >>> 1
+  let w4 := (w + 3) >>> 2
+  let h4 := (h + 3) >>> 2
+  let bw4 := ((w + 7) >>> 3) <<< 1
+  let bh4 := ((h + 7) >>> 3) <<< 1
+  let sbStep : Nat := 16
+  let sbh := (bh4 + sbStep - 1) >>> 4
+  let sb128w := (bw4 + 31) >>> 5
+  let b4Stride := (bw4 + 31) &&& (0xFFFFFFFF - 31)
+  let yStride := ((bw4 * 4 + 127) &&& (0xFFFFFFFF - 127)) + 128
+  let uvStride := yStride >>> 1
+  let yRows := ((bh4 * 4 + 127) &&& (0xFFFFFFFF - 127)) + 128
+  let uvRows := yRows >>> 1
+  let mut flatY : Array Nat := Array.replicate (yStride * yRows) 128
+  let mut flatU : Array Nat := Array.replicate (uvStride * uvRows) 128
+  let mut flatV : Array Nat := Array.replicate (uvStride * uvRows) 128
+  let keyOrIntra := !inter
+  let inCdf := av1InitDefaultCdf (av1Qcat cfg.qidx)
+  let cols := fh.tiling.cols
+  let rows := fh.tiling.rows
+  let nTiles := cols * rows
+  if nTiles == 0 then return none
+  let initAbove := av1ResetContext {} keyOrIntra
+  let mut aboveRows : Array (Array Av1BlockContext) :=
+    Array.replicate rows (Array.replicate sb128w initAbove)
+  let rf : Option Av1RefMvFrame :=
+    if inter then some (av1InitRefMvFrame fh cfg.seq refs0) else none
+  let mut lfMasks : Array Av1LfMask := Array.replicate (sb128w * ((sbh + 1) >>> 1)) {}
+  let level0 := av1CalcLfValues fh #[0, 0, 0, 0]
+  let h4Align := (h4 + 31) &&& (0xFFFFFFFF - 31)
+  let mut levelY : Array Nat := Array.replicate (b4Stride * h4Align * 2) 0
+  let mut levelUv : Array Nat := Array.replicate (b4Stride * ((h4Align + 1) >>> 1) * 2) 0
+  let alignH := (bh4 + 31) &&& (0xFFFFFFFF - 31)
+  let mut txLpfRightEdgeY : Array Nat := Array.replicate (alignH * cols) 2
+  let mut txLpfRightEdgeUv : Array Nat := Array.replicate ((alignH >>> 1) * cols) 1
+  let mut startOfTileRow : Array Nat := Array.replicate sbh 0
+  for trI in [:rows] do
+    let rs0 := fh.tiling.rowStartSb.getD trI 0
+    if rs0 < sbh then
+      startOfTileRow := startOfTileRow.set! rs0 trI
+  let mut ipredEdgeY : Array Nat := Array.replicate yStride 128
+  let mut ipredEdgeU : Array Nat := Array.replicate uvStride 128
+  let mut ipredEdgeV : Array Nat := Array.replicate uvStride 128
+  let mut tileEnc : Array Av1MsacEncoder := Array.replicate nTiles (Av1MsacEncoder.init false)
+  let mut tileCdf : Array (Array Nat) := Array.replicate nTiles inCdf
+  let dcDq := av1DqTbl.getD (cfg.qidx * 2) 4
+  let acDq := av1DqTbl.getD (cfg.qidx * 2 + 1) 4
+  for tileRow in [:rows] do
+    let sby0 := fh.tiling.rowStartSb.getD tileRow 0
+    let sby1 := Nat.min (fh.tiling.rowStartSb.getD (tileRow + 1) sbh) sbh
+    for sby in [sby0 : sby1] do
+      let by4 := sby <<< 4
+      for tileCol in [:cols] do
+        let t := tileRow * cols + tileCol
+        let col0 := (fh.tiling.colStartSb.getD tileCol 0) <<< 4
+        let col1 := Nat.min ((fh.tiling.colStartSb.getD (tileCol + 1) 0) <<< 4) bw4
+        let row0 := sby0 <<< 4
+        let row1 := Nat.min ((fh.tiling.rowStartSb.getD (tileRow + 1) sbh) <<< 4) bh4
+        let leftInit := av1ResetContext {} keyOrIntra
+        let ctxIn : Av1TileEncodeCtx := {
+          cfg := cfg, fh := fh, enc := tileEnc.getD t (Av1MsacEncoder.init false), cdf := tileCdf.getD t inCdf,
+          flatY := flatY, flatU := flatU, flatV := flatV,
+          srcY := y, srcU := u, srcV := v,
+          yStride := yStride, uvStride := uvStride,
+          w := w, h := h, w4 := w4, h4 := h4, bw := bw4, bh := bh4,
+          sb128w := sb128w, b4Stride := b4Stride,
+          above := aboveRows.getD tileRow #[], left := leftInit,
+          rf := rf, lfMasks := lfMasks,
+          level := level0, levelY := levelY, levelUv := levelUv,
+          dcDq := dcDq, acDq := acDq,
+          col0 := col0, col1 := col1, row0 := row0, row1 := row1,
+          sby := sby, sbyBy := by4,
+          ipredEdgeY := ipredEdgeY, ipredEdgeU := ipredEdgeU, ipredEdgeV := ipredEdgeV,
+          tl4x4Filter := 0, refs := refs0
+        }
+        let ctxOut := av1EncTileSbrow ctxIn
+        tileEnc := tileEnc.set! t ctxOut.enc
+        tileCdf := tileCdf.set! t ctxOut.cdf
+        flatY := ctxOut.flatY
+        flatU := ctxOut.flatU
+        flatV := ctxOut.flatV
+        aboveRows := aboveRows.set! tileRow ctxOut.above
+        lfMasks := ctxOut.lfMasks
+        levelY := ctxOut.levelY
+        levelUv := ctxOut.levelUv
+        let yOffRe := alignH * tileCol + by4
+        let byModY := by4 &&& 16
+        for k in [:sbStep] do
+          if yOffRe + k < txLpfRightEdgeY.size then
+            txLpfRightEdgeY := txLpfRightEdgeY.set! (yOffRe + k) (ctxOut.left.txLpfY.getD (byModY + k) 2)
+        let uvOffRe := (alignH >>> 1) * tileCol + (by4 >>> 1)
+        let uvSbStep := sbStep >>> 1
+        let byModUv := (by4 &&& 16) >>> 1
+        for k in [:uvSbStep] do
+          if uvOffRe + k < txLpfRightEdgeUv.size then
+            txLpfRightEdgeUv := txLpfRightEdgeUv.set! (uvOffRe + k) (ctxOut.left.txLpfUv.getD (byModUv + k) 1)
+      let yLast := Nat.min (by4 * 4 + sbStep * 4 - 1) (yRows - 1)
+      let uvLast := Nat.min (((by4 * 4) >>> 1) + ((sbStep * 4) >>> 1) - 1) (uvRows - 1)
+      let yEdgeBase := yLast * yStride
+      for x in [:yStride] do
+        ipredEdgeY := ipredEdgeY.set! x (flatY.getD (yEdgeBase + x) 128)
+      let uvEdgeBase := uvLast * uvStride
+      for x in [:uvStride] do
+        ipredEdgeU := ipredEdgeU.set! x (flatU.getD (uvEdgeBase + x) 128)
+        ipredEdgeV := ipredEdgeV.set! x (flatV.getD (uvEdgeBase + x) 128)
+  let (py, pu, pv, pys, puvs) := av1PostfilterFrame
+    cfg.seq fh flatY flatU flatV yStride uvStride lfMasks levelY levelUv b4Stride #[]
+    txLpfRightEdgeY txLpfRightEdgeUv aboveRows startOfTileRow alignH
+  let tmvs : Option (Array (Array (Option Av1TmvEntry))) :=
+    if inter then
+      match rf with
+      | some rfVal => some (av1SaveTmvs rfVal)
+      | none => none
+    else none
+  let upd := fh.tiling.update
+  let storedCdf := av1CdfThreadUpdate inCdf (tileCdf.getD upd inCdf) keyOrIntra
+  let mut refpocs : Array Nat := Array.mkEmpty 7
+  for ri in [:7] do
+    if inter then
+      let ridx := fh.refidx.getD ri 0
+      let rOff := match refs0.getD ridx none with | some s => s.hdr.frameOffset | none => 0
+      refpocs := refpocs.push rOff
+    else
+      refpocs := refpocs.push 0
+  let refStride := ((bw4 * 4 + 127) &&& (0xFFFFFFFF - 127)) + 128
+  let refUvStride := refStride >>> 1
+  let refPlaneY := av1CropPlaneRows py pys w h refStride
+  let refPlaneU := av1CropPlaneRows pu puvs cw ch refUvStride
+  let refPlaneV := av1CropPlaneRows pv puvs cw ch refUvStride
+  let slot : Av1RefSlot := {
+    hdr := fh
+    planes := #[refPlaneY, refPlaneU, refPlaneV]
+    stride := refStride
+    w := w
+    h := h
+    refpoc := refpocs
+    tmvs := tmvs
+    segmap := none
+    cdf := storedCdf
+  }
+  let mut tilePayloads : Array ByteArray := Array.mkEmpty nTiles
+  let mut maxTileSz : Nat := 0
+  for t in [:nTiles] do
+    let p := (tileEnc.getD t (Av1MsacEncoder.init false)).finalize
+    tilePayloads := tilePayloads.push p
+    if p.size > maxTileSz then maxTileSz := p.size
+  let mut nBytes : Nat := 1
+  while maxTileSz > (1 <<< (8 * nBytes)) && nBytes < 4 do
+    nBytes := nBytes + 1
+  let mut body := (av1EncBuildFrameHdrBits cfg frameNum inter nBytes).byteAlignZero.toBytes
+  if nTiles > 1 then
+    let mut tb := Av1BitWriter.empty
+    tb := tb.putBit 0
+    body := body ++ tb.byteAlignZero.toBytes
+  for t in [:nTiles] do
+    let payload := tilePayloads.getD t ByteArray.empty
+    if t + 1 < nTiles then
+      let sz := payload.size - 1
+      let mut szBytes := ByteArray.empty
+      for bI in [:nBytes] do
+        szBytes := szBytes.push (((sz >>> (8 * bI)) &&& 0xFF).toUInt8)
+      body := body ++ szBytes
+    body := body ++ payload
+  let frameObu := av1WrapObu av1ObuFrame body true
+  return some (frameObu, av1StoreRefs refs0 fh slot)
+
+def encodeAv1FromYuv420p (width height : Nat) (yuv : ByteArray) (qidx : Nat := 60)
+    (fmt : String := "ivf") (tilesLog2Cols : Nat := 0) (tilesLog2Rows : Nat := 0) :
+    Option ByteArray := Id.run do
+  let frameBytes := (width * height * 3) / 2
+  if width == 0 || height == 0 || frameBytes == 0 || yuv.size == 0 || yuv.size % frameBytes != 0 then
+    return none
+  let nFrames := yuv.size / frameBytes
+  let qClamped := Nat.min qidx 255
+  let lossless := qClamped == 0
+  let enableCdef := !lossless
+  let lfLevel := if lossless then 0 else 8
+  let seqHdrObu := av1WriteSeqHdrObu width height enableCdef false
+  let some seq0 := av1ParseSeqHdr (seqHdrObu.extract 2 seqHdrObu.size) | return none
+  if !seq0.isMain8Bit420 then return none
+  let cfg : Av1EncoderCfg := {
+    width := width, height := height, qidx := qClamped, lossless := lossless,
+    tilesLog2Cols := tilesLog2Cols, tilesLog2Rows := tilesLog2Rows,
+    enableCdef := enableCdef, lfLevel := lfLevel,
+    seqHdrObu := seqHdrObu, seq := seq0
+  }
+  let cw := (width + 1) >>> 1
+  let ch := (height + 1) >>> 1
+  let ySize := width * height
+  let uvSize := cw * ch
+  let mut refs : Array (Option Av1RefSlot) := Array.replicate 8 none
+  let mut ivfSamples : Array ByteArray := Array.mkEmpty nFrames
+  let mut mp4Samples : Array IsoMp4SampleDesc := Array.mkEmpty nFrames
+  for f in [:nFrames] do
+    let base := f * frameBytes
+    let mut yArr : Array Nat := Array.mkEmpty ySize
+    for i in [:ySize] do yArr := yArr.push ((yuv.get! (base + i)).toNat)
+    let mut uArr : Array Nat := Array.mkEmpty uvSize
+    for i in [:uvSize] do uArr := uArr.push ((yuv.get! (base + ySize + i)).toNat)
+    let mut vArr : Array Nat := Array.mkEmpty uvSize
+    for i in [:uvSize] do vArr := vArr.push ((yuv.get! (base + ySize + uvSize + i)).toNat)
+    let some (frameObu, refs1) := av1EncFrame cfg yArr uArr vArr refs f | return none
+    refs := refs1
+    let td := av1WrapObu av1ObuTd ByteArray.empty true
+    let seqPart := if f == 0 then seqHdrObu else ByteArray.empty
+    ivfSamples := ivfSamples.push (td ++ seqPart ++ frameObu)
+    let mp4Payload := seqPart ++ frameObu
+    mp4Samples := mp4Samples.push {
+      sampleIdx := f
+      dts := (f * 512).toUInt64
+      pts := (f * 512).toUInt64
+      duration := 512
+      frameType := if f == 0 then .iFrame else .pFrame
+      slice := ByteSlice.ofByteArray mp4Payload
+    }
+  if fmt == "mp4" then
+    return some (muxIsoMp4TrackCodec .av1 width height 15360 (av1BuildAv1C seqHdrObu seq0) mp4Samples)
+  if fmt == "obu" then
+    let mut cat := ByteArray.empty
+    for s in ivfSamples do cat := cat ++ s
+    return some cat
+  if fmt == "ivf" then
+    return some (av1MuxIvf width height ivfSamples)
+  return none
 
 end LeanAV.Av1Main
