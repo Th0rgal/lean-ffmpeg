@@ -1375,6 +1375,7 @@ def av1IiMask (c bs interintraType interintraMode wedgeIdx : Nat) : Array Nat :=
 @[inline] def av1EdgeI420LeftHasBottom : Nat := 32
 @[inline] def av1EdgeAllTopHasRight : Nat := 7
 @[inline] def av1EdgeAllLeftHasBottom : Nat := 56
+@[inline] def av1EdgeAllTrAndBl : Nat := 63
 
 inductive Av1EdgeNode where
   | mk
@@ -3729,6 +3730,8 @@ structure Av1BlockContext where
   partition : Array Nat := Array.replicate 16 0
   uvmode    : Array Nat := Array.replicate 32 0
   palSz     : Array Nat := Array.replicate 32 0
+  palSzUv   : Array Nat := Array.replicate 32 0
+  alPal     : Array (Array (Array Nat)) := Array.replicate 32 (Array.replicate 3 (Array.replicate 8 0))
   deriving Inhabited
 
 def av1ResetContext (ctx : Av1BlockContext) (keyframe : Bool) : Av1BlockContext :=
@@ -3752,6 +3755,7 @@ def av1ResetContext (ctx : Av1BlockContext) (keyframe : Bool) : Av1BlockContext 
     filter := #[Array.replicate 32 3, Array.replicate 32 3]
     segPred := Array.replicate 32 0
     palSz := Array.replicate 32 0
+    palSzUv := Array.replicate 32 0
   }
 
 def av1GetIntraCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat :=
@@ -5689,7 +5693,8 @@ def av1DecodeCoefs (dec0 : Av1MsacDecoder) (cdf0 : Array Nat)
     (tx bs : Nat) (intra : Bool) (plane yMode : Nat) (yAngle : Int) (uvMode : Nat)
     (reduced : Bool) (qidx : Nat) (lossless : Bool)
     (aArr : Array Nat) (aOff : Nat) (lArr : Array Nat) (lOff : Nat)
-    (cf0 : Array Int) (txtpIn : Nat) (dqDc dqAc : Nat) :
+    (cf0 : Array Int) (txtpIn : Nat) (dqDc dqAc : Nat)
+    (qmOpt : Option (Array (Array Nat)) := none) :
     Int × Nat × Nat × Av1MsacDecoder × Array Nat × Array Int := Id.run do
   let mut dec := dec0
   let mut cdf := cdf0
@@ -5855,6 +5860,13 @@ def av1DecodeCoefs (dec0 : Av1MsacDecoder) (cdf0 : Array Nat)
       dcTok := ht
   let dqShift := if ctx >= 2 then ctx - 2 else 0
   let cfMax : Nat := 0x7FFF
+  let qmTblOpt : Option (Array Nat) :=
+    if txtp < av1Idtx then
+      match qmOpt with
+      | some planeQm => some (planeQm.getD tx #[])
+      | none => none
+    else
+      none
   let mut cul : Nat := 0
   let mut dcSignLevel : Nat := 1 <<< 6
   if dcTok != 0 then
@@ -5862,7 +5874,10 @@ def av1DecodeCoefs (dec0 : Av1MsacDecoder) (cdf0 : Array Nat)
     let (dcSign, d6, c6) := dec.decodeBoolAdapt cdf (cdfOff_coef_dc_sign + (chroma * 3 + dcCtx) * 2)
     dec := d6; cdf := c6
     dcSignLevel := if dcSign == 0 then (2 <<< 6) else 0
-    let mut dcDq := dqDc
+    let mut dcDq :=
+      match qmTblOpt with
+      | some qt => (dqDc * qt.getD 0 32 + 16) >>> 5
+      | none => dqDc
     let mut dcTokFull := dcTok
     if dcTokFull == 15 then
       let (gol, d7) := av1ReadGolomb dec
@@ -5879,7 +5894,10 @@ def av1DecodeCoefs (dec0 : Av1MsacDecoder) (cdf0 : Array Nat)
       let (sign, d7) := dec.decodeBoolEqui
       dec := d7
       let rcTok := (cf.getD rc 0).toNat
-      let mut q := dqAc
+      let mut q :=
+        match qmTblOpt with
+        | some qt => (dqAc * qt.getD rc 32 + 16) >>> 5
+        | none => dqAc
       let mut tok : Nat := 0
       if rcTok >= (15 <<< 11) then
         let (gol, d8) := av1ReadGolomb dec
@@ -8670,6 +8688,1571 @@ def av1PostfilterFrame (seq : Av1SeqHdr) (hdr : Av1FrameHdr)
           yStUv cw ch rowHUv sby sbh sb128w
   return (yPlane, uPlane, vPlane)
 
+
+private def av1QmPackedB85 : String :=
+  "!7Y.MV#]lIemn[U!7+20ffYO4-L/]Keiq;oe19*Md0A6.b9m28br(V:dOl-_u[KrUbTP;2e0N[Dd3R(=d9S2_atgw-dl*F@d3[.>d9S7xau>24c77%<c6_j;u]6T%brCY<b9P51coFkRbU(M:b9dA2cQSqYd3@(:" ++
+  "bTm;2bOu:_e0348bTvChcRR.8au>20WUfrubTd2.^^f6$atq!ue/wp3cmv,,br:5.co$M3dU1I+u[KrWatpk&bTm;-cQiY2cR6m3c6:D/bqv;/br(Dn,:UG]au##+b9P;0bTvS3au>/-bTY5.bTd;/u[E:Ya_<7k" ++
+  "atpw.b9>23atpw,bTd8/bqv>0bx;gr!6RBNbTY/+br1D/c6i]0c6:D/bTY2.bTY5l,l)q0!6fVkau5/-bTmJ1b9G/-b9>,-br(A0u[i6[atpn(b9>,,bTmG0b9G/-bTd;/bTY5.u]6PwbTP)*bTd5-c6UP.bqd))" ++
+  "bTY2.br(Go0'C(>b9+w,b95)0atpq)b9>&)au##,bk?nEatpq+b95)0atgn*b9+q)bTY,*b3@/Hb9G2-b9P>/au5#jbTY/*b9>,.O6=@Kbqm2.cQC;,!6[Piau##+ato-Lc6CG.c6UP.bTP,(bTY/*b9G1Nc6CJ/" ++
+  "c6UP/br(2*b?tFlb9+pSc61>0cn_D/a</W#bT[Bkbr/w]bTmJ1b9.-k_ZkQfbTd/kU?KShatpn*_x/Z#bqf?mc25igatpw*atj$ja<8bjX6o_lcQ(2&c5m,+a<Ajoatpn'a<J^%b$WFka:QKpbT4n&b8pq'b9XAp" ++
+  "br12+_xAZ&bT4Apbr12,_x1rgclg/uc5d&jbTY!qb9YA-b973oZKK3ub8pn%^&s$%bqG(tb9dD4_>HexbrL,#d3?P+d3$M5u[L#reLqKWeaif@eiq<KeG6xhgdfa_aniT@gd@^#eQlXxatpn.br_sDbU:a9coK(%" ++
+  "atgk'c6:S5eKE7=co@%w-hb&6cQiY6c7-s:cQ_S2Nq@gCcRI.Bc76vvauG8-NScc*c7.(Dcox=A_x&h'Omf]=c7.+Fd4b_AdMLD*ud!&H_xB&8co[IMei&OCaBbXR_>x-%d3xFGe19'Tco^4'a'f#Mb9+n(c61;/" ++
+  "c6:G3d3-S2bTY2-bTd8/br*Ita_N=h!R*dmb9G5/bTmJ2au5,,bTY2-bqv>/u[E4W!6RDg!6RGiatpt,b95)1atgq+bTY2.bTd;/bx;k]a</Q$b94w)bTG#*bqm5/cQC;-atgk(bTY5.bTf@xa;tDxb9G/-b9>&)" ++
+  "bqv;-c6UP.bqv;.bTG#(b94v=_wPLa!7*gobr1D.br(>-c6UP.c63TnbTd;/bx<P-_c?mac6:D1cQLG2c61>0cn_D,_wW?$bTR?kan:<6!Q[MkbTmG2b9dG2bTmJ2atpe'c5cq!br(D2ua#41!Q[MjbTmG2bU(S4" ++
+  "br:Y3b9P8-_Z<<&b8pWcM;e,5!67;hb9YD2bU(V6brCd6au7<ebTm2&a<Sw/uc@^D!6@/dbTP21bTdD6br(P:atpw(c6C2#c6UG(aBb=J_Z<,q!6xgnbrCP3d36g:br(Y6b9P/,cQ't$c6Wa__#Qhm!67;gc6:G4" ++
+  "b9PA2d3Hs<brUa3cQCA1b8]H]A)P)ea'Zj_c61A1b9mA3c6L]5e034>cQiV5atq&1udXPS_Z5C]a<Ae*b9Y83auP>5brC]9co.%<c61M2b$AuX!5u7G!60CPau>,0auP84aumJ9av(V<b:Up:b9xUwa_<2Oco$p;" ++
+  "eKN==cR$sv0B0g<cR6v<brij:!6RVrT&.3Lc77.Fd4NRA_x/N*Mt2/2cQrm=eLK0Rei8_Fu[KrVa_<4gau#&,b9P;0br:]5au>2.bTY2.bTd;0u[E4W!6RDg!6RGiatpt,b95)1atgq+bTY2.bTd;/bx;sta</Q$" ++
+  "bqv;-bTP&+bTY/.cQC;-bTY2-atpk'b92xB_c?mac6:D1cQLG2c61>0cn_D,_wW?$bTR?kanrb;!Q[MjbTmG2bU(S4br:Y3b9P8-_Z<<&b8pWcOn3k'a;kH%b9P>1brCa7brLm7b9P),bq+Q#cQ'w!KAcH._c?dc" ++
+  "b9P5/cniV6bU1V6dN[+:b9Y5-cQL5#udXPS_Z5C]a<Ae*b9Y83auP>5brC]9co.%<c61M2b$?T%e0k.8b:u?4u[C0%bU(S5bo)6dc6LV5[HPNwatgZ'c5[0mcQ'w/a'[7ncWt!qbU1]vau,&/b9>&*b93?Qco$P," ++
+  "bTY8-bqm5-b5KXa_wkN%c6(8,b95!jb8pb%au+w(atgk)ZoNTUau+w*!6RBN^'$qubqd#'a<1iYbqm5mbT.$f!6./gatSPx!QRJia_E.dcQ<Kia;tE#bT.$dau5&'!R3aj!6[Mhb9+wi,NQT,au#&.bqOt&!6[Mi" ++
+  "au!w)atpk&atge%atge&P:!-5br(A.!o3Yjatgk)a_<4gatge%atge%b4NjQc61;,a'f%eb94t(bT@0jatge&atgh&atoETbqm2+a;tBbatpk&bTR<jb9+n&atge%atgdZbqm/)a;tBbatpk&b9=wib9+n&atge%" ++
+  "b9+me!QoDba_<1fatgh'a_<4gatpk'atge%arH3fa'f#Mb$W:hb9%'ha'Zvd!6[Jhatp,i!o,iPatgh'!6RBNata'iatg6Wa_E7g!6[Mh!6[HQata'Zat_ufatge%b9%'h!6@8d!o3Vh[eYBoat_ugb$W:g_wkGw" ++
+  "!6RBP]0h&[!6RGh!6KUN!69IL!o3YYb94t'ats-jatJQ!a'ZtN^'$ntb976k_c?ma!6R<LatgMuatpnia_<+d_wdXaatgZd_#x6#!6KUN_wdX_b8pZ#at&?!!6RGea</Jx_c?pba'[#Natpb#_wk?aatJQ!b?tAQ" ++
+  "a'ZnKa<(cbbTFw'a'ZnJa</Hbb8pegb8]SwatJNca<CugatAMvatLidb$W:g_wk?ba<:ofatLlcb$b@h!6@8ab$W:gatJSx!6T[O_wtH!atgZdat_xhatS^e,4<G<cR$g5XnIRqbr(5+])5=%dl<%-Xn.(jdO<RA" ++
+  "u[KqndNq5tbqvD/bqm2+b4l+WbqctfbTG,+bTY/,b6e3dbTR<jatgn(bTI9jZh/XgbrCS3b9I?ia<8PwZJbIdbrCS5bTv>._F$d^ZJWCbb9dD5brLS/b8SPuX5LYVbTdA2brC]7atpn$Uw8qO!6oapbr1M4br:J0" ++
+  "u[Ktkb9+w-bTd,(!6RGhatpq*a_<7hatge%atge%ao^X5b95&,atj$ea_<4hatgh(atgh&!6RDfatge%aq0@YatpqkatSNcatj$gb973ib9+n'atge&atgd^!QxSiatgbfa'ZtLb$W:hb@&JTatge%atgdha;mUb" ++
+  "!6fPi!o,iPa_<4ha_<4gatge#!o,i=_wGF_a<Jh(bTP#ib9+n&atphgatpe!a'Zvdatgdf_wGF]!6fSjbTd2+b94t'b976j_wN5va_<)La'Z8K_wPL^bqm/,bTP&*bTFw(b?tAPa</Sxa;k>wb9*w__wPL^bTP)+" ++
+  "bqd,,b94t)b?tCiatSMuat_uda;sba_F$][bTP&+bTP),bTP)+b[8Lja;b8va;k8uatot__Z5C[bTFw*bTP),bTP),b[8Lja</Pva</Px_wVHY_wW5r!6fSjb9>&*bqm2-b95)+!6[Deb8gNaato^W_wW0]a<8W&" ++
+  "atpt)bTY,,bTP/+bq[9ka</Nd_wM-Qa;k8sa'[%fb94w*au,#*bTP/+bqm5+atj'iapbpM_wW3^a</T%au!q*au!t*b9>&+bTG)+b$W>Qa83b8_F$WG_wkKebTG&)b[8STc6(8mc6(;,bxSXkbZwYpbrCS.au,#-" ++
+  "b9>#)b942dau##.au!t*au!h!b94Sma</W+brCV7atgWc_ZV^__Z33!br(J4cQia3b97+qa;tH!br1G1a<(cdb94t(bTY)jbTFw'atge%atgdQatpk'b[ARha'f%f!6RGi!6RGgatpk&atpk&ar?'a!6KUPatj*i" ++
+  "!6RBNb94qhb9+n&atLof!4m0N!69INb95#,atpn(atgh(!QoDaatgbfa'ZnJZJtRb!6@>gb9>,+b9G,+au!tjatpk$_wW;w!6@2_Zh8Xb!678eau,&+b9G/,b9G/matpe$atADvatSMuXQ$sZ_c?gbau!q(bqd/," ++
+  "au,&+bqd2+!6fJfa_<(_VW#8Sa;mU_atpn'bTG)*bTP,+bTP,,au,#*!6^cNu[L<;hwVjCi@FS],::A&fIm^Xu[i?$eL^6SQ0whldNw&$ei/U3ff=rDd3[CLgKe:'!6RMkd3[.AdNo.<cR&p#!6RDhco6s=d3R%;" ++
+  "coB!%atpq-c6Ug;cQid8cWt/$b9P82d3R!8c6UcVb9Y>2d3R!6br1FVcQia9cQid3cQT,ccR-v:b95)-UxQ.pc6(;.bo)TtcQUP-c4SH'b?tFm^Bf<%au=q*bTY8)cQrd/d3h9%dTp=u!o,iQb94t+bTP20b9G82" ++
+  "bqv;.bTY2-bTd8.u[E=Zatgh&bqv8.c61A2br(>/bTY/,bTY2-bx;e]a_<1gau,&+br(>/c6LP1bTY2-bTd8.br*Iu!6KUNatgh(bTG).b9>20bTY2-bTP,,bTY2-u[U'Xatgh&bTY,,bqm5/bqv;.b9>),bTY2-" ++
+  "bx;puatge%b9>#*bqm5/bTY2,bqv;.bTY2-bZwjvb9+n'bTG&,b9>/.bTP,+b95#+bTd8/KBU/=b9>#*bqm5/bTY/,bTY,)atpq*bNo<3bqm/+bqd/.bTY/,b$W=ibTP))b3f>Lb95#,au#&-bTP)kbTY,)au,&," ++
+  "Nr4CJbTd2,c6:D.bTY/lau!w*atf3Pb9>,,b9P8.b9>#jb9=wibTY4Tb9G2-bTm>/b973jbT4n(b9+mRbr(>/c6:D.bTP)'bTR<jbqtk]b9>//bTP,,_x&QebT[ELb9G50bTY2(bTFq(a_<7kU?TVebTY2+b8pn%" ++
+  "au.9OcQ_S1bTd&)a<Ab$bTcAnbTY/lbT+h&!6oVg[HPKt!6[Jha<Sb&c4.wrcPm&&bq=q(a:nhsc5P#%c5m&,Zhq<u_wvffbT!Drc6LD,b$WI]au52-!6oM]au>5/_xAAscQ_Y+_?<K)cmOW&bT!^*!6RZT,Nen:" ++
+  "f.GKUMC-UBeLSlGT&@klgd@$7P2O:Wg,.aku[Ktm!6o]rcR.+Aco6s:cWsw]b9+q)c6LY9cQrj9cQtj&a</Z-b9Y>2d3R!9bqm4L_ZNB*brUj:d3R!5cniIR_#Zx$c7..Ae0WF6bTm.L^AtvbcRI7DeL&XD^C3A<" ++
+  "^^$Qqd3x@Beiq6JcR-]nA)Ftcb9dM:d4*LIe18oGu[KrVa_E:ib9,#,b9G5/br:S3bTd8.bTY2-bTY5l,3Auq!6KUOau,&+bTm;/c6CJ0bTY2,bTY2-bT[:s!QoMg!6RDgatpq)bTd5-c6CG/bTY2-bTY2-bTf@t" ++
+  "a_E7h!6[Mhau!t(bTd5-c6CG/bTG#*b9>),bT[:wa'f%fb95,,au!w)bTY/,c6:D.bTY/,atge%b92r@a'ZtLb9G8/b9P5,br(>-c6CG.b@8[obqv;l1?6)#a_<4icQLD1bTP/.b9>/.bTP,(b9G/,!Qh^k_wGF_" ++
+  "a<8^+bTP50b9P;/bTmA0b9>)-_wW5wbr(@D_Z3$[a<8^*bTP51b9YD1c6UY3bTR<fa<Jn)a;mU)_>ntpa<8^*bTP51bTvM2c6_a5bTXw&b[8@cbr1Jo;W5:S!675ec6:D2c61G5bTmJ5bTY50bSgH!c5cmwLwH#4" ++
+  "a;dOdbqm81bTdG3brL]5dNQd3a<Jq'_?<H)uc[tJ_wGF[bqd5.bU(G2cQLV6c6id9bTG,mbTm;'_c*4Ka;b0]_c@!hbr(>2b9Y>2cnig7co6s8b9REmcQtjd_#ZiXa;t>xbTd5/auP82bU1P5cQrj8dko!5cX4mT" ++
+  "B&E[Q!672^au7<p!73jsauP85auY>8aumJ<au>,1u[BrVatgk-c6_p=cQrg8cK3&Ab:(V9c6Ud9bx]lvTAR?Ld3I.Bd43OCa<JT)P2Ep:c6Ua;dlkoMeKkIAu[KrVa_E:ib9,#,b9G5/br:S3bTd8.bTY2-bTY5l" ++
+  ",:C:qa_<1fb9+q)b9>,,bTmA/bTY2-bTY2-bTY5l-hd<sb94w-atgk)au!w*bTm>/b9>)+bTFw'atpmF_wPLa!6[Pnb95,.b9G2-bTm>/b9=t'bqv5ma_:N1_wPL^b9>/.b9YA0cQr]4cQ_S1b?t7bbr(;)a'Y6," ++
+  "_Z5C[b95)-bTvJ1cR$g6co-d3br1G(_x8n'_wL77_wN*[_x/Z)bTY>0c6US6c6La6d36Y3!6f]m_>h-O_#ZiXa;t>xbTd5/auP82bU1P5cQrj8dko!5cX4mT,m9%L^_<T7avX.(coQv8co-cq!6@AkcQ_%xbTm;," ++
+  "_?WZ(!6fdn_x]wkdNHms,NHZ2e/ea/bTm>/b94w)Qi)KZ!QxYmbTP,+bTNqcbT.$fbTY2,b95#*Y33Odatpq)b?tFjbRv7Y!6[Mib$W:g!5CZZb94w)b8pbf^B@#xb94kfa_;sabTY,'a_E+fb9.0g!6[Pj!67,a" ++
+  "bqf?ha</Z'a'f.h!R*Yib9+th,NQT+b9>&+cuOlkatge&atpq)atpk&atge%atge%Q6uE8bqm2.!o,iQb9+n(b9+n'atge%!6RDfapEmSbqm/,!Q[Aeatpk&bTP&(atpk&atpk&atfBUbqd,+!69IL!6RGgau!t(" ++
+  "atgh&a_<1fatgd]bqd))a'Zpba_<4gatpn'atge%atge&atgdf!QoGca<(cdatge&atge%b9+q'atge%!4FxPa'ZnKatge%b9+n&b$b@hatgh&areFRa'ZtMb$W:hatge%ata$ha_<1X!o,lQa_<4gatge%a'Zvd" ++
+  "#26n[!QoMg!6[Jgat_xg!o3Vh[-#.Uatge%atj$gatge#!6RBP]E:Tqat_ugatge%!69IL!o3V[!6[Jgatpk&atgZdatLid!Q[#Zb$W:hatge%!6R<LatLidasb)satpn'!6RDca_<+datSPsatgh'atge!atSPx" ++
+  "!6@8d^^R)watgbga</HbatSPtbTG#(atgZ!a'etKatSZ$atg^#_cHmca;tH!atpbea'Zpba'Zvdatgh#!6@8aa_<+eb9+n!b8gYxa<8W$atgWf_x(lfatCfbb9+h%!Q[AbbT4kgatJQ!a<1ie_wtH!!6[Dcb$W:e" ++
+  "b9+h&u[C6$au582bR;Hpc6CM,bS%ksdO3F<_X9[^dO3IEbZw]nbTvY3b95#-bTY/+b93NVbTm;)!6RGjb9>&*bTO>hatgnja_<4hb94w(!P11:auG50b95#*b8pe#a:Q9c!7*jrc6:J1b8Ufc_X^r]a<St/c6CS4" ++
+  "b9=h$_X0RV_x&^,br(J5bqm/*_tc1Q_c?vic6CM3br1M1b?ZSna</T'b9>5,!6RDfatpk'bTP&(b9+n&atge%atf.7atgk*atpnja</Q#b9+n'b9+q'atge%a_<1faq0CY!6fYk!6[Dca</Ndb$W:iatge&atge%" ++
+  "b9+n&aqKSFau!tjatgZda<(ff!6RGhatgbfat_ufatge%Z/kVNa_<1gb@/MSat_ugb$W:gatgbkZK&VMatSZ%bqm/*atge%atge%atge#a;mUbatge%XnI)Jau##*au!qib9.-hb9+n&atLida_<)La'Z8K_c?eI" ++
+  "atpt*au,#)b94t'b94qhatpk#a;k>watfwb_c?g^atpt)b9G,+bTP&)bTP&(atSMuat_ud_wVZ__c?g]b95#*au,#*bTY,*bTP))atCcda;k5uatfn^_wW5ratpq)b9>)*bqv5,bTP))atpk!_wkJwa;jT[_wW5r" ++
+  "!6fVjb9>&*bqm2-b9+w)atpe$atJE_atohYa;k8sa<8W&atpt)bTY,,b95&*bTFw(a</Nd_wM6Sa;k6^_c?seb94t*au!t*bTG)*bTY/*atj'hb59.P_c?g^a</T%au!q*!6oVkb9>&*bTP/+b$W;QT^#p8!60CH" ++
+  "ats*j!6hiT!6oVl!6qoV!6oVm!6T[Qu[Btqc6E^pbTY2-b94t(Yk3CdcQUM/b94w)_wW?!]am+Qc6:M4br1J0_wk8vZ/E:[bTY2/c6U]5c61;+u[Ktkatpt*bU(;latge%b9+q)b9+n'atge%atge%apEpR!6fYk" ++
+  "!6[Dca</Ndb$W:iatge&atge%b9+n&arQ3c!6KUNb979k!QoKOb9.-hatge%#jH^S!o3]matgk(!6[KPatpk&atgZdat_ud!69I=_Z,=[a</T'atpt*b9>&)b9>&)atg]wa</Nda;k8e_Z3&q_wkK%b95#+au,&*" ++
+  "bTY/+atgh&_Z3,v_wW2__>wwpa;tH!bTG#+au!w)bqm2-au!q'b8pb$!67)C_>wuZa;t>vb94t)au%0lau!t*b95#*bqd)jb$dOYcSue9haEgmn6IK(bUM%MdOC)Od3oUKe+D$ifI!r'dm8oD[gIq2eKW=CeLs02" ++
+  "a'Zvec6LV9co7(>cQids,:C=ubTmM7cR7%;cQtj#atpq*brC]7dNf%9cJx)Fb9G83c6ig7cQpkUbTY;3c6_d5bqtk[br:S5co&nub59Ibc6L]7b9G+ad3R!;br(>.XR*ovbr(5,ZKqU%!6RMYdl3(4c5P#*bTd)," ++
+  "bqoEpd2iV7u[KrWa_<2Ob9>&+bqd5/au>5.dN?Y1bTY/,bTY2k,:_M^au!q)bqd2.b9P8.d3$M0b9>&+bTY/j,:UFs!6oVjbqd2.au5/-cniJ0b9>),bTY2k,:L@r!6fPjbTG)-au5/-cniJ/b9>&+b9>)j,UU=q" ++
+  "a_<7hb9>#+bTG,.auG5,bqm5,bTY2-K-pDfats*ibTG&,au,)+cniJ/b9>)+bTP+Bb$W:hatgk'bTY/-bTP5.au!w*bTY2-bN?wDbTFw)au!w*bqv80atgn(atgh'bTW9Lb9+q)!6fVkbqv80atgn(b9>#(b9*6N" ++
+  "au!t(bTY,,bTP5-au,#*!6RJjbONaPbTG&+au,&+cQC;-a</W'atgdNbTY,,bTG),b9Y5+bTP,*!6[PkR-;BTbTG)-au>,*bqf?jbTI6iTB=)]au5,,cQC;,a<8ZhbqthZbqd5.b9Y5+bTY,'bTR?Jbqd5/auG2+" ++
+  "b[8FjatS^(UwqYdb9d;,b?tLhau%0gVuD4hcn_D.bqOw(_x&]ebqmA0au+q&b8phha:?Bqb9+t(atSb$b9F8pb9,#,_x8T$b8pJuau4n(_Zdfj[edQw_ZY[eb8]5sbqxKla_<@^au5,+!6fG^au5/-_xAGtc6:J)" ++
+  "_ZNN(cP=T&b8gZ(!6RWS,::8#dmK6QN9A@Wd4NXFT&IhkejYbKRGYu]fgM>cu[Ktm!6[Voc6is<dl34<c<Vn[atgh(bTdD5c6ij9c6SHFatq#0bTdA3c6_d5atx0Ga_<Ftc6CV6c6_d8a_:Q1a;tW/cR%!>c6ig5" ++
+  "bqEEJ_wNE,cR%(Cco[10d2JBB_Z39(dNx7DeL8X?cnEAX_#?ZocR$v>dO3LGeKkJ#,NJoo!QqfQbTG),b9G2-cQ_P5b9,#,b9>)+bT[:ra_WCi!R*YkbTP,-au>2-cniJ/bTP,+bTP,j,:L@r!6RDfb9+q)au,&*" ++
+  "c6:A2atgn*bTP,,bT[:s!QoKOatj$gb9+q)au!w)br(;1atgn)bTP)+b9;uA!6@;eau,#,b9+q)au!w)bqv80atgn)a_<1fb9)rB!6@;e!6xanbTG&+au!w)bqv80atgn&atpq*bTVu>a'ZtMcQLJ1au,&*bqv5-" ++
+  "bqd8-au,&,a_N=2_wW5ua'[+ibr1D0bqm;0au5/,cn_D._wN/vbTY4D_Z<*^a<Sn+c61A1b9P8-cQUJ3atgk%bqv5(a;rL<_wPL^!6xamc61A2au>8.co$Y5b9+w,a;b2vbr&9B_wW5sa<Jh)cQCG2b9YA1co$]7" ++
+  "b9+w#_x/e%_wL:8_wW2ra<Sn*c61A2b9YA0co-d8b95&,bqF]xbr*JV_#Qhna;tK$bqv;1b9P;/d3?j9b9mD.bxSXoatA?[?/bK_a;t;ubqm8.b9d;1br1P2dNHp8cQUG1!6RPnud!*9_*_S[a<Ab)b9P/0auG52" ++
+  "bTvJ4cQ_g7c6(>ob$AcR!5u7FatAK%!7#uY!76*]auY>4auf[!av(V5auI@ta_<1fbTd>4co-v;c6LUNa</Q)co$a6c6L]7!6xmH_#Zqxd3R(Ad3R.=bSpjS^^-TqcQij>e1&iKbr:Vr,NJoo!QqfQbTG),b9G2-" ++
+  "cQ_P5b9,#,b9>)+bT[:s!o3TPatge&atpq(bqv5.bTP8.au,&,b9>),bMiL&a<8W$bqm8-atpq(bTY,,bTP5-au,#)!6RDgaoI,C!6KXTb9G2,bqv5-bTG)-au>,*bqv;,!o1u3a;mXac61A1b9G5.c6CD1bTP8." ++
+  "au!k(bTFq#a7oPHa;t>tbqm50au52.cQiY6bqvJ2au+dvbr(2%_r_k>_wW5sbTP/-bTvA1c61M4brLV7b9+wkb9P/&_SgXr_*_S[a<Ab)b9P/0auG52bTvJ4cQ_g7c6(>ob$?K$d3wj2c7@.Hu[C*%au,52bQe<f" ++
+  "bTvG2]E:TubTFk&c5xEqbT,&od3-aq,NHZ0d3?a0bTY2.bTG#)RHaWZb$W:ibTP/,bTP(bbqoEib94w)bqm2+b7!aPa</T%b9>&)bTOPq!QxSibTI6ja;2qqb94t)atSWe^'$qub9=wk^BI)xbTFw%!6.2ebT@0e" ++
+  "!6@>hb8pWdbqm)%au!w'a</W%!R*Yib9+qg,NQQlbTP&,bTm/jatge%b9+q(au!q'b9%'gatge%Qo^e=b9G,,!o,iQatgh'au!nhb9+n&a_<1fS0n/Ab9>&+a'f#Matpk'atgk'atgh&atge%apc.WbTP)*a'f#M" ++
+  "atpk'atgk'!6[Jga_<1faqhibb9+n$!6@8d!6T[Pb$W@i!6[Jgatge%ar6*e!6R<La<(cdatge&atphgb9+n&atgbfYr[?P!6@6Lat_ugatgh&!6[HOatpk&arwQka'f#Natge%atphgb$W2Mat_uf[eRa[a_<1g" ++
+  "!6^fR!QoMe!Pc(G!Qh_Ob$W=h!6T[Oa'Zvdas>%Wa_<1fatgbfb9%'g!6@8d!mreZ!6RDfatge&!QoMga'f%e])vKpa_<1g!6[HOatgZeatLiYatge%atj$ha_<1d!6R<MasW#ratgegb9%'ga_<(catLiZb$W=i" ++
+  "!6^fRa;tBb_wkGr!6fPhb9%'ga</JvatLi[b94t(a_<1fa'Zva!6[8bats*hatLlcatSPvau!nha_E.da'Zv_bT@0i!6@8aa_<(f!6RGcb8gYxa</Q#b9+bda'Zvaatpk&a'evca_<1fa;tDub?tCh!673Ma_<1c" ++
+  "b8pbfb8pZ#!o5rSu[C0$!6ojrboaZpbTY8-b7V^pdO*@=_XKiadO*CDb?ZSnb9G;2atpq*bTd5,b93QVbr(;ma<8Z&b9G,+b94;ia_<:j!6RDfb9>#l[,M)OcQiV0b94t)atpe!Zh/Xcc6LS2c6:A.a_<1b[,AXa" ++
+  "c6LP2cQiY3b8SPuYMf(YbTdA1br:V5atpk#W8YDSau##-br1J2br1D.u[KrUa<Ab'c61D,!6RDfatj$ib9+t(!6[Jgatge%ap,r9!6oYkbTFwia'Zvdatge&b$W@iatge%atgbfaq9FY!6oYkatge#!6@8d!6T[P" ++
+  "atgk'!6[Jgatge%aqTX]au!t)!QoGc!Qh_Oatgegb?tChatgbfatgdla;mUb!R*Yj!o,lQ!6REOb9%'h$.ekVa<(fhatpk&a_</Natge%atj$gatSPxatge%Y2f7_atLigb94wjb9+n&a_<4g!6[HOatgbfa'ZnJ" ++
+  "Z/bMLa'f+hb9>#*b9+q(!6[KPb@&Lga;k>watftaa;mU_!6fSjbTG&+!6fQQbTFw(a_<1dat_uca;s^_a;t>t!6fPjbTG&*b9>&)b94t)!6RDfa;k8uatfwb_wW5sa<Ab&bqd,+au,#)bqm/,!6RDba</Px_wMK[" ++
+  "_wW5sa<A^&bTG&+au!w)bTY,,!6REOatSH_b9*q[a;k8sa<8W&atpqjbTY,,b95&*bT@0i!Qh_L_u'FV_wPL]!6fPib9+tjbqm2,au+w*b94tib$b@hU>Z+:!6@2_b9+q'b?tLkbTG)*bTP)+au+w)!6T[MU>e1;" ++
+  "!60CHats*j!6hiSau%0l!6oVl!6oVm!6T[Pu[Btqbr(>*b95#*bqm2+arn@Pc6:A,atpn(b8g^%])G$fbr:P3c6:D/b$W.dZh&L^bTY2.cQia5bqm2*u[KrUa<Ab'c61D,!6RDfatj$ib9+t(!6[Jgatge%apNsR" ++
+  "!6oYkatge#!6@8d!6T[Patgk'!6[Jgatge%are?e!6KXQatj*i!Qh_Ob$W=h!6ToF_wW5ua'[(hb973jatge%!6[HOb9%'gat_ud!69I<_Z<*]a'[%gb9>#*b?tIk!6fPhb9%'ga</Nd_wW5g_Z3&qa;tK$au+w)" ++
+  "bTG)+au,#)b[8Li_Z<2va;k5b_>wwpa;tH!bTG#+!6fVjbqm2-au!nhb$b>P_wM?V!6'=Ha;tH!b9+qibqd/*bqd/+b9>#+atj$h!6BGUc84B7gG.2flu2'$bU(dEdliGVcR7:GdgM-jeL&X$dlb[D[g%T1bULj;" ++
+  "fIR92a'Zveb9P>5c6Uj=c6LVq,:C=rbr:S5cR.!;cQgF1b9+w,c6LV8cQia6NT]+Gbr(D2co6m7cL8vTbr(D2co6m6apc1Zbr(D4c6LV1T_'JdbrLa6bTO#gbr1S7bTP(ic6La9bqP!jcR-v:!6o#_cQiS1^BxN(" ++
+  "bT4w,b$WFq!7*tW,NJuq!6[JgbTP,,au>/-c6(A0cQLA.bTP,+bZwZ^atgbfbTP)+au5),c6(A0c6*Hob9>&*bMNd)a_<1hau!tjc61>0au>//b9+w+bTP,,K.+Mga_<7hbTR<nb9>,+cQUP0au,#+b94vC!QoMg" ++
+  "!6fPib9+w*bTd2.bTd5+bqm5,bTMxC!6RBNbTG#*!6x]lbqd5.bqm/,b94w)bNR)Ea_<4gau!q)b95&*c61A.au!w*bTY1Jb9+n'atghhbqm2-au5)-b$WCjb94w)PNW#8atgk'bTP),au5)-b$WCkb9%'gReaHR" ++
+  "b973latpt)c61A-au!q'b9>%Qb94w)au!q)bTG,,bqd)+b9=wiapX!Ub9+w)bTY,-b9G)kbq[9ibTNTVb9+w*b9@9nbTY/*bTG#)!6Q-Bau,#*b[8Xnbqf?mb$bFlTB=)[b9G)-b9G)kbT4q)a'YeDb95&*c6:D." ++
+  "au!wka<Ad_b9>,+c6:G/!6oMfb?t=JbTd2/b9G,*bTG#&b9=#gau5,.b9+w)a<CudZ0'$qbqm/+a<JZ$bQnHmbqm/,bq=n&a:e^sb9,#&bqI-j[-GL[bqf?jb8]Gvau4w'a_<:_!6xdla<ASpc6LM0_Zt>tbqv>(" ++
+  "_c@!ic5-igb8_li!6RTR,::7wdm&uNO64UUd43OHU#X2jf.PKJT&@Nbf.dwZu[KrUatpn+cQrg9dO*7<c<Vmratge%br(J3c6im9c6JQJatpt-bTd;0c6_g7ato<La_<@pcQrg6brC]6a_:T3a'[+mcoI+<c6ij8" ++
+  "bq<-E_wWH(d3f7?coI+<cn/BE_Z39%d3o@Ad4*IAcPsu;_>o'#cR.!>d3xCFbr<Uwa'o)Ob9+n(b9>)*c61>0b9Y;1b?tOmbTP,+u[BrYa_</ObTP)+au,#+bqm;/bqoEnbTP)*bMrX*a_</Nat_uhatpn'c6(8." ++
+  "au5,.b9+w+b95#+LF9p)!6RDfa_<4gb94t*au!w)c6:G/!6oYkb9>%I!69ILatgh'bqd,)b94t)b95&*c61A.!6hiQatgdFa'Zpc!6[Mic6(5*b973latpt)c61A.!6oYkbTP+I_wPLa!Qx]nb9G,,bTG)*bTY,-" ++
+  "b9G)kbq[B7_c?eIa_<4ic6(;-bqv5.b95&*c61A.!6fJgbTY1F_wW3^atSZ&c6(>.br(;0b9>,+c6:G.au,&*_wW5B_Z<*^a<8^)au5,.bqd;/bTm;1b9P/lbT+Z#bqt$=a;dR_b9>,+c6:D1auG5/c61G0c618-" ++
+  "bTd)$_r_n@_wPL]b95&*cQLJ2auG80cQLS3c63Np_w<)wbk$H6_wPL]b9>)*cQLJ2auP;0cQLS4c63Npau5&$_TG*5_F$][!6x]lbqm>.cQUP4b9mD3c6LMpbxSUnbx=lPa;b2ra;tK$bqd5,cX5$scQUS4c6LP6" ++
+  "bT[Bp!XIC:!5u7Fat:[g!6qoWau@BrauP83!7H6aaumJ2au@:sa_<1f!6xjrc6Ug;br1IOa</T'cQUS3bTmJ6br(Fe_>x#wc6is>c6_m<bSpjY^^-Tqbr:Y;dlWUGbTmGp,NJrp!QxShbTP,,au5),c61G1c63Np" ++
+  "b9>&+b?ZPo!Qh_O!6RBNbTG#)au5&+bqd5.bqm/,bTP)+bN9.+!6RDfb95&*b9+q(au!t)bqd5-bqf?m!6RDfap*PI!6KXPbr(>/b9>)*bqd/,au5)-b$WCj#.aG5a'Zvbb9>/,c61A0au>/-bqd5.bqd)+bTFn!" ++
+  "a77/D_cHmcbTd2.bTY8-cniS3b9Y80b9+w+bqFdvQJqOBa'ZmbbTY,.b9G5-d3-]5b9dD3b?tOlc6(!wN8aM8a;t>tbTP/+c6(ApcniY3c6LV5bU1P3!7$!=,P&jI^B[B/cS#O+bUUd4co$_md2_A/br'qbb9G/+" ++
+  "_?NN'!R<plcQW^rbr3Ova<8^*cuOrnb9>,-bTG!UbTm>1a</T%b9G/,b93ndb9=qgatpn*b94w)Z6oBP!6RDgbTP)*b7Vqna_<4gbTP))a;51Z!6RDhb94qh]b_htau!t(!Q.&ab9>#)a'Zd^b9>&*_c?]^bTY,'" ++
+  "!6.5fb8p^ebTOtgbTI9katgh&b?ZSn!6@<NbTP,/b8p^ea_<4gatpk(atpk&b$W:gatf:<b?tLlb9G&la_<2Ob9.-jatphgb9+kgatfF?bTG)*b9G)'!Qh_PatgegbTG#(!6[JgatgdVb9,#*au!q%!Qh_Oatgh&" ++
+  "b9+q'!6[Jg!6RDHau+w(b9+eea<(cdatgegb94t'!6[Jgatgdbbqd))!69IJa_<1fatj$hatphgb9%'ga_;T@atCcaa_</Natge&atgbfb9+n&atg2l!6R>b!o3TPb$W=hat_ug!QoKO[e[YV!QhcPat_ugatgbf" ++
+  "b9%*f!5O(H!QoKOatj$h!6RDd!6RDf[l^$Ea_</Nb9+n&!6T[O!n$iEa_<1f!6RDfatgbfb8iufasDlXat_ufa_<4gat_uf!QoEM]bU^ra_</Nb9+n&!6RDda</Pp!6[HOb$W=ha_<1f_wkGwa;)nqatge%atj'i" ++
+  "atSPxask,sb$W=hb$bCf!6R>b^^R$_b9+q'!6KXLatgJu!6[Jha_</Na</Jv_ZNB!b9%'g_wtBaat&>wb$W:gatJNc_c?mda_<4datSPx_wtN#a_<)M_x&Qeb8irca<1lg!Q[Ab!6[Jg!673Ma_<1cb$W8Ob8pZ#" ++
+  "!o3VfbZwYtdkH]3c6BeZc6(5,bTcapc6is<bqO;fb9vY<d3!6?b9G53a<8Z&bTd8-b93TVbTv>.a'Zveb9G,+b946Satgh(a</Q#au!t(!PLHR!6oaob94t(b94t%a:H9c!6fYobqv8,bTP&j_uhr]a<Ah+c6LM0" ++
+  "bqv5+_XBcY_x&Z*c6CM2br(>,_u0LU_wkN'bqvA1br(D/b$?Jm!6@<Nbqm5/b8irea_<4gatpk(atphgb9+n&a_:c&a_<7hbqd,+!QTRM!6[Jgatgh'atge%atgbfaqBJDatpk*!6RGga'Zpb!6RDfb$W@iatge%" ++
+  "atge%aqhf_atpk)!Qh_Ma'o+fat_ugatphgatgbfatg-Ta<1ieatgh&a'f#Ma_<1f!6[Jga_</R[H,%Ra_E7hb9%-i!Qh_O!6[Jga_<2Oatge%YkEIb!6R>eb9@9latgbfb$W:gatge%a_</Na'ZnJZ/bRc!o3]l" ++
+  "atpk'b$W=hat_ugatgbfatJQ!atftba;t<aatpq(bTP)*atpk&b$W=hb$bCia;t>tYk<Caa'ZpbbTP&*b94w(bqd))atpn'a_<1ca</Q#WT(YXa'Zpbb9>#*au!t(bqd)*!6fPia_<1fatSMuYMx:^a'Zmab973l" ++
+  "atpq(bqd,+au!q)a_<4d_c?mcW8dPVa'Zmab973kb94wjbqm2,au!q)a_<2Oa_<(_X5UgX!6@-IbTG#)au%0kb95#)bqd/+b9%'h!6@;eUw;=<!6@2_b9+q'b?tJSbTG)*bTP)*b9>#)!6[BMUwDC=!672_!6^cR" ++
+  "!6^cS!6hiT!6hiU!6hiTat_uhu[Btpc6:D+atpn(bqm2+as)Ni!6fTRa_<1fbTP))b7sqja<Jk,br1D/bqm/%b7MTe_ZbQ'br1M4br(;,b$?Jm!6@<Nbqm5/b8irea_<4gatpk(atphgb9+n&a_:k>!6RGgbxSUk" ++
+  "atLiba_<1fatj$iatge%atge%atg$Qa<1ieatgh&a'f#Ma_<1f!6[Jga_</R[e>*h!6R>eb9@9latgbfb$W:gatge%a_</Na'ZnJZhAfea'f%fbTG&*b94t(atgegb9+nib9+h!a;seba;t<_a</T&au!q)b9+w)" ++
+  "ats*jatphgatge#_wVW_a;k6^_wkK%!6fSjb?tLlb9>#*au!nhb$W8O_wMEX!6'=Ha;tH!b9+qib[8Rkbqd/+b94w*atj$ha'^.Ub;%o2fIv^bj^u<tb9PM?f-Zg[c6j%Ed.YifdlbX$dO<UE[.2</a=GP=d4,C)" ++
+  "a'ZvdbTY80cQig;co-iL!QoPjbr(G3co@%:c03;Gau!w,br1P7cQ_XUb9+t)bTd;2co-g6R-DHTbqv>2cQi]2U?BGabTd>3c6CCcbqv>0c6U]5b6#rfbr1P5bql2ibr:Y7bTX;mcR$m7bR2^ucQ_V!d3Qv7^_3T*" ++
+  "a<T#*cQtj!a'x/OatgegbTP,+b9G,-au>,.bTv>-bTY/+Kg'v+a_<7hbTP),au.6oau5,/atgn)b92p1atgbfbTG&*b9>&,au5)-bTm;,bTY/+MCH=oa_<7hbTG#+au+w,au5,.b9+t)b93'G!Qh_O!6fPib95#)" ++
+  "bqd5,c61D.au!w*b3KC1a_</NbTG#)au!t*au5&,bTd5+bTP)*OnlG2atgegb94t)au%0mau,&-atgk)b9<9Lat_ugatgh'b9+tjc6(;-bqm/*bTP%Rats*iatgh'b9+tjc6(;-bqd)*atgdObTG#(atpn(au%0m" ++
+  "au,#,atgk(bTNX@b9+t(b94t)au+w+b9G))bT@0hSbfhVatpn'b[8Ulbqm8,au!t)bPB:Xatpq(bTG)*bqm8,au!qjTBO,Zb94wjc6(;-bqd)*atpmZb95#)b[8Ulbqm8,au!qjUx#VabTG)*bqm8,ats*ibPq__" ++
+  "b[8Xmbqv;-atpnia9Bcdau5&,b9G,*b$W:iVWmpfau,&-atgk)!66I7cQCG/c6(2+a</VacQCD/bqm/+bTFpmau5,.b9+t&!6ekVbTd5+bTY,%]bix!au!nhbS&2vau%0k_wN8wbTOt(^B@'!bSpGwbqm;$b9G,'" ++
+  "au.9ou[E4Xbra+GdI>:XdO*CFcjmf^eiq9Sd/1cYeLqN^dTp=u!6RDhbTmA2c6is=c6J<E!6RDfbTY5/c6Ud9c6AU9atpn*b95&,br:V7bTNTRa<8b-bTm>0br1P5b[7)<_wkQ*c6U]6c6Ud8bq<EM_wWE(c6Ua9" ++
+  "cR.!=bq*3H_Z33%cQrj:coR7Ac5W*A_Z3-#c6_j<coI.Abr*Iua'o)OatgegbTG)+b9G)-!73jpbTm;,bqm5,K^WF)!6KUNb9+t)b9>#+au>,-bTd5+bTY/+N913/!Qh_O!6fPib95#)bqd5,c61D.au,#*bNTC1" ++
+  "!6RBNatgbfb9+q'b9>#*au+w+bTd2*bTP)*Oup-5a_<4gb?tFiatpn(au%0mau,#,b$W@j!6Pf4!6@8datgk'c<pclb94t)ats*lau,#,atgk(b93-G!69ILatgk'c<pfnbTG#*au!q*au,#,atghjPkDe0!6KXR" ++
+  "b9REoau,#*bTG&)bqd2,bqd)*bTP(J_c?bHa_E@jc6(;-bqv8.au+w,au,&-atgk%_c>'+!60CKa'[(gc<plpbqm5.b9G)-au,&-atgk)b9<-Da;dR_!6oVm!6xanbTY8.c6(D/c61D/au!gw_r:W=_cHkJbqd2m" ++
+  "c61A/bTm;0auG2/bTd5+bTP,-MtDD8a'ZkIbTG,+c6(>/bTm;1auP81bTm;,b[8@aNT%V:a;t>tbqd2mc61A/br1D2auG51bTm;-bTP/-uc@bH_F$]]_x&W(au+w-au>/0b9P80c6:P2b[8Xkan('v_*_QG_ZNHf" ++
+  "bqd2mcX5!ZcuP.]d9m7^drL=[c<Vmr!QoMibr(D2co@!9c0t^6b9G;0bTY5.cQrg6bmqFS!6ojscQid7cR$m7c2GRR_x&e-cR$s<dO3C?cWt!r!o,lQatj$iau,#*bqd2mcn_P1c618-b9>%?a_N;Qa_</NbTG#)" ++
+  "b9>#+au5&-b9P/*bqm2,N[V_1a_<4gb?tFiatpn(au%0mau,#,b$W@j!6Pr8!69ILatgk'c<pfnbTG#*au!q*au,#,atghjS)XM6!6KXRau5&,b9G/,bqd2+c6(;.bqd)*a;dO8_Z<']a'[(gbxScobqv;0b9P/0" ++
+  "au5).b9+t%_Z1cGa;k6^_c?sec6(>-c6:D1b9Y52au>20b9+tj_Z(@=a;YI]a;kE#bqd2+cQCJ0cQLM2br1G4b9@9na<1amf-/R6b9dP:eb+gRc61D3bnwEjau,,.])vKrbqv#&bTd2(br(;,cQCJ1bx;gp!6odu" ++
+  "a</Q$b9>,-b93TVc6CPra<8W%bTY2,b5hieb?t=fatpq*b94vmb9+h!atge'b9>#)]*(Kma_<4hb94ti^I1KHatpn(a_;m[atge&b94qh^B?wub94w(!5Uh^b94w(!5itbb94t'^^f3!b9+^#bTFw%bTI6ib9.-i" ++
+  "b?ZSn!6@8eb9+w)cuOjSat_ug!6T[Q!6fPiatge%atf@>atpq(bTG)patge&!6[Jhatphgb9%'gTI.JCb94w(bx]SQatgbfb$W>Qb9+q'atge%aq0@YbTP&jb[8DQat_ug!6^cQatphgb9%'gVWdmcb$W>Ra'ZtL" ++
+  "a_<2Ob9+q'b$W:gatgddb94t'b$W2Ma<(cd!6T[P!6[Jha_<1fatg,k!Qh_M!6@6La_</Nb9+n&b9%'gatggn!QoGc!6@6Mat_ug!6[Jga_<1fa_;eCb8iuda_N>Qatge%b$W:g!mrfEa'o)Ob$W8Ob9+n&!6RDf" ++
+  "asY@^!o,iPatge%a_</P]L50Hatgbfb$W;Pat_ufasG+Xa_</Na_<2Oatge%!6RDd!5CWY!6KUNat_ug!6T_P!6RDYatgbfa_<1fatge%!6RDda;,+Z!6RDf!6[Jg!6KXO!5CXDb$W;Patgehatg]x^I(HHb9+n&" ++
+  "at_ufa'ZvXb$W=hatgehat_uc^fCTJb9+niatLid^'$ntatj$gat_uc_ZNB!b$W:ga;tDqb9+q'!6RBN_wW;xa_</Na</Dwatgbg_wm_datgZ!a</Q#at:[ca_<4d!6TcQatSZd,3o29b9P;1ZoNZYatpt+[Gq's" ++
+  "d3?m4ZJkUldO*@=L#b7'cR-a/atpn)bqv8,T&xnYbr(5'atpn(bTY,*XnfIib94n#atge&bTP#i]Dv:TbTd2+atge&b94t%[,]jOb9P5/b94w)bTG#$Zh8Xbb9P5/bTd5.bTP)%Yk3:]b9>,-br(A0bqv8(XPrjW" ++
+  "au!w,br(D1bTd5+KB*$watpn(bqd8oa'ZtLatge&!6^cRatphgb9+kgSL;5?bTP)*ats-g!6KUNatj$h!6[Mhatge%a_;)E!QxVjb9.-k!69IJa_<1fatgegb9+q'!6RDfar#pJb9+q(b$b>Pa;m[d!6RDfatge&" ++
+  "!6RDf!6Q^P!6RDfb9+kgb$W2Ma<(fea_<1fb9+n&!6K[Da'ZnJa_E:hb@AYUa_<1fatge%!6RDfarwFP_wd_g!6hiQatgbfa_</Natge%at_uf!69I;_c?bHatLifau+w)!6[HOb$W8Ob$W:gat_ufat_uO_c?bJ" ++
+  "a<A^(!6fPjatge%b$W;Pb9+kgatg]wa:$$aa'ZnKb?tLkb9+t(b9.-i!6[Jgatj'hatgde_F$Y[!69IMau%0kau!q(b94tibTG#(b$W:g_wW2]_Z<']a;tK#b?tIjbTP&*atpk(!6[Mha_<2Oatfn^a;dO^a;tHd" ++
+  "bTG&)b94w)b94t*!6fPj!6RBN_wMBXa;k6^a;tH!b?tIjbTG#*ats*kau!q)!6RDfatfbX!6'=Ha;tH!b9+q'bTG&)bTG&*b94t*!6T[Pa'YtA!6'=H!60CM!6^cR!6fPj!6hiT!6hiT!6qoR!6^YW!6[Vnb[8Fg" ++
+  "b94w+b94vpa;tE!b[APRatpn(atpAla;tK&bTd8-b9>&*atp;i_Z<3!bTd8/bTmA0b92_;!6@8eb95&*cX4aRa_<1fatj$i!6fPia_<4ga_:n?!QxVjb9.-k!69IJa_<1fatgegb9+q'!6RDfar?+Matge&at_ug" ++
+  "!69IJa_E7g!6RDgatgbfa_MsX!670Mb?tJSatge%!6KUN!6RDfatgbfa_<)L[,V/O!nxPhb[8RkbTFw'atj$h!6[Jg!6RDd_wVed!67*Ia'[!eb[8RkbTG#)b9.-jatpk'!6RDca;jbba;dO^a;tHdbTG&)b94w)" ++
+  "b94t*!6fPj!6RBN_wMKZ!6'=Ha;tH!b9+q'bTG&)bTG&*b94t*!6T[Pa'X_#fJTr;gbdQmu[E4XbrLpCdfdLYcR71DTBlJhdlDD$d3o=+dO<O6e0tREeQlXx!QoPibTmA3c6Ua;bNhR5au##-c6LY7d3+o>atgk*" ++
+  "bTmD3cR$f]atge'bTY80c6L]5S*.TTb9G/.c6LY4U$0A^bqv>1c6URib9G/-br(G4b6,xfbr(D2cQKMmbr(D2cQKSpbr1M5bRMktc6_XxcQig6^'IB)_?th.bT[:sa(*5Pb$W;Pb?tMTb[8YVbxSdWc<pv[b?tL1" ++
+  "$0M<U!6^cS!6hiU!6qoW!7#uZ!6T[SO!8$wa_<5Pb[8STbxSaVc<pmXcuOsVc0Gl8!6KUP!6hiS!6qoV!6qoW!7-$V!6mp$a_</Nb?tJSb?tMTbxSaVc<ppYb?tL:!6KUN!6KUP!6^cR!6qoU!6qoV!7-$V!6du9" ++
+  "!6KUN!6^cR!6^cT!6hiU!6qoX!6^cRQoTX$a_<2Ob$WARb?tJSbxSaVc<pdUbP')>a_<2Ob$WARb?tJSbxSaVc<pdUbPDQC!6^cQ!6hiS!6hiU!6qoW!6T[RRHOY>!6T[R!6^cS!6qoV!7#uT!6nF0b$WARb?tGR" ++
+  "b[8STbxSdWb$W@Bb$WARb?tGRb[8STbxSdWb$W@H!6hiS!6hiT!6hiU!7#uT!6n<E!6^cS!6hiT!6qoW!6T[RV_B;5b[8STb[8VUc<paTbn,dHb[8STb[8VUc<paTbnpGQ!6hiU!6qoW!6^cRUZslK!6qoV!7#uU" ++
+  "!6ef;bxSaVbxSgXb$W@KbxSaVbxSgXb$W@U!7#uW!7-$V!6eZR!6qoX!6^cR[lK'GcX4mVbR;_WcX4mVbSLUg!6^cSZi@d^!6oWRb?tLcb?tLi!6oGgc<Vn[b9>87e0s!fcR-v<dlD+kbrj.FdlM.hb:1vHfI@-0" ++
+  "a'ZtLb95#-br1M6cR-lTa_E7g!6fYnbr1P5cnpu@atge&atpq*br(D2cnh/Za<8Z(cQLG/bqvA2cQK#Wa<(cicQ_Y4br(D2cQJtU_wkB$cQid7cQia6cngwS_F$]dc6LY7co6v;cnq#R_Z<)vc6Ua8co@(>d38ix" ++
+  "a'o)Pb$W;Pb?tMTb[8VUbxSgXc<psZb?tO1a_bGRa_NARb[8STb[8VUc<pjWcX4mVblNT:a_</Pb?tJSb[8STbxSdWbxSgXb?tL9!Qh_O!6KUO!6KUO!6^cR!6hiT!6hiU!7-$U!6n!%a_</Na_<2Oa_<2Ob?tGR" ++
+  "b[8STb[8VUcX4jUbmB)<a'ZwMb$WARc<paTb?tGRb[8PSbxSaVc<paTbO3E3a'ZwMb$WARc<paTb?tGRb[8PSbxSaVc<paTbP&t:a'ZtNc<pmXb[8VUb[8STb[8STbxSdWb$WC3_c?eIa_NJUc<pgVbxS]Ub[8ST" ++
+  "b[8VUc<paTbm&k8_c?kKa'[)Pc<pjWc<pjWc<pjWbxSaVcX4jUbN?i*_c?kKa'[)Pc<pjWc<pjWc<pjWbxSaVcX4jUbOWW5_F6hJbxSaVbxSdWc<ppYc<ppYc<ppYb?tI,_F$THa'[)PbxSaVc<pmXcX4vYcX4vY" ++
+  "cX4mVbONN3_F$ZH_c?tNbxSdWc<pmXcX5!ZcuP+[cuOvWc/?O$_F$ZH_c?tNbxSdWc<pmXcX5!ZcuP+[cuOvWc03'+_*_QG_c?tNbxSaVc<ppYcX5!ZcuP.]d9m(Xc<Vmr!QoKObTd;0c6U]8bP0(Pb95&/b9>)-" ++
+  "bTmD4b6#_XatSe,c6U]7c6LV7b6,_Va;kH'cQrj:coI+?bZw]o!o,oS!6T[Q!6qoU!6qoV!7-$Y!76*W!6v[/#Ne$R!o>uU!6hiT!6qoW!6qoX!6^cSP:+-va_</Nb$W8Ob$W>Qb?tJSb[8STbxSgXb$WC?a'ZnJ" ++
+  "b$W;Pb[8YVb$W>Qb?tJSb?tMTbxSdWb$W@>_c?eIa_NJUc<pgVbxS]Ub[8STb[8VUc<paTbm&k8_c?kKa'[)Pc<pjWc<pjWc<pjWbxSaVcX4jUbOWW5_F6hJbxSaVbxSdWc<ppYc<ppYc<ppYb?tI:_*_KEa'ZkI" ++
+  "b[8VUc<pmXc<ppYcX5%[cX5%[b?tPS,P/aE_?3E*dO_GVd3Hg3c6BSqa_<7kbp]Aub9>)%b95#+_ZkW(!6oanbr/6Ca<Ae+d2iA*b95#+bTNfDbTd;1!QoPib9>)*V<GmebqI-gatpq)bTF8mb94n#atgh'b9>!t" ++
+  "!6R;aatge&b94svb8ire!6[Jhb9+Wba_<1fb94svatge%b9+q'^^[)vatpn'^B@#wats*bb94w*!6%)cbTFk%bTFq'au!q'LZAI$!6^cR!6qoY!69IL!6KUO!6T[Q!6^cR!6T[PSiaH-b[8STc!!mVb$W;Pb$W>Q" ++
+  "b?tAPb5MeG!6hiT!6r$V!6T[P!6T[Q!6^cP!6Z=/b?tMTb$WARa'o)Na_<2Ob?tDQb?tAPb6#mJbxSVSb[8DQa_</Nb$W>Qb$W>Qa_<4O!6hiR!6T[M!69IL!6KUO!6T[P!6^cP!6ZbS!6T[P!69IJ!6KUN!6T[P" ++
+  "!6T[Q!6KUO[OArC_c?eIa_</Na_<2Ob$W;Pa_<4Z!Qh_L!69IL!6KUN!6T[P!6T[O!6[*Eb$W2Oa_N>Qa_<2Ob$W8Ob7auYa'o)Pb$W8Ob$W;Pa_<4^#Ne*T!6KUO!6T[O!6R$Ga_N;Pa_<2Ob$W8Oasd=[!6KUN" ++
+  "!6KUO!6KUO!6KUO[eRSW!6KUN!6T[O!6T[O!6[-Fb$W8Oa_</Nb$W;Pa_<1Xb$W8Oa_</Nb$W;Pa_<1[!6T[P!6T[O!6^iR])xdZ!6T[O!6^iR^I(HHb$W;Pb@/O^b$W;Pb$W>Sat(Oa!6T[Q!6KUN]bWv]!6^cP" ++
+  "!6R3Ib?tGRa_<1[b?tGRa_<1c!6^cP!6[5b!6KUOa_</Nb8]Qcb8irf_wtQd,3o2:!6oap[O/n[atgk)])P9tco$a3Zh/_mco@%;Lwe;=br1S0atgh'bTY2+TfISEbqv8ma</T%b95#*XQI@hb[8Lga'Zveatpq(" ++
+  "^&_To!6fTSa_<1fb94sq_wN5tbr(A.atpk'atpjl_wN-]bTd8/bTP)*b973T_Z3&qbTd8/bTd5-bTY+k_Z)wobTY5.br(A0bTd1Da'ZnJb?tJSbxSgXa'ZtLa_<2Ob$W>Qb?tGRa_<4A!Qh_R!6hiS!6^iP!6KUO" ++
+  "!6T[P!6T[Q!6T[OV'l&1b[8STb?tGTa'ZtLb$W;Pb$W;Pb?tDQar6%Lb$W>Qb[JVSa'ZnLa_<2Oa_<2Ob?tAParQ7Ob$W>Qb[JVSa'ZnLa_<2Oa_<2Ob?tAPasauXa'ZtNb?tGVa_N;Pa_<2Ob$W8Ob7DXSa'ZtN" ++
+  "b?tGVa_N;Pa_<2Ob$W8Ob7M[S_c?kKa'[&Ob[8PSb$W8Ob$W8Ob$W8Ob$W8OarQ.L_c?kKa'[&Ob[8PSb$W8Ob$W8Ob$W8Ob$W8Oarn@O_c?eKb?tJSb?tJSb?tDQb$W;Pb$W>Sb6>pH_c?eKb?tJSb?tJSb?tDQ" ++
+  "b$W;Pb$W>Sb6n4L_c?eIa'[#Nb[8PSb[8PSb[8MRb?tGRb?tAPaqhVD_c?eIa'[#Nb[8PSb[8PSb[8MRb?tGRb?tAParH%J_F$ZH_c?qMb?tJSb?tJSb[8PSb[8PSb[8JQb5qSC_F$ZH_c?qMb?tJSb?tJSb[8PS" ++
+  "b[8PSb[8JQb65gF_F$ZH_c?qMb$WARb?tJSb[8PSb[8STb[8JQb?ZNWau,)-b?t=fb94w)bTOVqa<(cfb@&GQatgh'asatla'[%ibTd8-b94w*!51?Oa;kE$bqv>0bTd8/anLL'a'[#Nb[8VUcX4aRa_</Nb$W;P" ++
+  "b?tGRb?tAPb52QB!6hiT!6^cR!nq[N!6T[P!6T[P!6^cQ!6QQL!6T[Q!6hoS!69IJ!o,iQ!6KUO!6^cP!6R&X!69IL!o>uT#Ne*T!6KUO!6T[O!6ZtS!60CK!69IO!6hiS!6T[O!6T[O!6T[O!6T[O!6QeO!60CI" ++
+  "!o>uU!6^cS!6^cQ!6T[P!6T[Q!o;tN!60CI!69IN!6hiS!6hiS!6hiR!6^cR!6^cP!6QWJ!6'=H!60CM!6^cS!6^cS!6hiS!6hiS!6hiQ!6Y=(eM!43ei8xZu[BrVbU(]<dgV$_cR.!?Ux,dhcoH;&c6_j*d3R+3" ++
+  "d3f!<e6OOw!QoPhbTY5.cQid8dI%E>atpq*bTmD4cR,0Datgh'bTY81c6Uccatge&b95#-br1M6T'*qVb95#+br1M5Ux,Yab9>)-c6LXlb95#*bqvA2cNDBib9G2/c6TVmbTd;0c6Tdqbr(G2cO.tsc6LY#c6LV7" ++
+  "[f1o'_$E^(d3q7'a(*5Qb$W:gb9+q)ats*lau!t*bTP/+cuN/9$0M<U!6[Jhb9+qic6(8+bTY/-au@B=$0M<U!6[Jhb9+qibxS_mbTY/-au@B=#l)-S!6[Mhb9+qibqd/*bTY/-!7-$*#3GuR!6[Jgb?tGRbxS[m" ++
+  "b9>&,!7-$+a_N;Pa_<4gatpk(!6hiSb95#*bTG/nRlPr&a_</Nb9+n'!6^cSatpn(bTG)*c<o?.a_<1fatge&atj$j!6fSjbTG&kc<oE/b$W8Oatge%ats*j!6fPibTG&kc<oJG!6KUOa_<2Ob?tIjb94w)b9>#-" ++
+  "!3(?0!6[Jgatghhb?tIjb9>#+!7#u/b?tFiatge'!6^cRatpq(b[8YVVWP]^atpk'!6fPiatpq(b[8YVUwscGb$W>Qb9+q(b94t*!7#u6atpn'b$W@ib94w)au%0n!3J@I!6^cRatpn(b9+tjc<oaO!6^cS!6fPi" ++
+  "b95#)bxRdPb?tJSbTG#)b9>#,!3gV6b[8Rkb9>#*au.6S!6oVkau!t)bTG)lWTj4gau!t)bTG)lZR3TWbTP),!7#u=bTP)+b9>#-!4m9VbTP,lc<p+ZbTG)*c<p7_b9G).!5L^_!7-$IbxSgX_ZNNh^_,Xl!XG3B" ++
+  "atq#2d3mnRbTvJ5cR,mlb:(j>coH!la=,PAdlYO*a'ZtLb9+t*bTd>2co6x[a_E7g!6[PkbTd>3c6^-Eatge&atpk'bTd;0c6^Aaa<8Z(c61;-b9G//c6T8]a<(cibr(D1bTd;0c6T2Z_wkB$c6CM3br:S5c6^)U" ++
+  "_c?gebr(G3brCY8cR#2U_Z<,xbr(D2c6im;coK(%a'x/Qb$W:gb9+q)!6hiU!6oVkbqm8,cX3)9$0K#Uatgh&b9+qibqd/*bTY/-!7-$)a_kMSa_N@ib94t)!6hiSb9>)*bqd5nROQ$(a_E8Pa_<1gatge'!6fPi" ++
+  "b95#)b[8]WRle'(a_</Nb$W8Ob$W:h!6^cRatpn(b95#)c<oB/a'Zvd!6T[P!6fPhatgegb?tGRbTG#*au%0n!2DQ&a</Q#atghhc6(2)atpk'!6fPiau!t(b[8YVRH+A6!6RBNatgkibqd,)b9.-j!6fPib94w(" ++
+  "b[8YVSDuV8!QhcPbxS_nb94w*ats*k!6fPib95#)bxQt7!6@2ba_E7j!6x]latpqjb?tLkbTG#)b9>#,!2DN$a;mUba'Zvg!6x]lb95&*b[8XmbTP)+b9>#-!1#Tna;mUba'Zvg!6x]lb95&*b[8XmbTP)+b9>#-" ++
+  "!1w84a;mXa!R5xVau!t*bqd/lcQCD-bTd2.!7-#x_F$Y[!nq[R!6oVkb9>)+b[8[nbqm5.au.6p!1Z#0_wPL^!69IP!6oVkb95&*bxSipbqm5.b9I?r!1>bo_wW3^a;mUe!6oVkbTP/+bxSgXc61A0b9I?r!=,)V" ++
+  "!o5oRbTY2/br:V8RlPn;b95#*b95#+br1M5Uw^5W!6xjqbTd80br(G4W8dHAa<St-c6LS6cR$p;u[KrXa_N>Qatgh&b973l!6qoUau##+bqd8oP3)t8!6K[Qatpn'b?tJSbTP,,au+w-!2+f'!6KUN!6T[O!6T[O" ++
+  "b$W>QbTG#)b94w*au7<Fa'evcatge%b?tOlatge&atj$iatpk(b9+tjc<oGB!69LM!QoWSbqm2+b9>#*!6hiSatpn(bTG)lSb9a9a'Zvb!6RKQc6(8,b9G),!6x]lb95#*bTG,mR,drHa'etLbxS_mbTP,-au%0n" ++
+  "au+w*bqd2mcX3;;a;k6^a'ZnJbxS_mbTP),au.6pau,#+bqm8ncuR*^e0E:2b9G;4e*mFYdkHY0bo;Zr_wtT(^B6eqb9=wiatpkhbTP))bTY,,c0WMGbTY82b$b@ib9>),U*fdHbr(8matpn(bTX)ec61>,a'Zvd" ++
+  "b9>&+Yl&xna'Zpbatpn(bS:O]a</Q#b94vxb$W2Ma_<4gb94^da_<4gb94Yva_<1fatpmvb9+n&atpmwatgh&b94Ywb94t)_#x6!bSpZ$bT+k(!6fY/a'ZnJb9+n'au%0nb$W4e!Qh_P!6T[Patgegb?s31atpk(" ++
+  "!6hiTb8j$h!6T[Oatge%b$W>QV'l+Hau!q)!6oTUa_<1fatge%atj$i!3:K1b9+t(b$WCja'evca_</Nb$W:gatj$i!3]LJau%0j!6fNPa'o)Na_<2Ob9%'h!6^c9b9+t(a_<7ha'ZnKa_</Nb$W:gatj$i!4P'S" ++
+  "!6T[P!69LK!6KUN!6T[Oatge%b$VaW!6KUO!QTRK!6KUN!6RDfa_<2Ob$VtIatSNba'ZtMat_ufa_<2Ob$VwHa_<)La;tBca_</Natge%!6^cH!6T_N!o,oRa_<1fa_<2O]bX!Z!o,oRa_<1fa_<2O^frnOat_uf" ++
+  "!6T[P!5X1J!o,iP!6RBNb$W!^!6K[P!6KUN!6RBNb$Vv]!6KXO!6KUNa_<1fa_;m]!6KUN!6KUN!6RBNb$W!^a_</Na_</Nat_ug!5UcEa_<1f!6RDf!6T[G!6T[P!6RBNatgeg]E<m[!6RBNatgeg^fCP_atge%" ++
+  "!6T[Fb$W:gatge&!5iq^atge%b$W%_atge%b$W(b!6T[Q!6%&b!6^cKb$W>Qa'[#N_ZY[g!KTB1cnC8,bp8,tbT4k&bSJ5rd3Hj2bS%qkco@!:blWVIbTd>2a_<1fb95#+bPjkEbr(A/!69ILb94w)bR2KjbT[Bk" ++
+  "a;mXcb9+q)^B$^p!6fSi!Qh_Oatpmr_wN5tbr(>-atgh&b9+pn_wN-]bTY2-bTP)*b95!l_Z3&qbqm5-bTP/,bTP+m_>ntobqm5,bTY5.bTY4Ja'ZnJb9+n(!6qoVb8iuf!6KUO!6RDfb9+nhb?s30a_<1gb973k" ++
+  "!6fPf!Q[Ae!6KUO!6RDfb$W>QV_K83b94t)!6^cR!nq_O!6T[Oatge%atgegXQBNM!6[Jhb?tAPa_E/Ma<(fe!6RDfa_<2Ob?s]R!6RDfb9+qka_<)La'x/Oat_ufatge&!4xaDa_<2Oa_<2Qa'f#Oat_ufat_uh" ++
+  "!5COAa'f#Natj$ha_bGTa_</Natge%!51C?a'o)Ob?tFi!6KUN!o,iP!6KUNa_<2O[Gs8Qa'Zvb!6RHPb[8Ojat_uf!6T[O!6RBNa_<2OYk>bLa'ZtNb?tLkatge&!6KUN!6RBNatgbfb$V]Q!60FJ!o>uTatpk'" ++
+  "b9+nhb$W;Patge%atj$M_c?bIa'o/PbTG#(b94t(!6T[P!6RDfatgegYN*@aa'ZnJa'[&Ob9+q'b94t(!6fPhatpk&atgegX5X-E!69LK!6^cRatgh&b?tGRbTFw'b9+n'!6^c:_Z<,ra'Zp_ats*iatpk&b?tGR" ++
+  "bTG#(b9+n'ats*N_F$Y[!6@2_atj$i!6[Mhb9+qibTG#(b94t(!6hhm!6RJlbTRBlatpn)bRP!Xb9+nha'ZtLb9+q)]b:Bl!6fYlb94t'b9+q(])P*ga<Ae(bTY2.b9>),OQ6E-!6[Jgb?tMTc61/ja_</Nb$W:g" ++
+  "atpk'!6^c/!Qh_Pb9+qib?tGTa'f#Mb$W:gatge%atj$Pa_<1fatpk(!o,iN!69RO!6RBNatge%b$W![!69LM!QoNPb9%3k!o,iP!6RDfa_;dU!6@0JatLidb?tJSb9+n&!6KUO!6KUNa_</Nb$VaR!60FJ!o>uT" ++
+  "atpk'b9+nhb$W;Patge%atj$Q_wW5s!69IJ!6hiRatpk'b9+nhbTFw'b9+n&atj$Q_Z<,ra'Zp_ats*iatpk&b?tGRbTG#(b9+n'ats*/auYd'd4*CFg#:&6b9G>5e,KdObU(P:Wqs7jbrU&#c6C](cQij0cR6d8" ++
+  "eo0d!!Qh_Pb95#+br:P2bn%wIau!t)br1J1bnA/Jau!q)bTmA0bQJ;Matpn(bTd;/bQS>Matpk'bTd;.bo)?gb9+n)bTY2-YNWilau,&,bTXPqb95#+bTP+pb9>)-bTP+qbTY5.bTOSubqv;-^'@0$bT!h(bT+k)" ++
+  "!6obS,NK$s!QoKOb$W=hb973katpqjbqd,,!6w7*a_tUl!6KUP!6[KPbqd,+!6oVjb[8UF$Kh,Ua_<5Pb9.-jatpnibqd,,!6wC4at_uf!6[Jgb?tGRb973latpqjbn&&J!6KXQ!6RHPb?tFk!6oVjb?tOI#Ne$R" ++
+  "!R#lQb?tGRb973latpnic2S5Ka_</Nb9+n'!6[Jhb$WCjb973lUcEn/a_</Ob9+n'!6^cQb?tIjb973lV'l(G!6KUO!6REOb?tFj!6oVib[8UM!6RBNa_<2Oat_uhatgegbTG#*!6nWKa_</Nb$W:g!6fPhb$W@i" ++
+  "b973lWqj+d!6RDfa_<7hatj$iatpnibne-d!6[Jga_<7hatj$iatpnibnw:Oatge&!6[Jgb$W@ib973lXX:m9b9.-iatgegbTFw)!6nbO!6[KPb9+n'!6fPhb?tLTatghhb9+n(!6fPhb?tLRats*iatghhbTFw)" ++
+  "!6nnT!6[Jhb$W@ib9.-kZ6oHUats*jatpkhboMZlats*jatpkhbp/#qb?tIjb973lZ0/vUbTG#*!6o)Z!6oVjb?tL_!6oVjb?tLZbqd,+!6oAbb9@9m]b_l_bq+bfb[A[hbr3Ov!Qx]pcRGsmb95#-c6i(tauPM:" ++
+  "c6hjka<h8:d4,C)a'f#Mb94w*bTd>1br'&^!o3TPbTP),br(A0VC'+G!6RGgb9+q)bqv;-WxYRJatgn,atpn)bTY2-VtYSZatgn-b95#+bqv8-VW5DX!RF%sbTY5/bTY.f_wGLfcQ_S2c6UY3bQGlX!69IPc6CM1" ++
+  "cR$m6c<Vpq#Ne*Ta_<2Ob9+q)!6fPib?tLkbT[BoS)v!Da_</Nb9+n'!6fPib?tLkb9@9mT^QIG!QhfS!6[KPbTFw)!6oVjb[8UHa_WARa_</Oa_<4gatj$hatpnibTG#*!6nI3a_</Oa_<1f!6KUO!6REOb9+n(" ++
+  "!6fPib$WCI!o,iP!Qh_Oa_</Nb$W:h!6[Jgb?tIjb9.-kV_K22at_uf!6fPib?tChatj$hatgegbTG#*!6nBB!QTRN!6RBNbTG#+!6T[Ob$W>Qb9.-j!6[NQbn,SCa'f#Mat_uhatpqjb9+n(!6[Jgb?tIjats*k" ++
+  "U>n7>!QhiUb95#kbTG#*!6fPhb?tIjb9.-kS)XM7!QhiUb95#kbTG#*!6fPhb?tIjb9.-kU>n7>a'ZtObqd,+!6oVkb?tLkb973latpnibmB+Pa;mXca'f.hb9@9matpqjbqd,,!6oVjb?tLB_wW5s#35fRatpqj" ++
+  "bqd,,!6oVkb[8Ulb9@9mT&[QN_cQqLbqd,+!6oVkb?tOlbT[BoatptkbltgKa;dUa!R3akb?tLkbTR<nau!wkc6(5.!6qgYa_WFjb94w+c6CJ1V'c!F!6RGgb9+q)bqv;-[,]oh!RF%sbTY5/bTY.k_Z,@]c6UY3" ++
+  "br1S5bTf@ta(*5Rat_ug!6[Jhb?tIjb973lau!wkc1h>Fa_E5Qb?tFj!6fPhb?tLkb9@9mU*xh/a_E5Oat_uf!6T[Ob$W=hats*jatpkhbn]>J!QoKOa_<7hb973iatgegb9+n'!6fPib?tLIa'ZnKa_<1f!6fPi" ++
+  "b[8Ojats*iatghhbTFw)!6nHC!69LM#3kvnb[8Rkb973katghhbTG#)!6nNFa;t<aatLlhatpqjbqd,,!6oVjb[8Ulb973lUZ9)S_cQqLbqd,+!6oVkb?tOlbT[Boatptkbx;e#c6L;jbU(M8RO6&FbTG#,X6oin" ++
+  "atgq#!69ILb?tAPatj$hau!q(b?tLpQK5fKatpw1a<(cdb94t(W$^CLb9G2patpk'ar?0hbTP/)!QoMhatp8ob95#'!6@8db9+msbTFw%!6@8datgdx!6R>ba</Q#atgZ#!69IL!6RDf#3GrQa_<&Katge%!6R5b" ++
+  "atgbfatAN!at_ucb94t'a<8W$!6REOato6L!QTRO!6REObqd/.!69IL!Qh_Oa_<2Oatj$hVCB@Kb9.-jatpqja'x1g!6KUO!6REOb6/5N!6[KPbTG#*#l)-Sa_<1fat_ugW@,RMats*iatpnia'x/Oat_ufatgbf" ++
+  "b6JANatpnib$W=i!69RO!6KXP!6REOb6Z9gb973j!6[KPa'x/Oa_E8Patj$hZ0&ol!6T[Ob$W2Na'ZtLa_E8Pat_ug[-#4Watge%!69LK!6KUN!QqfPa_<4Yb@&GQa_<)Ma'ZtLa_E7g!6KUO^f_bKa;mU_!6KXO" ++
+  "!6KUNa_<1a!o,iNa'ZnJa_E5Oa_<1f!6R6Jat_ud!QTRM#3Q$S!6[5_a_E/Oa_WCi!6KUO_#hUh!6KUN!QxEQa_WAQa_E:b#Ne-U!6KXP_*i^Ja_E5Oa_E5Oat&6_a_</Oa_<1f!6R/_!Qh_O!6KXO!6[6Iat_uf" ++
+  "!6KUN!Qx;_a_</Na_</Ob8L_ba_</Nat_uf^^Qx^b$W:g!6R2a!6KUNa_<4b!6T[Oa_<4_b$W:g!6[?Latj$g_ZN<bb8gWdb$bCfb930Jco-a0au4JqcX=ikbT!QacQiY1bS%qkc6LY5c1T.PbTP)-cnEHjatpn'" ++
+  "b6//JbTP,,b?t;Natpk'as)Wmb94wjatSNcatge%^fCJ^!6RGia'f%ea_<1]a;k<aau!w)!6RDfa_<1Y_wGLebqm2*atpk&asDbia'f+jbTP)+b94t'[Gpoe!6@>ib95#+bqm/*QK/)4!6^cQb$WCjb9I?i!Qh_O" ++
+  "!6RBNb$W:h!6ZF4a_<4gb9.-j!6[NQa'x/Oa_E:h!6T[PW[GS7bTFw)!6[Jgb$k>Pa_<1f!6RDfa_<4Oa_E5Ob9+q)!6KUNb$W2Na'ZtLa_E8Pat_ugZK;/Sa_<4gats3k!69IJ#3GuRa_</Nb7D_Uat_ugatghk" ++
+  "a_<)La'x/Pat_uf!6[0Ia'ZwNa_<2Oatj$e#3GuR!6KXO!6[,Y!69LM#3Wgjb%/VWa_</Ob7sxXa;mUb!Qh_Patgega_E5Oa_E5Oa_E5Ob7aiUa;mXca'f+gb9.-iatgbfa_<1f!6KUNa_<1S_c?g^!QoENbTG#)" ++
+  "!6[Jga_</Nat_uf!6RBNas2Wia;m_c!6fPib$W=hats*hatgbfb$W:g!6QbN!6@0Ja'x5Qb9.-j!6[KPb9+n&!6T[Oa_<4R_wPL]!nq_Q!6[KPb?tFj!6[Jgb$W;Patj$gZ/bRca'ZnKa'[!eats*iatghhb9+n(" ++
+  "!6T[Ob$W=P_wW5s!69LK!6[Jgb?tFiats*iatghhb$W:h!6Ycvatpq)bTm/katgh&b7;Zmb94wjatSNcatge%a;k3_br(>-atgh&atgAm_c?eIbTd8-b9>)+ato?O!QTRO!6[KPbqd,-!69LM!6KUNa_<2Oatj$h" ++
+  "VC0/3bTFw)!6[Jgb$k>Pa_<1f!6RDfa_<4Sa_<1f!6[Jgb@8SSa'ZnMa_E7g!6KUO^-vBFb$b>Pb$W:h!69RO!Qh_O!Qh_P]b<dVa'ZtMa_<4gatj$g!Qh_O!Qh_O!Qh_P[e7ARa'f%c!R*Yjb$W=hat_uf!6RBN" ++
+  "a_<1f!6QqS!6@0Ja'x5Qb9.-j!6[KPb9+n&!6T[Oa_<4U_wW5s!69LK!6[Jgb?tFiats*iatghhb$W:h!6YfwcRZP)dNf4JOQHQ2au>;4XX:lNcQ_[xatpt,cP!H#br(#'br(5-c6(A5NT:0.!6[Miau5,,c6KHS" ++
+  "atge&au,&+br0HTa_<1gau,&+br'HSa_<1fatpq*au,+ma_<1fb9+t*au,(natge%atpq(bTcPpb9+n'bTG&,ZKT-nb9>#*bpS<^bqm/+bp8)tb95#,[HYNsbTct%b9>,$b9G2%br(;/c/Qf/a_N>Qat_uga_<7i" ++
+  "!6fPhbqd)+!3CT2$0K#Ua_<4h!6[KPbTFw)atgkiW@mxR!Qh_Pa_<7hatpk&b[8Ol!3j)<a_E5Ob9%'ia_<7hau%0ib[7T>a_E5Pb9%'ia_<7hau!q'b?sQ>a_E5Pb9%'ia_<5Pau%0ib[7Z;a_N;Qa_<1g!6[HO" ++
+  "bT@0k!6RKQXXCp:a_E5Ob9%'ha_<4gau!q'b?sT:a_E5Oa_E:h!6[HOb?tCjatghhXua!;at_ufa_<4g!6^cPb?tFk!4@2:a_E5Oat_ug!6RGg!6^cPb?saSa_E5Oat_ug!6RGg!6^cPb?sdU!6RBNat_ug!6REO" ++
+  "ats*hb?se?b9%'ha_<2Oatphgb?tCj!4G$Q!6[HOb$W:ha_<5Pats*Vb$W;Qb9+n'!6RHPats*X!6T_Ra_<4g!6[Jgb?sgV!R*WQb9%'hatghh[H7JXa_<4gatpk&b?snBb9.-iatgh&ats*Vb9.-iatgh&ats*]" ++
+  "atgh&ats*hb?t![b9+n(!6RHP]*(QqbTFw)!5_k]bTFw)!5Ue^atghh^BK=ab@/Rm!6%&d!676Mb[?Bmb9,#/cO.hlbTG)-c4J&pcQid6c4]*Wc6Uj<ci/W5a_E:ib9,#,b9G4ha_N;Pa_<4gbqv8-c3OgRat_uf" ++
+  "atpk'bTP,-XQBQNb$W=iatgk(au#!ma'f%fb95,,au!w)bTXDia'ZtLb9G8/b9P5,br'8ba'ZtLb9>2.b9Y;.br'>d_c?mab9>2/b9Y>/c6JKH#Ne0W!6RBNb9%'ib$W@iau%0jb?sDJ%-G>Xa_<4g!6[KPbTFw)" ++
+  "atghhWqcQR!QhiSa_<7h!6fPhb?tFk!4!];a_WARa_<4g!6[HObTFw)!6[NQX=D!;a_</Oa_</Ob9%'h!6RGgatpk&b?sQ<a_</Oa_<1f!Qh_P!QxQPb9+n'atghhXQBZQ!6RBOb$W:g!6RBNb9%'ha_<5Pb9.-Q" ++
+  "!nq[Na_<1f!6RHPb973ia_<4g!6[Jgb9+n'!3]D3a</Ndat_ugb$W@k!6RBNb9+n'!6RGgatj$Ka'etLb$b>Pb973jb?tFi!6fNPb9+n'atghhX5rwHa'f#Pb9@9kb[8Ok!6fQQbT@0k!6RHPUZB-@a'f#Pb9@9k" ++
+  "b[8Ok!6fQQbT@0k!6RHPVW>HCa'f#Pb973kb?tFj!6oWRbTFw)atghhW8vZE_cR!c!QxWRbTR<lb$WCkau!q'bqd)+!2jm=!60IMa'f(h!6fTRbTI6lb9+t(au+w(b[7JGa'ZkMa'[!g!6fTRbTI6lb9+t(au5&)" ++
+  "b[6<)#3Naib9+w+b9G1k!QoMgatge&!6fSjbTcSna'[!eb9>/-au,#*bTcYo_c?mab9>2/b9Y>/c6JKH#Ne0W!6RBNb9%'ib$W@iau%0jb?sDJ$KaBV#3WeRbT@0jatghhb973P#Ne$R!6KXO!6KXPa_<2Oatpk&" ++
+  "b9+n(!4+d;a_<1f!QqfPa_<1f!6[HOb9%'i!6[KPYN,eNat_ufa_<4h!6fTRat_ugatgegatpk&b$VSOa'ZnKa_WFm!6[QRb9.-jb$W@i!6hiQb?sAGa'ZnKa_WFl!6fTRb9.-kb$W@iau!q'b?sGIa'ZkKatLlf" ++
+  "b?tIl!6fQQbqm/+atgn(au%0.coR!1a'[4mdJF8Kco6]/b6wQqbqOt'^BR/uatj$ha</Q$!6KUPb9+n(bmhCTatpq)bU*Zmatge%b6JAMb9G,+bxgaTb94/hbTd5+b[ALhatggkbTd2+b?t;Na_<1g]EUhtb8irc" ++
+  "at_ug_cHsba;tBbatg^#atLib!QoMeb$W2Ma_E:h!o,lQ_wkEdatgVxa_<1f!6RDfatLieatJT$!6[P?a'etKatj$gb$W=j!6o^Ua'ZtMa_<1f!6RBNX!(v<ats*hb?tIl!69UQ!Qh_Ob$VH:atj$gb?tFj!6fQW" ++
+  "a_E7g!6T[9!QoNPb9.-ib$W@j#NW]h!Qh_Ob$VK9ats*hb?tFi!6[KSa'f%e!6KXP!4I8=!6RKQat_ugb$b8Qa_E5Oat_uSb9+n(!6REOatj'f#3GuR!6RBN[lJt[!Qh_Pa_<)Ma'f#Ma_E7g!5CW[!6RBNat_ud" ++
+  "!QTUN!6KXOa_;m^!6KXOa_E/Ma'f#Na_<1f!60OO!6@0Ja'f#Oa_</Na'x/Oa;mU_!QhfQ!6KULa_E5Oa'etOa_E5Oa'Zvd!QT[P#3N^Q_?33ba'x/Rat_uca_tSXaa/aZa_<&Pa_bGR_wd[d#3GuR!6'=J!6K[P" ++
+  "!6KXJa_</Pa_</Oa'ZtLa_</Oa_<#Jat_uf!Qh_K!6KUN!6RBN_cHtNa_<%ba_<1f!6.-Lb$kFi!672c!Qh_P!MFi*cQiM-b7awtbTFkeb8pZ!bTY,)at&/pbTdA2bPT@Tatpt*bU(;latge%b6JAMau##*b976h" ++
+  "atge&Zhh+UbTd/kb8pYwat_ug])xdYbTR<jatLiba_E:ea;mUb!6RGi!o,lQ^^6[WatSZ%bqm/*atge%[e>%Sau##*au!qib94Gm_c?eIatpt*au,#)b93WU!QTRMb$W:i!6[NQbT[Bi!QhcP!6RBNat_uL#NknT" ++
+  "ats*hb$W@j!QT[Pa_</Nat_uO!o,iPb9+n(!6REOatj-h!Qh_Oa_E8PYN>qR!6^cPb[8Li!6[KPa'etLa_<1f!Qqf@at_uf!R#lQb?tAQat_uda'evc!QhcPa_;aW!QoKOb?tCj#Ne$P!QT[P!QoKO])vIYa_<4g" ++
+  "atj'h!Qh_M!QTUN#3N^Q_Z5F^!Qh_O!QoNPata0l#3N^Q^Au!Y!QhiRb$W:h$0DBX!5_cEa'x/Patj$gb$b>Qa_WARa_;mYa'ZkKatLlfb$W=i!6[HOat_uf!6RBOa_;]Ta'ZkKatLlfb$W=i!6[HOat_uf!6RBO" ++
+  "a_;aUa'ZkOats*ib$W:g!6[Jga_E8Qb$VgT!QKOK#3NbRb9.-ia_<7h!6[HOb$W:g!4d(;_cHkMatj$hb$W=h!6fNPb9%'h!6RBN[,gsQ_cHkKa'[!f!6[HOb9.-iatgegatj$gb$Ui'au##*b9I?i!6RDfb7Mhn" ++
+  "au!wlatLib!6KUOa;t<aatgh(!6RBOatgPs_c?eIatpt*au,#)b93WU!QTRMb$W:i!6[NQbT[Bi!QhcP!6RBNat_uL!o,iPb9+n(!6REOatj-h!Qh_Oa_E8PZh^%Ta_E;Qats*h!QoKOa;mXaa_E5Pat_uXat_xg" ++
+  "!6[Jgb$b>Qa_<)Ma'f#Pat_uca'etLa_WCj!6REUa_bGR^^?fY_cR!c!QxTQb9.-ia_<1f!6KUNa_E5O[eG.S_cx:k!6[KPat_ugatgbgb$bAQ[Gs;Q!QT[Pb$W=i!6[HObT@0ia_<2Oat_u?!6fgebTvJ5e,0PK" ++
+  "!6[Pnbov1Yb9P4watgk*bS85ubTcw'bqv/,bTd;0S)c]=!6[JgbTP,,arppWat_uhb95#)ZokhX!6RJhbTR<Z!o,iP!6fPjb?stEatgbfbTG#)asDiWat_uhatpni]E:Tq!6[JgbTFStatgh&ats*^b?tIjau!px" ++
+  "atpk'b?t+ab94w(_ZNE$at8K#a_<7hb9+mSa(NMVb$b@h!6[HOb973ib9%'iXv%4Bat_xg!QxTQats*hb9%'iYV<n[!QhcQa_<4h!6RGg!6eoGat_xg!QxQPb9.-hb9%'iYsEkZ!o,iPb$W:i!R#oTZ7WlEa_N@i" ++
+  "!6RHQb@&OY$0D9U!o<ZQats-k!R*'Ca_N;Ra_<1g!6REOatphgb7G.Za_E5Patj$gb$bCi!6euAa_E5Pa_E:h!6REPb@&OY!6KXO!QhcQa_<1g!R#oT[,sDV!QhcQa_<1f!6REPbRm1Xa_E5Pat_ufa_<1ga_<4W" ++
+  "at_xg!QoKOat_ufb9%'h[e[]Ya_<1f!6RBNatj'j[lJqY!QxQPat_ufb9%'h[-#1Wb9%'ga_<1ga_<4Xb9%'ga_<1g!QxQPb8/3]at_ufb$W:h!Qx3Fb$bCj!QxQPasVx[b9.0ja_<1]a_<4h!6RDf!6[0Gats-j" ++
+  "a_<4[ats-ja_<4_b@&Lj!6fBLatphgb8AAwa_<4bb9%'ha<(cf_c?sabTWHO!QxYnbp/#patpq*bS/&qb9P>2bRsnm!74%xbmqGCa_E:hau!t*bTF>l#3GrQ!R*]kbTFGo!Qh_O!6RBNbTG#)as5!Wa_<1fat_ug" ++
+  "atpn'[lJi@atge&b9G)*atpn'YkGhMb$W=ib9P/+atpni[e>(Ra_E:kbqm8-bTY+k_c?eIa_<4ic6(;-bqv4Xa(<AVb$b@h!6[HOb976la_<7Q!6KuXa_E5Pb9%'hb$W:ha_<7Saa8gXa_bLk!6[KPatphgb7;X^" ++
+  "a_E5Sb9%'hb$W:ha_<4Ta_kMUa_E5Pa_E7h!6REPb9%'iZ73RAa_E5Pat_xg!QqiQb$bCi!6ZlAa_E5Pa_E7g!QhcQ!QoNQb9%'hZK;>X!QoKPb$b@h!6RBNatj'ia_<4U!nqcPa_</Ob9.-hbT@0ha_<1g!QxQP" ++
+  "b6n:Pa'Zvd!QoKOb9.-hbq[9ia_<1g!6REPb6Z.Na'Zvd!QoKOb9.-hbq[9ia_<1g!6REPb7)FRa'f#Nat_ufb?tCka_<4g!6[NRb9%'hY2o;Ka'o)Rb9@9jbTI6jb$W=j!6RGg!6ZQIa'ZnLa_bLn!6RJi!6[KP" ++
+  "b973ib9%'hXQ7)Ja'o)Qb973ibq[9jb$W=k!6RGg!6ehOa'Zp_!o,iN!QxWRau+tibTI6jb[8Lka_<75a_bIja_<7ib9>!p!QoKOatge%!6[Jhb9+Jp!6@9Mb94w,atpk'b?ssVa'ZtMb9G2-bqm5-apu,Da_bJT" ++
+  "at_uga_<4i!R*WQbR2IZa_E5Sb9%'hb$W:ha_<4Ta_kMUa_E5Pa_E7h!6REPb9%'iZ73RAa_E5Pat_xg!QqiQb$bCi!6ZuCa'o+f!6KXPb$W:ia_<1f!6REPb9%'hY2hZM!6RBOat_ugb$W:ja_<1f!6REOatj'i" ++
+  "[,gsQa'o)Rb9@9jbTI6jb$W=j!6RGg!6ZZLa'etMa_WFl!6RMi!6[KPb9@9jb9%'iR-VlG_ZbB'!7)_6bTY;2a<7wkc6:D+ast;xatSW#!QR;fa_E=j!6fSiV;sXBb?tIkbTvA+a_</NY:%1=bqm2-a_N;PYrR?T" ++
+  "bqd,,atLle!4m<Uc6(2+atLle!5L^^atgh&a'Zpb!5_taatj$e!6@6La_N=e!6@6Lat_ufa;m[db$W2Na_<2Ra_bGSa_</Na<1ie!6RDf!N];1a'Zve!QxQPb973jbqfBi!6K[P!Qnc?b9%'ha_<4i!6RMi!QT[P" ++
+  "a_E7Q#3NbSbT@0ib$W:iaa&YVar]]Sb$bFj!6[KPau!noa_E7R!QoPh!6[KPatj$gbT@0f#l)0TZ6xKU!6fQQat_ufb9%*f#Ne'SZR3NU!6fQQat_ufb9%*f#Ne'S[-,4Vb9.-hb$bDTa(*5QasVuYbT@0ha_<1f" ++
+  "a_<)Na'f#Nasd=]b$W:g!QqiO!nq_O!Qo2^b$W:g!QqiO!nq_O!QoAd#Ne*R!QTUN!QhrU!6@0Ka'f#Oa_bGRa;mXa!QhfQa_N;Pa'etPa_E7g!nqiR!noDe!nqiR!nxJf!69cTaa/aca_N5Ta_N7f!QhlS_c?kL" ++
+  "a_N=da_E5QatJQfa_WAQa_E.d!6KXMa_E5QatLie_wtMV!6oaobqOvsb9>)ma'Zvba_<7j!6R/YatSe+bTEw_!6@<Nbqm5/b8irea_;H:a_<7hbqd,+!QTRM!5(C@atpk*!6RGga'Zpb!5L^Zatpk)!Qh_Ma'o#M" ++
+  "a<1ieatgh&a'f#M_>wx[a_E7hb9%-i!5rnYa'Zvbb95#kbTFw'!5LTUa'o+hbTG#(b9.-Ha'o#Latj'ib$W=j!6RMj!69ON!QhcPXv.<Ua_<4h!6REOau!nla'Zvd!Qni>a_E7ha_<4h!6REPb@ASTa_E7T!o,lQ" ++
+  "b9%'hb$W:h!R#xS!o,lQZoNR@a_E:h!6fQRa_<1fa_<)Na'f#NasVuZat_xha_<4h#Ne'Q!QTcR]E3jZa_E:h!6[KTa_E/Na(3=^at_xg!QxQPb9%*h!o,iN!QTXO!n^XM!6RBOa_E7g!6RDf!QT[P#2x9Ka'o)R" ++
+  "atj'iaa&YW^^9+Z!o,uTb$bCi$KaEQa;mU_a'f#Qatj$gb9%'g!QoKPa_E7[a;mU_a'o)Na'f(g!6RHQb9%'ga_E5PasMkl!6@0La_<)Mb9.-hb@&Lj!6RBOa_E7Za;mU_a(EIm!R*WQat_ufb$W:g!Qo,Xa'Zp_" ++
+  "!QT_Qb$W:ha_<4g!6[KPatgbfapwQEau+w)bq[<hb$VmYatgh&b[APRa;m[ea;mUb!QoPia_N;P_#Qko!6R>eb9@9latgbfVtRrF!6REPb9.-ib?tCkb$W2Oa_E5ParJPQ!QoPh!6[KPatj'j#NPuR!Qnu@a_E5P" ++
+  "b9%'ib$b>Patgbfa'o#Ma_E7Za_E7g!QxQPb9.9l!QTUL#l/hSa'Zvd!QhcPa_<1fa_E/Pa_W4b!QTXO#NkkTb9%<n!nR,]!6@0La_<)Mb9.-hb@&Lj!6RBOa_E7Za;mU_a(EIm!R*WQat_ufb$W:g!QnC0b9Fn$" ++
+  "b[8[vWxYV6atgk*]L52[b9=awatgh(^^R#vbSpZ$bT4q)b9>+ga(*5Pb$W;Pb?tO^$0M<U!6^cS]1>BIa_<5PbpLXb!6KUP!6o6Ja_</Nb?tLb!6KUN!6KUP!6f2]!6KUN!6^cR^-d?Ga_<2Ob88<_a_<2Ob8Ufe" ++
+  "!6^cQ^''.a!6[HOb$WCcb$WASbq4k*UZ;fL!o3TQat_xgb$bCk!4xjF$0K#Va_E:i!QxTQ[mmjg!o,lRa_E:i!5=7Oa_N;Qb9%*ib$VnOata$h!QxQQb9.-[%HdGZa_E7h!QoNP]M(bOa_N@i!QxTQ]LvZNa_N@i" ++
+  "!QxTQ]LmTMa_N@i!QxTQ]bO(a!o,oSa_E:h!5O%G!o,lQ!o<ZRatj$[!QhfQ!QhfRa_E7h!5EpD!o,lQ!o<ZRatj$]!o3TRa_E7h!QoKO^-mD^!o,lQa_E7g!5X%Fa_N;Qat_xga_;p]a_N;Qat_xga_;v_!QoKP" ++
+  "at_xha_;qHb9%*ia_E7g!5NvFa_E:h!QoKO^'$l^b9%*ha_<!b!QoKPb9%'d!QoKPb9.-a!6RBOb9.-aat_xhb$W.c!QxTQ_cHvf!5u7Jb$W+cb$bAQb@%;F!QoMibSCO^!6RGhb8:Ubb9>)+^Atv[b9P;1WqO6K" ++
+  "!o5oR!6^cT[H7VZ!6K[R!6o5]#Ne$R!o>uU]L50Ea_</Nb$W8Ob$W@[!Qh_O!6KUO!6KUO!6f8]!69IM!6T[R!7#uT!6eqR!69IM!6T[R!7#uT!6f2Y!69IL!oZ0Z!6hiUUZ;[I#l/qTat_xgb$bCk!4xV@&E_d^" ++
+  "a_E:h!QxTQ[lJoLa_N;Ub9%*ib$VnDaaAmZa_kRl!QxTQ]0gxMa_N;Ub9%*ib$VqLa_WASa_E5Qb9%*hb$VnHa_N;Ra_E7g!o,lQa_E:h!53pF!o,oR!QoKQa_E7g!QxQP[lq0Ha_N;Qata$h!QoKPb9%'[#NPrQ" ++
+  "a_E7g!QoKPb9.0ia_E7h!51CBa'f%e!QoKPb9.0kb@&Ii!QxQPZ/e#Q!QoKPat_xhb$bFl!QoKPb9%'Sa'x)Nat_xga_E:i!R*^Tat_xha_;W?a'o#Mat_xg!o<bTb9@<kb$bCj!4v9Q!QT[P#lB,Xb9@<lb$bCk" ++
+  "!4FrL!QT[P#lB,Xb9@<lb$bCk!3&&3b$W8Ob?tL_#3GrQ!6KUN!6^cR]iP3Db$W;Pb$WARb$W@^a'ZnJb$W8ObxSdWb?tLNa(EGXat_xga_E7h!QxWR[3k[Ja_N;Ub9%*ib$VnDaaAmZa_kRl!QxTQ]LPBJa_N;Q" ++
+  "ata$h!QoKPb9%'Y#Ne*T!o,lQa_N;Qat_xha_;pZ#35iPa_E7g!QxTRbTR?ka_E:h!4Y%=a'f%e!QoKPb9.0kb@&Ii!QxQP]bCIWa'x/TbTR?lb[AUl!QxWRU?KYh^'I0!au40Pau##/b?sdUbr(A.!5:Z^bTFq!" ++
+  "b9.-fat_udbT@0iatotb!69IN!6^cT!76*S!6Q_=b?tJSb[8VXZ6xL@b[8STbxp5Eb?tMTb$WARa'ePW!6qoS!6hiO!Q'4K!6T[P!69IJ^^hFc!6T[M!6@9Oa_<&Ka<1lf!60CIb?tDQa'evd!69LP$Ka?Ua</Va" ++
+  "a'x)Nb9%*ia_E=j!R3hWa'f#NYUoTX!QoNQb976lb@g;Kb9%*ib$bCj!R*ZZZ7<^X!QxTRb9.0kb%J5Ib9%*ib$bCj!R*ZZZ7*QW!QxTRb9%*ib@&ATZoWZW!QxWSat_xhb$k>S[3k^W!QxWSat_xhb$k>S[H>:X" ++
+  "b976ja_E:i!nqiGb$bCj!QoKPb9.0g!nq_H!QxTRat_xga_N5Pa'Z^Eb9.0ia_E7g!nqcN!5ita!QoKPata$f!nq[Kb$kDRa_W;Qa'ZwSa_E1c!nq[O#l)0Ra'o#Lb%&PTa;m[b!6[HQa_E/Oa'f#Nata$f#NPoP" ++
+  "a_N5Ra</Nfa(*7h$i/Pv#Ne'Q!6KXMa_E7g!6KX3!6[Plc6*H[atpt+b9+gv!6[Miatg]x_cHvgbTF,d!69IN!6hiU!7-$R!6Q_<a_<8Qb[8PSb@/IW!Qh_R!6hiS!6^iP^&l!]!6^cS!o,iN!6?qX!6T[Q!6hoS" ++
+  "!69IJb8irc!6K[R!6^lMa'ZnJa_NARb@8Fc!60CK!69IO!6hiS!6ZNH#35iQa_E:i!QxWSbT[Ej#3Gr>$Kq2Wb9.0jb$bFl!QTcA#3GxTb$bCj!QoNQatj3j!P3dC!o<^Sb9.0ib$b@i#kn$C#3GxTb$bCj!QoNQ" ++
+  "atj3j!PLRDa_N@j!QxTRat_xga_N5Pa'ZWCa_E7g!QoNQb9.?n!QTXM!Pc!E!QoKPatj'ib%8]Va'o#M]L,*Eat_xgb$bCj$0D9S!nq_J$Kq2Wat_xg!o3TUa'eva!nqfQ#l8wUatj<ia'o#Oa_kRl!QoNX_#T7]" ++
+  "#3H*Wa_E7h$hD$N!Q[9La_tXn!QoNQa_N=h!5_eX!Q[9Ma_E/Ob9.0jb$b@i!QoKO]bCIWa;m[d!QTXPb$bCj!QoNQat_uH#3Z'V!6hiV!69L>a_</Nb[8STb$W;Pa'Zp]#3Z'T!6KUO!nxDb!60CK!oH$U!6KUO" ++
+  "WqO9J!QxQQb9.0jb@&On!QT[P!4IA>!o<^Sb9.0ib$b@i#kn$C#3GxTb$bCj!QoNQatj3j!Pl(F!QoKPatj'ib%8]Va'o#M]L,*Eat_xgb$bCj$0D9S!nq_Pa'o#Oa_kRl!QoNX_#T7]#3H*Wa_E7h$hSje!Q[9M" ++
+  "a_E/Ob9.0jb$b@i!QoKOW$hIHatj$id16U]!QxSd!o3Vh_F-hKatSTdatgZdatpb$b8ph+ZK)2V!QoKOb$W&Ia_tUl!6KUJ$Kh,Ua_<#Pat_uf!6'LO!6KXL#Ne$R!QT[Pa_</N_F$bJa_</O_cHsd!6KUK!6RBN" ++
+  "a_<%ba_</Oatgeg_ZWBdb?tGSZK)J_#NkhTat_xg^J%&Xata$h!o<ELaa^([a_N;Rat20q!6K[P!o3EZa_</Pa_N=c&bu)]!o,oR_,*PVa_WARat2$m#3H$T_G3MXa_WCe%H[e[#3NQVa_WATatAHja_WASat:ri" ++
+  "!6K[P!o3EMa_WASa_WCd!QhiR!o,rS_*_WLa_N;Sat:fe!6K[P!o3HOa_N;Pa_E7b!Qh_O!o,oR_*_WIa_N;Rat8Baa_N;RatAJx!o3TQatAHcatgbh_F-md!o3EKb9%-i_?<9datSZ$!o3TQa_N=f!6R>darZ=R" ++
+  "atgdwa_E5Oa_<&Katge%atgTba<8Z&b9XVo#Ne*Ta_<2O_#hUha_</N_?,Xg!QhfMa_WARa_</Oa_;wKa_</Oa_<1f!6KUG!o,iP!Qh_Oa_</N_F-bJat_uf!6fPib?t!Y!QTRN!6RBNbTG#+!4d+Eaa&[m!o3TQ" ++
+  "asvL_'BT;_!o,oR^fCNYa_</Qa_E7a!6L'[#Ne6Y^fCNUa_bGXb8CXa&EX,a$0Spg$i%W[!o,rS!o3BSa_</Qa_N;Ra_WCb$0D<V#3GxS!6K[P!o3<Na_N;Sa_N;Pa_N;RasmUd!o,rS!o,iP!o,oR^J%&Pa_N;R" ++
+  "atgbgatgbh^.1NKa_</Pa_N@ia_E:ia_MsY#kn$Ra_N=h!o<]i!QxYj!Qo#U#kn$Ra_N=h!o<]i!QxYj!Qo#U#kn$Ra_N=h!o<]i!QxYj!Qni<aa&[m!6KUIa_tSUa_N2Oa_</Oa_<1f!6KUKa'etKb$W:g!6fPi" ++
+  "b[7pT%H[qaa_N=h!Qo6Hab,@aa_WARat(O_&EX,a$0Spg$i%W[!o,rS!o3BPa_N;Sa_N;Pa_N;RasmUd!o,rS!o,iP!o,oR_+-kNa_</Pa_N@ia_E:ia_MsY#kn$Ra_N=h!o<]i!QxYj!QnkRcR->*c5xBnXX:fO" ++
+  "b9>)/YrR?VbTP1sbTd5+bppT#atpe$!o3Vfb9=5g!QTRO!6REObqd/.!4IA?atpkhbTG#+!4RD@!6[KPbTG#*!4[G@atghhb9+q)!4fJ?atpnib$W=i!4vBVb973j!6[KP]bUbt!6T[Ob$Vv]b?tChat_u_b@&GQ" ++
+  "a_kMSa'o)Pat_ucat_xg!6T_:a(*/Patj*ib$kIka_E=kb$jbCa'f(fa_E7ga_E:ia_E:ja_MZEatgbgb9+khatphhb94tja:8dWb$kIja_E:ha_E:ia_M^Datj*jat_xhat_xhb9%-V#NkkUb9+khb9+khb94qj" ++
+  "Z73WWa_E7ha_E7ga_E:ia_M^Ab9+khb9+khb9%-jb$stDatgbgb94qiata$iata$W!6RDf!QxVi!QoKQb9+ki[-#0m!QxVi!QoKQb9+ki[edFYatphhata$hb$t._!QxSh!QoKQatgbga;54[b9%*h!6KXOa_W&H" ++
+  "atphha_</Oata'_atphha_</Oata'cb9%0j!o,rQ!o-Ke!QTlU!QTiT!QTRM#Ne'Q#3GrQ!Q[9Lata'f!6RBQ_wkEga_WATaa.q@bTY/,cOC4Wbqv8,bSA8ubTY)ja_<+ba_<1gbR)=Oa'[#Nb9.-katptkYUI:=" ++
+  "b9+q(!6^cQb?se@a_E=iats*iatgeg[H7MW!6[Jhb?tAPatj$Za_<1f!6[Jgb@8SS])o]Xa_<4gats3k!6'CJ!6T_P!6T[Ob$W+_!69LM#3Wgjb$VMM#NPuRb$kIja_E:ia_E:jb$jbGatj*jat_xgb9%*ib9.3V" ++
+  "$0D9Uat_xhat_xgb$kIka_M^Ca_WCja_E7ha_E7ga_E7h#1bsE#3Ndj!QoPh!QoMg!QoNSZRWcEatphhatphhatgbgatj-Z!6KcR!QoMg!QxVi!o,oRata$Ya_</Pa_N=ha_E:ha_E5Ra_</Oa:pvW!o,iP!QoMg" ++
+  "!QoPh$KaEU]0gxEa_</Oatgbgatphna_N7Y!6K[P!6KXOat_xgb9%<n!nx2]#Ne*Ta_N=i!o,rS!6KXM_+6qNata'i!o3TRatgbh_*_QIa(*5Watgbgatgbh^fCHHa(*5Watgbgatgbh^fCHHa(*5Watgbgatgbh" ++
+  "X=D(=b9.-jatpqjYr[=>bTFw)!6[Jgb$Vs[!6RBNb9+n(#3GuP!69LM#3Wgjb$VMM#NPuRb$kIja_E:ia_E:jb$jbDa_E7ga_E:ha_E7h!o<aj!m<dC#3Ndj!QoPh!QoMg!QoNS[3k[Da_E7ga_E:ia_N;Ratgbh" ++
+  "]0gxEa_</Oatgbgatphna_N7Y!6K[P!6KXOat_xgb9%<n!nx?Pa'o+f#3GxSa_N=ha_N,Ka'o#Paa&[ma_E7ga_MMO#3GrQat1[c!QoEQatLrga'o)OatgZda_<1g^^9@e!o<NQa_kOk_dERm_d<Ll_d3Fk_d*>R" ++
+  "a(<ARa'o)PatLuhatCfd!QoBLa_E7ea_E7e!6RDcatg^$ast*na_tUl!6'fW%f(PY_G*Gba_</N_ZH<x!6KUK)<Lsf!61-b!6KUK(Zmad!61'_!6KUK($5Mb!60x]!nr3^#369^#366]#363[#35uT$Ka?RaaAmZ" ++
+  "a(WSVa_<&Oa_bGS_c[&Ra_E,Na_bGS_cHqPa_E/Ra_N5Na_bGRa(*5Qa'o)Na_<&La_</N_c?kKa_<(c!6KULata'i!Pl(F#3NVf#3GrO!o3TPat:_ca_<1f_>qLe#NtbOaaAop_ZGlk!QoAc%-@TX_ZG_g!o,lQ" ++
+  "_F?tNa_E5PatgNca_E5Pa_E7g_#hLe!QoKPb8A9laaAop!6'RQ'^qDa!6'@K)Wj%g!6'=J)Wj(h!6'=J(?Pgh!6'=J(?Pgh!6'=J(?Pgh!6'=J&EX>g!QI3Waa&YYa_<#Va_kMXa_</N_+R2Ua_bGVa_</N^g7)T" ++
+  "a_bGVa_</N^g7)Ta_bGVa_</N^g7)Ta_bGVa_</N_#hcl#Ne$R#NkhR_+I&Qa_</Ra_</Pa_</N]idEOatgVx%-@TX_co2Ra_E7g_+$kMa_E5PatgPt&buGha_<#Kabdfga_<#Jab>Lha_<#Jab>Lha_<%b&*=,c" ++
+  "#Ne$N$i%TZ#Ne0V!6KUH$i%TZ#Ne0V!6KUHaaT!_a_</Rat_u]!6fYdbTm2,bom+Ubqd,+]L58^bTX^^bqd/+]bikwb8]T$atAQ#b$W:Ta'o#Latj'ia_<4i]1>Da!6[HOb9=Q_atj'ja_<4h[l^&[!R*WQb94K[" ++
+  "atphgb9.-hb7m=]a_<7i!6RDY!6[HObTI6iasb)s!6[KPatpSv!6fNPatgN_b9.-hat&;w!6RDdb$kDWa_;SQ$023Uata'iata$hatphg]1PEJatge%!o3Vh#3Wgk!54.Mata$hata$hatgeg[mGNKb$tLjb$tOk" ++
+  "a_;bJatgbiatphiatge%!54!Iata'ib9%-iatgbf[m,>_a_WCja_N=hat_uX#l/sk#3Wgj!o3Vha_;bFatge%!o3Vha_N=ha_;bEatge%!o3Vi!o,iPa_;eFatgbhatpk&!o3TQ]1#/[a_N=iata$ha_DkEatgbh" ++
+  "atpk&!o3TQ]0h#Ya_N=iata$ha_Dp[ata$hatj*i!6RBN^&rf^atgeia_</O^^K:ab9%-i!6KXI!o3Vi#3GrQ!5c.Hatj-j!6KUG!6RDg#3GrQ!5iq^b$tJRa_<!ab$tJTa</NkacjKxYrfKVbTX^^a_<:ibTOdw" ++
+  "a_<7ib?t(^atgk'b?sjT!nq[Nb$bCj!6[P[#l/vl!6[KPatpB[a_E7ha_<4h!6RGX!o,lQb9%'hb$W:h]0gxDa_E:h!6fQRast0^at_xha_<4h!n$iFat_xha_<4h!n-q]!QhcQa_<4g!QnqR$023Uata'iatgbh" ++
+  "b9+nh[mmjga_N=hata$hb9%'Y&*C[ra_N=hata$hat_uX$KaKYb$tOkata$hat_uW$0DBXatgbhatge%!o3Vh!5*pG#Nkjja_N=hata$hat_uW$0DBXatgbhatge%!o3Vh!5*]A$0D?Wata$hb9+kia_</N]0q'I" ++
+  "a_WCia_N=iata'i!Pc%F#Ne-Uata'jatgbja_;hDa_bGRa_WCia_N=hb%AAKa_bGRa_WCia_N=hb%AAKa_bGRa_WCia_N=hb%AAKa_bGRa_WCia_N=hb%AFd!6KfS#3Nai!o3Vh#l)-L&*CYZa_WCi#3GxA$0T)U" ++
+  "b9.-hbS(C]!QoPh!6[KPatpK]a_E5Oatj'jb$b@]a_E7g!QxQPb9.3Xa(<;Satgbiatge%!o<]j!541Natgbhatge%!o3Vh!53vH#Nkjja_N=hata$hat_uW$0DBXatgbhatge%!o3Vh!5<mD#l)6Vata$hb9+kj" ++
+  "a_DtGa_bGRa_WCia_N=hb%AAKa_bGRa_WCia_N=hb%AFd!6KfS#3Nai!o3Vh#l)-A!QhlS_cf,ja_E1c)u.4h!o/jP&*1GtatMR!$02eg$KMee%-.TZJw)K7a'Zu*_cf,Oa<(rgaaAmYa;mul!QTUN%efWW&**bX" ++
+  "&**bX&**bX&*1Mba_W;Xa_</O_wQ9w#kn^g$hjEW*971i*TR7i*qo@j*qo@j*qo@j*qo@j*qo@j*qo@j*qo=i(Zmsgab>Lka)^:ja)^:ca_kD^aa&Y[_FxAVa'ZtXa'Ztea_W=e)<M+i#3Hhj!QiZj!QiZj!QiZj" ++
+  "!QiZjab>Lka)^:ca_kAPbSrog_ZbSt!nxJg!60IMb$W,Latj$c!6RHP_F$hL_wvfg!Q$lIa'o+g!nhfP!QxSh!QB[Rat_xc$0K&W_FR+h!n^[Pb$k8Pb9+kh_*rjda_E)Latgbg_F$dba_E+cat_xeb9%-i!QhlK" ++
+  "a(bSZa_<1f#l/eZa(3;Qata-k_G3GWat_ufa_kAbat_uf#NkW^at_uf#NkW[a_<1f#l/b[a_<1f#l/bZa_<1f#l/bYa_<1f#l/bXa_<1f#l/bWa_<1f#l/bVa_<1fa_k>Uat_ufa_k>Tat_ufa_bId#l/sk!6KcR" ++
+  "_+7!f!6KcR_+-se!6KcR_+$md!6KcR_*rgc!6KcR_*iab!6KcR_*_Ya!6KcR_ZGOba_bIfatgbka<(ria<(oh#l/kTatLofa'f%c!6R>d!5F%J!6'@K!6RHP^fLTIats*ea_</Nats*^a(*/Patj*f%-GAZ_F[/Q" ++
+  "atgbg_+-qPatphh^fihOatphh^fihOatphh_F$bNa_E7ga_E+c!6K[P!o3Vh!Pi_Na(3;Qata-k_H0._ata-g(ZtO##l/bcat_ufa_k>[a_kOk!6KcR^gI5Ya_<1fa_k;Waa&YUatgbk^gI5Ya_<1fa_k;Waa&YU" ++
+  "atgbk^gI5Ya_<1fa_k;Waa&YUatgbk_+$kZat_ufa_bId!o--Y#l/qSa_bId!QhuV$Ka?Uata-e!6KXO$KaQ[a_</Rat(Ra$KaBV#l)-Sa_bIZ%-G@o!QBRO#3Ndj!Q0FM#3Ndj!QKLL!o,rSb9%*^a(kYZa_<1f" ++
+  "#l/eeatgbkat2'n#l/qSa_bId%H[qa!6RDf#kH'W$Ka?Uata-e%H[qa!6RDf#kYrQ%-@b]a_</Rat1Ua!QhuV$0K#Ta_bI]!o,uR&budo60:Z&Js1Wna(kaba<-6K'^^Pg#NPoP#NPoP#ko2u%-.KW%HIQW%efZX" ++
+  "%efZX%efZX&*.u%#NQ-W(wvpi)<:vi)WV(j)WV%i)ts.j)ts.j)ts.j)ts.j)ts.j)ts.j)ts.j)tsXx%HIQW%efZX&*-4I(wvmh)WV%i)ts.j)ts.j)ts.j)tsOsac)$'%HIQW%efWW%emEZa_<)ea(*5ia(*5i" ++
+  "a'x/ha'o)ga'f%!Jv'P.a(37g&*<nX#Ne'Q%efWW5l#f>a_N5Xa_N5Xa_W;ia'x/la'f%!?KM:S)Wj4j(x2(j(x2(j(x2(j(x2(j(x2(j(x2(j&ELVva_E/Wa_W;ia'x0wa_E/daa&Sjaa&Sjaa(r?"
+
+private def av1QmB85Lut : Array Nat := Id.run do
+  let mut lut := Array.replicate 128 0
+  let mut idx := 0
+  for code in [33:127] do
+    if code != 34 && code != 92 && code != 96 then
+      if idx < 85 then
+        lut := lut.set! code idx
+        idx := idx + 1
+  return lut
+
+private def av1UnpackQmTbl : Array (Array (Array (Array Nat))) := Id.run do
+  let bytes := av1QmPackedB85.toUTF8
+  let lut := av1QmB85Lut
+  let nGroups := bytes.size / 5
+  let mut rle := Array.mkEmpty (nGroups * 4)
+  for g in [:nGroups] do
+    let base := g * 5
+    let mut acc : Nat := 0
+    for k in [:5] do
+      acc := acc * 85 + lut.getD (bytes.get! (base + k)).toNat 0
+    rle := rle.push ((acc >>> 24) &&& 255)
+    rle := rle.push ((acc >>> 16) &&& 255)
+    rle := rle.push ((acc >>> 8) &&& 255)
+    rle := rle.push (acc &&& 255)
+  let mut raw := Array.mkEmpty 51060
+  let mut prev : Nat := 32
+  let mut ri : Nat := 0
+  while ri < rle.size do
+    let b := rle.getD ri 0
+    ri := ri + 1
+    if b < 128 then
+      for _ in [:b + 1] do
+        raw := raw.push prev
+    else if b < 254 then
+      prev := (Int.ofNat prev + (Int.ofNat b - 191)).toNat
+      raw := raw.push prev
+    else if b == 254 then
+      prev := rle.getD ri 0
+      ri := ri + 1
+      raw := raw.push prev
+    else
+      ri := rle.size
+  let lens : Array Nat := #[16, 64, 256, 1024, 1024, 32, 32, 128, 128, 512, 512, 1024, 1024, 64, 64, 256, 256, 512, 512]
+  let mut out := Array.mkEmpty 15
+  for lvl in [:15] do
+    let mut plArr := Array.mkEmpty 2
+    for pl in [:2] do
+      let mut pos := (lvl * 2 + pl) * 1702
+      let mut txs : Array (Array Nat) := lens.map (fun len => Array.replicate len 0)
+      for (tx, s) in #[(0, 4), (1, 8), (2, 16), (3, 32)] do
+        let mut t := txs.getD tx #[]
+        for x in [:s] do
+          for y in [x:s] do
+            let v := raw.getD pos 0
+            pos := pos + 1
+            t := t.set! (x * s + y) v
+            t := t.set! (y * s + x) v
+        txs := txs.set! tx t
+      for (tx, w, h) in #[(5, 4, 8), (7, 8, 16), (9, 16, 32), (13, 4, 16), (15, 8, 32)] do
+        let n := w * h
+        let mut t := Array.mkEmpty n
+        for k in [:n] do
+          t := t.push (raw.getD (pos + k) 0)
+        pos := pos + n
+        txs := txs.set! tx t
+      for (dstTx, srcTx) in #[(4, 3), (11, 3), (12, 3), (17, 9)] do
+        txs := txs.set! dstTx (txs.getD srcTx #[])
+      for (srcTx, dstTx, sw, sh) in #[(5, 6, 4, 8), (7, 8, 8, 16), (9, 10, 16, 32), (13, 14, 4, 16), (15, 16, 8, 32)] do
+        let src := txs.getD srcTx #[]
+        let mut dst := txs.getD dstTx #[]
+        for x in [:sw] do
+          for y in [:sh] do
+            dst := dst.set! (y * sw + x) (src.getD (x * sh + y) 0)
+        txs := txs.set! dstTx dst
+      txs := txs.set! 18 (txs.getD 10 #[])
+      plArr := plArr.push txs
+    out := out.push plArr
+  return out
+
+def av1QmTbl : Array (Array (Array (Array Nat))) := av1UnpackQmTbl
+
+@[inline] def av1WedgeAllowedMask : Nat :=
+  (1 <<< 7) ||| (1 <<< 8) ||| (1 <<< 9) ||| (1 <<< 11) ||| (1 <<< 12) |||
+  (1 <<< 13) ||| (1 <<< 15) ||| (1 <<< 16) ||| (1 <<< 17)
+
+@[inline] def av1InterintraAllowedMask : Nat :=
+  (1 <<< 7) ||| (1 <<< 8) ||| (1 <<< 11) ||| (1 <<< 12) ||| (1 <<< 13) |||
+  (1 <<< 16) ||| (1 <<< 17)
+
+def av1InterintraToIntra : Array Nat := #[0, 1, 2, 9]
+
+def av1QuantDistLookup : Array Nat := #[4, 8, 11, 15, 19, 23, 28, 33, 38, 44, 50, 56, 64]
+
+@[inline] def av1BlockDimFull (bs : Nat) : Nat × Nat × Nat × Nat :=
+  (av1BlockDim.getD (bs * 4) 1, av1BlockDim.getD (bs * 4 + 1) 1,
+   av1BlockDim.getD (bs * 4 + 2) 0, av1BlockDim.getD (bs * 4 + 3) 0)
+
+@[inline] def av1BlockSizesAt (bl bp : Nat) : Nat × Nat :=
+  (av1BlockSizes.getD (bl * 20 + bp * 2) 0, av1BlockSizes.getD (bl * 20 + bp * 2 + 1) 0)
+
+@[inline] def av1Qcat (yac : Nat) : Nat :=
+  if yac <= 20 then 0 else if yac <= 60 then 1 else if yac <= 120 then 2 else 3
+
+@[inline] def av1TxShift (lw lh : Nat) : Nat :=
+  match lw, lh with
+  | 0, 0 | 0, 1 | 1, 0 => 0
+  | 0, 2 | 1, 1 | 2, 0 | 1, 2 | 2, 1 | 2, 3 | 3, 2 | 3, 4 | 4, 3 => 1
+  | _, _ => 2
+
+@[inline] def av1CompModeCtx (mctx : Nat) : Nat :=
+  let refmv := Nat.min (mctx &&& 15) 2
+  let gmv := (mctx >>> 4) &&& 1
+  gmv * 3 + refmv
+
+def av1QuantDistWeight (orderHintNBits ref0poc ref1poc curPoc : Nat) : Nat := Id.run do
+  let d1 := Nat.min (av1GetPocDiff orderHintNBits ref0poc curPoc).natAbs 31
+  let d0 := Nat.min (av1GetPocDiff orderHintNBits ref1poc curPoc).natAbs 31
+  let order : Nat := if d0 <= d1 then 1 else 0
+  let qdw : Array (Nat × Nat) := #[(2, 3), (2, 5), (2, 7)]
+  let qdl : Array (Nat × Nat) := #[(9, 7), (11, 5), (12, 4), (13, 3)]
+  let mut k : Nat := 0
+  while k < 3 do
+    let p := qdw.getD k (2, 3)
+    let c0 := if order == 0 then p.1 else p.2
+    let c1 := if order == 0 then p.2 else p.1
+    if (d0 > d1 && d0 * c0 < d1 * c1) || (d0 <= d1 && d0 * c0 > d1 * c1) then
+      break
+    k := k + 1
+  let lp := qdl.getD k (13, 3)
+  return if order == 0 then lp.1 else lp.2
+
+def av1NegDeinterleave (diff refVal maxv : Nat) : Nat :=
+  if refVal == 0 then diff
+  else if refVal + 1 >= maxv then maxv - diff - 1
+  else if 2 * refVal < maxv then
+    if diff <= 2 * refVal then
+      if (diff &&& 1) != 0 then refVal + ((diff + 1) >>> 1) else refVal - (diff >>> 1)
+    else diff
+  else
+    let v := maxv - refVal - 1
+    if diff <= 2 * v then
+      if (diff &&& 1) != 0 then refVal + ((diff + 1) >>> 1) else refVal - (diff >>> 1)
+    else maxv - (diff + 1)
+
+def av1ReadMvComp (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (comp : Nat) (mvPrec : Int)
+    : Int × Av1MsacDecoder × Array Nat := Id.run do
+  let offSign := if comp == 0 then cdfOff_mv_comp0_sign else cdfOff_mv_comp1_sign
+  let offClasses := if comp == 0 then cdfOff_mv_comp0_classes else cdfOff_mv_comp1_classes
+  let offClass0 := if comp == 0 then cdfOff_mv_comp0_class0 else cdfOff_mv_comp1_class0
+  let offClass0Fp := if comp == 0 then cdfOff_mv_comp0_class0_fp else cdfOff_mv_comp1_class0_fp
+  let offClass0Hp := if comp == 0 then cdfOff_mv_comp0_class0_hp else cdfOff_mv_comp1_class0_hp
+  let offClassN := if comp == 0 then cdfOff_mv_comp0_classN else cdfOff_mv_comp1_classN
+  let offClassNFp := if comp == 0 then cdfOff_mv_comp0_classN_fp else cdfOff_mv_comp1_classN_fp
+  let offClassNHp := if comp == 0 then cdfOff_mv_comp0_classN_hp else cdfOff_mv_comp1_classN_hp
+  let (sign, dec1, cdf1) := dec0.decodeBoolAdapt cdf0 offSign
+  let (cl, dec2, cdf2) := dec1.decodeSymbolAdapt cdf1 offClasses 10
+  let mut dec := dec2
+  let mut cdf := cdf2
+  let mut fp : Nat := 3
+  let mut hp : Nat := 1
+  let mut up : Nat := 0
+  if cl == 0 then
+    let (u0, d3, c3) := dec.decodeBoolAdapt cdf offClass0
+    up := u0; dec := d3; cdf := c3
+    if mvPrec >= 0 then
+      let (f0, d4, c4) := dec.decodeSymbolAdapt cdf (offClass0Fp + up * 4) 3
+      fp := f0; dec := d4; cdf := c4
+      if mvPrec > 0 then
+        let (h0, d5, c5) := dec.decodeBoolAdapt cdf offClass0Hp
+        hp := h0; dec := d5; cdf := c5
+  else
+    up := 1 <<< cl
+    for i in [:cl] do
+      let (bi, di, ci) := dec.decodeBoolAdapt cdf (offClassN + i * 2)
+      up := up ||| (bi <<< i)
+      dec := di; cdf := ci
+    if mvPrec >= 0 then
+      let (fn, d4, c4) := dec.decodeSymbolAdapt cdf offClassNFp 3
+      fp := fn; dec := d4; cdf := c4
+      if mvPrec > 0 then
+        let (hn, d5, c5) := dec.decodeBoolAdapt cdf offClassNHp
+        hp := hn; dec := d5; cdf := c5
+  let diff : Int := Int.ofNat (((up <<< 3) ||| (fp <<< 1) ||| hp) + 1)
+  return (if sign != 0 then -diff else diff, dec, cdf)
+
+def av1ReadMvResidual (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (mvY mvX mvPrec : Int)
+    : (Int × Int) × Av1MsacDecoder × Array Nat := Id.run do
+  let (joint, dec1, cdf1) := dec0.decodeSymbolAdapt cdf0 cdfOff_mv_joint 3
+  let mut dec := dec1
+  let mut cdf := cdf1
+  let mut y := mvY
+  let mut x := mvX
+  if (joint &&& 2) != 0 then
+    let (dy, d2, c2) := av1ReadMvComp dec cdf 0 mvPrec
+    y := y + dy; dec := d2; cdf := c2
+  if (joint &&& 1) != 0 then
+    let (dx, d3, c3) := av1ReadMvComp dec cdf 1 mvPrec
+    x := x + dx; dec := d3; cdf := c3
+  return ((av1S16 y, av1S16 x), dec, cdf)
+
+def av1AssignMv (mode : Nat) (mvstack : Array Av1MvCand) (gmv : Int × Int) (refIdx : Nat) : Int × Int :=
+  let getRef (c : Av1MvCand) : Int × Int := if refIdx == 0 then c.mv0 else c.mv1
+  if mode == 0 then getRef (mvstack.getD 0 {})
+  else if mode == 1 then getRef (mvstack.getD 1 {})
+  else if mode == 2 then gmv
+  else (0, 0)
+
+def av1AssignCompMv (mode : Nat) (mvstack : Array Av1MvCand) (gmv0 gmv1 : Int × Int)
+    : (Int × Int) × (Int × Int) :=
+  let c0 := mvstack.getD 0 {}
+  let c1 := mvstack.getD 1 {}
+  match mode with
+  | 0 => (c0.mv0, c0.mv1)
+  | 1 => (c1.mv0, c1.mv1)
+  | 2 => (c0.mv0, (0, 0))
+  | 3 => ((0, 0), c0.mv1)
+  | 4 => (c1.mv0, (0, 0))
+  | 5 => ((0, 0), c1.mv1)
+  | 6 => (gmv0, gmv1)
+  | _ => ((0, 0), (0, 0))
+
+def av1DrlNearest (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (mvstack : Array Av1MvCand)
+    : Nat × Av1MsacDecoder × Array Nat :=
+  if (mvstack.getD 0 {}).w > 0 then
+    let (b0, d1, c1) := dec0.decodeBoolAdapt cdf0 (cdfOff_m_drl_bit + av1GetDrlContext mvstack 0 * 2)
+    if b0 != 0 then
+      if (mvstack.getD 1 {}).w > 0 then
+        let (b1, d2, c2) := d1.decodeBoolAdapt c1 (cdfOff_m_drl_bit + av1GetDrlContext mvstack 1 * 2)
+        (if b1 != 0 then 2 else 1, d2, c2)
+      else (1, d1, c1)
+    else (0, d1, c1)
+  else (0, dec0, cdf0)
+
+def av1GetUniCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) (idx : Nat) : Nat :=
+  if idx == 1 then
+    av1GetUniP1Ctx a l yb4 xb4 haveTop haveLeft
+  else Id.run do
+    let mut cnt : Array Nat := #[0, 0, 0, 0]
+    let bump (r : Int) (ct : Array Nat) : Array Nat :=
+      if 0 <= r && r < 4 then ct.set! r.toNat (ct.getD r.toNat 0 + 1)
+      else if idx == 0 && r >= 4 then ct.set! 3 (ct.getD 3 0 + 1)
+      else ct
+    if haveTop && a.intra.getD xb4 0 == 0 then
+      cnt := bump (av1CtxRefAt a 0 xb4) cnt
+      if a.compType.getD xb4 0 != 0 then
+        cnt := bump (av1CtxRefAt a 1 xb4) cnt
+    if haveLeft && l.intra.getD yb4 0 == 0 then
+      cnt := bump (av1CtxRefAt l 0 yb4) cnt
+      if l.compType.getD yb4 0 != 0 then
+        cnt := bump (av1CtxRefAt l 1 yb4) cnt
+    return if idx == 0 then
+      av1CmpCnt (cnt.getD 0 0 + cnt.getD 1 0) (cnt.getD 2 0 + cnt.getD 3 0)
+    else
+      av1CmpCnt (cnt.getD 2 0) (cnt.getD 3 0)
+
+def av1FrameDq (fh : Av1FrameHdr) : Array (Array (Nat × Nat)) := Id.run do
+  let q := fh.quant
+  let base : Int := Int.ofNat q.yac
+  let deltas : Array (Int × Int) := #[
+    (q.ydcDelta, 0),
+    (q.udcDelta, q.uacDelta),
+    (q.vdcDelta, q.vacDelta)
+  ]
+  let mut out := Array.mkEmpty 8
+  for seg in [:8] do
+    let dqseg : Int :=
+      if fh.segmentation.enabled then
+        let d := (fh.segmentation.d.getD seg {}).deltaQ
+        if d != 0 then Int.ofNat (av1IclipU8 (base + d)) else base
+      else base
+    let mut plane := Array.mkEmpty 3
+    for (dcD, acD) in deltas do
+      let dc := (av1Iclip (dqseg + dcD) 0 255).toNat
+      let ac := (av1Iclip (dqseg + acD) 0 255).toNat
+      plane := plane.push (av1DqTbl.getD (dc * 2) 4, av1DqTbl.getD (ac * 2 + 1) 4)
+    out := out.push plane
+  return out
+
+structure Av1TileState where
+  lastQidx : Nat := 0
+  lfDelta  : Array Int := #[0, 0, 0, 0]
+  level    : Array Nat := #[]
+  lrRef    : Array Av1LrUnit := #[{}, {}, {}]
+  deriving Inhabited
+
+structure Av1TileDecodeCtx where
+  fh             : Av1FrameHdr := {}
+  seq            : Av1SeqHdr := {}
+  dec            : Av1MsacDecoder := default
+  cdf            : Array Nat := #[]
+  flatY          : Array Nat := #[]
+  flatU          : Array Nat := #[]
+  flatV          : Array Nat := #[]
+  yStride        : Nat := 0
+  uvStride       : Nat := 0
+  w              : Nat := 0
+  h              : Nat := 0
+  w4             : Nat := 0
+  h4             : Nat := 0
+  bw             : Nat := 0
+  bh             : Nat := 0
+  sbStep         : Nat := 16
+  sb128w         : Nat := 0
+  b4Stride       : Nat := 0
+  segmapH        : Nat := 0
+  above          : Array Av1BlockContext := #[]
+  left           : Av1BlockContext := {}
+  rf             : Option Av1RefMvFrame := none
+  segmap         : Array Nat := #[]
+  prevSegmap     : Option (Array Nat) := none
+  lfMasks        : Array Av1LfMask := #[]
+  lrUnits        : Option (Array Av1LrUnit) := none
+  levelY         : Array Nat := #[]
+  levelUv        : Array Nat := #[]
+  dq             : Array (Array (Nat × Nat)) := #[]
+  qm             : Option (Array (Array (Array Nat))) := none
+  st             : Av1TileState := {}
+  col0           : Nat := 0
+  col1           : Nat := 0
+  row0           : Nat := 0
+  row1           : Nat := 0
+  sby            : Nat := 0
+  sbyBy          : Nat := 0
+  ipredEdgeY     : Array Nat := #[]
+  ipredEdgeU     : Array Nat := #[]
+  ipredEdgeV     : Array Nat := #[]
+  tl4x4Filter    : Nat := 0
+  gmvWarpAllowed : Array Bool := Array.replicate 7 false
+  refs           : Array (Option Av1RefSlot) := Array.replicate 8 none
+  deriving Inhabited
+
+def av1ReadRestoration (ctx0 : Av1TileDecodeCtx) (bx by4 : Nat) : Av1TileDecodeCtx :=
+  match ctx0.lrUnits with
+  | none => ctx0
+  | some lrUnits0 => Id.run do
+    let fh := ctx0.fh
+    let rest := fh.restoration
+    let mut dec := ctx0.dec
+    let mut cdf := ctx0.cdf
+    let mut st := ctx0.st
+    let mut lrUnits := lrUnits0
+    let w4 := (ctx0.w + 3) >>> 2
+    let h4 := (ctx0.h + 3) >>> 2
+    for p in [:3] do
+      let rtype := rest.lrType.getD p 0
+      if rtype != 0 then
+        let ss : Nat := if p != 0 then 1 else 0
+        let uLog2 := rest.unitSize.getD (if p != 0 then 1 else 0) 8
+        let halfB4 := 1 <<< (uLog2 + ss - 3)
+        let maskB4 := (2 * halfB4) - 1
+        let skipCond :=
+          ((by4 &&& maskB4) != 0 && by4 != ctx0.row0) ||
+          (by4 + halfB4 > h4 && by4 > ctx0.row0) ||
+          ((bx &&& maskB4) != 0 && bx != ctx0.col0) ||
+          (bx + halfB4 > w4 && bx > ctx0.col0)
+        if !skipCond then
+          let mut utype : Nat := 0
+          if rtype == 1 then
+            let (fIdx, d1, c1) := dec.decodeSymbolAdapt cdf cdfOff_m_restore_switchable 2
+            dec := d1; cdf := c1
+            utype := fIdx + (if fIdx != 0 then 1 else 0)
+          else if rtype == 2 then
+            let (b1, d1, c1) := dec.decodeBoolAdapt cdf cdfOff_m_restore_wiener
+            dec := d1; cdf := c1
+            utype := if b1 != 0 then 2 else 0
+          else
+            let (b1, d1, c1) := dec.decodeBoolAdapt cdf cdfOff_m_restore_sgrproj
+            dec := d1; cdf := c1
+            utype := if b1 != 0 then 3 else 0
+          let mut fhTaps : Array Int := #[0, 0, 0]
+          let mut fvTaps : Array Int := #[0, 0, 0]
+          let mut sgrW : Array Int := #[0, 0]
+          let refU := st.lrRef.getD p {}
+          if utype == 2 then
+            let mut fv0 : Int := 0
+            if p == 0 then
+              let (v0, d1) := dec.decodeSubexp (refU.filterV.getD 0 0 + 5).toNat 16 1
+              dec := d1; fv0 := Int.ofNat v0 - 5
+            let (v1, d2) := dec.decodeSubexp (refU.filterV.getD 1 0 + 23).toNat 32 2
+            let (v2, d3) := d2.decodeSubexp (refU.filterV.getD 2 0 + 17).toNat 64 3
+            dec := d3
+            fvTaps := #[fv0, Int.ofNat v1 - 23, Int.ofNat v2 - 17]
+            let mut fh0 : Int := 0
+            if p == 0 then
+              let (h0, d4) := dec.decodeSubexp (refU.filterH.getD 0 0 + 5).toNat 16 1
+              dec := d4; fh0 := Int.ofNat h0 - 5
+            let (h1, d5) := dec.decodeSubexp (refU.filterH.getD 1 0 + 23).toNat 32 2
+            let (h2, d6) := d5.decodeSubexp (refU.filterH.getD 2 0 + 17).toNat 64 3
+            dec := d6
+            fhTaps := #[fh0, Int.ofNat h1 - 23, Int.ofNat h2 - 17]
+            sgrW := refU.sgrWeights
+            st := { st with lrRef := st.lrRef.set! p { refU with filterV := fvTaps, filterH := fhTaps } }
+          else if utype == 3 then
+            let (sgrIdx, d1) := dec.decodeBools 4
+            dec := d1
+            utype := 3 + sgrIdx
+            let r0 := av1SgrParams.getD (sgrIdx * 2) 0
+            let r1 := av1SgrParams.getD (sgrIdx * 2 + 1) 0
+            let mut w0 : Int := 0
+            if r0 != 0 then
+              let (u0, d2) := dec.decodeSubexp (refU.sgrWeights.getD 0 0 + 96).toNat 128 4
+              dec := d2; w0 := Int.ofNat u0 - 96
+            let mut w1 : Int := 95
+            if r1 != 0 then
+              let (u1, d3) := dec.decodeSubexp (refU.sgrWeights.getD 1 0 + 32).toNat 128 4
+              dec := d3; w1 := Int.ofNat u1 - 32
+            sgrW := #[w0, w1]
+            fvTaps := refU.filterV
+            fhTaps := refU.filterH
+            st := { st with lrRef := st.lrRef.set! p { refU with sgrWeights := sgrW } }
+          let spanY := Nat.max (2 * halfB4) 1
+          let spanX := Nat.max (2 * halfB4) 1
+          let y1 := if by4 + spanY + halfB4 > h4 then ctx0.h >>> 2 else Nat.min (by4 + spanY) h4
+          let x1 := if bx + spanX + halfB4 > w4 then ctx0.w >>> 2 else Nat.min (bx + spanX) w4
+          let uyEnd := Nat.max (by4 + 1) (Nat.min (y1 + 1) h4)
+          let uxEnd := Nat.max (bx + 1) (Nat.min (x1 + 1) w4)
+          let mut uy := by4
+          while uy < uyEnd do
+            let mut ux := bx
+            while ux < uxEnd do
+              let sbi := (uy >>> 5) * ctx0.sb128w + (ux >>> 5)
+              let uidx := (((uy &&& 16) >>> 4) <<< 1) ||| ((ux &&& 16) >>> 4)
+              let flatIdx := (sbi * 3 + p) * 4 + uidx
+              if flatIdx < lrUnits.size then
+                lrUnits := lrUnits.set! flatIdx { lrType := utype, filterH := fhTaps, filterV := fvTaps, sgrWeights := sgrW }
+              ux := ux + 16
+            uy := uy + 16
+    return { ctx0 with dec := dec, cdf := cdf, st := st, lrUnits := some lrUnits }
+
+def av1ReadSegId (ctx0 : Av1TileDecodeCtx) (bx by4 w4 h4 : Nat) (haveTop haveLeft : Bool)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 : Nat)
+    : Nat × Av1TileDecodeCtx × Av1BlockContext × Av1BlockContext := Id.run do
+  let seg := ctx0.fh.segmentation
+  let mut dec := ctx0.dec
+  let mut cdf := ctx0.cdf
+  let mut a := a0
+  let mut l := l0
+  let (pred, sctx) := av1GetCurFrameSegid by4 bx haveTop haveLeft ctx0.segmap ctx0.b4Stride
+  if seg.temporal then
+    let spCtx := a.segPred.getD xb4 0 + l.segPred.getD yb4 0
+    let (segPred, d1, c1) := dec.decodeBoolAdapt cdf (cdfOff_m_seg_pred + spCtx * 2)
+    dec := d1; cdf := c1
+    let mut asp := a.segPred
+    for i in [:Nat.min w4 (32 - xb4)] do
+      asp := asp.set! (xb4 + i) segPred
+    a := { a with segPred := asp }
+    let mut lsp := l.segPred
+    for i in [:Nat.min h4 (32 - yb4)] do
+      lsp := lsp.set! (yb4 + i) segPred
+    l := { l with segPred := lsp }
+    if segPred != 0 then
+      let sid :=
+        match ctx0.prevSegmap with
+        | none => 0
+        | some psm => av1GetPrevFrameSegid by4 bx w4 h4 psm ctx0.b4Stride
+      return (sid, { ctx0 with dec := dec, cdf := cdf }, a, l)
+  let mut asp := a.segPred
+  for i in [:Nat.min w4 (32 - xb4)] do
+    asp := asp.set! (xb4 + i) 0
+  a := { a with segPred := asp }
+  let mut lsp := l.segPred
+  for i in [:Nat.min h4 (32 - yb4)] do
+    lsp := lsp.set! (yb4 + i) 0
+  l := { l with segPred := lsp }
+  let (diff, d2, c2) := dec.decodeSymbolAdapt cdf (cdfOff_m_seg_id + sctx * 8) 7
+  dec := d2; cdf := c2
+  let lastI := seg.lastActiveSegid
+  if lastI < 0 then
+    return (0, { ctx0 with dec := dec, cdf := cdf }, a, l)
+  let last := lastI.toNat
+  let mut segId := if pred <= last then av1NegDeinterleave diff pred (last + 1) else diff
+  if segId > last || segId >= 8 then
+    segId := 0
+  return (segId, { ctx0 with dec := dec, cdf := cdf }, a, l)
+
+def av1ReadTxTree (fuel : Nat) (ctx0 : Av1TileDecodeCtx) (fromTx bx by4 depth : Nat)
+    (masks0 : Array Nat) (xOff yOff : Nat) : Av1TileDecodeCtx × Array Nat :=
+  match fuel with
+  | 0 => (ctx0, masks0)
+  | fuel' + 1 => Id.run do
+    let mut dec := ctx0.dec
+    let mut cdf := ctx0.cdf
+    let mut masks := masks0
+    let sb128x := bx >>> 5
+    let mut a := ctx0.above.getD sb128x {}
+    let mut l := ctx0.left
+    let bx4 := bx &&& 31
+    let by4Mod := by4 &&& 31
+    let txw := av1TxfmDim.getD (fromTx * 8 + 2) 0
+    let txh := av1TxfmDim.getD (fromTx * 8 + 3) 0
+    let tmax := av1TxfmDim.getD (fromTx * 8 + 5) 0
+    let mut isSplit : Nat := 0
+    if depth < 2 && fromTx > 0 then
+      let cat := 2 * (4 - tmax) - depth
+      let actx := if a.tx.getD bx4 0 < txw then 1 else 0
+      let lctx := if l.tx.getD by4Mod 0 < txh then 1 else 0
+      let (sp, d1, c1) := dec.decodeBoolAdapt cdf (cdfOff_m_txpart + (cat * 3 + actx + lctx) * 2)
+      dec := d1; cdf := c1; isSplit := sp
+      if isSplit != 0 then
+        masks := masks.set! depth (masks.getD depth 0 ||| (1 <<< (yOff * 4 + xOff)))
+    let mut ctx := { ctx0 with dec := dec, cdf := cdf }
+    if isSplit != 0 && tmax > 1 then
+      let sub := av1TxfmDim.getD (fromTx * 8 + 6) 0
+      let txsw := av1TxfmDim.getD (sub * 8) 1
+      let txsh := av1TxfmDim.getD (sub * 8 + 1) 1
+      let (c1, m1) := av1ReadTxTree fuel' ctx sub bx by4 (depth + 1) masks (xOff * 2) (yOff * 2)
+      ctx := c1; masks := m1
+      if txw >= txh && bx + txsw < ctx.bw then
+        let (c2, m2) := av1ReadTxTree fuel' ctx sub (bx + txsw) by4 (depth + 1) masks (xOff * 2 + 1) (yOff * 2)
+        ctx := c2; masks := m2
+      if txh >= txw && by4 + txsh < ctx.bh then
+        let (c3, m3) := av1ReadTxTree fuel' ctx sub bx (by4 + txsh) (depth + 1) masks (xOff * 2) (yOff * 2 + 1)
+        ctx := c3; masks := m3
+        if txw >= txh && bx + txsw < ctx.bw then
+          let (c4, m4) := av1ReadTxTree fuel' ctx sub (bx + txsw) (by4 + txsh) (depth + 1) masks (xOff * 2 + 1) (yOff * 2 + 1)
+          ctx := c4; masks := m4
+      return (ctx, masks)
+    else
+      let val := if isSplit != 0 then 0 else txw
+      let valH := if isSplit != 0 then 0 else txh
+      let wSet := 1 <<< txw
+      let hSet := 1 <<< txh
+      let mut atx := a.tx
+      for i in [:Nat.min wSet (32 - bx4)] do
+        atx := atx.set! (bx4 + i) val
+      a := { a with tx := atx }
+      let mut ltx := l.tx
+      for i in [:Nat.min hSet (32 - by4Mod)] do
+        ltx := ltx.set! (by4Mod + i) valH
+      l := { l with tx := ltx }
+      ctx := { ctx with above := ctx.above.set! sb128x a, left := l }
+      return (ctx, masks)
+
+private def av1PalFreeOffsets2 : Array Nat := #[
+  0x00, 0x00, 0x50, 0x15, 0x40, 0x15, 0xA0, 0x0A, 0x00, 0x15, 0x90, 0x0A,
+  0x80, 0x0A, 0xF0, 0x03, 0x00, 0x14, 0x50, 0x0A, 0x40, 0x0A, 0xE0, 0x03,
+  0x00, 0x0A, 0xD0, 0x03, 0xC0, 0x03, 0x00, 0x00, 0x00, 0x10, 0x50, 0x09,
+  0x40, 0x09, 0xA0, 0x03, 0x00, 0x09, 0x90, 0x03, 0x80, 0x03, 0x00, 0x00,
+  0x00, 0x08, 0x50, 0x03, 0x40, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x05, 0x40, 0x05, 0xA0, 0x02,
+  0x00, 0x05, 0x90, 0x02, 0x80, 0x02, 0x00, 0x00, 0x00, 0x04, 0x50, 0x02,
+  0x40, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x50, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+]
+
+@[inline] private def av1ResolvePalColor (colorIdx : Nat) (p : Array Nat) (prioCount mask : Nat) : Nat :=
+  if colorIdx < prioCount then
+    p.getD colorIdx 0
+  else
+    let rank0 := colorIdx - prioCount + (mask &&& 1)
+    let rank := if rank0 > 0 && ((mask >>> 1) &&& 1) != 0 then rank0 + 1 else rank0
+    let byteIdx := 2 * (mask >>> 2) + (rank >>> 2)
+    rank + ((av1PalFreeOffsets2.getD byteIdx 0 >>> (2 * (rank &&& 3))) &&& 3)
+
+def av1ReadPalPlane (ctx0 : Av1TileDecodeCtx) (pl bs : Nat) (a l : Av1BlockContext) (xb4 yb4 : Nat)
+    : Nat × Array (Array Nat) × Av1TileDecodeCtx := Id.run do
+  let mut dec := ctx0.dec
+  let mut cdf := ctx0.cdf
+  let bctx := av1BlockDim.getD (bs * 4 + 2) 0 + av1BlockDim.getD (bs * 4 + 3) 0 - 2
+  let (szM2, d1, c1) := dec.decodeSymbolAdapt cdf (cdfOff_m_pal_sz + (pl * 7 + bctx) * 8) 6
+  dec := d1; cdf := c1
+  let sz := szM2 + 2
+  let lSz := if pl != 0 then l.palSzUv.getD yb4 0 else l.palSz.getD yb4 0
+  let aSz := if (yb4 &&& 15) != 0 then (if pl != 0 then a.palSzUv.getD xb4 0 else a.palSz.getD xb4 0) else 0
+  let clSrc := (l.alPal.getD yb4 #[]).getD pl #[]
+  let caSrc := (a.alPal.getD xb4 #[]).getD pl #[]
+  let mut cl := Array.mkEmpty lSz
+  for k in [:lSz] do cl := cl.push (clSrc.getD k 0)
+  let mut ca := Array.mkEmpty aSz
+  for k in [:aSz] do ca := ca.push (caSrc.getD k 0)
+  let mut cache : Array Nat := #[]
+  let mut il : Nat := 0
+  let mut ia : Nat := 0
+  while il < cl.size && ia < ca.size do
+    let vl := cl.getD il 0
+    let va := ca.getD ia 0
+    if vl < va then
+      if cache.isEmpty || cache.getD (cache.size - 1) 0 != vl then
+        cache := cache.push vl
+      il := il + 1
+    else
+      if va == vl then
+        il := il + 1
+      if cache.isEmpty || cache.getD (cache.size - 1) 0 != va then
+        cache := cache.push va
+      ia := ia + 1
+  while il < cl.size do
+    let vl := cl.getD il 0
+    if cache.isEmpty || cache.getD (cache.size - 1) 0 != vl then
+      cache := cache.push vl
+    il := il + 1
+  while ia < ca.size do
+    let va := ca.getD ia 0
+    if cache.isEmpty || cache.getD (cache.size - 1) 0 != va then
+      cache := cache.push va
+    ia := ia + 1
+  let mut usedCache : Array Nat := #[]
+  for cval in cache do
+    if usedCache.size < sz then
+      let (ub, du) := dec.decodeBoolEqui
+      dec := du
+      if ub != 0 then
+        usedCache := usedCache.push cval
+  let nUsed := usedCache.size
+  let mut pal := Array.replicate sz 0
+  if nUsed < sz then
+    let mut i := nUsed
+    let (prev0, dp0) := dec.decodeBools 8
+    dec := dp0
+    let mut prev := prev0
+    pal := pal.set! i prev
+    i := i + 1
+    if i < sz then
+      let (badd, db) := dec.decodeBools 2
+      dec := db
+      let mut bits := 5 + badd
+      let step : Nat := if pl != 0 then 0 else 1
+      while i < sz do
+        let (delta, dd) := dec.decodeBools bits
+        dec := dd
+        prev := Nat.min (prev + delta + step) 255
+        pal := pal.set! i prev
+        i := i + 1
+        if prev + step >= 255 then
+          while i < sz do
+            pal := pal.set! i 255
+            i := i + 1
+        else
+          bits := Nat.min bits (1 + av1Ulog2 (255 - prev - step))
+    let mut n : Nat := 0
+    let mut m : Nat := nUsed
+    let mut merged := Array.replicate sz 0
+    for k in [:sz] do
+      if n < nUsed && (m >= sz || usedCache.getD n 0 <= pal.getD m 0) then
+        merged := merged.set! k (usedCache.getD n 0)
+        n := n + 1
+      else
+        merged := merged.set! k (pal.getD m 0)
+        m := m + 1
+    pal := merged
+  else
+    pal := usedCache
+  if pl == 0 then
+    return (sz, #[pal], { ctx0 with dec := dec, cdf := cdf })
+  let mut palV := Array.replicate sz 0
+  let (useDeltaV, dv0) := dec.decodeBoolEqui
+  dec := dv0
+  if useDeltaV != 0 then
+    let (baddV, dv1) := dec.decodeBools 2
+    let (prevV0, dv2) := dv1.decodeBools 8
+    dec := dv2
+    let bitsV := 4 + baddV
+    let mut prevV : Int := Int.ofNat prevV0
+    palV := palV.set! 0 prevV0
+    for k in [1:sz] do
+      let (dmag, dv3) := dec.decodeBools bitsV
+      dec := dv3
+      let mut deltaI : Int := Int.ofNat dmag
+      if dmag != 0 then
+        let (sgn, dv4) := dec.decodeBoolEqui
+        dec := dv4
+        if sgn != 0 then
+          deltaI := -deltaI
+      prevV := Int.emod (prevV + deltaI) 256
+      palV := palV.set! k prevV.toNat
+  else
+    for k in [:sz] do
+      let (vk, dvk) := dec.decodeBools 8
+      dec := dvk
+      palV := palV.set! k vk
+  return (sz, #[pal, palV], { ctx0 with dec := dec, cdf := cdf })
+
+def av1ReadPalIndices (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (pl sz bwPx bhPx wPx hPx : Nat)
+    : Array Nat × Av1MsacDecoder × Array Nat := Id.run do
+  let mut idx := Array.replicate (bwPx * bhPx) 0
+  let (i0, d0) := dec0.decodeUniform sz
+  idx := idx.set! 0 i0
+  let mut dec := d0
+  let mut cdf := cdf0
+  let base := cdfOff_m_color_map + (pl * 7 + (sz - 2)) * 40
+  if sz == 2 then
+    if wPx + hPx >= 2 then
+      for diag in [1 : wPx + hPx - 1] do
+        let first := Nat.min diag (wPx - 1)
+        let last := if diag + 1 >= hPx then diag + 1 - hPx else 0
+        let mut haveTop : Bool := decide (diag > first)
+        let cnt := first + 1 - last
+        for step in [:cnt] do
+          let j := first - step
+          let y := diag - j
+          let x := j
+          let haveLeft : Bool := decide (j > 0)
+          let mut cctx : Nat := 0
+          let mut p0 : Nat := 0
+          if !haveLeft then
+            cctx := 0
+            p0 := idx.getD ((y - 1) * bwPx + x) 0
+          else if !haveTop then
+            cctx := 0
+            p0 := idx.getD (y * bwPx + (x - 1)) 0
+          else
+            let lv := idx.getD (y * bwPx + (x - 1)) 0
+            let tp := idx.getD ((y - 1) * bwPx + x) 0
+            let tl := idx.getD ((y - 1) * bwPx + (x - 1)) 0
+            let sameTl : Nat := if tp == lv then 1 else 0
+            let sameTtl : Nat := if tp == tl then 1 else 0
+            cctx := 2 + sameTl + (sameTl &&& sameTtl)
+            p0 := if sameTl != 0 then tp else tl
+          let (bit, d1, c1) := dec.decodeBoolAdapt cdf (base + cctx * 8)
+          dec := d1; cdf := c1
+          idx := idx.set! (y * bwPx + x) (bit ^^^ p0)
+          haveTop := true
+  else
+    if wPx + hPx >= 2 then
+      for diag in [1 : wPx + hPx - 1] do
+        let first := Nat.min diag (wPx - 1)
+        let last := if diag + 1 >= hPx then diag + 1 - hPx else 0
+        let mut haveTop : Bool := decide (diag > first)
+        let cnt := first + 1 - last
+        for step in [:cnt] do
+          let j := first - step
+          let y := diag - j
+          let x := j
+          let haveLeft : Bool := decide (j > 0)
+          let mut cctx : Nat := 0
+          let mut prioCount : Nat := 1
+          let mut p : Array Nat := #[0, 0, 0]
+          let mut mask : Nat := 0
+          if !haveLeft then
+            let v := idx.getD ((y - 1) * bwPx + x) 0
+            cctx := 0; prioCount := 1; p := p.set! 0 v; mask := 1 <<< v
+          else if !haveTop then
+            let v := idx.getD (y * bwPx + (x - 1)) 0
+            cctx := 0; prioCount := 1; p := p.set! 0 v; mask := 1 <<< v
+          else
+            let lv := idx.getD (y * bwPx + (x - 1)) 0
+            let tp := idx.getD ((y - 1) * bwPx + x) 0
+            let tl := idx.getD ((y - 1) * bwPx + (x - 1)) 0
+            let sameTL := tp == lv
+            let sameTTl := tp == tl
+            let sameLTl := lv == tl
+            if sameTL && sameTTl then
+              cctx := 4; prioCount := 1; p := p.set! 0 tp; mask := 1 <<< tp
+            else if sameTL then
+              cctx := 3; prioCount := 2; p := p.set! 0 tp; p := p.set! 1 tl
+              mask := (1 <<< tp) ||| (1 <<< tl)
+            else if sameTTl || sameLTl then
+              let p1 := if sameTTl then lv else tp
+              cctx := 2; prioCount := 2; p := p.set! 0 tl; p := p.set! 1 p1
+              mask := (1 <<< tl) ||| (1 <<< p1)
+            else
+              cctx := 1; prioCount := 3
+              p := p.set! 0 (Nat.min tp lv)
+              p := p.set! 1 (Nat.max tp lv)
+              p := p.set! 2 tl
+              mask := (1 <<< tp) ||| (1 <<< lv) ||| (1 <<< tl)
+          let (cidx, d1, c1) := dec.decodeSymbolAdapt cdf (base + cctx * 8) (sz - 1)
+          dec := d1; cdf := c1
+          idx := idx.set! (y * bwPx + x) (av1ResolvePalColor cidx p prioCount mask)
+          haveTop := true
+  for y in [:hPx] do
+    for x in [wPx:bwPx] do
+      idx := idx.set! (y * bwPx + x) (idx.getD (y * bwPx + wPx - 1) 0)
+  for y in [hPx:bhPx] do
+    for x in [:bwPx] do
+      idx := idx.set! (y * bwPx + x) (idx.getD ((hPx - 1) * bwPx + x) 0)
+  return (idx, dec, cdf)
+
+def av1FillLfLevel (ctx0 : Av1TileDecodeCtx) (bx by4 bw4 bh4 cbw4 cbh4 : Nat)
+    (hasChroma : Bool) (segId rLf mLf : Nat) : Av1TileDecodeCtx := Id.run do
+  let lvl := ctx0.st.level
+  let stS := ctx0.b4Stride
+  let mut levelY := ctx0.levelY
+  let mut levelUv := ctx0.levelUv
+  let lfw4 := if bx < ctx0.w4 then Nat.min bw4 (ctx0.w4 - bx) else 0
+  let lfh4 := if by4 < ctx0.h4 then Nat.min bh4 (ctx0.h4 - by4) else 0
+  if lfw4 > 0 && lfh4 > 0 then
+    let lv0 := av1LfAt lvl segId 0 rLf mLf
+    let lv1 := av1LfAt lvl segId 1 rLf mLf
+    for yy in [:lfh4] do
+      let base := (by4 + yy) * stS + bx
+      for xx in [:lfw4] do
+        let o := (base + xx) * 2
+        levelY := levelY.set! o lv0
+        levelY := levelY.set! (o + 1) lv1
+  if hasChroma then
+    let cw4Tot := (ctx0.w4 + 1) >>> 1
+    let ch4Tot := (ctx0.h4 + 1) >>> 1
+    let cbx := bx >>> 1
+    let cby := by4 >>> 1
+    let lfcw4 := if cbx < cw4Tot then Nat.min (cw4Tot - cbx) cbw4 else 0
+    let lfch4 := if cby < ch4Tot then Nat.min (ch4Tot - cby) cbh4 else 0
+    if lfcw4 > 0 && lfch4 > 0 then
+      let lu := av1LfAt lvl segId 2 rLf mLf
+      let lv := av1LfAt lvl segId 3 rLf mLf
+      for yy in [:lfch4] do
+        let base := (cby + yy) * stS + cbx
+        for xx in [:lfcw4] do
+          let o := (base + xx) * 2
+          levelUv := levelUv.set! o lu
+          levelUv := levelUv.set! (o + 1) lv
+  return { ctx0 with levelY := levelY, levelUv := levelUv }
+
+@[inline] private def av1IsSmoothMode (m : Nat) : Bool :=
+  m == av1SmoothPred || m == av1SmoothVPred || m == av1SmoothHPred
+
+def av1ReconIntra (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 w4 h4 cbw4 cbh4 cw4 ch4 : Nat)
+    (haveTop haveLeft hasChroma : Bool) (edgeFlags : Nat)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 : Nat)
+    (_segId : Nat) (skip : Bool) (qidx : Nat) (lossless : Bool)
+    (bdq : Array (Nat × Nat)) (tx uvTx yMode : Nat) (yAngle : Int) (uvMode : Nat) (uvAngle : Int)
+    (cflAlpha : Array Int) (palY : Option (Array (Array Nat))) (palIdxY : Array Nat)
+    (palUv : Option (Array (Array Nat))) (palIdxUv : Array Nat)
+    : Av1TileDecodeCtx × Av1BlockContext × Av1BlockContext := Id.run do
+  let fh := ctx0.fh
+  let seq := ctx0.seq
+  let mut dec := ctx0.dec
+  let mut cdf := ctx0.cdf
+  let mut flatY := ctx0.flatY
+  let mut flatU := ctx0.flatU
+  let mut flatV := ctx0.flatV
+  let mut a := a0
+  let mut l := l0
+  let ys := ctx0.yStride
+  let uvs := ctx0.uvStride
+  let (tw4, th4, lw, lh, _) := av1TxDim tx
+  let (utw4, uth4, ulw, ulh, _) := av1TxDim uvTx
+  let mut cf : Array Int := Array.replicate 1024 0
+  let shiftY := av1TxShift lw lh
+  let shiftUv := av1TxShift ulw ulh
+  let cbx := bx - (bx &&& 1)
+  let cby := by4 - (by4 &&& 1)
+  let cHt := cby > ctx0.row0
+  let cHl := cbx > ctx0.col0
+  let edgeFiltFlag : Nat := if seq.intraEdgeFilter then 1 else 0
+  let qmY : Option (Array (Array Nat)) := ctx0.qm.map (fun q => q.getD 0 #[])
+  let qmU : Option (Array (Array Nat)) := ctx0.qm.map (fun q => q.getD 1 #[])
+  let qmV : Option (Array (Array Nat)) := ctx0.qm.map (fun q => q.getD 2 #[])
+  let (dqYDc, dqYAc) := bdq.getD 0 (4, 4)
+  let mut initY : Nat := 0
+  while initY < h4 do
+    let subH4 := Nat.min h4 (initY + 16)
+    let subCh4 := Nat.min ch4 ((initY + 16) >>> 1)
+    let mut initX : Nat := 0
+    while initX < w4 do
+      if initX == 0 && initY == 0 then
+        if let some pyArr := palY then
+          flatY := av1PalPred flatY (by4 * 4 * ys + bx * 4) ys (pyArr.getD 0 #[]) palIdxY (bw4 * 4) (bh4 * 4)
+      let smFlag : Nat :=
+        if (haveTop && av1IsSmoothMode (a.mode.getD xb4 0)) ||
+           (haveLeft && av1IsSmoothMode (l.mode.getD yb4 0)) then 512 else 0
+      let sbTr : Bool :=
+        if initX + 16 < w4 then true
+        else if initY != 0 then false
+        else (edgeFlags &&& av1EdgeI444TopHasRight) != 0
+      let sbBl : Bool :=
+        if initX != 0 then false
+        else if initY + 16 < h4 then true
+        else (edgeFlags &&& av1EdgeI444LeftHasBottom) != 0
+      let subW4 := Nat.min w4 (initX + 16)
+      let mut yy := initY
+      while yy < subH4 do
+        let mut xx := initX
+        while xx < subW4 do
+          let px := (bx + xx) * 4
+          let py := (by4 + yy) * 4
+          let doff := py * ys + px
+          if palY.isNone then
+            let ht := (by4 + yy) > ctx0.row0
+            let hl := (bx + xx) > ctx0.col0
+            let mut ef : Nat := 0
+            if !((yy > initY || !sbTr) && xx + tw4 >= subW4) then
+              ef := ef ||| av1EdgeI444TopHasRight
+            if !(xx > initX || (!sbBl && yy + th4 >= subH4)) then
+              ef := ef ||| av1EdgeI444LeftHasBottom
+            let topSb := if ctx0.sby > 0 && by4 + yy == ctx0.sbyBy then some ctx0.ipredEdgeY else none
+            let (m, ang, ebuf, tl) := av1PrepareIntraEdges
+              (bx + xx) hl (by4 + yy) ht ctx0.col1 ctx0.row1 ef
+              flatY doff ys topSb 0 yMode yAngle tw4 th4 edgeFiltFlag
+            let angBase : Nat := (if yMode == 13 then yAngle else ang).toNat
+            let aArg := angBase ||| smFlag ||| (edgeFiltFlag <<< 10)
+            let mw := (ctx0.bw - (bx + xx)) * 4
+            let mh := (ctx0.bh - (by4 + yy)) * 4
+            flatY := av1IntraPred flatY doff ys ebuf tl m (tw4 * 4) (th4 * 4) aArg mw mh
+          if !skip then
+            let (eob, txtp, rctx, d1, c1, cf1) := av1DecodeCoefs
+              dec cdf tx bs true 0 yMode yAngle uvMode
+              fh.reducedTxtpSet qidx lossless a.lcoef (xb4 + xx) l.lcoef (yb4 + yy)
+              cf 0 dqYDc dqYAc qmY
+            dec := d1; cdf := c1; cf := cf1
+            let wFill := Nat.min tw4 (ctx0.bw - (bx + xx))
+            let hFill := Nat.min th4 (ctx0.bh - (by4 + yy))
+            let mut alc := a.lcoef
+            for k in [:Nat.min wFill (32 - (xb4 + xx))] do
+              alc := alc.set! (xb4 + xx + k) rctx
+            a := { a with lcoef := alc }
+            let mut llc := l.lcoef
+            for k in [:Nat.min hFill (32 - (yb4 + yy))] do
+              llc := llc.set! (yb4 + yy + k) rctx
+            l := { l with lcoef := llc }
+            if eob >= 0 then
+              let (fy1, cf2) := av1InvTxfmAdd flatY ys cf eob tx shiftY txtp doff
+              flatY := fy1; cf := cf2
+          else
+            let mut alc := a.lcoef
+            for k in [:Nat.min tw4 (32 - (xb4 + xx))] do
+              alc := alc.set! (xb4 + xx + k) 0x40
+            a := { a with lcoef := alc }
+            let mut llc := l.lcoef
+            for k in [:Nat.min th4 (32 - (yb4 + yy))] do
+              llc := llc.set! (yb4 + yy + k) 0x40
+            l := { l with lcoef := llc }
+          xx := xx + tw4
+        yy := yy + th4
+      if hasChroma then
+        if uvMode == av1CflPred && initX == 0 && initY == 0 then
+          let maskTw := tw4 - 1
+          let maskTh := th4 - 1
+          let furthestR0 := (cw4 <<< 1) + maskTw
+          let furthestR := furthestR0 - (furthestR0 &&& maskTw)
+          let furthestB0 := (ch4 <<< 1) + maskTh
+          let furthestB := furthestB0 - (furthestB0 &&& maskTh)
+          let wPad := cbw4 - (furthestR >>> 1)
+          let hPad := cbh4 - (furthestB >>> 1)
+          let acBuf := av1CflAc420 flatY (cby * 4 * ys + cbx * 4) ys wPad hPad (cbw4 * 4) (cbh4 * 4)
+          for pl in [:2] do
+            let alpha := cflAlpha.getD pl 0
+            if alpha != 0 then
+              let pbuf := if pl == 0 then flatU else flatV
+              let doff := (cby >>> 1) * 4 * uvs + (cbx >>> 1) * 4
+              let topSb :=
+                if ctx0.sby > 0 && cby == ctx0.sbyBy then
+                  some (if pl == 0 then ctx0.ipredEdgeU else ctx0.ipredEdgeV)
+                else none
+              let (m, _, ebuf, tl) := av1PrepareIntraEdges
+                (bx >>> 1) ((bx >>> 1) > (ctx0.col0 >>> 1))
+                (by4 >>> 1) ((by4 >>> 1) > (ctx0.row0 >>> 1))
+                (ctx0.col1 >>> 1) (ctx0.row1 >>> 1) 0
+                pbuf doff uvs topSb 0 av1DcPred 0 utw4 uth4 0
+              let pbuf1 := av1CflPredict pbuf doff uvs ebuf tl m (utw4 * 4) (uth4 * 4) acBuf alpha
+              if pl == 0 then flatU := pbuf1 else flatV := pbuf1
+        else if initX == 0 && initY == 0 then
+          if let some puvArr := palUv then
+            let uvDoff := (by4 >>> 1) * 4 * uvs + (bx >>> 1) * 4
+            flatU := av1PalPred flatU uvDoff uvs (puvArr.getD 0 #[]) palIdxUv (cbw4 * 4) (cbh4 * 4)
+            flatV := av1PalPred flatV uvDoff uvs (puvArr.getD 1 #[]) palIdxUv (cbw4 * 4) (cbh4 * 4)
+        let smUv : Nat :=
+          if (cHt && av1IsSmoothMode (a.uvmode.getD cxb4 0)) ||
+             (cHl && av1IsSmoothMode (l.uvmode.getD cyb4 0)) then 512 else 0
+        let uvTr : Bool :=
+          if ((initX + 16) >>> 1) < cw4 then true
+          else if initY != 0 then false
+          else (edgeFlags &&& av1EdgeI420TopHasRight) != 0
+        let uvBl : Bool :=
+          if initX != 0 then false
+          else if ((initY + 16) >>> 1) < ch4 then true
+          else (edgeFlags &&& av1EdgeI420LeftHasBottom) != 0
+        let subCw4 := Nat.min cw4 ((initX + 16) >>> 1)
+        for pl in [:2] do
+          let mut pbuf := if pl == 0 then flatU else flatV
+          let (dqUvDc, dqUvAc) := bdq.getD (1 + pl) (4, 4)
+          let qmUv := if pl == 0 then qmU else qmV
+          let mut cyy := initY >>> 1
+          while cyy < subCh4 do
+            let mut cxx := initX >>> 1
+            while cxx < subCw4 do
+              let tBx := bx + (cxx <<< 1)
+              let tBy := by4 + (cyy <<< 1)
+              let xpos := tBx >>> 1
+              let ypos := tBy >>> 1
+              let doff := ypos * 4 * uvs + xpos * 4
+              if palUv.isNone && !(uvMode == av1CflPred && cflAlpha.getD pl 0 != 0) then
+                let mut ef : Nat := 0
+                if !((cyy > (initY >>> 1) || !uvTr) && cxx + utw4 >= subCw4) then
+                  ef := ef ||| av1EdgeI444TopHasRight
+                if !(cxx > (initX >>> 1) || (!uvBl && cyy + uth4 >= subCh4)) then
+                  ef := ef ||| av1EdgeI444LeftHasBottom
+                let topSb :=
+                  if ctx0.sby > 0 && (tBy - (tBy &&& 1)) == ctx0.sbyBy then
+                    some (if pl == 0 then ctx0.ipredEdgeU else ctx0.ipredEdgeV)
+                  else none
+                let uvm := if uvMode == av1CflPred then av1DcPred else uvMode
+                let (m, ang, ebuf, tl) := av1PrepareIntraEdges
+                  xpos (xpos > (ctx0.col0 >>> 1))
+                  ypos (ypos > (ctx0.row0 >>> 1))
+                  (ctx0.col1 >>> 1) (ctx0.row1 >>> 1) ef
+                  pbuf doff uvs topSb 0 uvm uvAngle utw4 uth4 edgeFiltFlag
+                let aArg := ang.toNat ||| smUv ||| (edgeFiltFlag <<< 10)
+                let mw := (4 * ctx0.bw + 1 - 4 * (tBx - (tBx &&& 1))) >>> 1
+                let mh := (4 * ctx0.bh + 1 - 4 * (tBy - (tBy &&& 1))) >>> 1
+                pbuf := av1IntraPred pbuf doff uvs ebuf tl m (utw4 * 4) (uth4 * 4) aArg mw mh
+              if !skip then
+                let aCc := a.ccoef.getD pl #[]
+                let lCc := l.ccoef.getD pl #[]
+                let (eob, txtp, rctx, d2, c2, cf2) := av1DecodeCoefs
+                  dec cdf uvTx bs true (1 + pl) yMode yAngle uvMode
+                  fh.reducedTxtpSet qidx lossless aCc (cxb4 + cxx) lCc (cyb4 + cyy)
+                  cf 0 dqUvDc dqUvAc qmUv
+                dec := d2; cdf := c2; cf := cf2
+                let wFill := Nat.min utw4 ((ctx0.bw - tBx + 1) >>> 1)
+                let hFill := Nat.min uth4 ((ctx0.bh - tBy + 1) >>> 1)
+                let mut acc := aCc
+                for k in [:Nat.min wFill (32 - (cxb4 + cxx))] do
+                  acc := acc.set! (cxb4 + cxx + k) rctx
+                a := { a with ccoef := a.ccoef.set! pl acc }
+                let mut lcc := lCc
+                for k in [:Nat.min hFill (32 - (cyb4 + cyy))] do
+                  lcc := lcc.set! (cyb4 + cyy + k) rctx
+                l := { l with ccoef := l.ccoef.set! pl lcc }
+                if eob >= 0 then
+                  let (pb1, cf3) := av1InvTxfmAdd pbuf uvs cf eob uvTx shiftUv txtp doff
+                  pbuf := pb1; cf := cf3
+              else
+                let mut acc := a.ccoef.getD pl #[]
+                for k in [:Nat.min utw4 (32 - (cxb4 + cxx))] do
+                  acc := acc.set! (cxb4 + cxx + k) 0x40
+                a := { a with ccoef := a.ccoef.set! pl acc }
+                let mut lcc := l.ccoef.getD pl #[]
+                for k in [:Nat.min uth4 (32 - (cyb4 + cyy))] do
+                  lcc := lcc.set! (cyb4 + cyy + k) 0x40
+                l := { l with ccoef := l.ccoef.set! pl lcc }
+              cxx := cxx + utw4
+            cyy := cyy + uth4
+          if pl == 0 then flatU := pbuf else flatV := pbuf
+      initX := initX + 16
+    initY := initY + 16
+  return ({ ctx0 with dec := dec, cdf := cdf, flatY := flatY, flatU := flatU, flatV := flatV }, a, l)
+
+def av1DecodeIntraB (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 bwLog2 bhLog2 w4 h4 cbw4 cbh4 cw4 ch4 : Nat)
+    (haveTop haveLeft hasChroma : Bool) (edgeFlags : Nat)
+    (a0 l0 : Av1BlockContext) (xb4 yb4 cxb4 cyb4 segId : Nat)
+    (skip : Bool) (qidx : Nat) (lossless : Bool) (bdq : Array (Nat × Nat))
+    (lfm0 : Av1LfMask) : Av1TileDecodeCtx × Av1BlockContext × Av1BlockContext × Av1LfMask := Id.run do
+  let fh := ctx0.fh
+  let seq := ctx0.seq
+  let mut dec := ctx0.dec
+  let mut cdf := ctx0.cdf
+  let mut a := a0
+  let mut l := l0
+  let mut lfm := lfm0
+  let keyOrIntra := fh.frameType == av1FrameKey || fh.frameType == av1FrameIntra
+  let mut yMode : Nat := 0
+  if keyOrIntra then
+    let am := av1IntraModeCtx.getD (a.mode.getD xb4 0) 0
+    let lm := av1IntraModeCtx.getD (l.mode.getD yb4 0) 0
+    let (ym, d1, c1) := dec.decodeSymbolAdapt cdf (cdfOff_kfym + (am * 5 + lm) * 16) 12
+    yMode := ym; dec := d1; cdf := c1
+  else
+    let (ym, d1, c1) := dec.decodeSymbolAdapt cdf (cdfOff_m_y_mode + av1YmodeSizeCtx.getD bs 0 * 16) 12
+    yMode := ym; dec := d1; cdf := c1
+  let mut yAngle : Int := 0
+  if av1VertPred <= yMode && yMode <= 8 && bwLog2 + bhLog2 >= 2 then
+    let (ya, d2, c2) := dec.decodeSymbolAdapt cdf (cdfOff_m_angle_delta + (yMode - av1VertPred) * 8) 6
+    yAngle := Int.ofNat ya - 3; dec := d2; cdf := c2
+  let mut uvMode : Nat := av1DcPred
+  let mut uvAngle : Int := 0
+  let mut cflAlpha : Array Int := #[0, 0]
+  if hasChroma then
+    let cflOk := if lossless then (cbw4 == 1 && cbh4 == 1) else (cbw4 <= 8 && cbh4 <= 8)
+    let ubase := cdfOff_m_uv_mode + ((if cflOk then 13 else 0) + yMode) * 16
+    let (uvm, d3, c3) := dec.decodeSymbolAdapt cdf ubase (if cflOk then 13 else 12)
+    uvMode := uvm; dec := d3; cdf := c3
+    if uvMode == av1CflPred then
+      let (sj0, d4, c4) := dec.decodeSymbolAdapt cdf cdfOff_m_cfl_sign 7
+      dec := d4; cdf := c4
+      let signJoint := sj0 + 1
+      let su := signJoint / 3
+      let sv := signJoint % 3
+      if su != 0 then
+        let cflCtxU := (if su == 2 then 3 else 0) + sv
+        let (au0, d5, c5) := dec.decodeSymbolAdapt cdf (cdfOff_m_cfl_alpha + cflCtxU * 16) 15
+        dec := d5; cdf := c5
+        let au : Int := Int.ofNat (au0 + 1)
+        cflAlpha := cflAlpha.set! 0 (if su == 1 then -au else au)
+      if sv != 0 then
+        let cflCtxV := (if sv == 2 then 3 else 0) + su
+        let (av0, d6, c6) := dec.decodeSymbolAdapt cdf (cdfOff_m_cfl_alpha + cflCtxV * 16) 15
+        dec := d6; cdf := c6
+        let av : Int := Int.ofNat (av0 + 1)
+        cflAlpha := cflAlpha.set! 1 (if sv == 1 then -av else av)
+    else if av1VertPred <= uvMode && uvMode <= 8 && bwLog2 + bhLog2 >= 2 then
+      let (ua, d4, c4) := dec.decodeSymbolAdapt cdf (cdfOff_m_angle_delta + (uvMode - av1VertPred) * 8) 6
+      uvAngle := Int.ofNat ua - 3; dec := d4; cdf := c4
+  let mut ctx := { ctx0 with dec := dec, cdf := cdf }
+  let mut palSzY : Nat := 0
+  let mut palSzUv : Nat := 0
+  let mut palY : Option (Array (Array Nat)) := none
+  let mut palUv : Option (Array (Array Nat)) := none
+  let mut palIdxY : Array Nat := #[]
+  let mut palIdxUv : Array Nat := #[]
+  if fh.allowScreenContentTools && Nat.max bw4 bh4 <= 16 && bw4 + bh4 >= 4 then
+    if yMode == av1DcPred then
+      let pctx := (if a.palSz.getD xb4 0 > 0 then 1 else 0) + (if l.palSz.getD yb4 0 > 0 then 1 else 0)
+      let bctx := bwLog2 + bhLog2 - 2
+      let (usePalY, d5, c5) := ctx.dec.decodeBoolAdapt ctx.cdf (cdfOff_m_pal_y + (bctx * 3 + pctx) * 2)
+      ctx := { ctx with dec := d5, cdf := c5 }
+      if usePalY != 0 then
+        let (sy, py, ctx1) := av1ReadPalPlane ctx 0 bs a l xb4 yb4
+        palSzY := sy; palY := some py; ctx := ctx1
+    if hasChroma && uvMode == av1DcPred then
+      let (usePalUv, d6, c6) := ctx.dec.decodeBoolAdapt ctx.cdf (cdfOff_m_pal_uv + (if palSzY != 0 then 1 else 0) * 2)
+      ctx := { ctx with dec := d6, cdf := c6 }
+      if usePalUv != 0 then
+        let (suv, puv, ctx2) := av1ReadPalPlane ctx 1 bs a l xb4 yb4
+        palSzUv := suv; palUv := some puv; ctx := ctx2
+  if seq.filterIntra && yMode == av1DcPred && palSzY == 0 && Nat.max bw4 bh4 <= 8 then
+    let (useFi, d7, c7) := ctx.dec.decodeBoolAdapt ctx.cdf (cdfOff_m_use_filter_intra + bs * 2)
+    ctx := { ctx with dec := d7, cdf := c7 }
+    if useFi != 0 then
+      yMode := 13
+      let (fi, d8, c8) := ctx.dec.decodeSymbolAdapt ctx.cdf cdfOff_m_filter_intra 4
+      yAngle := Int.ofNat fi
+      ctx := { ctx with dec := d8, cdf := c8 }
+  if palSzY != 0 then
+    let (piy, d9, c9) := av1ReadPalIndices ctx.dec ctx.cdf 0 palSzY (bw4 * 4) (bh4 * 4) (w4 * 4) (h4 * 4)
+    palIdxY := piy; ctx := { ctx with dec := d9, cdf := c9 }
+  if palSzUv != 0 then
+    let (piuv, d10, c10) := av1ReadPalIndices ctx.dec ctx.cdf 1 palSzUv (cbw4 * 4) (cbh4 * 4) (cw4 * 4) (ch4 * 4)
+    palIdxUv := piuv; ctx := { ctx with dec := d10, cdf := c10 }
+  let maxTx := av1MaxTxfmForBs.getD (bs * 4) 0
+  let tmax := av1TxfmDim.getD (maxTx * 8 + 5) 0
+  let mut tx := maxTx
+  if lossless then
+    tx := 0
+  else if fh.txfmMode == 2 && tmax > 0 then
+    let (_, _, mlw, mlh, _) := av1TxDim maxTx
+    let tctx := av1GetTxCtx a l mlw mlh yb4 xb4
+    let (depth, d11, c11) := ctx.dec.decodeSymbolAdapt ctx.cdf (cdfOff_m_txsz + ((tmax - 1) * 3 + tctx) * 4) (Nat.min tmax 2)
+    ctx := { ctx with dec := d11, cdf := c11 }
+    tx := maxTx
+    for _ in [:depth] do
+      tx := av1TxfmDim.getD (tx * 8 + 6) 0
+  let uvTx := if lossless then 0 else av1MaxTxfmForBs.getD (bs * 4 + 1) 0
+  let (_, _, lw, lh, _) := av1TxDim tx
+  let (ctx3, a1, l1) := av1ReconIntra ctx bs bx by4 bw4 bh4 w4 h4 cbw4 cbh4 cw4 ch4
+    haveTop haveLeft hasChroma edgeFlags a l xb4 yb4 cxb4 cyb4
+    segId skip qidx lossless bdq tx uvTx yMode yAngle uvMode uvAngle
+    cflAlpha palY palIdxY palUv palIdxUv
+  ctx := ctx3; a := a1; l := l1
+  let lfw4 := if bx < ctx.w4 then Nat.min bw4 (ctx.w4 - bx) else 0
+  let lfh4 := if by4 < ctx.h4 then Nat.min bh4 (ctx.h4 - by4) else 0
+  if lfw4 > 0 && lfh4 > 0 then
+    let mut aSlice := Array.mkEmpty lfw4
+    for i in [:lfw4] do aSlice := aSlice.push (a.txLpfY.getD (xb4 + i) 2)
+    let mut lSlice := Array.mkEmpty lfh4
+    for i in [:lfh4] do lSlice := lSlice.push (l.txLpfY.getD (yb4 + i) 2)
+    let (fy1, _, _) := av1MaskEdgesIntra lfm.filterY yb4 xb4 lfw4 lfh4 tx aSlice lSlice
+    lfm := { lfm with filterY := fy1 }
+    let mut atly := a.txLpfY
+    for i in [:Nat.min lfw4 (32 - xb4)] do atly := atly.set! (xb4 + i) (Nat.min 2 lh)
+    a := { a with txLpfY := atly }
+    let mut ltly := l.txLpfY
+    for i in [:Nat.min lfh4 (32 - yb4)] do ltly := ltly.set! (yb4 + i) (Nat.min 2 lw)
+    l := { l with txLpfY := ltly }
+  if hasChroma then
+    let cw4Tot := (ctx.w4 + 1) >>> 1
+    let ch4Tot := (ctx.h4 + 1) >>> 1
+    let cbx2 := bx >>> 1
+    let cby2 := by4 >>> 1
+    let lfcw4 := if cbx2 < cw4Tot then Nat.min (cw4Tot - cbx2) cbw4 else 0
+    let lfch4 := if cby2 < ch4Tot then Nat.min (ch4Tot - cby2) cbh4 else 0
+    if lfcw4 > 0 && lfch4 > 0 then
+      let (_, _, ulw, ulh, _) := av1TxDim uvTx
+      let mut aCSlice := Array.mkEmpty lfcw4
+      for i in [:lfcw4] do aCSlice := aCSlice.push (a.txLpfUv.getD (cxb4 + i) 1)
+      let mut lCSlice := Array.mkEmpty lfch4
+      for i in [:lfch4] do lCSlice := lCSlice.push (l.txLpfUv.getD (cyb4 + i) 1)
+      let (fuv1, _, _) := av1MaskEdgesChroma lfm.filterUv cyb4 cxb4 lfcw4 lfch4 false uvTx aCSlice lCSlice
+      lfm := { lfm with filterUv := fuv1 }
+      let mut atluv := a.txLpfUv
+      for i in [:Nat.min lfcw4 (32 - cxb4)] do atluv := atluv.set! (cxb4 + i) (if ulh != 0 then 1 else 0)
+      a := { a with txLpfUv := atluv }
+      let mut ltluv := l.txLpfUv
+      for i in [:Nat.min lfch4 (32 - cyb4)] do ltluv := ltluv.set! (cyb4 + i) (if ulw != 0 then 1 else 0)
+      l := { l with txLpfUv := ltluv }
+  let yModeNofilt := if yMode == 13 then av1DcPred else yMode
+  for i in [:Nat.min bw4 (32 - xb4)] do
+    let xi := xb4 + i
+    a := { a with
+      txIntra := a.txIntra.set! xi (Int.ofNat lw)
+      tx := a.tx.set! xi lw
+      mode := a.mode.set! xi yModeNofilt
+      palSz := a.palSz.set! xi palSzY
+      palSzUv := a.palSzUv.set! xi (if hasChroma then palSzUv else 0)
+    }
+    if palSzY > 0 then
+      if let some pyArr := palY then
+        let mut ap := a.alPal.getD xi #[]
+        let mut ap0 := ap.getD 0 #[]
+        let src0 := pyArr.getD 0 #[]
+        for k in [:palSzY] do ap0 := ap0.set! k (src0.getD k 0)
+        ap := ap.set! 0 ap0
+        a := { a with alPal := a.alPal.set! xi ap }
+    if hasChroma && palSzUv > 0 then
+      if let some puvArr := palUv then
+        let mut ap := a.alPal.getD xi #[]
+        let mut ap1 := ap.getD 1 #[]
+        let mut ap2 := ap.getD 2 #[]
+        let src0 := puvArr.getD 0 #[]
+        let src1 := puvArr.getD 1 #[]
+        for k in [:palSzUv] do
+          ap1 := ap1.set! k (src0.getD k 0)
+          ap2 := ap2.set! k (src1.getD k 0)
+        ap := (ap.set! 1 ap1).set! 2 ap2
+        a := { a with alPal := a.alPal.set! xi ap }
+    if !keyOrIntra then
+      a := { a with
+        compType := a.compType.set! xi av1CompInterNone
+        ref := (a.ref.set! 0 ((a.ref.getD 0 #[]).set! xi (-1))).set! 1 ((a.ref.getD 1 #[]).set! xi (-1))
+        filter := (a.filter.set! 0 ((a.filter.getD 0 #[]).set! xi 3)).set! 1 ((a.filter.getD 1 #[]).set! xi 3)
+      }
+  for i in [:Nat.min bh4 (32 - yb4)] do
+    let yi := yb4 + i
+    l := { l with
+      txIntra := l.txIntra.set! yi (Int.ofNat lh)
+      tx := l.tx.set! yi lh
+      mode := l.mode.set! yi yModeNofilt
+      palSz := l.palSz.set! yi palSzY
+      palSzUv := l.palSzUv.set! yi (if hasChroma then palSzUv else 0)
+    }
+    if palSzY > 0 then
+      if let some pyArr := palY then
+        let mut lp := l.alPal.getD yi #[]
+        let mut lp0 := lp.getD 0 #[]
+        let src0 := pyArr.getD 0 #[]
+        for k in [:palSzY] do lp0 := lp0.set! k (src0.getD k 0)
+        lp := lp.set! 0 lp0
+        l := { l with alPal := l.alPal.set! yi lp }
+    if hasChroma && palSzUv > 0 then
+      if let some puvArr := palUv then
+        let mut lp := l.alPal.getD yi #[]
+        let mut lp1 := lp.getD 1 #[]
+        let mut lp2 := lp.getD 2 #[]
+        let src0 := puvArr.getD 0 #[]
+        let src1 := puvArr.getD 1 #[]
+        for k in [:palSzUv] do
+          lp1 := lp1.set! k (src0.getD k 0)
+          lp2 := lp2.set! k (src1.getD k 0)
+        lp := (lp.set! 1 lp1).set! 2 lp2
+        l := { l with alPal := l.alPal.set! yi lp }
+    if !keyOrIntra then
+      l := { l with
+        compType := l.compType.set! yi av1CompInterNone
+        ref := (l.ref.set! 0 ((l.ref.getD 0 #[]).set! yi (-1))).set! 1 ((l.ref.getD 1 #[]).set! yi (-1))
+        filter := (l.filter.set! 0 ((l.filter.getD 0 #[]).set! yi 3)).set! 1 ((l.filter.getD 1 #[]).set! yi 3)
+      }
+  if hasChroma then
+    let mut auvm := a.uvmode
+    for i in [:Nat.min cbw4 (32 - cxb4)] do auvm := auvm.set! (cxb4 + i) uvMode
+    a := { a with uvmode := auvm }
+    let mut luvm := l.uvmode
+    for i in [:Nat.min cbh4 (32 - cyb4)] do luvm := luvm.set! (cyb4 + i) uvMode
+    l := { l with uvmode := luvm }
+  ctx := av1FillLfLevel ctx bx by4 bw4 bh4 cbw4 cbh4 hasChroma segId 0 0
+  if let some rf0 := ctx.rf then
+    let sw := if bx < rf0.iw4 then Nat.min bw4 (rf0.iw4 - bx) else 0
+    let sh := if by4 < rf0.ih4 then Nat.min bh4 (rf0.ih4 - by4) else 0
+    let rf1 := av1SplatMv rf0 bs by4 bx sw sh 0 (-1) (av1InvalidMv, 0) (0, 0) 0
+    ctx := { ctx with rf := some rf1 }
+  return (ctx, a, l, lfm)
+
 end LeanAV.Av1Main
-
-
