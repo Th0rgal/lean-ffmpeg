@@ -98,10 +98,11 @@ def av1AlPartCtx : Array Nat := #[
 ]
 
 def av1BlockSizes : Array Nat := #[
-  0, 0, 1, 0, 2, 0, 0, 0, 3, 1, 1, 3, 3, 2, 2, 3, 0, 0, 0, 0, 3, 0, 4, 0, 6,
-  0, 0, 0, 7, 4, 4, 7, 7, 6, 6, 7, 5, 0, 10, 0, 7, 0, 8, 0, 11, 0, 0, 0, 12, 8,
-  8, 12, 12, 11, 11, 12, 9, 0, 15, 0, 12, 0, 13, 0, 16, 0, 0, 0, 17, 13, 13, 17, 17, 16, 16,
-  17, 14, 0, 19, 0, 17, 0, 18, 0, 20, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  0, 0, 1, 0, 2, 0, 0, 0, 3, 1, 1, 3, 3, 2, 2, 3, 0, 0, 0, 0,
+  3, 0, 4, 0, 6, 0, 0, 0, 7, 4, 4, 7, 7, 6, 6, 7, 5, 0, 10, 0,
+  7, 0, 8, 0, 11, 0, 0, 0, 12, 8, 8, 12, 12, 11, 11, 12, 9, 0, 15, 0,
+  12, 0, 13, 0, 16, 0, 0, 0, 17, 13, 13, 17, 17, 16, 16, 17, 14, 0, 19, 0,
+  17, 0, 18, 0, 20, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 ]
 
 def av1BlockDim : Array Nat := #[
@@ -1405,11 +1406,10 @@ def buildAv1EdgeNode : Nat → Nat → Bool → Bool → Av1EdgeNode
     let h1 := ef &&& (av1EdgeAllLeftHasBottom ||| av1EdgeI420TopHasRight)
     let v0 := ef ||| av1EdgeAllTopHasRight
     let v1 := ef &&& (av1EdgeAllTopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
-    let sp0 := av1EdgeAllTrAndBl
-    let sp1 := (ef &&& av1EdgeAllTopHasRight) ||| av1EdgeI422LeftHasBottom
-    let sp2 := ef ||| av1EdgeI444TopHasRight
-    let sp3 := ef &&& (av1EdgeI420TopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
-    Av1EdgeNode.mk ef h0 h1 v0 v1 0 0 #[sp0, sp1, sp2, sp3] #[]
+    let sp0 := (ef &&& av1EdgeAllTopHasRight) ||| av1EdgeI422LeftHasBottom
+    let sp1 := ef ||| av1EdgeI444TopHasRight
+    let sp2 := ef &&& (av1EdgeI420TopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
+    Av1EdgeNode.mk ef h0 h1 v0 v1 0 0 #[sp0, sp1, sp2] #[]
   | fuel + 1, bl, topHasRight, leftHasBottom =>
     let ef := (if topHasRight then av1EdgeAllTopHasRight else 0) |||
               (if leftHasBottom then av1EdgeAllLeftHasBottom else 0)
@@ -1418,11 +1418,10 @@ def buildAv1EdgeNode : Nat → Nat → Bool → Bool → Av1EdgeNode
       let h1 := ef &&& (av1EdgeAllLeftHasBottom ||| av1EdgeI420TopHasRight)
       let v0 := ef ||| av1EdgeAllTopHasRight
       let v1 := ef &&& (av1EdgeAllTopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
-      let sp0 := av1EdgeAllTrAndBl
-      let sp1 := (ef &&& av1EdgeAllTopHasRight) ||| av1EdgeI422LeftHasBottom
-      let sp2 := ef ||| av1EdgeI444TopHasRight
-      let sp3 := ef &&& (av1EdgeI420TopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
-      Av1EdgeNode.mk ef h0 h1 v0 v1 0 0 #[sp0, sp1, sp2, sp3] #[]
+      let sp0 := (ef &&& av1EdgeAllTopHasRight) ||| av1EdgeI422LeftHasBottom
+      let sp1 := ef ||| av1EdgeI444TopHasRight
+      let sp2 := ef &&& (av1EdgeI420TopHasRight ||| av1EdgeI420LeftHasBottom ||| av1EdgeI422LeftHasBottom)
+      Av1EdgeNode.mk ef h0 h1 v0 v1 0 0 #[sp0, sp1, sp2] #[]
     else
       let h0 := ef ||| av1EdgeAllLeftHasBottom
       let h1 := ef &&& av1EdgeAllLeftHasBottom
@@ -4244,14 +4243,20 @@ def av1InitRefMvFrame (hdr : Av1FrameHdr) (seq : Av1SeqHdr) (refs : Array (Optio
     useRefFrameMvs := !mfmvRef.isEmpty
   }
 
-def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1RefMvFrame := Id.run do
-  let mut rpProj := Array.replicate (rf.ih8 * rf.rpStride) (none : Option Av1TmvEntry)
+def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot))
+    (colStart8 : Nat) (colEnd8In : Nat) (rowStart8 : Nat) (rowEnd8In : Nat) : Av1RefMvFrame := Id.run do
+  let mut rpProj := rf.rpProj
   if !rf.useRefFrameMvs then
-    return { rf with rpProj := rpProj }
-  let sbStep8 := 8 <<< rf.seq.sb128
-  let mut rowStart8 : Nat := 0
-  while rowStart8 < rf.ih8 do
-    let rowEnd8 := Nat.min (rowStart8 + sbStep8) rf.ih8
+    return rf
+  let rowEnd8 := Nat.min rowEnd8In rf.ih8
+  let colEnd8 := Nat.min colEnd8In rf.iw8
+  let colStart8i := colStart8 - 8
+  let colEnd8i := Nat.min (colEnd8 + 8) rf.iw8
+  for y in [rowStart8:rowEnd8] do
+    let rowBase := y * rf.rpStride
+    for x in [colStart8:colEnd8] do
+      rpProj := rpProj.set! (rowBase + x) none
+  if rowStart8 < rowEnd8 && colStart8 < colEnd8 then
     for n in [:rf.mfmvRef.size] do
       let r := rf.mfmvRef.getD n 0
       let ref2cur := rf.mfmvRef2Cur.getD n av1InvalidRef2Cur
@@ -4267,8 +4272,8 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1Ref
               let y0 := Nat.max ySb rowStart8
               let y1 := Nat.min (ySb + 8) rowEnd8
               let srcRow := src.getD y #[]
-              let mut x : Nat := 0
-              while x < rf.iw8 do
+              let mut x : Nat := colStart8i
+              while x < colEnd8i do
                 let rbOpt := if y < src.size && x < srcRow.size then srcRow.getD x none else none
                 match rbOpt with
                 | none => x := x + 1
@@ -4290,14 +4295,14 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1Ref
                       let mut keepGoing := true
                       while keepGoing do
                         let xSb := (curX / 8) * 8
-                        let xLo : Int := Int.ofNat (xSb - 8)
-                        let xHi : Int := Int.ofNat (Nat.min (xSb + 16) rf.iw8)
+                        let xLo : Int := Int.ofNat (Nat.max (xSb - 8) colStart8)
+                        let xHi : Int := Int.ofNat (Nat.min (xSb + 16) colEnd8)
                         if xLo <= px && px < xHi then
                           let pxNat := px.toNat
                           if pyNat < rf.ih8 && pxNat < rf.iw8 then
                             rpProj := rpProj.set! (pyNat * rf.rpStride + pxNat) (some { mvY := rb.mvY, mvX := rb.mvX, ref := ref2ref })
                         curX := curX + 1
-                        if curX >= rf.iw8 then
+                        if curX >= colEnd8i then
                           keepGoing := false
                         else
                           let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
@@ -4314,7 +4319,7 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1Ref
                       let mut keepGoing := true
                       while keepGoing do
                         curX := curX + 1
-                        if curX >= rf.iw8 then
+                        if curX >= colEnd8i then
                           keepGoing := false
                         else
                           let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
@@ -4324,7 +4329,6 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1Ref
                             if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
                               keepGoing := false
                       x := curX
-    rowStart8 := rowStart8 + sbStep8
   return { rf with rpProj := rpProj }
 
 def av1SaveTmvs (rf : Av1RefMvFrame) : Array (Array (Option Av1TmvEntry)) := Id.run do
@@ -4707,9 +4711,6 @@ def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 :
       else
         stack := stack.push { mv0 := same0.getD 0 (0, 0), mv1 := same1.getD 0 (0, 0), w := 2 }
         stack := stack.push { mv0 := same0.getD 1 (0, 0), mv1 := same1.getD 1 (0, 0), w := 2 }
-      stack := stack.extract 0 2
-      stack := stack.set! 0 { (stack.getD 0 {}) with w := 2 }
-      stack := stack.set! 1 { (stack.getD 1 {}) with w := 2 }
     for idx in [:stack.size] do
       let e := stack.getD idx {}
       let c0 := (av1Iclip e.mv0.1 topB bottomB, av1Iclip e.mv0.2 leftB rightB)
@@ -11378,7 +11379,6 @@ def av1DecodeInterB (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 bwLog2 bhLog2 w
           let (isAvg, dj, cj) := dec.decodeBoolAdapt cdf (cdfOff_m_jnt_comp + jctx * 2)
           dec := dj; cdf := cj
           compType := if isAvg != 0 then av1CompInterAvg else av1CompInterWAvg
-          ctx := { ctx with jntW := av1QuantDistWeight seq.orderHintNBits r0p.toNat r1p.toNat fh.frameOffset }
         else
           compType := av1CompInterAvg
       else
@@ -11394,6 +11394,16 @@ def av1DecodeInterB (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 bwLog2 bhLog2 w
           compType := av1CompInterSeg
         let (ms, dms) := dec.decodeBoolEqui
         dec := dms; maskSign := ms
+      if compType == av1CompInterWAvg || compType == av1CompInterSeg then
+        let r0p : Nat :=
+          match ctx.refs.getD (fh.refidx.getD r0Nat 0) none with
+          | some sl => sl.hdr.frameOffset
+          | none => 0
+        let r1p : Nat :=
+          match ctx.refs.getD (fh.refidx.getD r1Nat 0) none with
+          | some sl => sl.hdr.frameOffset
+          | none => 0
+        ctx := { ctx with jntW := av1QuantDistWeight seq.orderHintNBits r0p r1p fh.frameOffset }
     else
       let mut r0Nat : Nat := 0
       match sdata with
@@ -12026,15 +12036,15 @@ def av1DecodeSbAux (fuel : Nat) (ctx0 : Av1TileDecodeCtx) (bl bx by4 : Nat) (edg
         ctx := av1DecodeB ctx bs0 (bx + hsz) by4 (av1EdgeNodeV edge 1)
     else if bp == av1PartitionSplit then
       if bl == 4 then
-        ctx := av1DecodeB ctx bs0 bx by4 (eSplit.getD 0 0)
+        ctx := av1DecodeB ctx bs0 bx by4 av1EdgeAllTrAndBl
         let tlF := ctx.tl4x4Filter
         if bx + 1 < ctx0.bw then
-          ctx := av1DecodeB ctx bs0 (bx + 1) by4 (eSplit.getD 1 0)
+          ctx := av1DecodeB ctx bs0 (bx + 1) by4 (eSplit.getD 0 0)
         if by4 + 1 < ctx0.bh then
-          ctx := av1DecodeB ctx bs0 bx (by4 + 1) (eSplit.getD 2 0)
+          ctx := av1DecodeB ctx bs0 bx (by4 + 1) (eSplit.getD 1 0)
           if bx + 1 < ctx0.bw then
             ctx := { ctx with tl4x4Filter := tlF }
-            ctx := av1DecodeB ctx bs0 (bx + 1) (by4 + 1) (eSplit.getD 3 0)
+            ctx := av1DecodeB ctx bs0 (bx + 1) (by4 + 1) (eSplit.getD 2 0)
       else
         if haveH && haveV then
           ctx := av1DecodeSbAux fuel' ctx (bl + 1) bx by4 (eChild.getD 0 default)
@@ -12258,9 +12268,6 @@ def av1DecodeFrame (seq : Av1SeqHdr) (refs0 : Array (Option Av1RefSlot)) (fhIn :
             segmap := psm
   let mut rf : Option Av1RefMvFrame :=
     if isInter || fh.allowIntrabc then some (av1InitRefMvFrame fh seq refs0) else none
-  if isInter && fh.useRefFrameMvs then
-    if let some rf0 := rf then
-      rf := some (av1LoadTmvs rf0 refs0)
   let initAboveElem := av1ResetContext {} keyOrIntra
   let mut aboveRows : Array (Array Av1BlockContext) :=
     Array.replicate rows (Array.replicate sb128w initAboveElem)
@@ -12331,6 +12338,11 @@ def av1DecodeFrame (seq : Av1SeqHdr) (refs0 : Array (Option Av1RefSlot)) (fhIn :
     let row1 := Nat.min ((fh.tiling.rowStartSb.getD (tileRow + 1) sbh) <<< sbShift) bh
     for sby in [sby0 : sby1] do
       let by4 := sby <<< sbShift
+      if isInter && fh.useRefFrameMvs then
+        if let some rf0 := rf then
+          let rowStart8 := by4 >>> 1
+          let rowEnd8 := (by4 + sbStep) >>> 1
+          rf := some (av1LoadTmvs rf0 refs0 0 (bw >>> 1) rowStart8 rowEnd8)
       for tileCol in [:cols] do
         let t := tileRow * cols + tileCol
         let col0 := (fh.tiling.colStartSb.getD tileCol 0) <<< sbShift
@@ -13841,15 +13853,15 @@ private def av1EncSb (fuel : Nat) (ctx0 : Av1TileEncodeCtx) (bl bx by4 : Nat) (e
           ctx := av1EncBlock ctx bl bs0 bp bx by4 (av1EdgeNodeO edge)
         else if bp == av1PartitionSplit then
           if bl == 4 then
-            ctx := av1EncBlock ctx bl bs0 bp bx by4 (eSplit.getD 0 0)
+            ctx := av1EncBlock ctx bl bs0 bp bx by4 av1EdgeAllTrAndBl
             let tlF := ctx.tl4x4Filter
             if bx + 1 < bw then
-              ctx := av1EncBlock ctx bl bs0 bp (bx + 1) by4 (eSplit.getD 1 0)
+              ctx := av1EncBlock ctx bl bs0 bp (bx + 1) by4 (eSplit.getD 0 0)
             if by4 + 1 < bh then
-              ctx := av1EncBlock ctx bl bs0 bp bx (by4 + 1) (eSplit.getD 2 0)
+              ctx := av1EncBlock ctx bl bs0 bp bx (by4 + 1) (eSplit.getD 1 0)
               if bx + 1 < bw then
                 ctx := { ctx with tl4x4Filter := tlF }
-                ctx := av1EncBlock ctx bl bs0 bp (bx + 1) (by4 + 1) (eSplit.getD 3 0)
+                ctx := av1EncBlock ctx bl bs0 bp (bx + 1) (by4 + 1) (eSplit.getD 2 0)
           else
             if haveH && haveV then
               ctx := av1EncSb fuel' ctx (bl + 1) bx by4 (eChild.getD 0 default)
