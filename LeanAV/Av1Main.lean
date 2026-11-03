@@ -2635,7 +2635,7 @@ structure Av1TmvEntry where
 
 structure Av1RefSlot where
   hdr    : Av1FrameHdr := {}
-  planes : Array (Array (Array Nat)) := #[]
+  planes : Array (Array Nat) := #[]
   stride : Nat := 0
   w      : Nat := 0
   h      : Nat := 0
@@ -7313,6 +7313,1350 @@ def av1BlendV (dst0 : Array Nat) (dstOff dstStride : Nat) (tmp : Array Nat) (w h
       let v := (dst.getD (db + x) 0 * (64 - m) + tmp.getD (tb + x) 0 * m + 32) >>> 6
       dst := dst.set! (db + x) v
   return dst
+
+@[inline] def av1LrHaveLeft : Nat := 1
+@[inline] def av1LrHaveRight : Nat := 2
+@[inline] def av1LrHaveTop : Nat := 4
+@[inline] def av1LrHaveBottom : Nat := 8
+@[inline] def av1CdefHaveLeft : Nat := 1
+@[inline] def av1CdefHaveRight : Nat := 2
+@[inline] def av1CdefHaveTop : Nat := 4
+@[inline] def av1CdefHaveBottom : Nat := 8
+def av1CdefPad : Int := -32768
+
+def av1CalcEih (sharpness : Nat) : Array Nat × Array Nat := Id.run do
+  let mut e : Array Nat := Array.replicate 64 0
+  let mut i : Array Nat := Array.replicate 64 0
+  for level in [:64] do
+    let mut limit := level
+    if sharpness > 0 then
+      limit := limit >>> ((sharpness + 3) >>> 2)
+      if limit > 9 - sharpness then
+        limit := 9 - sharpness
+    if limit < 1 then
+      limit := 1
+    i := i.set! level limit
+    e := e.set! level (2 * (level + 2) + limit)
+  return (e, i)
+
+private def av1LfClip63 (v : Int) : Nat :=
+  if v < 0 then 0 else if v > 63 then 63 else v.toNat
+
+def av1CalcLfValues (hdr : Av1FrameHdr) (lfDelta : Array Int) : Array Nat := Id.run do
+  let lf := hdr.loopfilter
+  let seg := hdr.segmentation
+  let nSeg := if seg.enabled then 8 else 1
+  let mut out : Array Nat := Array.replicate (8 * 4 * 8 * 2) 0
+  if lf.levelY.getD 0 0 == 0 && lf.levelY.getD 1 0 == 0 then
+    return out
+  let mr := lf.modeRefDeltaEnabled
+  let multi := hdr.delta.lfMulti
+  let baseOf (baseLvl : Nat) (dlt segD : Int) : Nat :=
+    av1LfClip63 (Int.ofNat (av1LfClip63 (Int.ofNat baseLvl + dlt)) + segD)
+  let fill (baseOff base : Nat) : Array Nat := Id.run do
+    let mut dst := out
+    if !mr then
+      for r in [:8] do
+        dst := dst.set! (baseOff + r * 2) base
+        dst := dst.set! (baseOff + r * 2 + 1) base
+      return dst
+    let sh : Nat := if base >= 32 then 1 else 0
+    let v0 := Int.ofNat base + (lf.refDelta.getD 0 0 <<< sh)
+    let c0 := av1LfClip63 v0
+    dst := dst.set! (baseOff + 0) c0
+    dst := dst.set! (baseOff + 1) c0
+    for r in [1:8] do
+      for m in [:2] do
+        let v := Int.ofNat base + ((lf.modeDelta.getD m 0 + lf.refDelta.getD r 0) <<< sh)
+        dst := dst.set! (baseOff + r * 2 + m) (av1LfClip63 v)
+    return dst
+  for s in [:nSeg] do
+    let sd := if seg.enabled then seg.d.getD s {} else {}
+    let segOn := seg.enabled
+    let b0 := baseOf (lf.levelY.getD 0 0) (lfDelta.getD 0 0) (if segOn then sd.deltaLfYV else 0)
+    out := fill (s * 64 + 0 * 16) b0
+    let d1 := if multi then lfDelta.getD 1 0 else lfDelta.getD 0 0
+    let b1 := baseOf (lf.levelY.getD 1 0) d1 (if segOn then sd.deltaLfYH else 0)
+    out := fill (s * 64 + 1 * 16) b1
+    let du := if multi then lfDelta.getD 2 0 else lfDelta.getD 0 0
+    let dv := if multi then lfDelta.getD 3 0 else lfDelta.getD 0 0
+    if lf.levelU != 0 then
+      out := fill (s * 64 + 2 * 16) (baseOf lf.levelU du (if segOn then sd.deltaLfU else 0))
+    if lf.levelV != 0 then
+      out := fill (s * 64 + 3 * 16) (baseOf lf.levelV dv (if segOn then sd.deltaLfV else 0))
+  return out
+
+@[inline] def av1LfAt (lvl : Array Nat) (seg pl refIdx mode : Nat) : Nat :=
+  lvl.getD (seg * 64 + pl * 16 + refIdx * 2 + mode) 0
+
+structure Av1LfMask where
+  filterY : Array Nat := Array.replicate (2 * 32 * 3 * 2) 0
+  filterUv : Array Nat := Array.replicate (2 * 32 * 2 * 2) 0
+  cdefIdx : Array Int := #[-1, -1, -1, -1]
+  noskip : Array Nat := Array.replicate (16 * 2) 0
+  deriving Inhabited
+
+@[inline] def av1LfYAt (m : Array Nat) (edge pos lvl sidx : Nat) : Nat :=
+  m.getD (edge * 192 + pos * 6 + lvl * 2 + sidx) 0
+
+@[inline] def av1LfYOr (m : Array Nat) (edge pos lvl sidx smask : Nat) : Array Nat :=
+  let i := edge * 192 + pos * 6 + lvl * 2 + sidx
+  m.set! i (m.getD i 0 ||| smask)
+
+@[inline] def av1LfUvAt (m : Array Nat) (edge pos lvl sidx : Nat) : Nat :=
+  m.getD (edge * 128 + pos * 4 + lvl * 2 + sidx) 0
+
+@[inline] def av1LfUvOr (m : Array Nat) (edge pos lvl sidx smask : Nat) : Array Nat :=
+  let i := edge * 128 + pos * 4 + lvl * 2 + sidx
+  m.set! i (m.getD i 0 ||| smask)
+
+def av1MaskEdgesIntra (masks0 : Array Nat) (by4 bx4 w4 h4 tx : Nat) (a l : Array Nat) : Array Nat × Array Nat × Array Nat := Id.run do
+  let (w4t, h4t, lw, lh, _) := av1TxDim tx
+  let twc := Nat.min 2 lw
+  let thc := Nat.min 2 lh
+  let mut masks := masks0
+  let mut mask := 1 <<< by4
+  for y in [:h4] do
+    let sidx := if mask >= 0x10000 then 1 else 0
+    masks := av1LfYOr masks 0 bx4 (Nat.min twc (l.getD y 0)) sidx (mask >>> (sidx <<< 4))
+    mask := mask <<< 1
+  mask := 1 <<< bx4
+  for x in [:w4] do
+    let sidx := if mask >= 0x10000 then 1 else 0
+    masks := av1LfYOr masks 1 by4 (Nat.min thc (a.getD x 0)) sidx (mask >>> (sidx <<< 4))
+    mask := mask <<< 1
+  let t1 := 1 <<< by4
+  let inner := ((t1 <<< h4) - t1) &&& 0xFFFFFFFF
+  let inner1 := inner &&& 0xFFFF
+  let inner2 := inner >>> 16
+  let mut x := w4t
+  while x < w4 do
+    if inner1 != 0 then
+      masks := av1LfYOr masks 0 (bx4 + x) twc 0 inner1
+    if inner2 != 0 then
+      masks := av1LfYOr masks 0 (bx4 + x) twc 1 inner2
+    x := x + w4t
+  let t2 := 1 <<< bx4
+  let innerB := ((t2 <<< w4) - t2) &&& 0xFFFFFFFF
+  let innerB1 := innerB &&& 0xFFFF
+  let innerB2 := innerB >>> 16
+  let mut y := h4t
+  while y < h4 do
+    if innerB1 != 0 then
+      masks := av1LfYOr masks 1 (by4 + y) thc 0 innerB1
+    if innerB2 != 0 then
+      masks := av1LfYOr masks 1 (by4 + y) thc 1 innerB2
+    y := y + h4t
+  let mut aOut := a
+  let mut lOut := l
+  for xi in [:w4] do
+    aOut := aOut.set! xi thc
+  for yi in [:h4] do
+    lOut := lOut.set! yi twc
+  return (masks, aOut, lOut)
+
+def av1MaskEdgesChroma (masks0 : Array Nat) (by4 bx4 w4 h4 : Nat) (skip : Bool) (tx : Nat) (a l : Array Nat) : Array Nat × Array Nat × Array Nat := Id.run do
+  let (w4t, h4t, lw, lh, _) := av1TxDim tx
+  let twc := if lw != 0 then 1 else 0
+  let thc := if lh != 0 then 1 else 0
+  let mut masks := masks0
+  let mut mask := 1 <<< by4
+  for y in [:h4] do
+    let sidx := if mask >= 256 then 1 else 0
+    masks := av1LfUvOr masks 0 bx4 (Nat.min twc (l.getD y 0)) sidx (mask >>> (sidx <<< 3))
+    mask := mask <<< 1
+  mask := 1 <<< bx4
+  for x in [:w4] do
+    let sidx := if mask >= 256 then 1 else 0
+    masks := av1LfUvOr masks 1 by4 (Nat.min thc (a.getD x 0)) sidx (mask >>> (sidx <<< 3))
+    mask := mask <<< 1
+  if !skip then
+    let t1 := 1 <<< by4
+    let inner := ((t1 <<< h4) - t1) &&& 0xFFFFFFFF
+    let inner1 := inner &&& 255
+    let inner2 := inner >>> 8
+    let mut x := w4t
+    while x < w4 do
+      if inner1 != 0 then
+        masks := av1LfUvOr masks 0 (bx4 + x) twc 0 inner1
+      if inner2 != 0 then
+        masks := av1LfUvOr masks 0 (bx4 + x) twc 1 inner2
+      x := x + w4t
+    let t2 := 1 <<< bx4
+    let innerB := ((t2 <<< w4) - t2) &&& 0xFFFFFFFF
+    let innerB1 := innerB &&& 255
+    let innerB2 := innerB >>> 8
+    let mut y := h4t
+    while y < h4 do
+      if innerB1 != 0 then
+        masks := av1LfUvOr masks 1 (by4 + y) thc 0 innerB1
+      if innerB2 != 0 then
+        masks := av1LfUvOr masks 1 (by4 + y) thc 1 innerB2
+      y := y + h4t
+  let mut aOut := a
+  let mut lOut := l
+  for xi in [:w4] do
+    aOut := aOut.set! xi thc
+  for yi in [:h4] do
+    lOut := lOut.set! yi twc
+  return (masks, aOut, lOut)
+
+private partial def av1DecompTx (txa0 : Array Nat) (ox oy tx depth yOff xOff : Nat) (txMasks : Array Nat) : Array Nat :=
+  let (w4t, h4t, lw, lh, sub) := av1TxDim tx
+  let isSplit := if tx == 0 || depth > 1 then 0 else (txMasks.getD depth 0 >>> (yOff * 4 + xOff)) &&& 1
+  if isSplit != 0 then
+    let htw := w4t >>> 1
+    let hth := h4t >>> 1
+    let t1 := av1DecompTx txa0 ox oy sub (depth + 1) (yOff * 2) (xOff * 2) txMasks
+    let t2 := if w4t >= h4t then av1DecompTx t1 (ox + htw) oy sub (depth + 1) (yOff * 2) (xOff * 2 + 1) txMasks else t1
+    let t3 := if h4t >= w4t then av1DecompTx t2 ox (oy + hth) sub (depth + 1) (yOff * 2 + 1) (xOff * 2) txMasks else t2
+    if h4t >= w4t && w4t >= h4t then av1DecompTx t3 (ox + htw) (oy + hth) sub (depth + 1) (yOff * 2 + 1) (xOff * 2 + 1) txMasks else t3
+  else Id.run do
+    let mut txa := txa0
+    let clw := Nat.min 2 lw
+    let clh := Nat.min 2 lh
+    for y in [:h4t] do
+      for x in [:w4t] do
+        txa := txa.set! (0 * 2 * 1024 + 0 * 1024 + (oy + y) * 32 + (ox + x)) clw
+        txa := txa.set! (1 * 2 * 1024 + 0 * 1024 + (oy + y) * 32 + (ox + x)) clh
+      txa := txa.set! (0 * 2 * 1024 + 1 * 1024 + (oy + y) * 32 + ox) w4t
+    for x in [:w4t] do
+      txa := txa.set! (1 * 2 * 1024 + 1 * 1024 + oy * 32 + (ox + x)) h4t
+    return txa
+
+@[inline] private def av1TxaAt (txa : Array Nat) (d k y x : Nat) : Nat :=
+  txa.getD (d * 2 * 1024 + k * 1024 + y * 32 + x) 0
+
+def av1MaskEdgesInter (masks0 : Array Nat) (by4 bx4 w4 h4 : Nat) (skip : Bool) (maxTx : Nat) (txMasks a l : Array Nat) : Array Nat × Array Nat × Array Nat := Id.run do
+  let (w4t, h4t, _, _, _) := av1TxDim maxTx
+  let mut txa : Array Nat := Array.replicate (2 * 2 * 32 * 32) 0
+  let mut y := 0
+  let mut yOff := 0
+  while y < h4 do
+    let mut x := 0
+    let mut xOff := 0
+    while x < w4 do
+      txa := av1DecompTx txa x y maxTx 0 yOff xOff txMasks
+      x := x + w4t
+      xOff := xOff + 1
+    y := y + h4t
+    yOff := yOff + 1
+  let mut masks := masks0
+  let mut mask := 1 <<< by4
+  for yi in [:h4] do
+    let sidx := if mask >= 0x10000 then 1 else 0
+    masks := av1LfYOr masks 0 bx4 (Nat.min (av1TxaAt txa 0 0 yi 0) (l.getD yi 0)) sidx (mask >>> (sidx <<< 4))
+    mask := mask <<< 1
+  mask := 1 <<< bx4
+  for xi in [:w4] do
+    let sidx := if mask >= 0x10000 then 1 else 0
+    masks := av1LfYOr masks 1 by4 (Nat.min (av1TxaAt txa 1 0 0 xi) (a.getD xi 0)) sidx (mask >>> (sidx <<< 4))
+    mask := mask <<< 1
+  if !skip then
+    mask := 1 <<< by4
+    for yi in [:h4] do
+      let sidx := if mask >= 0x10000 then 1 else 0
+      let smask := mask >>> (sidx <<< 4)
+      let mut ltx := av1TxaAt txa 0 0 yi 0
+      let mut step := av1TxaAt txa 0 1 yi 0
+      let mut x := step
+      while x < w4 do
+        let rtx := av1TxaAt txa 0 0 yi x
+        masks := av1LfYOr masks 0 (bx4 + x) (Nat.min rtx ltx) sidx smask
+        ltx := rtx
+        step := av1TxaAt txa 0 1 yi x
+        x := x + step
+      mask := mask <<< 1
+    mask := 1 <<< bx4
+    for xi in [:w4] do
+      let sidx := if mask >= 0x10000 then 1 else 0
+      let smask := mask >>> (sidx <<< 4)
+      let mut ttx := av1TxaAt txa 1 0 0 xi
+      let mut step := av1TxaAt txa 1 1 0 xi
+      let mut yy := step
+      while yy < h4 do
+        let btx := av1TxaAt txa 1 0 yy xi
+        masks := av1LfYOr masks 1 (by4 + yy) (Nat.min ttx btx) sidx smask
+        ttx := btx
+        step := av1TxaAt txa 1 1 yy xi
+        yy := yy + step
+      mask := mask <<< 1
+  let mut aOut := a
+  let mut lOut := l
+  for yi in [:h4] do
+    lOut := lOut.set! yi (av1TxaAt txa 0 0 yi (w4 - 1))
+  for xi in [:w4] do
+    aOut := aOut.set! xi (av1TxaAt txa 1 0 (h4 - 1) xi)
+  return (masks, aOut, lOut)
+
+@[inline] private def av1PfPx (plane : Array Nat) (stride : Nat) (x y : Int) : Int :=
+  Int.ofNat (plane.getD (y.toNat * stride + x.toNat) 0)
+
+@[inline] private def av1PfSet (plane : Array Nat) (stride : Nat) (x y v : Int) : Array Nat :=
+  plane.set! (y.toNat * stride + x.toNat) (av1IclipU8 v)
+
+def av1LoopFilterEdge (dst0 : Array Nat) (pStride x0 y0 dx dy eLim iLim hLim wd : Nat) : Array Nat := Id.run do
+  let mut dst := dst0
+  let dxI := Int.ofNat dx
+  let dyI := Int.ofNat dy
+  let eI := Int.ofNat eLim
+  let iI := Int.ofNat iLim
+  let hI := Int.ofNat hLim
+  for step in [:4] do
+    let stepI := Int.ofNat step
+    let px := Int.ofNat x0 + stepI * (1 - dxI)
+    let py := Int.ofNat y0 + stepI * (1 - dyI)
+    let atPx (k : Int) : Int := av1PfPx dst pStride (px + k * dxI) (py + k * dyI)
+    let p1 := atPx (-2)
+    let p0 := atPx (-1)
+    let q0 := atPx 0
+    let q1 := atPx 1
+    let mut fm := Int.ofNat (p1 - p0).natAbs <= iI && Int.ofNat (q1 - q0).natAbs <= iI &&
+      Int.ofNat (p0 - q0).natAbs * 2 + Int.ofNat ((p1 - q1).natAbs >>> 1) <= eI
+    let mut p2 : Int := 0
+    let mut q2 : Int := 0
+    let mut p3 : Int := 0
+    let mut q3 : Int := 0
+    if wd > 4 then
+      p2 := atPx (-3)
+      q2 := atPx 2
+      fm := fm && Int.ofNat (p2 - p1).natAbs <= iI && Int.ofNat (q2 - q1).natAbs <= iI
+      if wd > 6 then
+        p3 := atPx (-4)
+        q3 := atPx 3
+        fm := fm && Int.ofNat (p3 - p2).natAbs <= iI && Int.ofNat (q3 - q2).natAbs <= iI
+    if fm then
+      let mut flat8out := false
+      let mut flat8in := false
+      let mut p6 : Int := 0; let mut p5 : Int := 0; let mut p4 : Int := 0
+      let mut q4 : Int := 0; let mut q5 : Int := 0; let mut q6 : Int := 0
+      if wd >= 16 then
+        p6 := atPx (-7); p5 := atPx (-6); p4 := atPx (-5)
+        q4 := atPx 4; q5 := atPx 5; q6 := atPx 6
+        flat8out := (p6 - p0).natAbs <= 1 && (p5 - p0).natAbs <= 1 && (p4 - p0).natAbs <= 1 &&
+                    (q4 - q0).natAbs <= 1 && (q5 - q0).natAbs <= 1 && (q6 - q0).natAbs <= 1
+      if wd >= 6 then
+        flat8in := (p2 - p0).natAbs <= 1 && (p1 - p0).natAbs <= 1 && (q1 - q0).natAbs <= 1 && (q2 - q0).natAbs <= 1
+      if wd >= 8 then
+        flat8in := flat8in && (p3 - p0).natAbs <= 1 && (q3 - q0).natAbs <= 1
+      if wd >= 16 && flat8out && flat8in then
+        let vals : Array Int := #[
+          av1ArithShiftRight (p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) 4,
+          av1ArithShiftRight (p6 * 5 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8) 4,
+          av1ArithShiftRight (p6 * 4 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8) 4,
+          av1ArithShiftRight (p6 * 3 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8) 4,
+          av1ArithShiftRight (p6 * 2 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8) 4,
+          av1ArithShiftRight (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8) 4,
+          av1ArithShiftRight (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8) 4,
+          av1ArithShiftRight (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 * 2 + 8) 4,
+          av1ArithShiftRight (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 * 3 + 8) 4,
+          av1ArithShiftRight (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 * 4 + 8) 4,
+          av1ArithShiftRight (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 * 5 + 8) 4,
+          av1ArithShiftRight (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 7 + 8) 4
+        ]
+        for k in [:12] do
+          let kOff := Int.ofNat k - 6
+          dst := av1PfSet dst pStride (px + kOff * dxI) (py + kOff * dyI) (vals.getD k 0)
+      else if wd >= 8 && flat8in then
+        let vals : Array Int := #[
+          av1ArithShiftRight (p3 * 3 + 2 * p2 + p1 + p0 + q0 + 4) 3,
+          av1ArithShiftRight (p3 * 2 + p2 + 2 * p1 + p0 + q0 + q1 + 4) 3,
+          av1ArithShiftRight (p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2 + 4) 3,
+          av1ArithShiftRight (p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3 + 4) 3,
+          av1ArithShiftRight (p1 + p0 + q0 + 2 * q1 + q2 + q3 * 2 + 4) 3,
+          av1ArithShiftRight (p0 + q0 + q1 + 2 * q2 + q3 * 3 + 4) 3
+        ]
+        for k in [:6] do
+          let kOff := Int.ofNat k - 3
+          dst := av1PfSet dst pStride (px + kOff * dxI) (py + kOff * dyI) (vals.getD k 0)
+      else if wd == 6 && flat8in then
+        let vals : Array Int := #[
+          av1ArithShiftRight (p2 * 3 + 2 * p1 + 2 * p0 + q0 + 4) 3,
+          av1ArithShiftRight (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) 3,
+          av1ArithShiftRight (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) 3,
+          av1ArithShiftRight (p0 + 2 * q0 + 2 * q1 + q2 * 3 + 4) 3
+        ]
+        for k in [:4] do
+          let kOff := Int.ofNat k - 2
+          dst := av1PfSet dst pStride (px + kOff * dxI) (py + kOff * dyI) (vals.getD k 0)
+      else
+        let hev := Int.ofNat (p1 - p0).natAbs > hI || Int.ofNat (q1 - q0).natAbs > hI
+        let clipd (v : Int) : Int := if v < -128 then -128 else if v > 127 then 127 else v
+        let min127 (v : Int) : Int := if v > 127 then 127 else v
+        if hev then
+          let f := clipd (3 * (q0 - p0) + clipd (p1 - q1))
+          let f1 := av1ArithShiftRight (min127 (f + 4)) 3
+          let f2 := av1ArithShiftRight (min127 (f + 3)) 3
+          dst := av1PfSet dst pStride (px - dxI) (py - dyI) (p0 + f2)
+          dst := av1PfSet dst pStride px py (q0 - f1)
+        else
+          let f := clipd (3 * (q0 - p0))
+          let f1 := av1ArithShiftRight (min127 (f + 4)) 3
+          let f2 := av1ArithShiftRight (min127 (f + 3)) 3
+          dst := av1PfSet dst pStride (px - dxI) (py - dyI) (p0 + f2)
+          dst := av1PfSet dst pStride px py (q0 - f1)
+          let fOuter := av1ArithShiftRight (f1 + 1) 1
+          dst := av1PfSet dst pStride (px - 2 * dxI) (py - 2 * dyI) (p1 + fOuter)
+          dst := av1PfSet dst pStride (px + dxI) (py + dyI) (q1 - fOuter)
+  return dst
+
+def av1FilterSbColsY (plane0 : Array Nat) (pStride xPx yPx : Nat) (levels : Array Nat)
+    (b4Stride ly0 lx0 : Nat) (masks : Array Nat) (haveLeft : Bool)
+    (w4 starty4 endy4 : Nat) (eLut iLut : Array Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let maxY := (1 <<< (endy4 - starty4)) - 1
+  for x in [:w4] do
+    if haveLeft || x != 0 then
+      let hm0 := if starty4 == 0 then av1LfYAt masks 0 x 0 0 ||| (if endy4 > 16 then av1LfYAt masks 0 x 0 1 <<< 16 else 0) else av1LfYAt masks 0 x 0 1
+      let hm1 := if starty4 == 0 then av1LfYAt masks 0 x 1 0 ||| (if endy4 > 16 then av1LfYAt masks 0 x 1 1 <<< 16 else 0) else av1LfYAt masks 0 x 1 1
+      let hm2 := if starty4 == 0 then av1LfYAt masks 0 x 2 0 ||| (if endy4 > 16 then av1LfYAt masks 0 x 2 1 <<< 16 else 0) else av1LfYAt masks 0 x 2 1
+      let h0 := hm0 &&& maxY
+      let h1 := hm1 &&& maxY
+      let h2 := hm2 &&& maxY
+      let vm := h0 ||| h1 ||| h2
+      let mut bit := 1
+      let mut yy := 0
+      while vm >= bit do
+        if (vm &&& bit) != 0 then
+          let ry := ly0 + starty4 + yy
+          let rx := lx0 + x
+          let lCur := levels.getD ((ry * b4Stride + rx) * 2) 0
+          let lvl := if lCur != 0 then lCur else levels.getD ((ry * b4Stride + rx - 1) * 2) 0
+          if lvl != 0 then
+            let idx := if (h2 &&& bit) != 0 then 2 else if (h1 &&& bit) != 0 then 1 else 0
+            plane := av1LoopFilterEdge plane pStride (xPx + x * 4) (yPx + (starty4 + yy) * 4) 1 0
+              (eLut.getD lvl 0) (iLut.getD lvl 0) (lvl >>> 4) (4 <<< idx)
+        bit := bit <<< 1
+        yy := yy + 1
+  return plane
+
+def av1FilterSbRowsY (plane0 : Array Nat) (pStride xPx yPx : Nat) (levels : Array Nat)
+    (b4Stride ly0 lx0 : Nat) (masks : Array Nat) (haveTop : Bool)
+    (w4 starty4 endy4 : Nat) (eLut iLut : Array Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  for y in [starty4:endy4] do
+    if haveTop || y != 0 then
+      let v0 := av1LfYAt masks 1 y 0 0 ||| (av1LfYAt masks 1 y 0 1 <<< 16)
+      let v1 := av1LfYAt masks 1 y 1 0 ||| (av1LfYAt masks 1 y 1 1 <<< 16)
+      let v2 := av1LfYAt masks 1 y 2 0 ||| (av1LfYAt masks 1 y 2 1 <<< 16)
+      let vm := v0 ||| v1 ||| v2
+      let mut bit := 1
+      let mut xx := 0
+      while vm >= bit && xx < w4 do
+        if (vm &&& bit) != 0 then
+          let ry := ly0 + y
+          let rx := lx0 + xx
+          let lCur := levels.getD ((ry * b4Stride + rx) * 2 + 1) 0
+          let lvl := if lCur != 0 then lCur else levels.getD (((ry - 1) * b4Stride + rx) * 2 + 1) 0
+          if lvl != 0 then
+            let idx := if (v2 &&& bit) != 0 then 2 else if (v1 &&& bit) != 0 then 1 else 0
+            plane := av1LoopFilterEdge plane pStride (xPx + xx * 4) (yPx + y * 4) 0 1
+              (eLut.getD lvl 0) (iLut.getD lvl 0) (lvl >>> 4) (4 <<< idx)
+        bit := bit <<< 1
+        xx := xx + 1
+  return plane
+
+def av1FilterSbColsUv (u0 v0 : Array Nat) (uvStride xPx yPx : Nat) (levels : Array Nat)
+    (b4Stride ly0 lx0 : Nat) (masks : Array Nat) (haveLeft : Bool)
+    (w4 starty4 endy4 : Nat) (eLut iLut : Array Nat) : Array Nat × Array Nat := Id.run do
+  let mut u := u0
+  let mut v := v0
+  let maxY := (1 <<< (endy4 - starty4)) - 1
+  for x in [:w4] do
+    if haveLeft || x != 0 then
+      let hm0 := if starty4 == 0 then av1LfUvAt masks 0 x 0 0 ||| (if endy4 > 8 then av1LfUvAt masks 0 x 0 1 <<< 8 else 0) else av1LfUvAt masks 0 x 0 1
+      let hm1 := if starty4 == 0 then av1LfUvAt masks 0 x 1 0 ||| (if endy4 > 8 then av1LfUvAt masks 0 x 1 1 <<< 8 else 0) else av1LfUvAt masks 0 x 1 1
+      let h0 := hm0 &&& maxY
+      let h1 := hm1 &&& maxY
+      let vm := h0 ||| h1
+      let mut bit := 1
+      let mut yy := 0
+      while vm >= bit do
+        if (vm &&& bit) != 0 then
+          let ry := ly0 + starty4 + yy
+          let rx := lx0 + x
+          let cBase := (ry * b4Stride + rx) * 2
+          let pBase := (ry * b4Stride + rx - 1) * 2
+          let lu := if levels.getD cBase 0 != 0 then levels.getD cBase 0 else levels.getD pBase 0
+          let lv := if levels.getD (cBase + 1) 0 != 0 then levels.getD (cBase + 1) 0 else levels.getD (pBase + 1) 0
+          let idx := if (h1 &&& bit) != 0 then 1 else 0
+          if lu != 0 then
+            u := av1LoopFilterEdge u uvStride (xPx + x * 4) (yPx + (starty4 + yy) * 4) 1 0
+              (eLut.getD lu 0) (iLut.getD lu 0) (lu >>> 4) (4 + 2 * idx)
+          if lv != 0 then
+            v := av1LoopFilterEdge v uvStride (xPx + x * 4) (yPx + (starty4 + yy) * 4) 1 0
+              (eLut.getD lv 0) (iLut.getD lv 0) (lv >>> 4) (4 + 2 * idx)
+        bit := bit <<< 1
+        yy := yy + 1
+  return (u, v)
+
+def av1FilterSbRowsUv (u0 v0 : Array Nat) (uvStride xPx yPx : Nat) (levels : Array Nat)
+    (b4Stride ly0 lx0 : Nat) (masks : Array Nat) (haveTop : Bool)
+    (w4 starty4 endy4 : Nat) (eLut iLut : Array Nat) : Array Nat × Array Nat := Id.run do
+  let mut u := u0
+  let mut v := v0
+  for y in [starty4:endy4] do
+    if haveTop || y != 0 then
+      let v0m := av1LfUvAt masks 1 y 0 0 ||| (av1LfUvAt masks 1 y 0 1 <<< 8)
+      let v1m := av1LfUvAt masks 1 y 1 0 ||| (av1LfUvAt masks 1 y 1 1 <<< 8)
+      let vm := v0m ||| v1m
+      let mut bit := 1
+      let mut xx := 0
+      while vm >= bit && xx < w4 do
+        if (vm &&& bit) != 0 then
+          let ry := ly0 + y
+          let rx := lx0 + xx
+          let cBase := (ry * b4Stride + rx) * 2
+          let pBase := ((ry - 1) * b4Stride + rx) * 2
+          let lu := if levels.getD cBase 0 != 0 then levels.getD cBase 0 else levels.getD pBase 0
+          let lv := if levels.getD (cBase + 1) 0 != 0 then levels.getD (cBase + 1) 0 else levels.getD (pBase + 1) 0
+          let idx := if (v1m &&& bit) != 0 then 1 else 0
+          if lu != 0 then
+            u := av1LoopFilterEdge u uvStride (xPx + xx * 4) (yPx + y * 4) 0 1
+              (eLut.getD lu 0) (iLut.getD lu 0) (lu >>> 4) (4 + 2 * idx)
+          if lv != 0 then
+            v := av1LoopFilterEdge v uvStride (xPx + xx * 4) (yPx + y * 4) 0 1
+              (eLut.getD lv 0) (iLut.getD lv 0) (lv >>> 4) (4 + 2 * idx)
+        bit := bit <<< 1
+        xx := xx + 1
+  return (u, v)
+
+private def av1CdefUmin (a b : Int) : Int :=
+  let toU32 (x : Int) : Nat :=
+    if x >= 0 then x.toNat % 0x100000000
+    else ((x % 0x100000000 + 0x100000000) % 0x100000000).toNat
+  if toU32 a < toU32 b then a else b
+
+def av1CdefFindDir (plane : Array Nat) (pStride x0 y0 : Nat) : Nat × Nat := Id.run do
+  let mut hv0 : Array Int := Array.replicate 8 0
+  let mut hv1 : Array Int := Array.replicate 8 0
+  let mut diag0 : Array Int := Array.replicate 15 0
+  let mut diag1 : Array Int := Array.replicate 15 0
+  let mut alt : Array Int := Array.replicate (4 * 11) 0
+  for y in [:8] do
+    let rowBase := (y0 + y) * pStride + x0
+    for x in [:8] do
+      let px : Int := Int.ofNat (plane.getD (rowBase + x) 0) - 128
+      diag0 := diag0.set! (y + x) (diag0.getD (y + x) 0 + px)
+      let a0 := 0 * 11 + y + (x >>> 1)
+      alt := alt.set! a0 (alt.getD a0 0 + px)
+      hv0 := hv0.set! y (hv0.getD y 0 + px)
+      let a1 := 1 * 11 + 3 + y - (x >>> 1)
+      alt := alt.set! a1 (alt.getD a1 0 + px)
+      diag1 := diag1.set! (7 + y - x) (diag1.getD (7 + y - x) 0 + px)
+      let a2 := 2 * 11 + 3 - (y >>> 1) + x
+      alt := alt.set! a2 (alt.getD a2 0 + px)
+      hv1 := hv1.set! x (hv1.getD x 0 + px)
+      let a3 := 3 * 11 + (y >>> 1) + x
+      alt := alt.set! a3 (alt.getD a3 0 + px)
+  let mut cost : Array Int := Array.replicate 8 0
+  let mut c2 : Int := 0
+  let mut c6 : Int := 0
+  for n in [:8] do
+    c2 := c2 + hv0.getD n 0 * hv0.getD n 0
+    c6 := c6 + hv1.getD n 0 * hv1.getD n 0
+  cost := cost.set! 2 (c2 * 105)
+  cost := cost.set! 6 (c6 * 105)
+  let divTable : Array Int := #[840, 420, 280, 210, 168, 140, 120]
+  let mut c0 : Int := diag0.getD 7 0 * diag0.getD 7 0 * 105
+  let mut c4 : Int := diag1.getD 7 0 * diag1.getD 7 0 * 105
+  for n in [:7] do
+    let d := divTable.getD n 0
+    c0 := c0 + (diag0.getD n 0 * diag0.getD n 0 + diag0.getD (14 - n) 0 * diag0.getD (14 - n) 0) * d
+    c4 := c4 + (diag1.getD n 0 * diag1.getD n 0 + diag1.getD (14 - n) 0 * diag1.getD (14 - n) 0) * d
+  cost := cost.set! 0 c0
+  cost := cost.set! 4 c4
+  for n in [:4] do
+    let mut c : Int := 0
+    for m in [:5] do
+      let v := alt.getD (n * 11 + 3 + m) 0
+      c := c + v * v
+    c := c * 105
+    for m in [:3] do
+      let d := divTable.getD (2 * m + 1) 0
+      let vL := alt.getD (n * 11 + m) 0
+      let vR := alt.getD (n * 11 + 10 - m) 0
+      c := c + (vL * vL + vR * vR) * d
+    cost := cost.set! (n * 2 + 1) c
+  let mut best : Nat := 0
+  for n in [1:8] do
+    if cost.getD n 0 > cost.getD best 0 then
+      best := n
+  let var := (av1ArithShiftRight (cost.getD best 0 - cost.getD (best ^^^ 4) 0) 10).toNat
+  return (best, var)
+
+def av1CdefAdjustStrength (strength var : Nat) : Nat :=
+  if var == 0 then 0
+  else
+    let v6 := var >>> 6
+    let i := if v6 != 0 then Nat.min (av1Ulog2 v6) 12 else 0
+    (strength * (4 + i) + 8) >>> 4
+
+def av1CdefConstrain (diff : Int) (threshold shift : Nat) : Int :=
+  let ad := diff.natAbs
+  let shifted := ad >>> shift
+  let rem := if threshold > shifted then threshold - shifted else 0
+  let v := Int.ofNat (Nat.min ad rem)
+  if diff < 0 then -v else if diff > 0 then v else 0
+
+def av1CdefFilter (plane0 : Array Nat) (pStride x0 y0 : Nat)
+    (left : Array Nat) (top : Array Nat) (topStride topOff : Nat)
+    (botOpt : Option (Array Nat × Nat × Nat))
+    (pri sec direction damping w h edges : Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let ts : Nat := 12
+  let mut tmp : Array Int := Array.replicate (ts * (h + 4)) av1CdefPad
+  let base : Int := Int.ofNat (2 * ts + 2)
+  let xs : Int := if (edges &&& av1CdefHaveLeft) != 0 then -2 else 0
+  let xe : Int := Int.ofNat (w + (if (edges &&& av1CdefHaveRight) != 0 then 2 else 0))
+  if (edges &&& av1CdefHaveTop) != 0 then
+    for yr in [:2] do
+      let y : Int := Int.ofNat yr - 2
+      let tRowBase : Int := Int.ofNat (topOff + yr * topStride) + Int.ofNat x0
+      let mut x := xs
+      while x < xe do
+        let ti := (base + x + y * Int.ofNat ts).toNat
+        tmp := tmp.set! ti (Int.ofNat (top.getD (tRowBase + x).toNat 0))
+        x := x + 1
+  for y in [:h] do
+    let pRowBase := (y0 + y) * pStride
+    let mut x := xs
+    while x < 0 do
+      let ti := (base + x + Int.ofNat (y * ts)).toNat
+      tmp := tmp.set! ti (Int.ofNat (left.getD (y * 2 + (2 + x).toNat) 0))
+      x := x + 1
+    let mut xp : Nat := 0
+    let xeN := xe.toNat
+    while xp < xeN do
+      let ti := (base + Int.ofNat xp + Int.ofNat (y * ts)).toNat
+      tmp := tmp.set! ti (Int.ofNat (plane.getD (pRowBase + x0 + xp) 0))
+      xp := xp + 1
+  if (edges &&& av1CdefHaveBottom) != 0 then
+    if let some (bot, botStride, botOff) := botOpt then
+      for yr in [:2] do
+        let y : Int := Int.ofNat (h + yr)
+        let bRowBase : Int := Int.ofNat (botOff + yr * botStride) + Int.ofNat x0
+        let mut x := xs
+        while x < xe do
+          let ti := (base + x + y * Int.ofNat ts).toNat
+          tmp := tmp.set! ti (Int.ofNat (bot.getD (bRowBase + x).toNat 0))
+          x := x + 1
+  let di := direction * 2
+  if pri != 0 then
+    let priTap : Int := Int.ofNat (4 - (pri &&& 1))
+    let uPri := av1Ulog2 pri
+    let priShift : Nat := if damping > uPri then damping - uPri else 0
+    if sec != 0 then
+      let uSec := av1Ulog2 sec
+      let secShift : Nat := if damping > uSec then damping - uSec else 0
+      for y in [:h] do
+        let t : Int := base + Int.ofNat (y * ts)
+        let pRow := (y0 + y) * pStride + x0
+        for x in [:w] do
+          let px : Int := Int.ofNat (plane.getD (pRow + x) 0)
+          let mut sm : Int := 0
+          let mut lo : Int := px
+          let mut hi : Int := px
+          let mut tap := priTap
+          let tx : Int := t + Int.ofNat x
+          for k in [:2] do
+            let o1 := av1CdefDirections.getD (di + 4 + k) 0
+            let o2 := av1CdefDirections.getD (di + 8 + k) 0
+            let o3 := av1CdefDirections.getD (di + k) 0
+            let p0 := tmp.getD (tx + o1).toNat av1CdefPad
+            let p1 := tmp.getD (tx - o1).toNat av1CdefPad
+            sm := sm + tap * av1CdefConstrain (p0 - px) pri priShift
+            sm := sm + tap * av1CdefConstrain (p1 - px) pri priShift
+            tap := Int.ofNat ((tap.toNat &&& 3) ||| 2)
+            lo := av1CdefUmin p0 (av1CdefUmin p1 lo)
+            if p0 > hi then hi := p0
+            if p1 > hi then hi := p1
+            let st : Int := Int.ofNat (2 - k)
+            let s0 := tmp.getD (tx + o2).toNat av1CdefPad
+            let s1 := tmp.getD (tx - o2).toNat av1CdefPad
+            let s2 := tmp.getD (tx + o3).toNat av1CdefPad
+            let s3 := tmp.getD (tx - o3).toNat av1CdefPad
+            for s in #[s0, s1, s2, s3] do
+              sm := sm + st * av1CdefConstrain (s - px) sec secShift
+              lo := av1CdefUmin s lo
+              if s > hi then hi := s
+          let bias : Int := if sm < 0 then 1 else 0
+          let v := px + av1ArithShiftRight (sm - bias + 8) 4
+          let clamped := if v < lo then lo else if v > hi then hi else v
+          plane := plane.set! (pRow + x) (av1IclipU8 clamped)
+    else
+      for y in [:h] do
+        let t : Int := base + Int.ofNat (y * ts)
+        let pRow := (y0 + y) * pStride + x0
+        for x in [:w] do
+          let px : Int := Int.ofNat (plane.getD (pRow + x) 0)
+          let mut sm : Int := 0
+          let mut tap := priTap
+          let tx : Int := t + Int.ofNat x
+          for k in [:2] do
+            let o1 := av1CdefDirections.getD (di + 4 + k) 0
+            let p0 := tmp.getD (tx + o1).toNat av1CdefPad
+            let p1 := tmp.getD (tx - o1).toNat av1CdefPad
+            sm := sm + tap * av1CdefConstrain (p0 - px) pri priShift
+            sm := sm + tap * av1CdefConstrain (p1 - px) pri priShift
+            tap := Int.ofNat ((tap.toNat &&& 3) ||| 2)
+          let bias : Int := if sm < 0 then 1 else 0
+          let v := px + av1ArithShiftRight (sm - bias + 8) 4
+          plane := plane.set! (pRow + x) (av1IclipU8 v)
+  else if sec != 0 then
+    let uSec := av1Ulog2 sec
+    let secShift : Nat := if damping > uSec then damping - uSec else 0
+    for y in [:h] do
+      let t : Int := base + Int.ofNat (y * ts)
+      let pRow := (y0 + y) * pStride + x0
+      for x in [:w] do
+        let px : Int := Int.ofNat (plane.getD (pRow + x) 0)
+        let mut sm : Int := 0
+        let tx : Int := t + Int.ofNat x
+        for k in [:2] do
+          let o1 := av1CdefDirections.getD (di + 8 + k) 0
+          let o2 := av1CdefDirections.getD (di + k) 0
+          let st : Int := Int.ofNat (2 - k)
+          let s0 := tmp.getD (tx + o1).toNat av1CdefPad
+          let s1 := tmp.getD (tx - o1).toNat av1CdefPad
+          let s2 := tmp.getD (tx + o2).toNat av1CdefPad
+          let s3 := tmp.getD (tx - o2).toNat av1CdefPad
+          for s in #[s0, s1, s2, s3] do
+            sm := sm + st * av1CdefConstrain (s - px) sec secShift
+        let bias : Int := if sm < 0 then 1 else 0
+        let v := px + av1ArithShiftRight (sm - bias + 8) 4
+        plane := plane.set! (pRow + x) (av1IclipU8 v)
+  return plane
+
+structure Av1LrUnit where
+  lrType     : Nat := 0
+  filterH    : Array Int := #[3, -7, 15]
+  filterV    : Array Int := #[3, -7, 15]
+  sgrWeights : Array Int := #[-32, 31]
+  deriving Inhabited, Repr, DecidableEq
+
+private def av1LrExtendRow (src : Array Nat) (rowOff x0 w pw : Nat)
+    (leftOpt : Option (Array Nat × Nat)) (edges : Nat) : Array Int := Id.run do
+  let mut out : Array Int := Array.replicate (w + 6) 0
+  for i in [:w] do
+    out := out.set! (3 + i) (Int.ofNat (src.getD (rowOff + x0 + i) 0))
+  if (edges &&& av1LrHaveLeft) != 0 then
+    match leftOpt with
+    | some (lbuf, loff) =>
+      out := out.set! 0 (Int.ofNat (lbuf.getD (loff + 1) 0))
+      out := out.set! 1 (Int.ofNat (lbuf.getD (loff + 2) 0))
+      out := out.set! 2 (Int.ofNat (lbuf.getD (loff + 3) 0))
+    | none =>
+      out := out.set! 0 (Int.ofNat (src.getD (rowOff + x0 - 3) 0))
+      out := out.set! 1 (Int.ofNat (src.getD (rowOff + x0 - 2) 0))
+      out := out.set! 2 (Int.ofNat (src.getD (rowOff + x0 - 1) 0))
+  else
+    let v0 := Int.ofNat (src.getD (rowOff + x0) 0)
+    out := out.set! 0 v0
+    out := out.set! 1 v0
+    out := out.set! 2 v0
+  if (edges &&& av1LrHaveRight) != 0 then
+    for k in [:3] do
+      let idx := Nat.min (pw - 1) (x0 + w + k)
+      out := out.set! (3 + w + k) (Int.ofNat (src.getD (rowOff + idx) 0))
+  else
+    let vLast := Int.ofNat (src.getD (rowOff + x0 + w - 1) 0)
+    out := out.set! (3 + w) vLast
+    out := out.set! (4 + w) vLast
+    out := out.set! (5 + w) vLast
+  return out
+
+private def av1LrRows (plane : Array Nat) (pStride pw x0 y0 w h : Nat)
+    (leftOpt : Option (Array Nat × Nat))
+    (lpfPlane : Array Nat) (lpfStride topIdx botIdx edges : Nat) : Array Int := Id.run do
+  let pw6 := w + 6
+  let mut patch : Array Int := Array.replicate ((h + 6) * pw6) 0
+  let copyRow (dstRow : Nat) (r : Array Int) (p : Array Int) : Array Int := Id.run do
+    let mut dst := p
+    let base := dstRow * pw6
+    for i in [:pw6] do
+      dst := dst.set! (base + i) (r.getD i 0)
+    return dst
+  let mut mid0 : Array Int := #[]
+  let mut midLast : Array Int := #[]
+  for y in [:h] do
+    let lRowOpt := match leftOpt with
+      | some (lb, lRow0) => some (lb, (lRow0 + y) * 4)
+      | none => none
+    let r := av1LrExtendRow plane ((y0 + y) * pStride) x0 w pw lRowOpt edges
+    if y == 0 then mid0 := r
+    if y + 1 == h then midLast := r
+    patch := copyRow (3 + y) r patch
+  if (edges &&& av1LrHaveTop) != 0 then
+    let rm2 := av1LrExtendRow lpfPlane (topIdx * lpfStride) x0 w pw none edges
+    let rm1 := av1LrExtendRow lpfPlane ((topIdx + 1) * lpfStride) x0 w pw none edges
+    patch := copyRow 0 rm2 patch
+    patch := copyRow 1 rm2 patch
+    patch := copyRow 2 rm1 patch
+  else
+    patch := copyRow 0 mid0 patch
+    patch := copyRow 1 mid0 patch
+    patch := copyRow 2 mid0 patch
+  if (edges &&& av1LrHaveBottom) != 0 then
+    let rp0 := av1LrExtendRow lpfPlane (botIdx * lpfStride) x0 w pw none edges
+    let rp1 := av1LrExtendRow lpfPlane ((botIdx + 1) * lpfStride) x0 w pw none edges
+    patch := copyRow (3 + h) rp0 patch
+    patch := copyRow (4 + h) rp1 patch
+    patch := copyRow (5 + h) rp1 patch
+  else
+    patch := copyRow (3 + h) midLast patch
+    patch := copyRow (4 + h) midLast patch
+    patch := copyRow (5 + h) midLast patch
+  return patch
+
+def av1WienerBlock (plane0 : Array Nat) (pStride pw x0 y0 w h : Nat)
+    (fh3 fv3 : Array Int) (leftOpt : Option (Array Nat × Nat))
+    (lpfPlane : Array Nat) (lpfStride topIdx botIdx edges : Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let fh0 := fh3.getD 0 0; let fh1 := fh3.getD 1 0; let fh2 := fh3.getD 2 0
+  let fv0 := fv3.getD 0 0; let fv1 := fv3.getD 1 0; let fv2 := fv3.getD 2 0
+  let fh : Array Int := #[fh0, fh1, fh2, -(fh0 + fh1 + fh2) * 2, fh2, fh1, fh0]
+  let fv : Array Int := #[fv0, fv1, fv2, 128 - (fv0 + fv1 + fv2) * 2, fv2, fv1, fv0]
+  let patch := av1LrRows plane pStride pw x0 y0 w h leftOpt lpfPlane lpfStride topIdx botIdx edges
+  let pw6 := w + 6
+  let mut hor : Array Int := Array.replicate ((h + 6) * w) 0
+  for r in [:h + 6] do
+    let rBase := r * pw6
+    let hBase := r * w
+    for x in [:w] do
+      let mut sm : Int := (1 <<< 14) + patch.getD (rBase + x + 3) 0 * 128
+      for k in [:7] do
+        sm := sm + patch.getD (rBase + x + k) 0 * fh.getD k 0
+      let v := av1ArithShiftRight (sm + 4) 3
+      let clamped : Int := if v < 0 then 0 else if v > 32767 then 32767 else v
+      hor := hor.set! (hBase + x) clamped
+  for y in [:h] do
+    let pRow := (y0 + y) * pStride + x0
+    for x in [:w] do
+      let mut sm : Int := -(1 <<< 18)
+      for k in [:7] do
+        sm := sm + hor.getD ((y + k) * w + x) 0 * fv.getD k 0
+      plane := plane.set! (pRow + x) (av1IclipU8 (av1ArithShiftRight (sm + 1024) 11))
+  return plane
+
+private def av1SgrAb (patch : Array Int) (w h radius s : Nat) : Array Int × Array Int := Id.run do
+  let n : Int := if radius == 1 then 9 else 25
+  let oneByX : Int := if radius == 1 then 455 else 164
+  let pw6 := w + 6
+  let w2 := w + 2
+  let mut matA : Array Int := Array.replicate ((h + 2) * w2) 0
+  let mut matB : Array Int := Array.replicate ((h + 2) * w2) 0
+  let span := 2 * radius + 1
+  for ry in [:h + 2] do
+    let cy := ry + 2
+    for rx in [:w2] do
+      let cx := rx + 2
+      let mut sm : Int := 0
+      let mut sq : Int := 0
+      for dyi in [:span] do
+        let rowOff := (cy + dyi - radius) * pw6
+        for dxi in [:span] do
+          let v := patch.getD (rowOff + cx + dxi - radius) 0
+          sm := sm + v
+          sq := sq + v * v
+      let diff := sq * n - sm * sm
+      let p : Int := if diff > 0 then diff else 0
+      let z := (av1ArithShiftRight (p * Int.ofNat s + (1 <<< 19)) 20).toNat
+      let xv : Int := Int.ofNat (av1SgrXByX.getD (if z < 255 then z else 255) 0)
+      let idx := ry * w2 + rx
+      matA := matA.set! idx (av1ArithShiftRight (xv * sm * oneByX + (1 <<< 11)) 12)
+      matB := matB.set! idx xv
+  return (matA, matB)
+
+private def av1SgrT3 (patch : Array Int) (w h s1 : Nat) : Array Int := Id.run do
+  let (matA, matB) := av1SgrAb patch w h 1 s1
+  let pw6 := w + 6
+  let w2 := w + 2
+  let mut out : Array Int := Array.replicate (h * w) 0
+  for y in [:h] do
+    let srcOff := (y + 3) * pw6
+    let r0 := y * w2
+    let r1 := (y + 1) * w2
+    let r2 := (y + 2) * w2
+    let oRow := y * w
+    for x in [:w] do
+      let i := x + 1
+      let a := (matB.getD (r1 + i) 0 + matB.getD (r1 + i - 1) 0 + matB.getD (r1 + i + 1) 0 +
+                matB.getD (r0 + i) 0 + matB.getD (r2 + i) 0) * 4 +
+               (matB.getD (r0 + i - 1) 0 + matB.getD (r2 + i - 1) 0 +
+                matB.getD (r0 + i + 1) 0 + matB.getD (r2 + i + 1) 0) * 3
+      let b := (matA.getD (r1 + i) 0 + matA.getD (r1 + i - 1) 0 + matA.getD (r1 + i + 1) 0 +
+                matA.getD (r0 + i) 0 + matA.getD (r2 + i) 0) * 4 +
+               (matA.getD (r0 + i - 1) 0 + matA.getD (r2 + i - 1) 0 +
+                matA.getD (r0 + i + 1) 0 + matA.getD (r2 + i + 1) 0) * 3
+      out := out.set! (oRow + x) (av1ArithShiftRight (b - a * patch.getD (srcOff + x + 3) 0 + 256) 9)
+  return out
+
+private def av1SgrT5 (patch : Array Int) (w h s0 : Nat) : Array Int := Id.run do
+  let (matA, matB) := av1SgrAb patch w h 2 s0
+  let pw6 := w + 6
+  let w2 := w + 2
+  let mut out : Array Int := Array.replicate (h * w) 0
+  let mut y : Nat := 0
+  while y < h do
+    let src0 := (y + 3) * pw6
+    let r0 := y * w2
+    let r1 := (y + 2) * w2
+    let oRow0 := y * w
+    for x in [:w] do
+      let i := x + 1
+      let a := (matB.getD (r0 + i) 0 + matB.getD (r1 + i) 0) * 6 +
+               (matB.getD (r0 + i - 1) 0 + matB.getD (r1 + i - 1) 0 +
+                matB.getD (r0 + i + 1) 0 + matB.getD (r1 + i + 1) 0) * 5
+      let b := (matA.getD (r0 + i) 0 + matA.getD (r1 + i) 0) * 6 +
+               (matA.getD (r0 + i - 1) 0 + matA.getD (r1 + i - 1) 0 +
+                matA.getD (r0 + i + 1) 0 + matA.getD (r1 + i + 1) 0) * 5
+      out := out.set! (oRow0 + x) (av1ArithShiftRight (b - a * patch.getD (src0 + x + 3) 0 + 256) 9)
+    if y + 1 < h then
+      let src1 := (y + 4) * pw6
+      let oRow1 := (y + 1) * w
+      for x in [:w] do
+        let i := x + 1
+        let a := matB.getD (r1 + i) 0 * 6 + (matB.getD (r1 + i - 1) 0 + matB.getD (r1 + i + 1) 0) * 5
+        let b := matA.getD (r1 + i) 0 * 6 + (matA.getD (r1 + i - 1) 0 + matA.getD (r1 + i + 1) 0) * 5
+        out := out.set! (oRow1 + x) (av1ArithShiftRight (b - a * patch.getD (src1 + x + 3) 0 + 128) 8)
+    y := y + 2
+  return out
+
+def av1SgrBlock (plane0 : Array Nat) (pStride pw x0 y0 w h sgrIdx : Nat)
+    (weights : Array Int) (leftOpt : Option (Array Nat × Nat))
+    (lpfPlane : Array Nat) (lpfStride topIdx botIdx edges : Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let s0 := av1SgrParams.getD (sgrIdx * 2) 0
+  let s1 := av1SgrParams.getD (sgrIdx * 2 + 1) 0
+  let w0 := weights.getD 0 0
+  let w1 := 128 - (w0 + weights.getD 1 0)
+  let patch := av1LrRows plane pStride pw x0 y0 w h leftOpt lpfPlane lpfStride topIdx botIdx edges
+  if s0 != 0 && s1 != 0 then
+    let t5 := av1SgrT5 patch w h s0
+    let t3 := av1SgrT3 patch w h s1
+    for y in [:h] do
+      let pRow := (y0 + y) * pStride + x0
+      let tRow := y * w
+      for x in [:w] do
+        let cur := Int.ofNat (plane.getD (pRow + x) 0)
+        let adj := av1ArithShiftRight (w0 * t5.getD (tRow + x) 0 + w1 * t3.getD (tRow + x) 0 + 1024) 11
+        plane := plane.set! (pRow + x) (av1IclipU8 (cur + adj))
+  else if s0 != 0 then
+    let t5 := av1SgrT5 patch w h s0
+    for y in [:h] do
+      let pRow := (y0 + y) * pStride + x0
+      let tRow := y * w
+      for x in [:w] do
+        let cur := Int.ofNat (plane.getD (pRow + x) 0)
+        let adj := av1ArithShiftRight (w0 * t5.getD (tRow + x) 0 + 1024) 11
+        plane := plane.set! (pRow + x) (av1IclipU8 (cur + adj))
+  else
+    let t3 := av1SgrT3 patch w h s1
+    for y in [:h] do
+      let pRow := (y0 + y) * pStride + x0
+      let tRow := y * w
+      for x in [:w] do
+        let cur := Int.ofNat (plane.getD (pRow + x) 0)
+        let adj := av1ArithShiftRight (w1 * t3.getD (tRow + x) 0 + 1024) 11
+        plane := plane.set! (pRow + x) (av1IclipU8 (cur + adj))
+  return plane
+
+private def av1CopyLpfPlane (plane : Array Nat) (pStride : Nat) (dstLines0 : Array Nat)
+    (lpfStride sby sb128 ss srcW h : Nat) : Array Nat := Id.run do
+  let mut dstLines := dstLines0
+  let offset := (if sby != 0 then 8 else 0) >>> ss
+  let mut row := (sby <<< ((6 - ss) + sb128)) - offset
+  let rowH := Nat.min ((sby + 1) <<< ((6 - ss) + sb128)) (h - 1)
+  let mut stripeH := (64 - (if row != 0 then 0 else 8)) >>> ss
+  if row != 0 then
+    let top := 4 <<< sb128
+    for k in [:4] do
+      let dOff := k * lpfStride
+      let sOff := (top + k) * lpfStride
+      for i in [:srcW] do
+        dstLines := dstLines.set! (dOff + i) (dstLines.getD (sOff + i) 0)
+  let mut d : Nat := 4
+  let mut sy : Nat := row + stripeH - 2
+  while row + stripeH <= rowH do
+    let nLines := 4 - (if row + stripeH + 1 == h then 1 else 0)
+    for i in [:4] do
+      let dOff := d * lpfStride
+      if i == nLines then
+        let prevOff := (d - 1) * lpfStride
+        for c in [:srcW] do
+          dstLines := dstLines.set! (dOff + c) (dstLines.getD (prevOff + c) 0)
+      else
+        let pOff := sy * pStride
+        for c in [:srcW] do
+          dstLines := dstLines.set! (dOff + c) (plane.getD (pOff + c) 0)
+      d := d + 1
+      sy := sy + 1
+    row := row + stripeH
+    stripeH := 64 >>> ss
+    sy := sy + stripeH - 4
+  return dstLines
+
+private def av1CdefSbrow (hdr : Av1FrameHdr) (yPlane0 uPlane0 vPlane0 : Array Nat)
+    (yStride uvStride : Nat) (cdefY0 cdefU0 cdefV0 : Array Nat)
+    (cdefYStride cdefUvStride : Nat)
+    (lfMasks : Array Av1LfMask) (rowMaskOff byStart byEnd bw bh : Nat) :
+    Array Nat × Array Nat × Array Nat × Array Nat × Array Nat × Array Nat := Id.run do
+  let mut yPlane := yPlane0
+  let mut uPlane := uPlane0
+  let mut vPlane := vPlane0
+  let mut cdefY := cdefY0
+  let mut cdefU := cdefU0
+  let mut cdefV := cdefV0
+  let cdef := hdr.cdef
+  let damping := cdef.damping
+  let sb64w := (bw + 15) >>> 4
+  let mut edges := av1CdefHaveBottom ||| (if byStart > 0 then av1CdefHaveTop else 0)
+  let mut by4 := byStart
+  while by4 < byEnd do
+    let tf := (by4 >>> 1) &&& 1
+    let byIdx := (by4 &&& 30) >>> 1
+    if by4 + 2 >= bh then
+      edges := edges - (edges &&& av1CdefHaveBottom)
+    let y0 := by4 * 4
+    let cy0 := by4 * 2
+    if (edges &&& av1CdefHaveBottom) != 0 then
+      let ntf := 1 - tf
+      for r in [:2] do
+        let dstOffY := (ntf * 2 + r) * cdefYStride
+        let srcOffY := (y0 + 6 + r) * yStride
+        for c in [:bw * 4] do
+          cdefY := cdefY.set! (dstOffY + c) (yPlane.getD (srcOffY + c) 0)
+        let dstOffC := (ntf * 2 + r) * cdefUvStride
+        let srcOffC := (cy0 + 2 + r) * uvStride
+        for c in [:bw * 2] do
+          cdefU := cdefU.set! (dstOffC + c) (uPlane.getD (srcOffC + c) 0)
+          cdefV := cdefV.set! (dstOffC + c) (vPlane.getD (srcOffC + c) 0)
+    let mut lrBakY0 : Array Nat := Array.replicate 16 0
+    let mut lrBakY1 : Array Nat := Array.replicate 16 0
+    let mut lrBakU0 : Array Nat := Array.replicate 8 0
+    let mut lrBakU1 : Array Nat := Array.replicate 8 0
+    let mut lrBakV0 : Array Nat := Array.replicate 8 0
+    let mut lrBakV1 : Array Nat := Array.replicate 8 0
+    edges := (edges - (edges &&& av1CdefHaveLeft)) ||| av1CdefHaveRight
+    let mut prevFlag : Nat := 0
+    let mut bit : Nat := 0
+    for sbx in [:sb64w] do
+      let sb128x := sbx >>> 1
+      let sb64Idx := ((by4 &&& 16) >>> 3) + (sbx &&& 1)
+      let rMask := lfMasks.getD (rowMaskOff + sb128x) {}
+      let cdefIdx := rMask.cdefIdx.getD sb64Idx (-1)
+      if cdefIdx < 0 then
+        prevFlag := 0
+        edges := edges ||| av1CdefHaveLeft
+      else
+        let ci := cdefIdx.toNat
+        let yLvl := cdef.yStrength.getD ci 0
+        let uvLvl := cdef.uvStrength.getD ci 0
+        if yLvl == 0 && uvLvl == 0 then
+          prevFlag := 0
+          edges := edges ||| av1CdefHaveLeft
+        else
+          let n0 := rMask.noskip.getD (byIdx * 2) 0
+          let n1 := rMask.noskip.getD (byIdx * 2 + 1) 0
+          let noskipMask := (n1 <<< 16) ||| n0
+          let flag := (if yLvl != 0 then 1 else 0) ||| (if uvLvl != 0 then 2 else 0)
+          let yPri := yLvl >>> 2
+          let ySec := (yLvl &&& 3) + (if (yLvl &&& 3) == 3 then 1 else 0)
+          let uvPri := uvLvl >>> 2
+          let uvSec := (uvLvl &&& 3) + (if (uvLvl &&& 3) == 3 then 1 else 0)
+          let bxEnd := Nat.min ((sbx + 1) * 16) bw
+          let mut bx := sbx * 16
+          while bx < bxEnd do
+            if bx + 2 >= bw then
+              edges := edges - (edges &&& av1CdefHaveRight)
+            if (noskipMask &&& (3 <<< (bx &&& 30))) == 0 then
+              prevFlag := 0
+              edges := edges ||| av1CdefHaveLeft
+            else
+              let doLeft := (prevFlag ^^^ flag) &&& flag
+              prevFlag := flag
+              let x0 := bx * 4
+              let cx0 := bx * 2
+              if doLeft != 0 && (edges &&& av1CdefHaveLeft) != 0 then
+                if (doLeft &&& 1) != 0 then
+                  for yy in [:8] do
+                    let v0 := yPlane.getD ((y0 + yy) * yStride + x0 - 2) 0
+                    let v1 := yPlane.getD ((y0 + yy) * yStride + x0 - 1) 0
+                    if bit == 0 then
+                      lrBakY0 := (lrBakY0.set! (yy * 2) v0).set! (yy * 2 + 1) v1
+                    else
+                      lrBakY1 := (lrBakY1.set! (yy * 2) v0).set! (yy * 2 + 1) v1
+                if (doLeft &&& 2) != 0 then
+                  for yy in [:4] do
+                    let u0v := uPlane.getD ((cy0 + yy) * uvStride + cx0 - 2) 0
+                    let u1v := uPlane.getD ((cy0 + yy) * uvStride + cx0 - 1) 0
+                    let v0v := vPlane.getD ((cy0 + yy) * uvStride + cx0 - 2) 0
+                    let v1v := vPlane.getD ((cy0 + yy) * uvStride + cx0 - 1) 0
+                    if bit == 0 then
+                      lrBakU0 := (lrBakU0.set! (yy * 2) u0v).set! (yy * 2 + 1) u1v
+                      lrBakV0 := (lrBakV0.set! (yy * 2) v0v).set! (yy * 2 + 1) v1v
+                    else
+                      lrBakU1 := (lrBakU1.set! (yy * 2) u0v).set! (yy * 2 + 1) u1v
+                      lrBakV1 := (lrBakV1.set! (yy * 2) v0v).set! (yy * 2 + 1) v1v
+              if (edges &&& av1CdefHaveRight) != 0 then
+                let nbit := 1 - bit
+                if (flag &&& 1) != 0 then
+                  for yy in [:8] do
+                    let v0 := yPlane.getD ((y0 + yy) * yStride + x0 + 6) 0
+                    let v1 := yPlane.getD ((y0 + yy) * yStride + x0 + 7) 0
+                    if nbit == 0 then
+                      lrBakY0 := (lrBakY0.set! (yy * 2) v0).set! (yy * 2 + 1) v1
+                    else
+                      lrBakY1 := (lrBakY1.set! (yy * 2) v0).set! (yy * 2 + 1) v1
+                if (flag &&& 2) != 0 then
+                  for yy in [:4] do
+                    let u0v := uPlane.getD ((cy0 + yy) * uvStride + cx0 + 2) 0
+                    let u1v := uPlane.getD ((cy0 + yy) * uvStride + cx0 + 3) 0
+                    let v0v := vPlane.getD ((cy0 + yy) * uvStride + cx0 + 2) 0
+                    let v1v := vPlane.getD ((cy0 + yy) * uvStride + cx0 + 3) 0
+                    if nbit == 0 then
+                      lrBakU0 := (lrBakU0.set! (yy * 2) u0v).set! (yy * 2 + 1) u1v
+                      lrBakV0 := (lrBakV0.set! (yy * 2) v0v).set! (yy * 2 + 1) v1v
+                    else
+                      lrBakU1 := (lrBakU1.set! (yy * 2) u0v).set! (yy * 2 + 1) u1v
+                      lrBakV1 := (lrBakV1.set! (yy * 2) v0v).set! (yy * 2 + 1) v1v
+              let (direction, var) :=
+                if yPri != 0 || uvPri != 0 then av1CdefFindDir yPlane yStride x0 y0 else (0, 0)
+              let botYOpt :=
+                if (edges &&& av1CdefHaveBottom) != 0 then some (yPlane, yStride, (y0 + 8) * yStride) else none
+              let leftY := if bit == 0 then lrBakY0 else lrBakY1
+              if yPri != 0 then
+                let adj := av1CdefAdjustStrength yPri var
+                if adj != 0 || ySec != 0 then
+                  yPlane := av1CdefFilter yPlane yStride x0 y0 leftY cdefY cdefYStride (tf * 2 * cdefYStride)
+                    botYOpt adj ySec direction damping 8 8 edges
+              else if ySec != 0 then
+                yPlane := av1CdefFilter yPlane yStride x0 y0 leftY cdefY cdefYStride (tf * 2 * cdefYStride)
+                  botYOpt 0 ySec 0 damping 8 8 edges
+              if uvLvl != 0 then
+                let uvdir := if uvPri != 0 then direction else 0
+                let leftU := if bit == 0 then lrBakU0 else lrBakU1
+                let leftV := if bit == 0 then lrBakV0 else lrBakV1
+                let botUOpt :=
+                  if (edges &&& av1CdefHaveBottom) != 0 then some (uPlane, uvStride, (cy0 + 4) * uvStride) else none
+                let botVOpt :=
+                  if (edges &&& av1CdefHaveBottom) != 0 then some (vPlane, uvStride, (cy0 + 4) * uvStride) else none
+                uPlane := av1CdefFilter uPlane uvStride cx0 cy0 leftU cdefU cdefUvStride (tf * 2 * cdefUvStride)
+                  botUOpt uvPri uvSec uvdir (damping - 1) 4 4 edges
+                vPlane := av1CdefFilter vPlane uvStride cx0 cy0 leftV cdefV cdefUvStride (tf * 2 * cdefUvStride)
+                  botVOpt uvPri uvSec uvdir (damping - 1) 4 4 edges
+              bit := bit ^^^ 1
+              edges := edges ||| av1CdefHaveLeft
+            bx := bx + 2
+          edges := edges ||| av1CdefHaveLeft
+    edges := edges ||| av1CdefHaveTop
+    by4 := by4 + 2
+  return (yPlane, uPlane, vPlane, cdefY, cdefU, cdefV)
+
+private def av1LrStripe (plane0 : Array Nat) (pStride pw : Nat)
+    (lpfPlane : Array Nat) (lpfStride : Nat)
+    (x y0 unitW rowH sby sbh ss : Nat) (lr : Av1LrUnit)
+    (leftOpt0 : Option (Array Nat × Nat)) (edges0 : Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let mut y := y0
+  let mut leftOpt := leftOpt0
+  let mut edges := edges0
+  let mut stripeH := Nat.min ((64 - (if y == 0 then 8 else 0)) >>> ss) (rowH - y)
+  let mut lpfIdx : Nat := 0
+  while y + stripeH <= rowH && stripeH > 0 do
+    if sby + 1 != sbh || y + stripeH != rowH then
+      edges := edges ||| av1LrHaveBottom
+    else
+      edges := edges - (edges &&& av1LrHaveBottom)
+    if lr.lrType == 2 then
+      plane := av1WienerBlock plane pStride pw x y unitW stripeH lr.filterH lr.filterV leftOpt
+        lpfPlane lpfStride lpfIdx (lpfIdx + 6) edges
+    else if lr.lrType >= 3 then
+      plane := av1SgrBlock plane pStride pw x y unitW stripeH (lr.lrType - 3) lr.sgrWeights leftOpt
+        lpfPlane lpfStride lpfIdx (lpfIdx + 6) edges
+    if let some (lb, lRow) := leftOpt then
+      leftOpt := some (lb, lRow + stripeH)
+    y := y + stripeH
+    edges := edges ||| av1LrHaveTop
+    stripeH := Nat.min (64 >>> ss) (rowH - y)
+    lpfIdx := lpfIdx + 4
+  return plane
+
+private def av1LrPlaneSbrow (plane0 : Array Nat) (pStride : Nat)
+    (lpfPlane : Array Nat) (lpfStride : Nat)
+    (lrUnits : Array Av1LrUnit) (pl unitSizeLog2 y w h rowH sby sbh sb128w : Nat) : Array Nat := Id.run do
+  let mut plane := plane0
+  let ss : Nat := if pl != 0 then 1 else 0
+  let unitSize := 1 <<< unitSizeLog2
+  let halfUnit := unitSize >>> 1
+  let maxUnit := unitSize + halfUnit
+  let rowY := y + (if y != 0 then 8 >>> ss else 0)
+  let shiftHor := 7 - ss
+  let mut edges := (if y > 0 then av1LrHaveTop else 0) ||| av1LrHaveRight
+  let mask := unitSize - 1
+  let mut aligned := rowY - (rowY &&& mask)
+  if aligned != 0 && aligned + halfUnit > h then
+    aligned := aligned - unitSize
+  aligned := aligned <<< ss
+  let sbIdx := (aligned >>> 7) * sb128w
+  let unitIdx := ((aligned >>> 6) &&& 1) <<< 1
+  let lrAt (sb u : Nat) : Av1LrUnit := lrUnits.getD ((sb * 3 + pl) * 4 + u) {}
+  let mut curLr := lrAt sbIdx unitIdx
+  let mut restore := curLr.lrType != 0
+  let backupH := rowH - y
+  let mut border0 : Array Nat := Array.replicate (backupH * 4) 0
+  let mut border1 : Array Nat := Array.replicate (backupH * 4) 0
+  let mut x : Nat := 0
+  let mut bit : Nat := 0
+  while x + maxUnit <= w do
+    let nextX := x + unitSize
+    let nextU := unitIdx + ((nextX >>> (shiftHor - 1)) &&& 1)
+    let nextLr := lrAt (sbIdx + (nextX >>> shiftHor)) nextU
+    let restoreNext := nextLr.lrType != 0
+    if restoreNext then
+      for r in [:backupH] do
+        let srcOff := (y + r) * pStride + x + unitSize - 4
+        let dstOff := r * 4
+        for k in [:4] do
+          let px := plane.getD (srcOff + k) 0
+          if bit == 0 then
+            border0 := border0.set! (dstOff + k) px
+          else
+            border1 := border1.set! (dstOff + k) px
+    if restore then
+      let leftOpt :=
+        if (edges &&& av1LrHaveLeft) != 0 then
+          some (if bit == 0 then border1 else border0, 0)
+        else none
+      plane := av1LrStripe plane pStride w lpfPlane lpfStride x y unitSize rowH sby sbh ss curLr leftOpt edges
+    x := nextX
+    curLr := nextLr
+    restore := restoreNext
+    edges := edges ||| av1LrHaveLeft
+    bit := bit ^^^ 1
+  if restore then
+    edges := edges - (edges &&& av1LrHaveRight)
+    let leftOpt :=
+      if (edges &&& av1LrHaveLeft) != 0 then
+        some (if bit == 0 then border1 else border0, 0)
+      else none
+    plane := av1LrStripe plane pStride w lpfPlane lpfStride x y (w - x) rowH sby sbh ss curLr leftOpt edges
+  return plane
+
+def av1PostfilterFrame (seq : Av1SeqHdr) (hdr : Av1FrameHdr)
+    (yPlane0 uPlane0 vPlane0 : Array Nat) (yStride uvStride : Nat)
+    (lfMasks : Array Av1LfMask) (levelY levelUv : Array Nat) (b4Stride : Nat)
+    (lrUnits : Array Av1LrUnit) : Array Nat × Array Nat × Array Nat := Id.run do
+  let mut yPlane := yPlane0
+  let mut uPlane := uPlane0
+  let mut vPlane := vPlane0
+  let sb128 := seq.sb128
+  let isSb64 := 1 - sb128
+  let sbsz := 32 >>> isSb64
+  let w0 := hdr.width0
+  let h := hdr.height
+  let w4 := (w0 + 3) >>> 2
+  let h4 := (h + 3) >>> 2
+  let bw := ((w0 + 7) >>> 3) <<< 1
+  let bh := ((h + 7) >>> 3) <<< 1
+  let sb128w := (bw + 31) >>> 5
+  let sbh := (bh + sbsz - 1) / sbsz
+  let lf := hdr.loopfilter
+  let doLf := lf.levelY.getD 0 0 != 0 || lf.levelY.getD 1 0 != 0
+  let doCdef := !hdr.allLossless && seq.cdef && !hdr.allowIntrabc
+  let rest := hdr.restoration
+  let restorePlanes :=
+    (if rest.lrType.getD 0 0 != 0 then 1 else 0) |||
+    (if rest.lrType.getD 1 0 != 0 then 2 else 0) |||
+    (if rest.lrType.getD 2 0 != 0 then 4 else 0)
+  let (eLut, iLut) := if doLf then av1CalcEih lf.sharpness else (#[], #[])
+  let lpfYStride := bw <<< 2
+  let lpfUvStride := bw <<< 1
+  let mut lpfY : Array Nat := if seq.cdef || restorePlanes != 0 then Array.replicate (12 * lpfYStride) 0 else #[]
+  let mut lpfU : Array Nat := if seq.cdef || restorePlanes != 0 then Array.replicate (12 * lpfUvStride) 0 else #[]
+  let mut lpfV : Array Nat := if seq.cdef || restorePlanes != 0 then Array.replicate (12 * lpfUvStride) 0 else #[]
+  let mut cdefY : Array Nat := if doCdef then Array.replicate (4 * lpfYStride) 0 else #[]
+  let mut cdefU : Array Nat := if doCdef then Array.replicate (4 * lpfUvStride) 0 else #[]
+  let mut cdefV : Array Nat := if doCdef then Array.replicate (4 * lpfUvStride) 0 else #[]
+  for sby in [:sbh] do
+    let rowMaskOff := (sby >>> isSb64) * sb128w
+    let starty4 := (sby &&& isSb64) <<< 4
+    let endy4 := starty4 + Nat.min (h4 - sby * sbsz) sbsz
+    let uvEndy4 := (endy4 + 1) >>> 1
+    let yPx := sby * (64 <<< sb128)
+    let uvPx := yPx >>> 1
+    if doLf then
+      for x in [:sb128w] do
+        if x * 32 < w4 then
+          let subW4 := Nat.min 32 (w4 - x * 32)
+          let rm := lfMasks.getD (rowMaskOff + x) {}
+          yPlane := av1FilterSbColsY yPlane yStride (x * 128) (yPx - starty4 * 4) levelY b4Stride
+            (sby * sbsz - starty4) (x * 32) rm.filterY (x > 0) subW4 starty4 endy4 eLut iLut
+      if lf.levelU != 0 || lf.levelV != 0 then
+        for x in [:sb128w] do
+          if x * 32 < w4 then
+            let subW4 := (Nat.min 32 (w4 - x * 32) + 1) >>> 1
+            if subW4 > 0 then
+              let rm := lfMasks.getD (rowMaskOff + x) {}
+              let (u1, v1) := av1FilterSbColsUv uPlane vPlane uvStride (x * 64) (uvPx - (starty4 >>> 1) * 4)
+                levelUv b4Stride ((sby * sbsz >>> 1) - (starty4 >>> 1)) (x * 16) rm.filterUv
+                (x > 0) subW4 (starty4 >>> 1) uvEndy4 eLut iLut
+              uPlane := u1; vPlane := v1
+      let haveTop := sby > 0
+      for x in [:sb128w] do
+        if x * 32 < w4 then
+          let subW4 := Nat.min 32 (w4 - x * 32)
+          let rm := lfMasks.getD (rowMaskOff + x) {}
+          yPlane := av1FilterSbRowsY yPlane yStride (x * 128) (yPx - starty4 * 4) levelY b4Stride
+            (sby * sbsz - starty4) (x * 32) rm.filterY haveTop subW4 starty4 endy4 eLut iLut
+      if lf.levelU != 0 || lf.levelV != 0 then
+        for x in [:sb128w] do
+          if x * 32 < w4 then
+            let subW4 := (Nat.min 32 (w4 - x * 32) + 1) >>> 1
+            if subW4 > 0 then
+              let rm := lfMasks.getD (rowMaskOff + x) {}
+              let (u1, v1) := av1FilterSbRowsUv uPlane vPlane uvStride (x * 64) (uvPx - (starty4 >>> 1) * 4)
+                levelUv b4Stride ((sby * sbsz >>> 1) - (starty4 >>> 1)) (x * 16) rm.filterUv
+                haveTop subW4 (starty4 >>> 1) uvEndy4 eLut iLut
+              uPlane := u1; vPlane := v1
+    if seq.cdef || restorePlanes != 0 then
+      lpfY := av1CopyLpfPlane yPlane yStride lpfY lpfYStride sby sb128 0 lpfYStride h
+      let ch := (h + 1) >>> 1
+      lpfU := av1CopyLpfPlane uPlane uvStride lpfU lpfUvStride sby sb128 1 lpfUvStride ch
+      lpfV := av1CopyLpfPlane vPlane uvStride lpfV lpfUvStride sby sb128 1 lpfUvStride ch
+    if doCdef then
+      let start := sby * sbsz
+      if sby > 0 then
+        let prevMaskOff := ((sby - 1) >>> isSb64) * sb128w
+        let (y1, u1, v1, cy1, cu1, cv1) := av1CdefSbrow hdr yPlane uPlane vPlane yStride uvStride
+          cdefY cdefU cdefV lpfYStride lpfUvStride lfMasks prevMaskOff (start - 2) start bw bh
+        yPlane := y1; uPlane := u1; vPlane := v1; cdefY := cy1; cdefU := cu1; cdefV := cv1
+      let nBlks := sbsz - (if sby + 1 < sbh then 2 else 0)
+      let (y2, u2, v2, cy2, cu2, cv2) := av1CdefSbrow hdr yPlane uPlane vPlane yStride uvStride
+        cdefY cdefU cdefV lpfYStride lpfUvStride lfMasks rowMaskOff start (Nat.min (start + nBlks) bh) bw bh
+      yPlane := y2; uPlane := u2; vPlane := v2; cdefY := cy2; cdefU := cu2; cdefV := cv2
+    if restorePlanes != 0 then
+      let notLast := if sby + 1 < sbh then 1 else 0
+      let offsetY := if sby != 0 then 8 else 0
+      let w1 := hdr.width1
+      if rest.lrType.getD 0 0 != 0 then
+        let rowHY := Nat.min (((sby + 1) <<< (6 + sb128)) - 8 * notLast) h
+        let ySt := (sby <<< (6 + sb128)) - offsetY
+        yPlane := av1LrPlaneSbrow yPlane yStride lpfY lpfYStride lrUnits 0 (rest.unitSize.getD 0 8)
+          ySt w1 h rowHY sby sbh sb128w
+      let cw := (w1 + 1) >>> 1
+      let ch := (h + 1) >>> 1
+      let offsetUv := offsetY >>> 1
+      let rowHUv := Nat.min (((sby + 1) <<< (5 + sb128)) - 4 * notLast) ch
+      let yStUv := (sby <<< (5 + sb128)) - offsetUv
+      if rest.lrType.getD 1 0 != 0 then
+        uPlane := av1LrPlaneSbrow uPlane uvStride lpfU lpfUvStride lrUnits 1 (rest.unitSize.getD 1 7)
+          yStUv cw ch rowHUv sby sbh sb128w
+      if rest.lrType.getD 2 0 != 0 then
+        vPlane := av1LrPlaneSbrow vPlane uvStride lpfV lpfUvStride lrUnits 2 (rest.unitSize.getD 1 7)
+          yStUv cw ch rowHUv sby sbh sb128w
+  return (yPlane, uPlane, vPlane)
 
 end LeanAV.Av1Main
 
