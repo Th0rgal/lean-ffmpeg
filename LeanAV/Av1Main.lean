@@ -1609,19 +1609,26 @@ def getVlc (br : Av1BitReader) : Nat × Av1BitReader := Id.run do
   let (tail, cur2) := cur.getBits nBits
   return (((1 <<< nBits) - 1) + tail, cur2)
 
-def getSubexp (br : Av1BitReader) (refVal n : Nat) : Nat × Av1BitReader := Id.run do
+def av1InvRecenterInt (r : Int) (v : Nat) : Int :=
+  let vn : Int := Int.ofNat v
+  if vn > r * 2 then vn
+  else if (v &&& 1) == 0 then r + Int.ofNat (v >>> 1)
+  else r - Int.ofNat ((v + 1) >>> 1)
+
+def getSubexpSigned (br : Av1BitReader) (refVal : Int) (n : Nat) : Int × Av1BitReader := Id.run do
   let mut cur := br
   let mut v : Nat := 0
   let mut i : Nat := 0
   let k : Nat := 3
+  let nn : Int := Int.ofNat n
   for _ in [:32] do
     let b := if i > 0 then k + i - 1 else k
     if n < v + 3 * (1 <<< b) then
       let (u, next) := cur.getUniform (n - v + 1)
       v := v + u
       cur := next
-      let res := if refVal * 2 <= n then av1InvRecenter refVal v
-                 else n - av1InvRecenter (n - refVal) v
+      let res := if refVal * 2 <= nn then av1InvRecenterInt refVal v
+                 else nn - av1InvRecenterInt (nn - refVal) v
       return (res, cur)
     let (bit, next1) := cur.getBit
     cur := next1
@@ -1629,12 +1636,16 @@ def getSubexp (br : Av1BitReader) (refVal n : Nat) : Nat × Av1BitReader := Id.r
       let (bits, next2) := cur.getBits b
       v := v + bits
       cur := next2
-      let res := if refVal * 2 <= n then av1InvRecenter refVal v
-                 else n - av1InvRecenter (n - refVal) v
+      let res := if refVal * 2 <= nn then av1InvRecenterInt refVal v
+                 else nn - av1InvRecenterInt (nn - refVal) v
       return (res, cur)
     v := v + (1 <<< b)
     i := i + 1
   return (0, { cur with err := true })
+
+def getSubexp (br : Av1BitReader) (refVal n : Nat) : Nat × Av1BitReader :=
+  let (res, br') := getSubexpSigned br (Int.ofNat refVal) n
+  (res.toNat, br')
 
 def byteAlign (br : Av1BitReader) : Av1BitReader :=
   let rem := br.bitPos &&& 7
@@ -1711,6 +1722,32 @@ def putVlc (bw : Av1BitWriter) (v : Nat) : Av1BitWriter := Id.run do
   if n > 0 then
     cur := cur.putBits (v1 - (1 <<< n)) n
   return cur
+
+def putSubexpSigned (bw : Av1BitWriter) (refVal : Int) (v : Int) (n : Nat) : Av1BitWriter :=
+  let nn : Int := Int.ofNat n
+  let raw : Nat :=
+    if refVal * 2 <= nn then av1RecenterNonneg refVal.toNat v.toNat
+    else av1RecenterNonneg (nn - refVal).toNat (nn - v).toNat
+  Id.run do
+    let mut cur := bw
+    let mut acc : Nat := 0
+    let mut i : Nat := 0
+    let k : Nat := 3
+    for _ in [:32] do
+      let b := if i > 0 then k + i - 1 else k
+      if n < acc + 3 * (1 <<< b) then
+        return cur.putUniform (raw - acc) (n - acc + 1)
+      let span := 1 <<< b
+      if raw < acc + span then
+        cur := cur.putBit 0
+        return cur.putBits (raw - acc) b
+      cur := cur.putBit 1
+      acc := acc + span
+      i := i + 1
+    return cur
+
+def putSubexp (bw : Av1BitWriter) (refVal v n : Nat) : Av1BitWriter :=
+  putSubexpSigned bw (Int.ofNat refVal) (Int.ofNat v) n
 
 def byteAlignZero (bw : Av1BitWriter) : Av1BitWriter := Id.run do
   let mut arr := bw.bits
@@ -2042,6 +2079,2639 @@ def encodeHiTok (enc : Av1MsacEncoder) (tok : Nat) (cdf : Array Nat) (base : Nat
   return cur.encodeSymbolAdapt (Nat.min rem 3) cdf' base 3
 
 end Av1MsacEncoder
+
+@[inline] def av1ObuSeqHdr : Nat := 1
+@[inline] def av1ObuTd : Nat := 2
+@[inline] def av1ObuFrameHdr : Nat := 3
+@[inline] def av1ObuTileGrp : Nat := 4
+@[inline] def av1ObuMetadata : Nat := 5
+@[inline] def av1ObuFrame : Nat := 6
+@[inline] def av1ObuRedundantFrameHdr : Nat := 7
+@[inline] def av1ObuPadding : Nat := 15
+
+@[inline] def av1FrameKey : Nat := 0
+@[inline] def av1FrameInter : Nat := 1
+@[inline] def av1FrameIntra : Nat := 2
+@[inline] def av1FrameSwitch : Nat := 3
+
+@[inline] def av1PrimaryRefNone : Nat := 7
+@[inline] def av1Adaptive : Nat := 2
+
+def av1EncodeLeb128 (val : Nat) : ByteArray := Id.run do
+  if val == 0 then
+    return ByteArray.mk #[0]
+  let mut out := ByteArray.emptyWithCapacity 5
+  let mut v := val
+  for _ in [:8] do
+    if v == 0 then
+      return out
+    let b := v &&& 0x7F
+    v := v >>> 7
+    let byteVal : UInt8 := (if v > 0 then b ||| 0x80 else b).toUInt8
+    out := out.push byteVal
+  return out
+
+def av1DecodeLeb128 (data : ByteArray) (pos : Nat) : Option (Nat × Nat) := Id.run do
+  let mut val : Nat := 0
+  for i in [:8] do
+    if pos + i >= data.size then
+      return none
+    let b := (data.get! (pos + i)).toNat
+    val := val ||| ((b &&& 0x7F) <<< (7 * i))
+    if (b &&& 0x80) == 0 then
+      if val >= (1 <<< 32) then
+        return none
+      return some (val, pos + i + 1)
+  return none
+
+def av1WrapObu (obuType : Nat) (payload : ByteArray) (hasSize : Bool := true) : ByteArray :=
+  let hdrByte : UInt8 := (((obuType &&& 0xF) <<< 3) ||| (if hasSize then 0x02 else 0x00)).toUInt8
+  let head := ByteArray.mk #[hdrByte]
+  if hasSize then
+    head ++ av1EncodeLeb128 payload.size ++ payload
+  else
+    head ++ payload
+
+structure Av1ObuPacket where
+  obuType    : Nat
+  temporalId : Nat
+  spatialId  : Nat
+  hasSize    : Bool
+  payload    : ByteArray
+  deriving Inhabited, DecidableEq
+
+def av1ParseObus (data : ByteArray) : Option (Array Av1ObuPacket) := Id.run do
+  let mut obus : Array Av1ObuPacket := #[]
+  let mut pos : Nat := 0
+  let n := data.size
+  while pos < n do
+    let hdr := (data.get! pos).toNat
+    pos := pos + 1
+    if (hdr &&& 0x80) != 0 then
+      return none
+    let obuType := (hdr >>> 3) &&& 0xF
+    let hasExt := ((hdr >>> 2) &&& 1) != 0
+    let hasSize := ((hdr >>> 1) &&& 1) != 0
+    if (hdr &&& 1) != 0 then
+      return none
+    let mut temporalId : Nat := 0
+    let mut spatialId : Nat := 0
+    if hasExt then
+      if pos >= n then
+        return none
+      let ext := (data.get! pos).toNat
+      pos := pos + 1
+      temporalId := (ext >>> 5) &&& 7
+      spatialId := (ext >>> 3) &&& 3
+      if (ext &&& 7) != 0 then
+        return none
+    if hasSize then
+      match av1DecodeLeb128 data pos with
+      | none => return none
+      | some (sz, nextPos) =>
+        if nextPos + sz > n then
+          return none
+        let payload := data.extract nextPos (nextPos + sz)
+        pos := nextPos + sz
+        obus := obus.push { obuType := obuType, temporalId := temporalId, spatialId := spatialId, hasSize := true, payload := payload }
+    else
+      let payload := data.extract pos n
+      pos := n
+      obus := obus.push { obuType := obuType, temporalId := temporalId, spatialId := spatialId, hasSize := false, payload := payload }
+  return some obus
+
+def av1GetPocDiff (orderHintNBits : Nat) (poc0 poc1 : Int) : Int :=
+  if orderHintNBits == 0 then 0
+  else
+    let mask : Int := Int.ofNat (1 <<< (orderHintNBits - 1))
+    let full : Int := mask * 2
+    let rem : Int := ((poc0 - poc1) % full + full) % full
+    if rem >= mask then rem - full else rem
+
+def av1TileLog2 (sz tgt : Nat) : Nat :=
+  let rec go (fuel k : Nat) : Nat :=
+    match fuel with
+    | 0 => k
+    | f + 1 => if (sz <<< k) < tgt then go f (k + 1) else k
+  go 32 0
+
+structure Av1OperatingPoint where
+  idc                      : Nat := 0
+  majorLevel               : Nat := 0
+  minorLevel               : Nat := 0
+  tier                     : Nat := 0
+  decoderModelParamPresent : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1SeqHdr where
+  profile                         : Nat := 0
+  stillPicture                    : Bool := false
+  reducedStillPictureHeader       : Bool := false
+  timingInfoPresent               : Bool := false
+  decoderModelInfoPresent         : Bool := false
+  equalPictureInterval            : Bool := false
+  encoderDecoderBufferDelayLength : Nat := 0
+  bufferRemovalDelayLength        : Nat := 0
+  framePresentationDelayLength    : Nat := 0
+  displayModelInfoPresent         : Bool := false
+  numOperatingPoints              : Nat := 1
+  operatingPoints                 : Array Av1OperatingPoint := #[]
+  widthNBits                      : Nat := 1
+  heightNBits                     : Nat := 1
+  maxWidth                        : Nat := 1
+  maxHeight                       : Nat := 1
+  frameIdNumbersPresent           : Bool := false
+  deltaFrameIdNBits               : Nat := 0
+  frameIdNBits                    : Nat := 0
+  sb128                           : Nat := 0
+  filterIntra                     : Bool := false
+  intraEdgeFilter                 : Bool := false
+  interIntra                      : Bool := false
+  maskedCompound                  : Bool := false
+  warpedMotion                    : Bool := false
+  dualFilter                      : Bool := false
+  orderHint                       : Bool := false
+  jntComp                         : Bool := false
+  refFrameMvs                     : Bool := false
+  screenContentTools              : Nat := 0
+  forceIntegerMv                  : Nat := 0
+  orderHintNBits                  : Nat := 0
+  superRes                        : Bool := false
+  cdef                            : Bool := false
+  restoration                     : Bool := false
+  hbd                             : Nat := 0
+  monochrome                      : Bool := false
+  colorDescriptionPresent         : Bool := false
+  pri                             : Nat := 2
+  trc                             : Nat := 2
+  mtrx                            : Nat := 2
+  colorRange                      : Nat := 0
+  ssHor                           : Nat := 1
+  ssVer                           : Nat := 1
+  layout                          : Nat := 1
+  chr                             : Nat := 0
+  separateUvDeltaQ                : Bool := false
+  filmGrainPresent                : Bool := false
+  isMain8Bit420                   : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+def av1ParseSeqHdr (payload : ByteArray) (strict : Bool := true) : Option Av1SeqHdr := Id.run do
+  if payload.isEmpty then
+    return none
+  let mut gb := Av1BitReader.init payload
+  let (profile, gb1) := gb.getBits 3; gb := gb1
+  let (spBit, gb2) := gb.getBit; gb := gb2
+  let (rspBit, gb3) := gb.getBit; gb := gb3
+  let stillPicture := spBit != 0
+  let reducedStill := rspBit != 0
+  if profile > 2 then
+    return none
+  if reducedStill && !stillPicture then
+    return none
+  let mut h : Av1SeqHdr := {
+    profile := profile
+    stillPicture := stillPicture
+    reducedStillPictureHeader := reducedStill
+  }
+  if reducedStill then
+    let (maj, gba) := gb.getBits 3; gb := gba
+    let (mnr, gbb) := gb.getBits 2; gb := gbb
+    h := { h with operatingPoints := #[{ idc := 0, majorLevel := maj, minorLevel := mnr, tier := 0, decoderModelParamPresent := false }] }
+  else
+    let (tip, gba) := gb.getBit; gb := gba
+    h := { h with timingInfoPresent := tip != 0 }
+    if h.timingInfoPresent then
+      let (numUnits, gbb) := gb.getBits 32; gb := gbb
+      let (timeScale, gbc) := gb.getBits 32; gb := gbc
+      if strict && (numUnits == 0 || timeScale == 0) then
+        return none
+      let (epi, gbd) := gb.getBit; gb := gbd
+      h := { h with equalPictureInterval := epi != 0 }
+      if h.equalPictureInterval then
+        let (vlcVal, gbe) := gb.getVlc; gb := gbe
+        if vlcVal == 0xFFFFFFFF then
+          return none
+      let (dmip, gbf) := gb.getBit; gb := gbf
+      h := { h with decoderModelInfoPresent := dmip != 0 }
+      if h.decoderModelInfoPresent then
+        let (edbdl, gbg) := gb.getBits 5; gb := gbg
+        let (decTick, gbh) := gb.getBits 32; gb := gbh
+        if strict && decTick == 0 then
+          return none
+        let (brdl, gbi) := gb.getBits 5; gb := gbi
+        let (fpdl, gbj) := gb.getBits 5; gb := gbj
+        h := { h with
+          encoderDecoderBufferDelayLength := edbdl + 1
+          bufferRemovalDelayLength := brdl + 1
+          framePresentationDelayLength := fpdl + 1
+        }
+    let (dispMip, gbk) := gb.getBit; gb := gbk
+    let (nopM1, gbl) := gb.getBits 5; gb := gbl
+    let nop := nopM1 + 1
+    let mut ops : Array Av1OperatingPoint := Array.mkEmpty nop
+    for _ in [:nop] do
+      let (idc, gbm) := gb.getBits 12; gb := gbm
+      if idc != 0 && ((idc &&& 0xFF) == 0 || (idc &&& 0xF00) == 0) then
+        return none
+      let (majM2, gbn) := gb.getBits 3; gb := gbn
+      let maj := 2 + majM2
+      let (mnr, gbo) := gb.getBits 2; gb := gbo
+      let mut tier : Nat := 0
+      if maj > 3 then
+        let (tb, gbp) := gb.getBit; gb := gbp
+        tier := tb
+      let mut dmp := false
+      if h.decoderModelInfoPresent then
+        let (dmpB, gbq) := gb.getBit; gb := gbq
+        dmp := dmpB != 0
+        if dmp then
+          let (_, gbr1) := gb.getBits h.encoderDecoderBufferDelayLength; gb := gbr1
+          let (_, gbr2) := gb.getBits h.encoderDecoderBufferDelayLength; gb := gbr2
+          let (_, gbr3) := gb.getBit; gb := gbr3
+      if dispMip != 0 then
+        let (dp, gbs) := gb.getBit; gb := gbs
+        if dp != 0 then
+          let (_, gbt) := gb.getBits 4; gb := gbt
+      ops := ops.push { idc := idc, majorLevel := maj, minorLevel := mnr, tier := tier, decoderModelParamPresent := dmp }
+    h := { h with displayModelInfoPresent := dispMip != 0, numOperatingPoints := nop, operatingPoints := ops }
+  let (wnb, gb4) := gb.getBits 4; gb := gb4
+  let (hnb, gb5) := gb.getBits 4; gb := gb5
+  let widthNBits := wnb + 1
+  let heightNBits := hnb + 1
+  let (mwM1, gb6) := gb.getBits widthNBits; gb := gb6
+  let (mhM1, gb7) := gb.getBits heightNBits; gb := gb7
+  h := { h with widthNBits := widthNBits, heightNBits := heightNBits, maxWidth := mwM1 + 1, maxHeight := mhM1 + 1 }
+  if !h.reducedStillPictureHeader then
+    let (fidp, gb8) := gb.getBit; gb := gb8
+    if fidp != 0 then
+      let (dfid, gb9) := gb.getBits 4; gb := gb9
+      let (fidAdd, gb10) := gb.getBits 3; gb := gb10
+      let deltaBits := dfid + 2
+      h := { h with frameIdNumbersPresent := true, deltaFrameIdNBits := deltaBits, frameIdNBits := fidAdd + deltaBits + 1 }
+  let (sb128, gb11) := gb.getBit; gb := gb11
+  let (fi, gb12) := gb.getBit; gb := gb12
+  let (ief, gb13) := gb.getBit; gb := gb13
+  h := { h with sb128 := sb128, filterIntra := fi != 0, intraEdgeFilter := ief != 0 }
+  if h.reducedStillPictureHeader then
+    h := { h with screenContentTools := av1Adaptive, forceIntegerMv := av1Adaptive }
+  else
+    let (ii, gba) := gb.getBit; gb := gba
+    let (mc, gbb) := gb.getBit; gb := gbb
+    let (wm, gbc) := gb.getBit; gb := gbc
+    let (df, gbd) := gb.getBit; gb := gbd
+    let (oh, gbe) := gb.getBit; gb := gbe
+    let mut jc := false
+    let mut rfm := false
+    if oh != 0 then
+      let (jcb, gbf) := gb.getBit; gb := gbf
+      let (rfmb, gbg) := gb.getBit; gb := gbg
+      jc := jcb != 0
+      rfm := rfmb != 0
+    let (chooseSct, gbh) := gb.getBit; gb := gbh
+    let mut sct : Nat := av1Adaptive
+    if chooseSct == 0 then
+      let (sctB, gbi) := gb.getBit; gb := gbi
+      sct := sctB
+    let mut fimv : Nat := av1Adaptive
+    if sct != 0 then
+      let (chooseImv, gbj) := gb.getBit; gb := gbj
+      if chooseImv == 0 then
+        let (imvB, gbk) := gb.getBit; gb := gbk
+        fimv := imvB
+    let mut ohBits : Nat := 0
+    if oh != 0 then
+      let (ohb, gbl) := gb.getBits 3; gb := gbl
+      ohBits := ohb + 1
+    h := { h with
+      interIntra := ii != 0
+      maskedCompound := mc != 0
+      warpedMotion := wm != 0
+      dualFilter := df != 0
+      orderHint := oh != 0
+      jntComp := jc
+      refFrameMvs := rfm
+      screenContentTools := sct
+      forceIntegerMv := fimv
+      orderHintNBits := ohBits
+    }
+  let (sr, gb14) := gb.getBit; gb := gb14
+  let (cdefB, gb15) := gb.getBit; gb := gb15
+  let (restB, gb16) := gb.getBit; gb := gb16
+  let (hbd0, gb17) := gb.getBit; gb := gb17
+  let mut hbd := hbd0
+  if h.profile == 2 && hbd != 0 then
+    let (hbd1, gb18) := gb.getBit; gb := gb18
+    hbd := hbd + hbd1
+  let mut mono := false
+  if h.profile != 1 then
+    let (mb, gb19) := gb.getBit; gb := gb19
+    mono := mb != 0
+  let (cdp, gb20) := gb.getBit; gb := gb20
+  let mut pri : Nat := 2
+  let mut trc : Nat := 2
+  let mut mtrx : Nat := 2
+  if cdp != 0 then
+    let (p, gb21) := gb.getBits 8; gb := gb21
+    let (t, gb22) := gb.getBits 8; gb := gb22
+    let (m, gb23) := gb.getBits 8; gb := gb23
+    pri := p; trc := t; mtrx := m
+  let mut colorRange : Nat := 0
+  let mut ssHor : Nat := 1
+  let mut ssVer : Nat := 1
+  let mut layout : Nat := 1
+  let mut chr : Nat := 0
+  if mono then
+    let (cr, gb24) := gb.getBit; gb := gb24
+    colorRange := cr; ssHor := 1; ssVer := 1; layout := 0; chr := 0
+  else if pri == 1 && trc == 13 && mtrx == 0 then
+    layout := 3; ssHor := 0; ssVer := 0; colorRange := 1
+    if h.profile != 1 && !(h.profile == 2 && hbd == 2) then
+      return none
+  else
+    let (cr, gb24) := gb.getBit; gb := gb24
+    colorRange := cr
+    if h.profile == 0 then
+      layout := 1; ssHor := 1; ssVer := 1
+    else if h.profile == 1 then
+      layout := 3; ssHor := 0; ssVer := 0
+    else
+      if hbd == 2 then
+        let (sh, gb25) := gb.getBit; gb := gb25
+        ssHor := sh
+        if ssHor != 0 then
+          let (sv, gb26) := gb.getBit; gb := gb26
+          ssVer := sv
+        else
+          ssVer := 0
+      else
+        ssHor := 1; ssVer := 0
+      layout := if ssHor != 0 then (if ssVer != 0 then 1 else 2) else 3
+    if ssHor != 0 && ssVer != 0 then
+      let (chPos, gb27) := gb.getBits 2; gb := gb27
+      chr := chPos
+  if strict && mtrx == 0 && layout != 3 then
+    return none
+  let mut sepUv := false
+  if !mono then
+    let (su, gb28) := gb.getBit; gb := gb28
+    sepUv := su != 0
+  let (fgp, gb29) := gb.getBit; gb := gb29
+  if strict then
+    let (okTrail, gb30) := gb.checkTrailingBits; gb := gb30
+    if !okTrail then
+      return none
+    while gb.bitPos < gb.endIdx * 8 do
+      let (z, gb31) := gb.getBits 8; gb := gb31
+      if z != 0 then
+        return none
+  else if gb.err then
+    return none
+  let isMain8 := h.profile == 0 && hbd == 0 && !mono && ssHor == 1 && ssVer == 1
+  return some { h with
+    superRes := sr != 0
+    cdef := cdefB != 0
+    restoration := restB != 0
+    hbd := hbd
+    monochrome := mono
+    colorDescriptionPresent := cdp != 0
+    pri := pri
+    trc := trc
+    mtrx := mtrx
+    colorRange := colorRange
+    ssHor := ssHor
+    ssVer := ssVer
+    layout := layout
+    chr := chr
+    separateUvDeltaQ := sepUv
+    filmGrainPresent := fgp != 0
+    isMain8Bit420 := isMain8
+  }
+
+structure Av1WmParams where
+  wmType : Nat := 0
+  matrix : Array Int := #[0, 0, 65536, 0, 0, 65536]
+  abcd   : Array Int := #[0, 0, 0, 0]
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1Tiling where
+  uniform    : Bool := true
+  cols       : Nat := 1
+  rows       : Nat := 1
+  log2Cols   : Nat := 0
+  log2Rows   : Nat := 0
+  colStartSb : Array Nat := #[0, 1]
+  rowStartSb : Array Nat := #[0, 1]
+  update     : Nat := 0
+  nBytes     : Nat := 0
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1QuantParams where
+  yac      : Nat := 0
+  ydcDelta : Int := 0
+  udcDelta : Int := 0
+  uacDelta : Int := 0
+  vdcDelta : Int := 0
+  vacDelta : Int := 0
+  qm       : Bool := false
+  qmY      : Nat := 0
+  qmU      : Nat := 0
+  qmV      : Nat := 0
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1SegFeature where
+  deltaQ    : Int := 0
+  deltaLfYV : Int := 0
+  deltaLfYH : Int := 0
+  deltaLfU  : Int := 0
+  deltaLfV  : Int := 0
+  ref       : Int := -1
+  skip      : Bool := false
+  globalmv  : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1Segmentation where
+  enabled         : Bool := false
+  updateMap       : Bool := false
+  temporal        : Bool := false
+  updateData      : Bool := false
+  qidx            : Array Nat := Array.replicate 8 0
+  lossless        : Array Bool := Array.replicate 8 false
+  d               : Array Av1SegFeature := Array.replicate 8 {}
+  lastActiveSegid : Int := -1
+  preskip         : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1DeltaQParams where
+  qPresent  : Bool := false
+  qResLog2  : Nat := 0
+  lfPresent : Bool := false
+  lfResLog2 : Nat := 0
+  lfMulti   : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+def av1DefaultModeDelta : Array Int := #[0, 0]
+def av1DefaultRefDelta : Array Int := #[1, 0, 0, 0, -1, 0, -1, -1]
+
+structure Av1LoopfilterParams where
+  levelY              : Array Nat := #[0, 0]
+  levelU              : Nat := 0
+  levelV              : Nat := 0
+  sharpness           : Nat := 0
+  modeRefDeltaEnabled : Bool := false
+  modeRefDeltaUpdate  : Bool := false
+  modeDelta           : Array Int := av1DefaultModeDelta
+  refDelta            : Array Int := av1DefaultRefDelta
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1CdefParams where
+  damping    : Nat := 3
+  nBits      : Nat := 0
+  yStrength  : Array Nat := Array.replicate 8 0
+  uvStrength : Array Nat := Array.replicate 8 0
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1RestorationParams where
+  lrType   : Array Nat := #[0, 0, 0]
+  unitSize : Array Nat := #[8, 8]
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1FrameHdr where
+  temporalId              : Nat := 0
+  spatialId               : Nat := 0
+  showExistingFrame       : Bool := false
+  existingFrameIdx        : Nat := 0
+  frameType               : Nat := av1FrameKey
+  showFrame               : Bool := true
+  showableFrame           : Bool := false
+  errorResilientMode      : Bool := false
+  disableCdfUpdate        : Bool := false
+  allowScreenContentTools : Bool := false
+  forceIntegerMv          : Bool := false
+  frameId                 : Nat := 0
+  frameSizeOverride       : Bool := false
+  frameOffset             : Nat := 0
+  primaryRefFrame         : Nat := av1PrimaryRefNone
+  refreshFrameFlags       : Nat := 0
+  allowIntrabc            : Bool := false
+  frameRefShortSignaling  : Bool := false
+  refidx                  : Array Nat := Array.replicate 7 0
+  width0                  : Nat := 0
+  width1                  : Nat := 0
+  height                  : Nat := 0
+  renderWidth             : Nat := 0
+  renderHeight            : Nat := 0
+  haveRenderSize          : Bool := false
+  superResEnabled         : Bool := false
+  superResD               : Nat := 8
+  hp                      : Bool := false
+  subpelFilterMode        : Nat := 0
+  switchableMotionMode    : Bool := false
+  useRefFrameMvs          : Bool := false
+  refreshContext          : Bool := false
+  tiling                  : Av1Tiling := {}
+  quant                   : Av1QuantParams := {}
+  delta                   : Av1DeltaQParams := {}
+  allLossless             : Bool := false
+  segmentation            : Av1Segmentation := {}
+  loopfilter              : Av1LoopfilterParams := {}
+  cdef                    : Av1CdefParams := {}
+  restoration             : Av1RestorationParams := {}
+  txfmMode                : Nat := 0
+  switchableCompRefs      : Bool := false
+  skipModeAllowed         : Bool := false
+  skipModeEnabled         : Bool := false
+  skipModeRefs            : Array Nat := #[0, 0]
+  warpMotion              : Bool := false
+  reducedTxtpSet          : Bool := false
+  gmv                     : Array Av1WmParams := Array.replicate 7 {}
+  filmGrainPresent        : Bool := false
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1TmvEntry where
+  mvY : Int := 0
+  mvX : Int := 0
+  ref : Nat := 0
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1RefSlot where
+  hdr    : Av1FrameHdr := {}
+  planes : Array (Array (Array Nat)) := #[]
+  stride : Nat := 0
+  w      : Nat := 0
+  h      : Nat := 0
+  refpoc : Array Nat := Array.replicate 7 0
+  tmvs   : Option (Array (Array (Option Av1TmvEntry))) := none
+  segmap : Option (Array Nat) := none
+  cdf    : Array Nat := #[]
+  deriving Inhabited
+
+private def av1ArithShiftRight (x : Int) (sh : Nat) : Int :=
+  Int.fdiv x (Int.ofNat (1 <<< sh))
+
+private def av1ReadFrameSize (seq : Av1SeqHdr) (hdr0 : Av1FrameHdr) (gb0 : Av1BitReader)
+    (refs : Array (Option Av1RefSlot)) (useRef : Bool) : Option (Av1FrameHdr × Av1BitReader) := Id.run do
+  let mut gb := gb0
+  let mut hdr := hdr0
+  if useRef then
+    for i in [:7] do
+      let (b, gb1) := gb.getBit; gb := gb1
+      if b != 0 then
+        let rIdx := hdr.refidx.getD i 0
+        match refs.getD rIdx none with
+        | none => return none
+        | some refSlot =>
+          let rh := refSlot.hdr
+          let w1 := rh.width1
+          let h1 := rh.height
+          let rw := rh.renderWidth
+          let rht := rh.renderHeight
+          let mut srEnabled := false
+          if seq.superRes then
+            let (srb, gb2) := gb.getBit; gb := gb2
+            srEnabled := srb != 0
+          let mut srD : Nat := 8
+          let mut w0 : Nat := w1
+          if srEnabled then
+            let (db, gb3) := gb.getBits 3; gb := gb3
+            srD := 9 + db
+            w0 := Nat.max ((w1 * 8 + (srD >>> 1)) / srD) (Nat.min 16 w1)
+          hdr := { hdr with
+            width0 := w0, width1 := w1, height := h1,
+            renderWidth := rw, renderHeight := rht,
+            superResEnabled := srEnabled, superResD := srD
+          }
+          return some (hdr, gb)
+  let mut w1 := seq.maxWidth
+  let mut h1 := seq.maxHeight
+  if hdr.frameSizeOverride then
+    let (wm1, gb1) := gb.getBits seq.widthNBits; gb := gb1
+    let (hm1, gb2) := gb.getBits seq.heightNBits; gb := gb2
+    w1 := wm1 + 1
+    h1 := hm1 + 1
+  let mut srEnabled := false
+  if seq.superRes then
+    let (srb, gb3) := gb.getBit; gb := gb3
+    srEnabled := srb != 0
+  let mut srD : Nat := 8
+  let mut w0 : Nat := w1
+  if srEnabled then
+    let (db, gb4) := gb.getBits 3; gb := gb4
+    srD := 9 + db
+    w0 := Nat.max ((w1 * 8 + (srD >>> 1)) / srD) (Nat.min 16 w1)
+  let (hrsB, gb5) := gb.getBit; gb := gb5
+  let hrs := hrsB != 0
+  let mut rw := w1
+  let mut rht := h1
+  if hrs then
+    let (rwm1, gb6) := gb.getBits 16; gb := gb6
+    let (rhm1, gb7) := gb.getBits 16; gb := gb7
+    rw := rwm1 + 1
+    rht := rhm1 + 1
+  hdr := { hdr with
+    width0 := w0, width1 := w1, height := h1,
+    haveRenderSize := hrs, renderWidth := rw, renderHeight := rht,
+    superResEnabled := srEnabled, superResD := srD
+  }
+  return some (hdr, gb)
+
+private def av1ParseTiling (hdr : Av1FrameHdr) (seq : Av1SeqHdr) (gb0 : Av1BitReader) :
+    Option (Av1Tiling × Av1BitReader) := Id.run do
+  let mut gb := gb0
+  let sbszMin1 := (64 <<< seq.sb128) - 1
+  let sbszLog2 := 6 + seq.sb128
+  let sbw := (hdr.width0 + sbszMin1) >>> sbszLog2
+  let sbh := (hdr.height + sbszMin1) >>> sbszLog2
+  let maxTileWidthSb := 4096 >>> sbszLog2
+  let maxTileAreaSb := (4096 * 2304) >>> (2 * sbszLog2)
+  let minLog2Cols := av1TileLog2 maxTileWidthSb sbw
+  let maxLog2Cols := av1TileLog2 1 (Nat.min sbw 64)
+  let maxLog2Rows := av1TileLog2 1 (Nat.min sbh 64)
+  let minLog2Tiles := Nat.max (av1TileLog2 maxTileAreaSb (sbw * sbh)) minLog2Cols
+  let (uniB, gb1) := gb.getBit; gb := gb1
+  let uniform := uniB != 0
+  if uniform then
+    let mut log2Cols := minLog2Cols
+    while log2Cols < maxLog2Cols do
+      let (more, gb2) := gb.getBit; gb := gb2
+      if more == 0 then
+        break
+      log2Cols := log2Cols + 1
+    let tileW := 1 + ((sbw - 1) >>> log2Cols)
+    let mut colStart : Array Nat := #[]
+    let mut sbx : Nat := 0
+    while sbx < sbw do
+      colStart := colStart.push sbx
+      sbx := sbx + tileW
+    let cols := colStart.size
+    let minLog2Rows := if minLog2Tiles > log2Cols then minLog2Tiles - log2Cols else 0
+    let mut log2Rows := minLog2Rows
+    while log2Rows < maxLog2Rows do
+      let (more, gb3) := gb.getBit; gb := gb3
+      if more == 0 then
+        break
+      log2Rows := log2Rows + 1
+    let tileH := 1 + ((sbh - 1) >>> log2Rows)
+    let mut rowStart : Array Nat := #[]
+    let mut sby : Nat := 0
+    while sby < sbh do
+      rowStart := rowStart.push sby
+      sby := sby + tileH
+    let rows := rowStart.size
+    colStart := colStart.push sbw
+    rowStart := rowStart.push sbh
+    let mut update : Nat := 0
+    let mut nBytes : Nat := 0
+    if log2Cols != 0 || log2Rows != 0 then
+      let (upd, gb4) := gb.getBits (log2Cols + log2Rows); gb := gb4
+      if upd >= cols * rows then
+        return none
+      let (nb, gb5) := gb.getBits 2; gb := gb5
+      update := upd
+      nBytes := nb + 1
+    let til : Av1Tiling := {
+      uniform := true, cols := cols, rows := rows, log2Cols := log2Cols, log2Rows := log2Rows,
+      colStartSb := colStart, rowStartSb := rowStart, update := update, nBytes := nBytes
+    }
+    return some (til, gb)
+  else
+    let mut colStart : Array Nat := #[]
+    let mut widest : Nat := 0
+    let mut mArea : Nat := sbw * sbh
+    let mut sbx : Nat := 0
+    while sbx < sbw && colStart.size < 64 do
+      let twSb := Nat.min (sbw - sbx) maxTileWidthSb
+      let mut tw : Nat := 1
+      if twSb > 1 then
+        let (u, gb2) := gb.getUniform twSb; gb := gb2
+        tw := 1 + u
+      colStart := colStart.push sbx
+      sbx := sbx + tw
+      if tw > widest then widest := tw
+    let cols := colStart.size
+    let log2Cols := av1TileLog2 1 cols
+    if minLog2Tiles != 0 then
+      mArea := mArea >>> (minLog2Tiles + 1)
+    let maxThSb := Nat.max (mArea / Nat.max widest 1) 1
+    let mut rowStart : Array Nat := #[]
+    let mut sby : Nat := 0
+    while sby < sbh && rowStart.size < 64 do
+      let thSb := Nat.min (sbh - sby) maxThSb
+      let mut th : Nat := 1
+      if thSb > 1 then
+        let (u, gb3) := gb.getUniform thSb; gb := gb3
+        th := 1 + u
+      rowStart := rowStart.push sby
+      sby := sby + th
+    let rows := rowStart.size
+    let log2Rows := av1TileLog2 1 rows
+    colStart := colStart.push sbw
+    rowStart := rowStart.push sbh
+    let mut update : Nat := 0
+    let mut nBytes : Nat := 0
+    if log2Cols != 0 || log2Rows != 0 then
+      let (upd, gb4) := gb.getBits (log2Cols + log2Rows); gb := gb4
+      if upd >= cols * rows then
+        return none
+      let (nb, gb5) := gb.getBits 2; gb := gb5
+      update := upd
+      nBytes := nb + 1
+    let til : Av1Tiling := {
+      uniform := false, cols := cols, rows := rows, log2Cols := log2Cols, log2Rows := log2Rows,
+      colStartSb := colStart, rowStartSb := rowStart, update := update, nBytes := nBytes
+    }
+    return some (til, gb)
+
+private def av1ParseQuant (seq : Av1SeqHdr) (gb0 : Av1BitReader) : Av1QuantParams × Av1BitReader := Id.run do
+  let mut gb := gb0
+  let (yac, gb1) := gb.getBits 8; gb := gb1
+  let (ydcP, gb2) := gb.getBit; gb := gb2
+  let mut ydcDelta : Int := 0
+  if ydcP != 0 then
+    let (v, gb3) := gb.getSBits 7; gb := gb3
+    ydcDelta := v
+  let mut udcDelta : Int := 0
+  let mut uacDelta : Int := 0
+  let mut vdcDelta : Int := 0
+  let mut vacDelta : Int := 0
+  if !seq.monochrome then
+    let mut diffUv := false
+    if seq.separateUvDeltaQ then
+      let (du, gb4) := gb.getBit; gb := gb4
+      diffUv := du != 0
+    let (udcP, gb5) := gb.getBit; gb := gb5
+    if udcP != 0 then
+      let (v, gb6) := gb.getSBits 7; gb := gb6
+      udcDelta := v
+    let (uacP, gb7) := gb.getBit; gb := gb7
+    if uacP != 0 then
+      let (v, gb8) := gb.getSBits 7; gb := gb8
+      uacDelta := v
+    if diffUv then
+      let (vdcP, gb9) := gb.getBit; gb := gb9
+      if vdcP != 0 then
+        let (v, gb10) := gb.getSBits 7; gb := gb10
+        vdcDelta := v
+      let (vacP, gb11) := gb.getBit; gb := gb11
+      if vacP != 0 then
+        let (v, gb12) := gb.getSBits 7; gb := gb12
+        vacDelta := v
+    else
+      vdcDelta := udcDelta
+      vacDelta := uacDelta
+  let (qmB, gb13) := gb.getBit; gb := gb13
+  let qm := qmB != 0
+  let mut qmY : Nat := 0
+  let mut qmU : Nat := 0
+  let mut qmV : Nat := 0
+  if qm then
+    let (qy, gb14) := gb.getBits 4; gb := gb14
+    let (qu, gb15) := gb.getBits 4; gb := gb15
+    qmY := qy; qmU := qu
+    if seq.separateUvDeltaQ then
+      let (qv, gb16) := gb.getBits 4; gb := gb16
+      qmV := qv
+    else
+      qmV := qu
+  let qp : Av1QuantParams := {
+    yac := yac, ydcDelta := ydcDelta, udcDelta := udcDelta, uacDelta := uacDelta,
+    vdcDelta := vdcDelta, vacDelta := vacDelta, qm := qm, qmY := qmY, qmU := qmU, qmV := qmV
+  }
+  return (qp, gb)
+
+private def av1ReadSegFeature (gb0 : Av1BitReader) : Option (Av1SegFeature × Int × Bool × Av1BitReader) := Id.run do
+  let mut gb := gb0
+  let mut s : Av1SegFeature := {}
+  let mut lastActive : Int := -1
+  let mut preskip := false
+  let (dqP, gb1) := gb.getBit; gb := gb1
+  if dqP != 0 then
+    let (v, gb2) := gb.getSBits 9; gb := gb2
+    s := { s with deltaQ := v }
+    lastActive := 0
+  let (dyvP, gb3) := gb.getBit; gb := gb3
+  if dyvP != 0 then
+    let (v, gb4) := gb.getSBits 7; gb := gb4
+    s := { s with deltaLfYV := v }
+    lastActive := 0
+  let (dyhP, gb5) := gb.getBit; gb := gb5
+  if dyhP != 0 then
+    let (v, gb6) := gb.getSBits 7; gb := gb6
+    s := { s with deltaLfYH := v }
+    lastActive := 0
+  let (duP, gb7) := gb.getBit; gb := gb7
+  if duP != 0 then
+    let (v, gb8) := gb.getSBits 7; gb := gb8
+    s := { s with deltaLfU := v }
+    lastActive := 0
+  let (dvP, gb9) := gb.getBit; gb := gb9
+  if dvP != 0 then
+    let (v, gb10) := gb.getSBits 7; gb := gb10
+    s := { s with deltaLfV := v }
+    lastActive := 0
+  let (refP, gb11) := gb.getBit; gb := gb11
+  if refP != 0 then
+    let (r, gb12) := gb.getBits 3; gb := gb12
+    s := { s with ref := Int.ofNat r }
+    lastActive := 0
+    preskip := true
+  else
+    s := { s with ref := -1 }
+  let (skB, gb13) := gb.getBit; gb := gb13
+  s := { s with skip := skB != 0 }
+  if s.skip then
+    lastActive := 0
+    preskip := true
+  let (gmB, gb14) := gb.getBit; gb := gb14
+  s := { s with globalmv := gmB != 0 }
+  if s.globalmv then
+    lastActive := 0
+    preskip := true
+  return some (s, lastActive, preskip, gb)
+
+private def av1ShortSignalingRefIdx (seq : Av1SeqHdr) (frameOffset : Nat) (r0 r3 : Nat)
+    (refs : Array (Option Av1RefSlot)) : Option (Array Nat) := Id.run do
+  let mut fo : Array Int := Array.replicate 8 0
+  let mut earliestRef : Nat := 0
+  let mut earliestOff : Int := 1 <<< 30
+  for i in [:8] do
+    match refs.getD i none with
+    | none => return none
+    | some slot =>
+      let diff := av1GetPocDiff seq.orderHintNBits (Int.ofNat slot.hdr.frameOffset) (Int.ofNat frameOffset)
+      fo := fo.set! i diff
+      if diff < earliestOff then
+        earliestOff := diff
+        earliestRef := i
+  let usedMark : Int := -(Int.ofNat (1 <<< 31))
+  let toU32 (v : Int) : Nat :=
+    if v >= 0 then v.toNat % 0x100000000
+    else ((v % 0x100000000 + 0x100000000) % 0x100000000).toNat
+  fo := fo.set! r0 usedMark
+  fo := fo.set! r3 usedMark
+  let mut refidxOut : Array Int := #[(Int.ofNat r0), -1, -1, (Int.ofNat r3), -1, -1, -1]
+  let mut r6 : Int := -1
+  let mut latestOff : Int := 0
+  for i in [:8] do
+    let v := fo.getD i usedMark
+    if v >= latestOff then
+      latestOff := v
+      r6 := Int.ofNat i
+  if r6 >= 0 then
+    fo := fo.set! r6.toNat usedMark
+  refidxOut := refidxOut.set! 6 r6
+  for idx in [4:6] do
+    let mut eU : Nat := 0xFF
+    let mut chosen : Int := -1
+    for j in [:8] do
+      let hu := toU32 (fo.getD j usedMark)
+      if hu < eU then
+        eU := hu
+        chosen := Int.ofNat j
+    if chosen >= 0 then
+      fo := fo.set! chosen.toNat usedMark
+    refidxOut := refidxOut.set! idx chosen
+  for idx in [1:7] do
+    let cur := refidxOut.getD idx (-1)
+    if cur < 0 then
+      let mut lU : Nat := 0xFFFFFF00
+      let mut chosen : Int := -1
+      for j in [:8] do
+        let hu := toU32 (fo.getD j usedMark)
+        if hu >= lU then
+          lU := hu
+          chosen := Int.ofNat j
+      if chosen >= 0 then
+        fo := fo.set! chosen.toNat usedMark
+      let finalIdx := if chosen >= 0 then chosen.toNat else earliestRef
+      refidxOut := refidxOut.set! idx (Int.ofNat finalIdx)
+  let mut res : Array Nat := Array.mkEmpty 7
+  for idx in [:7] do
+    let v := refidxOut.getD idx 0
+    res := res.push (if v >= 0 then v.toNat else earliestRef)
+  return some res
+
+def av1ParseFrameHdr (seq : Av1SeqHdr) (gb0 : Av1BitReader) (refs : Array (Option Av1RefSlot))
+    (temporalId : Nat := 0) (spatialId : Nat := 0) : Option (Av1FrameHdr × Av1BitReader) := Id.run do
+  let mut gb := gb0
+  let mut showExisting := false
+  if !seq.reducedStillPictureHeader then
+    let (seB, gb1) := gb.getBit; gb := gb1
+    showExisting := seB != 0
+  let mut hdr : Av1FrameHdr := {
+    temporalId := temporalId
+    spatialId := spatialId
+    showExistingFrame := showExisting
+  }
+  if showExisting then
+    let (efIdx, gb1) := gb.getBits 3; gb := gb1
+    hdr := { hdr with existingFrameIdx := efIdx }
+    if seq.decoderModelInfoPresent && !seq.equalPictureInterval then
+      let (_, gb2) := gb.getBits seq.framePresentationDelayLength; gb := gb2
+    if seq.frameIdNumbersPresent then
+      let (fid, gb3) := gb.getBits seq.frameIdNBits; gb := gb3
+      hdr := { hdr with frameId := fid }
+      match refs.getD efIdx none with
+      | none => return none
+      | some rSlot =>
+        if rSlot.hdr.frameId != fid then
+          return none
+    if gb.err then return none else return some (hdr, gb)
+  let mut frameType : Nat := av1FrameKey
+  let mut showFrame := true
+  if !seq.reducedStillPictureHeader then
+    let (ft, gb1) := gb.getBits 2; gb := gb1
+    let (sf, gb2) := gb.getBit; gb := gb2
+    frameType := ft
+    showFrame := sf != 0
+  let mut showableFrame := false
+  if showFrame then
+    if seq.decoderModelInfoPresent && !seq.equalPictureInterval then
+      let (_, gb3) := gb.getBits seq.framePresentationDelayLength; gb := gb3
+    showableFrame := frameType != av1FrameKey
+  else
+    let (shb, gb3) := gb.getBit; gb := gb3
+    showableFrame := shb != 0
+  let mut errRes := (frameType == av1FrameKey && showFrame) || frameType == av1FrameSwitch || seq.reducedStillPictureHeader
+  if !errRes then
+    let (erb, gb4) := gb.getBit; gb := gb4
+    errRes := erb != 0
+  let (dcu, gb5) := gb.getBit; gb := gb5
+  let disableCdfUpdate := dcu != 0
+  let mut allowSct := seq.screenContentTools != 0
+  if seq.screenContentTools == av1Adaptive then
+    let (sctB, gb6) := gb.getBit; gb := gb6
+    allowSct := sctB != 0
+  let mut forceIntMv := false
+  if allowSct then
+    if seq.forceIntegerMv == av1Adaptive then
+      let (fimB, gb7) := gb.getBit; gb := gb7
+      forceIntMv := fimB != 0
+    else
+      forceIntMv := seq.forceIntegerMv != 0
+  let isKeyOrIntra := frameType == av1FrameKey || frameType == av1FrameIntra
+  let isInterOrSwitch := frameType == av1FrameInter || frameType == av1FrameSwitch
+  if isKeyOrIntra then
+    forceIntMv := true
+  let mut frameId : Nat := 0
+  if seq.frameIdNumbersPresent then
+    let (fid, gb8) := gb.getBits seq.frameIdNBits; gb := gb8
+    frameId := fid
+  let mut frameSizeOverride := false
+  if !seq.reducedStillPictureHeader then
+    if frameType == av1FrameSwitch then
+      frameSizeOverride := true
+    else
+      let (fso, gb9) := gb.getBit; gb := gb9
+      frameSizeOverride := fso != 0
+  let mut frameOffset : Nat := 0
+  if seq.orderHint then
+    let (foff, gb10) := gb.getBits seq.orderHintNBits; gb := gb10
+    frameOffset := foff
+  let mut primaryRef : Nat := av1PrimaryRefNone
+  if !errRes && isInterOrSwitch then
+    let (pr, gb11) := gb.getBits 3; gb := gb11
+    primaryRef := pr
+  if seq.decoderModelInfoPresent then
+    let (bdp, gb12) := gb.getBit; gb := gb12
+    if bdp != 0 then
+      for op in seq.operatingPoints do
+        if op.decoderModelParamPresent then
+          let inT := ((op.idc >>> temporalId) &&& 1) != 0
+          let inS := ((op.idc >>> (spatialId + 8)) &&& 1) != 0
+          if op.idc == 0 || (inT && inS) then
+            let (_, gb13) := gb.getBits seq.bufferRemovalDelayLength; gb := gb13
+  hdr := { hdr with
+    frameType := frameType
+    showFrame := showFrame
+    showableFrame := showableFrame
+    errorResilientMode := errRes
+    disableCdfUpdate := disableCdfUpdate
+    allowScreenContentTools := allowSct
+    forceIntegerMv := forceIntMv
+    frameId := frameId
+    frameSizeOverride := frameSizeOverride
+    frameOffset := frameOffset
+    primaryRefFrame := primaryRef
+  }
+  if isKeyOrIntra then
+    let mut rff : Nat := 0xFF
+    if !(frameType == av1FrameKey && showFrame) then
+      let (r, gb14) := gb.getBits 8; gb := gb14
+      rff := r
+    if rff != 0xFF && errRes && seq.orderHint then
+      for _ in [:8] do
+        let (_, gb15) := gb.getBits seq.orderHintNBits; gb := gb15
+    if frameType == av1FrameIntra && rff == 0xFF then
+      return none
+    hdr := { hdr with refreshFrameFlags := rff }
+    match av1ReadFrameSize seq hdr gb refs false with
+    | none => return none
+    | some (hdr1, gb16) =>
+      hdr := hdr1; gb := gb16
+    if hdr.allowScreenContentTools && !hdr.superResEnabled then
+      let (ibc, gb17) := gb.getBit; gb := gb17
+      hdr := { hdr with allowIntrabc := ibc != 0 }
+  else
+    let mut rff : Nat := 0xFF
+    if frameType != av1FrameSwitch then
+      let (r, gb14) := gb.getBits 8; gb := gb14
+      rff := r
+    if errRes && seq.orderHint then
+      for _ in [:8] do
+        let (_, gb15) := gb.getBits seq.orderHintNBits; gb := gb15
+    let mut shortSig := false
+    let mut refidx := hdr.refidx
+    if seq.orderHint then
+      let (ssB, gb16) := gb.getBit; gb := gb16
+      shortSig := ssB != 0
+      if shortSig then
+        let (r0, gb17) := gb.getBits 3; gb := gb17
+        let (r3, gb18) := gb.getBits 3; gb := gb18
+        match av1ShortSignalingRefIdx seq frameOffset r0 r3 refs with
+        | none => return none
+        | some rArr => refidx := rArr
+    for i in [:7] do
+      if !shortSig then
+        let (ri, gb19) := gb.getBits 3; gb := gb19
+        refidx := refidx.set! i ri
+      if seq.frameIdNumbersPresent then
+        let (dltM1, gb20) := gb.getBits seq.deltaFrameIdNBits; gb := gb20
+        let delta := dltM1 + 1
+        let mask := (1 <<< seq.frameIdNBits) - 1
+        let refId := (frameId + (1 <<< seq.frameIdNBits) - delta) &&& mask
+        match refs.getD (refidx.getD i 0) none with
+        | none => return none
+        | some rSlot =>
+          if rSlot.hdr.frameId != refId then
+            return none
+    hdr := { hdr with refreshFrameFlags := rff, frameRefShortSignaling := shortSig, refidx := refidx }
+    let useRef := !errRes && frameSizeOverride
+    match av1ReadFrameSize seq hdr gb refs useRef with
+    | none => return none
+    | some (hdr1, gb21) =>
+      hdr := hdr1; gb := gb21
+    let mut hp := false
+    if !hdr.forceIntegerMv then
+      let (hpB, gb22) := gb.getBit; gb := gb22
+      hp := hpB != 0
+    let (sfSw, gb23) := gb.getBit; gb := gb23
+    let mut subpelMode : Nat := 4
+    if sfSw == 0 then
+      let (sm, gb24) := gb.getBits 2; gb := gb24
+      subpelMode := sm
+    let (smmB, gb25) := gb.getBit; gb := gb25
+    let mut useRfm := false
+    if !errRes && seq.refFrameMvs && seq.orderHint && isInterOrSwitch then
+      let (urB, gb26) := gb.getBit; gb := gb26
+      useRfm := urB != 0
+    hdr := { hdr with hp := hp, subpelFilterMode := subpelMode, switchableMotionMode := smmB != 0, useRefFrameMvs := useRfm }
+  let mut refreshCtx := false
+  if !seq.reducedStillPictureHeader && !hdr.disableCdfUpdate then
+    let (rcDisable, gb27) := gb.getBit; gb := gb27
+    refreshCtx := rcDisable == 0
+  hdr := { hdr with refreshContext := refreshCtx }
+  match av1ParseTiling hdr seq gb with
+  | none => return none
+  | some (til, gb28) =>
+    hdr := { hdr with tiling := til }; gb := gb28
+  let (quant, gb29) := av1ParseQuant seq gb; gb := gb29
+  if quant.qm then
+    return none
+  let (segEnB, gb30) := gb.getBit; gb := gb30
+  let segEn := segEnB != 0
+  let mut segUpdMap := false
+  let mut segTemp := false
+  let mut segUpdData := false
+  let mut segD : Array Av1SegFeature := Array.replicate 8 {}
+  let mut lastActiveSeg : Int := -1
+  let mut preskip := false
+  if segEn then
+    if hdr.primaryRefFrame == av1PrimaryRefNone then
+      segUpdMap := true
+      segUpdData := true
+    else
+      let (umB, gb31) := gb.getBit; gb := gb31
+      segUpdMap := umB != 0
+      if segUpdMap then
+        let (tmB, gb32) := gb.getBit; gb := gb32
+        segTemp := tmB != 0
+      let (udB, gb33) := gb.getBit; gb := gb33
+      segUpdData := udB != 0
+    if segUpdData then
+      for i in [:8] do
+        match av1ReadSegFeature gb with
+        | none => return none
+        | some (feat, la, ps, gbNext) =>
+          gb := gbNext
+          segD := segD.set! i feat
+          if la >= 0 then lastActiveSeg := Int.ofNat i
+          if ps then preskip := true
+    else
+      let priRef := hdr.refidx.getD hdr.primaryRefFrame 0
+      match refs.getD priRef none with
+      | none => return none
+      | some priSlot =>
+        let prevSeg := priSlot.hdr.segmentation
+        segD := prevSeg.d
+        lastActiveSeg := prevSeg.lastActiveSegid
+        preskip := prevSeg.preskip
+  let mut dqPresent := false
+  let mut dqResLog2 : Nat := 0
+  let mut dlfPresent := false
+  let mut dlfResLog2 : Nat := 0
+  let mut dlfMulti := false
+  if quant.yac != 0 then
+    let (dqpB, gb34) := gb.getBit; gb := gb34
+    dqPresent := dqpB != 0
+    if dqPresent then
+      let (dqr, gb35) := gb.getBits 2; gb := gb35
+      dqResLog2 := dqr
+      if !hdr.allowIntrabc then
+        let (dlfpB, gb36) := gb.getBit; gb := gb36
+        dlfPresent := dlfpB != 0
+        if dlfPresent then
+          let (dlfr, gb37) := gb.getBits 2; gb := gb37
+          let (dlfm, gb38) := gb.getBit; gb := gb38
+          dlfResLog2 := dlfr
+          dlfMulti := dlfm != 0
+  let deltaLossless := quant.ydcDelta == 0 && quant.udcDelta == 0 && quant.uacDelta == 0 && quant.vdcDelta == 0 && quant.vacDelta == 0
+  let mut qidxArr : Array Nat := Array.replicate 8 0
+  let mut losslessArr : Array Bool := Array.replicate 8 false
+  let mut allLossless := true
+  for i in [:8] do
+    let qi : Nat :=
+      if segEn then
+        let raw := Int.ofNat quant.yac + (segD.getD i {}).deltaQ
+        (av1Iclip raw 0 255).toNat
+      else quant.yac
+    let ll := qi == 0 && deltaLossless
+    qidxArr := qidxArr.set! i qi
+    losslessArr := losslessArr.set! i ll
+    if !ll then allLossless := false
+  let segStruct : Av1Segmentation := {
+    enabled := segEn, updateMap := segUpdMap, temporal := segTemp, updateData := segUpdData,
+    qidx := qidxArr, lossless := losslessArr, d := segD, lastActiveSegid := lastActiveSeg, preskip := preskip
+  }
+  let mut lf : Av1LoopfilterParams := {}
+  if allLossless || hdr.allowIntrabc then
+    lf := { lf with modeRefDeltaEnabled := true, modeRefDeltaUpdate := true }
+  else
+    let (ly0, gb39) := gb.getBits 6; gb := gb39
+    let (ly1, gb40) := gb.getBits 6; gb := gb40
+    let mut lu : Nat := 0
+    let mut lv : Nat := 0
+    if !seq.monochrome && (ly0 != 0 || ly1 != 0) then
+      let (u0, gb41) := gb.getBits 6; gb := gb41
+      let (v0, gb42) := gb.getBits 6; gb := gb42
+      lu := u0; lv := v0
+    let (shp, gb43) := gb.getBits 3; gb := gb43
+    let mut modeDelta := av1DefaultModeDelta
+    let mut refDelta := av1DefaultRefDelta
+    if hdr.primaryRefFrame != av1PrimaryRefNone then
+      let priRef := hdr.refidx.getD hdr.primaryRefFrame 0
+      match refs.getD priRef none with
+      | none => return none
+      | some priSlot =>
+        modeDelta := priSlot.hdr.loopfilter.modeDelta
+        refDelta := priSlot.hdr.loopfilter.refDelta
+    let (mrdeB, gb44) := gb.getBit; gb := gb44
+    let mrde := mrdeB != 0
+    let mut mrdu := false
+    if mrde then
+      let (mrduB, gb45) := gb.getBit; gb := gb45
+      mrdu := mrduB != 0
+      if mrdu then
+        for i in [:8] do
+          let (upB, gb46) := gb.getBit; gb := gb46
+          if upB != 0 then
+            let (dv, gb47) := gb.getSBits 7; gb := gb47
+            refDelta := refDelta.set! i dv
+        for i in [:2] do
+          let (upB, gb48) := gb.getBit; gb := gb48
+          if upB != 0 then
+            let (dv, gb49) := gb.getSBits 7; gb := gb49
+            modeDelta := modeDelta.set! i dv
+    lf := { levelY := #[ly0, ly1], levelU := lu, levelV := lv, sharpness := shp,
+            modeRefDeltaEnabled := mrde, modeRefDeltaUpdate := mrdu, modeDelta := modeDelta, refDelta := refDelta }
+  let mut cdef : Av1CdefParams := {}
+  if !allLossless && seq.cdef && !hdr.allowIntrabc then
+    let (dmp, gb50) := gb.getBits 2; gb := gb50
+    let (nb, gb51) := gb.getBits 2; gb := gb51
+    let mut ys := cdef.yStrength
+    let mut uvs := cdef.uvStrength
+    for i in [:1 <<< nb] do
+      let (yv, gb52) := gb.getBits 6; gb := gb52
+      ys := ys.set! i yv
+      if !seq.monochrome then
+        let (uv, gb53) := gb.getBits 6; gb := gb53
+        uvs := uvs.set! i uv
+    cdef := { damping := dmp + 3, nBits := nb, yStrength := ys, uvStrength := uvs }
+  let mut rest : Av1RestorationParams := {}
+  if (!allLossless || hdr.superResEnabled) && seq.restoration && !hdr.allowIntrabc then
+    let (rt0, gb54) := gb.getBits 2; gb := gb54
+    let mut rt1 : Nat := 0
+    let mut rt2 : Nat := 0
+    if !seq.monochrome then
+      let (r1, gb55) := gb.getBits 2; gb := gb55
+      let (r2, gb56) := gb.getBits 2; gb := gb56
+      rt1 := r1; rt2 := r2
+    let mut us0 : Nat := 8
+    let mut us1 : Nat := 8
+    if rt0 != 0 || rt1 != 0 || rt2 != 0 then
+      us0 := 6 + seq.sb128
+      let (inc1, gb57) := gb.getBit; gb := gb57
+      if inc1 != 0 then
+        us0 := us0 + 1
+        if seq.sb128 == 0 then
+          let (inc2, gb58) := gb.getBit; gb := gb58
+          us0 := us0 + inc2
+      us1 := us0
+      if (rt1 != 0 || rt2 != 0) && seq.ssHor == 1 && seq.ssVer == 1 then
+        let (subUv, gb59) := gb.getBit; gb := gb59
+        us1 := us1 - subUv
+    rest := { lrType := #[rt0, rt1, rt2], unitSize := #[us0, us1] }
+  let mut txfmMode : Nat := 0
+  if !allLossless then
+    let (txSw, gb60) := gb.getBit; gb := gb60
+    txfmMode := if txSw != 0 then 2 else 1
+  let mut swCompRefs := false
+  if isInterOrSwitch then
+    let (scrB, gb61) := gb.getBit; gb := gb61
+    swCompRefs := scrB != 0
+  let mut skipModeAllowed := false
+  let mut skipModeRefs : Array Nat := #[0, 0]
+  if swCompRefs && isInterOrSwitch && seq.orderHint then
+    let poc : Int := Int.ofNat frameOffset
+    let mut offBefore : Int := -1
+    let mut offAfter : Int := -1
+    let mut offBeforeIdx : Nat := 0
+    let mut offAfterIdx : Nat := 0
+    for i in [:7] do
+      match refs.getD (hdr.refidx.getD i 0) none with
+      | none => return none
+      | some rSlot =>
+        let rpoc : Int := Int.ofNat rSlot.hdr.frameOffset
+        let diff := av1GetPocDiff seq.orderHintNBits rpoc poc
+        if diff > 0 then
+          if offAfter < 0 || av1GetPocDiff seq.orderHintNBits offAfter rpoc > 0 then
+            offAfter := rpoc
+            offAfterIdx := i
+        else if diff < 0 then
+          if offBefore < 0 || av1GetPocDiff seq.orderHintNBits rpoc offBefore > 0 then
+            offBefore := rpoc
+            offBeforeIdx := i
+    if offBefore >= 0 && offAfter >= 0 then
+      skipModeRefs := #[Nat.min offBeforeIdx offAfterIdx, Nat.max offBeforeIdx offAfterIdx]
+      skipModeAllowed := true
+    else if offBefore >= 0 then
+      let mut offBefore2 : Int := -1
+      let mut offBefore2Idx : Nat := 0
+      for i in [:7] do
+        match refs.getD (hdr.refidx.getD i 0) none with
+        | none => pure ()
+        | some rSlot =>
+          let rpoc : Int := Int.ofNat rSlot.hdr.frameOffset
+          if av1GetPocDiff seq.orderHintNBits rpoc offBefore < 0 then
+            if offBefore2 < 0 || av1GetPocDiff seq.orderHintNBits rpoc offBefore2 > 0 then
+              offBefore2 := rpoc
+              offBefore2Idx := i
+      if offBefore2 >= 0 then
+        skipModeRefs := #[Nat.min offBeforeIdx offBefore2Idx, Nat.max offBeforeIdx offBefore2Idx]
+        skipModeAllowed := true
+  let mut skipModeEnabled := false
+  if skipModeAllowed then
+    let (smeB, gb62) := gb.getBit; gb := gb62
+    skipModeEnabled := smeB != 0
+  let mut warpMotion := false
+  if !hdr.errorResilientMode && isInterOrSwitch && seq.warpedMotion then
+    let (wmB, gb63) := gb.getBit; gb := gb63
+    warpMotion := wmB != 0
+  let (rtsB, gb64) := gb.getBit; gb := gb64
+  let reducedTxtpSet := rtsB != 0
+  let mut gmvArr : Array Av1WmParams := Array.replicate 7 {}
+  if isInterOrSwitch then
+    for i in [:7] do
+      let (isG, gb65) := gb.getBit; gb := gb65
+      let mut gType : Nat := 0
+      if isG != 0 then
+        let (isRot, gb66) := gb.getBit; gb := gb66
+        if isRot != 0 then
+          gType := 2
+        else
+          let (isTr, gb67) := gb.getBit; gb := gb67
+          gType := if isTr != 0 then 1 else 3
+      if gType != 0 then
+        let mut refMat : Array Int := #[0, 0, 65536, 0, 0, 65536]
+        if hdr.primaryRefFrame != av1PrimaryRefNone then
+          let priRef := hdr.refidx.getD hdr.primaryRefFrame 0
+          match refs.getD priRef none with
+          | none => return none
+          | some priSlot =>
+            refMat := (priSlot.hdr.gmv.getD i {}).matrix
+        let mut mat : Array Int := #[0, 0, 65536, 0, 0, 65536]
+        let mut bitsT : Nat := if hdr.hp then 9 else 8
+        let mut shiftT : Nat := if hdr.hp then 13 else 14
+        if gType >= 2 then
+          let r2 := av1ArithShiftRight (refMat.getD 2 65536 - 65536) 1
+          let (s2, gb68) := gb.getSubexpSigned (r2 + 4096) 8192; gb := gb68
+          let m2 := 65536 + 2 * (s2 - 4096)
+          let r3 := av1ArithShiftRight (refMat.getD 3 0) 1
+          let (s3, gb69) := gb.getSubexpSigned (r3 + 4096) 8192; gb := gb69
+          let m3 := 2 * (s3 - 4096)
+          mat := mat.set! 2 m2
+          mat := mat.set! 3 m3
+          bitsT := 12
+          shiftT := 10
+        if gType == 3 then
+          let r4 := av1ArithShiftRight (refMat.getD 4 0) 1
+          let (s4, gb70) := gb.getSubexpSigned (r4 + 4096) 8192; gb := gb70
+          let m4 := 2 * (s4 - 4096)
+          let r5 := av1ArithShiftRight (refMat.getD 5 65536 - 65536) 1
+          let (s5, gb71) := gb.getSubexpSigned (r5 + 4096) 8192; gb := gb71
+          let m5 := 65536 + 2 * (s5 - 4096)
+          mat := mat.set! 4 m4
+          mat := mat.set! 5 m5
+        else
+          mat := mat.set! 4 (-(mat.getD 3 0))
+          mat := mat.set! 5 (mat.getD 2 65536)
+        let offT : Int := Int.ofNat (1 <<< bitsT)
+        let r0 := av1ArithShiftRight (refMat.getD 0 0) shiftT
+        let (s0, gb72) := gb.getSubexpSigned (r0 + offT) (2 <<< bitsT); gb := gb72
+        let m0 := (s0 - offT) * Int.ofNat (1 <<< shiftT)
+        let r1 := av1ArithShiftRight (refMat.getD 1 0) shiftT
+        let (s1, gb73) := gb.getSubexpSigned (r1 + offT) (2 <<< bitsT); gb := gb73
+        let m1 := (s1 - offT) * Int.ofNat (1 <<< shiftT)
+        mat := mat.set! 0 m0
+        mat := mat.set! 1 m1
+        gmvArr := gmvArr.set! i { wmType := gType, matrix := mat, abcd := #[0, 0, 0, 0] }
+  let mut fgPresent := false
+  if seq.filmGrainPresent && (hdr.showFrame || hdr.showableFrame) then
+    let (fgB, gb74) := gb.getBit; gb := gb74
+    fgPresent := fgB != 0
+    if fgPresent then
+      let (_, gb75) := gb.getBits 16; gb := gb75
+      let mut fgUpd := hdr.frameType != av1FrameInter
+      if !fgUpd then
+        let (fuB, gb76) := gb.getBit; gb := gb76
+        fgUpd := fuB != 0
+      if !fgUpd then
+        let (_, gb77) := gb.getBits 3; gb := gb77
+      else
+        let (numY, gb78) := gb.getBits 4; gb := gb78
+        if numY > 14 then return none
+        for _ in [:numY] do
+          let (_, gb79) := gb.getBits 16; gb := gb79
+        let mut csfl := false
+        if !seq.monochrome then
+          let (cB, gb80) := gb.getBit; gb := gb80
+          csfl := cB != 0
+        let mut numUv : Array Nat := #[0, 0]
+        if !(seq.monochrome || csfl || (seq.ssVer == 1 && seq.ssHor == 1 && numY == 0)) then
+          for pl in [:2] do
+            let (nu, gb81) := gb.getBits 4; gb := gb81
+            if nu > 10 then return none
+            numUv := numUv.set! pl nu
+            for _ in [:nu] do
+              let (_, gb82) := gb.getBits 16; gb := gb82
+        let (_, gb83) := gb.getBits 2; gb := gb83
+        let (arLag, gb84) := gb.getBits 2; gb := gb84
+        let numYPos := 2 * arLag * (arLag + 1)
+        if numY != 0 then
+          for _ in [:numYPos] do
+            let (_, gb85) := gb.getBits 8; gb := gb85
+        for pl in [:2] do
+          if numUv.getD pl 0 != 0 || csfl then
+            for _ in [:numYPos + (if numY != 0 then 1 else 0)] do
+              let (_, gb86) := gb.getBits 8; gb := gb86
+        let (_, gb87) := gb.getBits 4; gb := gb87
+        for pl in [:2] do
+          if numUv.getD pl 0 != 0 then
+            let (_, gb88) := gb.getBits 25; gb := gb88
+        let (_, gb89) := gb.getBits 2; gb := gb89
+  if gb.err then
+    return none
+  hdr := { hdr with
+    quant := quant
+    delta := { qPresent := dqPresent, qResLog2 := dqResLog2, lfPresent := dlfPresent, lfResLog2 := dlfResLog2, lfMulti := dlfMulti }
+    allLossless := allLossless
+    segmentation := segStruct
+    loopfilter := lf
+    cdef := cdef
+    restoration := rest
+    txfmMode := txfmMode
+    switchableCompRefs := swCompRefs
+    skipModeAllowed := skipModeAllowed
+    skipModeEnabled := skipModeEnabled
+    skipModeRefs := skipModeRefs
+    warpMotion := warpMotion
+    reducedTxtpSet := reducedTxtpSet
+    gmv := gmvArr
+    filmGrainPresent := fgPresent
+  }
+  return some (hdr, gb)
+
+def av1ParseTileGroupPayload (hdr : Av1FrameHdr) (gb0 : Av1BitReader) (fullData : ByteArray) :
+    Option (Array (Nat × ByteArray)) := Id.run do
+  let cols := hdr.tiling.cols
+  let rows := hdr.tiling.rows
+  let nTiles := cols * rows
+  if nTiles == 0 then
+    return none
+  let mut gb := gb0
+  let mut havePos := false
+  if nTiles > 1 then
+    let (hpB, gb1) := gb.getBit; gb := gb1
+    havePos := hpB != 0
+  let mut tStart : Nat := 0
+  let mut tEnd : Nat := nTiles - 1
+  if havePos then
+    let nb := hdr.tiling.log2Cols + hdr.tiling.log2Rows
+    let (ts, gb2) := gb.getBits nb; gb := gb2
+    let (te, gb3) := gb.getBits nb; gb := gb3
+    tStart := ts
+    tEnd := te
+  gb := gb.byteAlign
+  if gb.err || tStart > tEnd || tEnd >= nTiles then
+    return none
+  let mut pos := gb.bitPos >>> 3
+  let endPos := gb.endIdx
+  let nBytes := hdr.tiling.nBytes
+  let mut tiles : Array (Nat × ByteArray) := #[]
+  for tIdx in [tStart : tEnd + 1] do
+    if tIdx < tEnd then
+      if pos + nBytes > endPos then
+        return none
+      let mut sz : Nat := 0
+      for bi in [:nBytes] do
+        sz := sz ||| ((fullData.get! (pos + bi)).toNat <<< (8 * bi))
+      sz := sz + 1
+      pos := pos + nBytes
+      if pos + sz > endPos then
+        return none
+      tiles := tiles.push (tIdx, fullData.extract pos (pos + sz))
+      pos := pos + sz
+    else
+      if pos >= endPos then
+        return none
+      tiles := tiles.push (tIdx, fullData.extract pos endPos)
+      pos := endPos
+  return some tiles
+
+def av1WriteSeqHdrObu (width height : Nat) (enableCdef : Bool := true) (enableRestoration : Bool := true) : ByteArray :=
+  let bw := Av1BitWriter.empty
+  let bw := bw.putBits 0 3
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBits 0 5
+  let bw := bw.putBits 0 12
+  let bw := bw.putBits 0 5
+  let wBits := Nat.max 1 (av1Ulog2 (Nat.max 1 (width - 1)) + 1)
+  let hBits := Nat.max 1 (av1Ulog2 (Nat.max 1 (height - 1)) + 1)
+  let bw := bw.putBits (wBits - 1) 4
+  let bw := bw.putBits (hBits - 1) 4
+  let bw := bw.putBits (width - 1) wBits
+  let bw := bw.putBits (height - 1) hBits
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 1
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 1
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 1
+  let bw := bw.putBit 1
+  let bw := bw.putBits 6 3
+  let bw := bw.putBit 0
+  let bw := bw.putBit (if enableCdef then 1 else 0)
+  let bw := bw.putBit (if enableRestoration then 1 else 0)
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.putBits 0 2
+  let bw := bw.putBit 0
+  let bw := bw.putBit 0
+  let bw := bw.addTrailingBits
+  av1WrapObu av1ObuSeqHdr bw.toBytes true
+
+def av1BuildAv1C (seqHdrObu : ByteArray) (seq : Av1SeqHdr) : ByteArray :=
+  let op0 := seq.operatingPoints.getD 0 {}
+  let b0 : UInt8 := 0x81
+  let b1 : UInt8 := (((seq.profile &&& 7) <<< 5) ||| (op0.majorLevel &&& 0x1F)).toUInt8
+  let b2 : UInt8 :=
+    (((op0.tier &&& 1) <<< 7) |||
+     ((seq.hbd &&& 1) <<< 6) |||
+     ((if seq.hbd == 2 then 1 else 0) <<< 5) |||
+     ((if seq.monochrome then 1 else 0) <<< 4) |||
+     ((seq.ssHor &&& 1) <<< 3) |||
+     ((seq.ssVer &&& 1) <<< 2) |||
+     (seq.chr &&& 3)).toUInt8
+  let b3 : UInt8 := 0x00
+  ByteArray.mk #[b0, b1, b2, b3] ++ seqHdrObu
+
+def av1ParseAv1C (cfg : ByteArray) : Option Av1SeqHdr := Id.run do
+  if cfg.size < 4 then
+    return none
+  if cfg.get! 0 != 0x81 || ((cfg.get! 3) &&& 0xE0) != 0 then
+    return none
+  let rest := cfg.extract 4 cfg.size
+  match av1ParseObus rest with
+  | none => return none
+  | some obus =>
+    let mut seqPayload : Option ByteArray := none
+    for o in obus do
+      if o.obuType == av1ObuSeqHdr then
+        match seqPayload with
+        | none => seqPayload := some o.payload
+        | some _ => return none
+    match seqPayload with
+    | none => return none
+    | some p => av1ParseSeqHdr p
+
+structure Av1IvfInfo where
+  fourcc    : ByteArray
+  width     : Nat
+  height    : Nat
+  fpsNum    : Nat
+  fpsDen    : Nat
+  numFrames : Nat
+  deriving Inhabited, DecidableEq
+
+def av1DemuxIvf (data : ByteArray) : Option (Av1IvfInfo × Array (UInt64 × ByteArray)) := Id.run do
+  if data.size < 32 then
+    return none
+  if data.get! 0 != 'D'.toNat.toUInt8 || data.get! 1 != 'K'.toNat.toUInt8 ||
+     data.get! 2 != 'I'.toNat.toUInt8 || data.get! 3 != 'F'.toNat.toUInt8 then
+    return none
+  let s := ByteSlice.ofByteArray data
+  let ver := (readU16LE s 4).toNat
+  let hdrLen := (readU16LE s 6).toNat
+  let fourcc := data.extract 8 12
+  let width := (readU16LE s 12).toNat
+  let height := (readU16LE s 14).toNat
+  let fpsNum := (readU32LE s 16).toNat
+  let fpsDen := (readU32LE s 20).toNat
+  let numFrames := (readU32LE s 24).toNat
+  if ver != 0 || hdrLen < 32 || data.size < hdrLen then
+    return none
+  let mut pos := hdrLen
+  let mut packets : Array (UInt64 × ByteArray) := #[]
+  while pos + 12 <= data.size do
+    let frameSz := (readU32LE s pos).toNat
+    let pts := readU64LE s (pos + 4)
+    pos := pos + 12
+    if pos + frameSz > data.size then
+      return none
+    packets := packets.push (pts, data.extract pos (pos + frameSz))
+    pos := pos + frameSz
+  if pos != data.size then
+    return none
+  return some ({ fourcc := fourcc, width := width, height := height, fpsNum := fpsNum, fpsDen := fpsDen, numFrames := numFrames }, packets)
+
+def av1MuxIvf (width height : Nat) (frames : Array ByteArray) (fpsNum : Nat := 25) (fpsDen : Nat := 1) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity 64
+  out := out.push 'D'.toNat.toUInt8 |>.push 'K'.toNat.toUInt8 |>.push 'I'.toNat.toUInt8 |>.push 'F'.toNat.toUInt8
+  out := pushU16LE out 0
+  out := pushU16LE out 32
+  out := out.push 'A'.toNat.toUInt8 |>.push 'V'.toNat.toUInt8 |>.push '0'.toNat.toUInt8 |>.push '1'.toNat.toUInt8
+  out := pushU16LE out width.toUInt16
+  out := pushU16LE out height.toUInt16
+  out := pushU32LE out fpsNum.toUInt32
+  out := pushU32LE out fpsDen.toUInt32
+  out := pushU32LE out frames.size.toUInt32
+  out := pushU32LE out 0
+  for idx in [:frames.size] do
+    let pkt := frames.getD idx ByteArray.empty
+    out := pushU32LE out pkt.size.toUInt32
+    out := pushU32LE out idx.toUInt32
+    out := pushU32LE out 0
+    out := out ++ pkt
+  return out
+
+@[inline] def av1DcPred : Nat := 0
+@[inline] def av1VertPred : Nat := 1
+@[inline] def av1HorPred : Nat := 2
+@[inline] def av1SmoothPred : Nat := 9
+@[inline] def av1PaethPred : Nat := 12
+@[inline] def av1CflPred : Nat := 13
+@[inline] def av1NearestMv : Nat := 0
+@[inline] def av1NearMv : Nat := 1
+@[inline] def av1GlobalMv : Nat := 2
+@[inline] def av1NewMv : Nat := 3
+@[inline] def av1CompInterNone : Nat := 0
+@[inline] def av1CompInterWAvg : Nat := 1
+@[inline] def av1CompInterAvg : Nat := 2
+@[inline] def av1CompInterSeg : Nat := 3
+@[inline] def av1CompInterWedge : Nat := 4
+
+structure Av1BlockContext where
+  mode      : Array Nat := Array.replicate 32 0
+  lcoef     : Array Nat := Array.replicate 32 0x40
+  ccoef     : Array (Array Nat) := #[Array.replicate 32 0x40, Array.replicate 32 0x40]
+  segPred   : Array Nat := Array.replicate 32 0
+  skip      : Array Nat := Array.replicate 32 0
+  skipMode  : Array Nat := Array.replicate 32 0
+  intra     : Array Nat := Array.replicate 32 0
+  compType  : Array Nat := Array.replicate 32 0
+  ref       : Array (Array Int) := #[Array.replicate 32 (-1), Array.replicate 32 (-1)]
+  filter    : Array (Array Nat) := #[Array.replicate 32 3, Array.replicate 32 3]
+  txIntra   : Array Int := Array.replicate 32 (-1)
+  tx        : Array Nat := Array.replicate 32 4
+  txLpfY    : Array Nat := Array.replicate 32 2
+  txLpfUv   : Array Nat := Array.replicate 32 1
+  partition : Array Nat := Array.replicate 16 0
+  uvmode    : Array Nat := Array.replicate 32 0
+  palSz     : Array Nat := Array.replicate 32 0
+  deriving Inhabited
+
+def av1ResetContext (ctx : Av1BlockContext) (keyframe : Bool) : Av1BlockContext :=
+  let kf : Nat := if keyframe then 1 else 0
+  let modeVal : Nat := if keyframe then av1DcPred else av1NearestMv
+  { ctx with
+    intra := Array.replicate 32 kf
+    uvmode := Array.replicate 32 av1DcPred
+    mode := Array.replicate 32 modeVal
+    partition := Array.replicate 16 0
+    skip := Array.replicate 32 0
+    skipMode := Array.replicate 32 0
+    txLpfY := Array.replicate 32 2
+    txLpfUv := Array.replicate 32 1
+    txIntra := Array.replicate 32 (-1)
+    tx := Array.replicate 32 4
+    ref := if keyframe then ctx.ref else #[Array.replicate 32 (-1), Array.replicate 32 (-1)]
+    compType := if keyframe then ctx.compType else Array.replicate 32 0
+    lcoef := Array.replicate 32 0x40
+    ccoef := #[Array.replicate 32 0x40, Array.replicate 32 0x40]
+    filter := #[Array.replicate 32 3, Array.replicate 32 3]
+    segPred := Array.replicate 32 0
+    palSz := Array.replicate 32 0
+  }
+
+def av1GetIntraCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat :=
+  if haveLeft then
+    if haveTop then
+      let c := l.intra.getD yb4 0 + a.intra.getD xb4 0
+      c + (if c == 2 then 1 else 0)
+    else
+      l.intra.getD yb4 0 * 2
+  else
+    if haveTop then a.intra.getD xb4 0 * 2 else 0
+
+def av1GetTxCtx (a l : Av1BlockContext) (maxLw maxLh : Int) (yb4 xb4 : Nat) : Nat :=
+  (if l.txIntra.getD yb4 0 >= maxLh then 1 else 0) + (if a.txIntra.getD xb4 0 >= maxLw then 1 else 0)
+
+def av1GetPartitionCtx (a l : Av1BlockContext) (bl yb8 xb8 : Nat) : Nat :=
+  let sh := 4 - bl
+  ((a.partition.getD xb8 0 >>> sh) &&& 1) + (((l.partition.getD yb8 0 >>> sh) &&& 1) <<< 1)
+
+def av1GatherLeftPartitionProb (cdf : Array Nat) (base bl : Nat) : Int := Id.run do
+  let g (i : Nat) : Int := Int.ofNat (cdf.getD i 0)
+  let mut out : Int := g (base + 1 - 1) - g (base + 1)
+  out := out + (g (base + 3 - 1) - g (base + 6))
+  if bl != 0 then
+    out := out + (g (base + 8 - 1) - g (base + 8))
+  return out
+
+def av1GatherTopPartitionProb (cdf : Array Nat) (base bl : Nat) : Int := Id.run do
+  let g (i : Nat) : Int := Int.ofNat (cdf.getD i 0)
+  let mut out : Int := g (base + 2 - 1) - g (base + 4)
+  out := out + g (base + 6 - 1)
+  if bl != 0 then
+    out := out + (g (base + 9 - 1) - g (base + 7))
+  return out
+
+@[inline]
+private def av1CtxRefAt (ctx : Av1BlockContext) (plane off : Nat) : Int :=
+  (ctx.ref.getD plane #[]).getD off (-1)
+
+def av1GetFilterCtx (a l : Av1BlockContext) (comp dirIdx : Nat) (ref yb4 xb4 : Nat) : Nat :=
+  let aRef0 := av1CtxRefAt a 0 xb4
+  let aRef1 := av1CtxRefAt a 1 xb4
+  let lRef0 := av1CtxRefAt l 0 yb4
+  let lRef1 := av1CtxRefAt l 1 yb4
+  let af := if aRef0 == Int.ofNat ref || aRef1 == Int.ofNat ref then (a.filter.getD dirIdx #[]).getD xb4 3 else 3
+  let lf := if lRef0 == Int.ofNat ref || lRef1 == Int.ofNat ref then (l.filter.getD dirIdx #[]).getD yb4 3 else 3
+  if af == lf then comp * 4 + af
+  else if af == 3 then comp * 4 + lf
+  else if lf == 3 then comp * 4 + af
+  else comp * 4 + 3
+
+@[inline]
+def av1IsIntraOrBwd (r : Int) : Nat :=
+  if r < 0 || r >= 4 then 1 else 0
+
+def av1GetCompCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat :=
+  if haveTop then
+    if haveLeft then
+      if a.compType.getD xb4 0 != 0 then
+        if l.compType.getD yb4 0 != 0 then 4
+        else 2 + av1IsIntraOrBwd (av1CtxRefAt l 0 yb4)
+      else if l.compType.getD yb4 0 != 0 then
+        2 + av1IsIntraOrBwd (av1CtxRefAt a 0 xb4)
+      else
+        (if av1CtxRefAt l 0 yb4 >= 4 then 1 else 0) ^^^
+        (if av1CtxRefAt a 0 xb4 >= 4 then 1 else 0)
+    else
+      if a.compType.getD xb4 0 != 0 then 3 else (if av1CtxRefAt a 0 xb4 >= 4 then 1 else 0)
+  else if haveLeft then
+    if l.compType.getD yb4 0 != 0 then 3 else (if av1CtxRefAt l 0 yb4 >= 4 then 1 else 0)
+  else
+    1
+
+@[inline]
+def av1HasUniComp (edge : Av1BlockContext) (off : Nat) : Nat :=
+  let r0 := av1CtxRefAt edge 0 off
+  let r1 := av1CtxRefAt edge 1 off
+  if (r0 < 4) == (r1 < 4) then 1 else 0
+
+def av1GetCompDirCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat :=
+  if haveTop && haveLeft then
+    let ai := a.intra.getD xb4 0 != 0
+    let li := l.intra.getD yb4 0 != 0
+    if ai && li then 2
+    else if ai || li then
+      let edge := if ai then l else a
+      let off := if ai then yb4 else xb4
+      if edge.compType.getD off 0 == av1CompInterNone then 2
+      else 1 + 2 * av1HasUniComp edge off
+    else
+      let ac := a.compType.getD xb4 0 != av1CompInterNone
+      let lc := l.compType.getD yb4 0 != av1CompInterNone
+      let ar0 := av1CtxRefAt a 0 xb4
+      let lr0 := av1CtxRefAt l 0 yb4
+      if !ac && !lc then
+        1 + 2 * (if (ar0 >= 4) == (lr0 >= 4) then 1 else 0)
+      else if !ac || !lc then
+        let edge := if ac then a else l
+        let off := if ac then xb4 else yb4
+        if av1HasUniComp edge off == 0 then 1
+        else 3 + (if (ar0 >= 4) == (lr0 >= 4) then 1 else 0)
+      else
+        let au := av1HasUniComp a xb4
+        let lu := av1HasUniComp l yb4
+        if au == 0 && lu == 0 then 0
+        else if au == 0 || lu == 0 then 2
+        else 3 + (if (ar0 == 4) == (lr0 == 4) then 1 else 0)
+  else if haveTop || haveLeft then
+    let edge := if haveLeft then l else a
+    let off := if haveLeft then yb4 else xb4
+    if edge.intra.getD off 0 != 0 || edge.compType.getD off 0 == av1CompInterNone then 2
+    else 4 * av1HasUniComp edge off
+  else 2
+
+def av1GetJntCompCtx (orderHintNBits : Nat) (poc ref0poc ref1poc : Int)
+    (a l : Av1BlockContext) (yb4 xb4 : Nat) : Nat :=
+  let d0 := (av1GetPocDiff orderHintNBits ref0poc poc).natAbs
+  let d1 := (av1GetPocDiff orderHintNBits poc ref1poc).natAbs
+  let offset := if d0 == d1 then 1 else 0
+  let ac := if a.compType.getD xb4 0 >= av1CompInterAvg || av1CtxRefAt a 0 xb4 == 6 then 1 else 0
+  let lc := if l.compType.getD yb4 0 >= av1CompInterAvg || av1CtxRefAt l 0 yb4 == 6 then 1 else 0
+  3 * offset + ac + lc
+
+def av1GetMaskCompCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) : Nat :=
+  let ac := if a.compType.getD xb4 0 >= av1CompInterSeg then 1 else (if av1CtxRefAt a 0 xb4 == 6 then 3 else 0)
+  let lc := if l.compType.getD yb4 0 >= av1CompInterSeg then 1 else (if av1CtxRefAt l 0 yb4 == 6 then 3 else 0)
+  Nat.min (ac + lc) 5
+
+@[inline]
+def av1CmpCnt (c0 c1 : Nat) : Nat :=
+  if c0 == c1 then 1 else (if c0 < c1 then 0 else 2)
+
+def av1GetRefCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt0 : Nat := 0
+  let mut cnt1 : Nat := 0
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    if av1CtxRefAt a 0 xb4 >= 4 then cnt1 := cnt1 + 1 else cnt0 := cnt0 + 1
+    if a.compType.getD xb4 0 != 0 then
+      if av1CtxRefAt a 1 xb4 >= 4 then cnt1 := cnt1 + 1 else cnt0 := cnt0 + 1
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    if av1CtxRefAt l 0 yb4 >= 4 then cnt1 := cnt1 + 1 else cnt0 := cnt0 + 1
+    if l.compType.getD yb4 0 != 0 then
+      if av1CtxRefAt l 1 yb4 >= 4 then cnt1 := cnt1 + 1 else cnt0 := cnt0 + 1
+  return av1CmpCnt cnt0 cnt1
+
+def av1GetFwdRefCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0, 0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if 0 <= r && r < 4 then ct.set! r.toNat (ct.getD r.toNat 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0 + cnt.getD 1 0) (cnt.getD 2 0 + cnt.getD 3 0)
+
+def av1GetFwdRef1Ctx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if 0 <= r && r < 2 then ct.set! r.toNat (ct.getD r.toNat 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0) (cnt.getD 1 0)
+
+def av1GetFwdRef2Ctx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if 2 <= r && r < 4 then ct.set! (r.toNat - 2) (ct.getD (r.toNat - 2) 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0) (cnt.getD 1 0)
+
+def av1GetBwdRefCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if r >= 4 && r < 7 then ct.set! (r.toNat - 4) (ct.getD (r.toNat - 4) 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0 + cnt.getD 1 0) (cnt.getD 2 0)
+
+def av1GetBwdRef1Ctx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if r >= 4 && r < 7 then ct.set! (r.toNat - 4) (ct.getD (r.toNat - 4) 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0) (cnt.getD 1 0)
+
+def av1GetUniP1Ctx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) : Nat := Id.run do
+  let mut cnt : Array Nat := #[0, 0, 0]
+  let bump (r : Int) (ct : Array Nat) : Array Nat :=
+    if 1 <= r && r < 4 then ct.set! (r.toNat - 1) (ct.getD (r.toNat - 1) 0 + 1) else ct
+  if haveTop && a.intra.getD xb4 0 == 0 then
+    cnt := bump (av1CtxRefAt a 0 xb4) cnt
+    if a.compType.getD xb4 0 != 0 then
+      cnt := bump (av1CtxRefAt a 1 xb4) cnt
+  if haveLeft && l.intra.getD yb4 0 == 0 then
+    cnt := bump (av1CtxRefAt l 0 yb4) cnt
+    if l.compType.getD yb4 0 != 0 then
+      cnt := bump (av1CtxRefAt l 1 yb4) cnt
+  return av1CmpCnt (cnt.getD 0 0) (cnt.getD 1 0 + cnt.getD 2 0)
+
+structure Av1MvCand where
+  mv0 : Int × Int := (0, 0)
+  mv1 : Int × Int := (0, 0)
+  w   : Nat := 0
+  deriving Inhabited, Repr, DecidableEq
+
+def av1GetDrlContext (stack : Array Av1MvCand) (refIdx : Nat) : Nat :=
+  let w0 := (stack.getD refIdx {}).w
+  let w1 := (stack.getD (refIdx + 1) {}).w
+  if w0 >= 640 then (if w1 < 640 then 1 else 0)
+  else (if w1 < 640 then 2 else 0)
+
+def av1GetCurFrameSegid (by4 bx4 : Nat) (haveTop haveLeft : Bool) (curSegMap : Array Nat) (stride : Nat) : Nat × Nat :=
+  let idx := bx4 + by4 * stride
+  if haveLeft && haveTop then
+    let lv := curSegMap.getD (idx - 1) 0
+    let av := curSegMap.getD (idx - stride) 0
+    let alv := curSegMap.getD (idx - stride - 1) 0
+    let sctx := if lv == av && alv == lv then 2 else (if lv == av || alv == lv || av == alv then 1 else 0)
+    let pred := if av == alv then av else lv
+    (pred, sctx)
+  else
+    let pred := if haveLeft then curSegMap.getD (idx - 1) 0 else (if haveTop then curSegMap.getD (idx - stride) 0 else 0)
+    (pred, 0)
+
+def av1GetPrevFrameSegid (by4 bx4 w4 h4 : Nat) (refSegMap : Array Nat) (stride : Nat) : Nat := Id.run do
+  let mut segId : Nat := 8
+  let base := by4 * stride + bx4
+  for y in [:h4] do
+    let row := base + y * stride
+    for x in [:w4] do
+      let v := refSegMap.getD (row + x) 0
+      if v < segId then segId := v
+    if segId == 0 then
+      return 0
+  return segId
+
+@[inline]
+def av1S16 (v : Int) : Int :=
+  let r := ((v % 65536) + 65536) % 65536
+  if r >= 32768 then r - 65536 else r
+
+def av1FixIntMvPrecision (mvY mvX : Int) : Int × Int :=
+  let fix1 (c : Int) : Int :=
+    let s : Int := if c < 0 then -1 else 0
+    av1S16 (av1ArithShiftRight (c - s + 3) 3 * 8)
+  (fix1 mvY, fix1 mvX)
+
+def av1FixMvPrecision (hdr : Av1FrameHdr) (mvY mvX : Int) : Int × Int :=
+  if hdr.forceIntegerMv then av1FixIntMvPrecision mvY mvX
+  else if !hdr.hp then
+    let fixHp (c : Int) : Int :=
+      let s : Int := if c < 0 then -1 else 0
+      av1S16 (av1ArithShiftRight (c - s) 1 * 2)
+    (fixHp mvY, fixHp mvX)
+  else
+    (av1S16 mvY, av1S16 mvX)
+
+def av1GetGmv2d (gmv : Av1WmParams) (bx4 by4 bw4 bh4 : Nat) (hdr : Av1FrameHdr) : Int × Int :=
+  let mat := gmv.matrix
+  if gmv.wmType == 0 then (0, 0)
+  else if gmv.wmType == 1 then
+    let resY := av1S16 (av1ArithShiftRight (mat.getD 0 0) 13)
+    let resX := av1S16 (av1ArithShiftRight (mat.getD 1 0) 13)
+    if hdr.forceIntegerMv then av1FixIntMvPrecision resY resX else (resY, resX)
+  else
+    let x : Int := Int.ofNat (bx4 * 4 + bw4 * 2 - 1)
+    let y : Int := Int.ofNat (by4 * 4 + bh4 * 2 - 1)
+    let xc := (mat.getD 2 65536 - 65536) * x + mat.getD 3 0 * y + mat.getD 0 0
+    let yc := (mat.getD 5 65536 - 65536) * y + mat.getD 4 0 * x + mat.getD 1 0
+    let noHp : Nat := if hdr.hp then 0 else 1
+    let shift := 16 - (3 - noHp)
+    let rnd : Int := Int.ofNat ((1 <<< shift) >>> 1)
+    let ry := av1ApplySign (av1ArithShiftRight (Int.ofNat yc.natAbs + rnd) shift) yc * Int.ofNat (1 <<< noHp)
+    let rx := av1ApplySign (av1ArithShiftRight (Int.ofNat xc.natAbs + rnd) shift) xc * Int.ofNat (1 <<< noHp)
+    let ry := av1S16 ry
+    let rx := av1S16 rx
+    if hdr.forceIntegerMv then av1FixIntMvPrecision ry rx else (ry, rx)
+
+@[inline] def av1InvalidMv : Int := -32768
+@[inline] def av1InvalidRef2Cur : Int := 0x7FFFFFFF
+
+def av1MvProjDivMult : Array Int := #[
+  0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638,
+  1489, 1365, 1260, 1170, 1092, 1024, 963, 910, 862, 819, 780, 744,
+  712, 682, 655, 630, 606, 585, 564, 546, 528
+]
+
+def av1MvProjection (my mx num : Int) (den : Nat) : Int × Int :=
+  let frac : Int := num * av1MvProjDivMult.getD den 0
+  let proj (c : Int) : Int :=
+    let v := c * frac
+    let bias : Int := if v < 0 then 8191 else 8192
+    av1Iclip (av1ArithShiftRight (v + bias) 14) (-0x3FFF) 0x3FFF
+  (proj my, proj mx)
+
+structure Av1RefMvCell where
+  bs   : Nat := 0
+  ref0 : Int := -1
+  ref1 : Int := -1
+  mv0  : Int × Int := (0, 0)
+  mv1  : Int × Int := (0, 0)
+  mf   : Nat := 0
+  deriving Inhabited, Repr, DecidableEq
+
+structure Av1RefMvFrame where
+  hdr            : Av1FrameHdr := {}
+  seq            : Av1SeqHdr := {}
+  iw8            : Nat := 0
+  ih8            : Nat := 0
+  iw4            : Nat := 0
+  ih4            : Nat := 0
+  rStride        : Nat := 1
+  sbsz           : Nat := 16
+  rpStride       : Nat := 16
+  r              : Array Av1RefMvCell := #[]
+  rpProj         : Array (Option Av1TmvEntry) := #[]
+  signBias       : Array Nat := Array.replicate 7 0
+  mfmvSign       : Array Nat := Array.replicate 7 0
+  pocdiff        : Array Int := Array.replicate 7 0
+  mfmvRef        : Array Nat := #[]
+  mfmvRef2Cur    : Array Int := #[]
+  mfmvRef2Ref    : Array (Array Nat) := #[]
+  useRefFrameMvs : Bool := false
+  deriving Inhabited
+
+def av1InitRefMvFrame (hdr : Av1FrameHdr) (seq : Av1SeqHdr) (refs : Array (Option Av1RefSlot)) : Av1RefMvFrame := Id.run do
+  let iw8 := (hdr.width0 + 7) >>> 3
+  let ih8 := (hdr.height + 7) >>> 3
+  let iw4 := iw8 <<< 1
+  let ih4 := ih8 <<< 1
+  let rStride := iw4 + 1
+  let sbsz := 16 <<< seq.sb128
+  let rpStride := ((hdr.width0 + 127) / 128 * 128) >>> 3
+  let rArr := Array.replicate ((ih4 + 1) * rStride) ({} : Av1RefMvCell)
+  let rpArr := Array.replicate (ih8 * rpStride) (none : Option Av1TmvEntry)
+  let poc : Int := Int.ofNat hdr.frameOffset
+  let nb := seq.orderHintNBits
+  let mut signBias : Array Nat := Array.replicate 7 0
+  let mut mfmvSign : Array Nat := Array.replicate 7 0
+  let mut pocdiff : Array Int := Array.replicate 7 0
+  for i in [:7] do
+    match refs.getD (hdr.refidx.getD i 0) none with
+    | none => pure ()
+    | some rfSlot =>
+      let rp : Int := Int.ofNat rfSlot.hdr.frameOffset
+      let diff := av1GetPocDiff nb rp poc
+      signBias := signBias.set! i (if diff > 0 then 1 else 0)
+      mfmvSign := mfmvSign.set! i (if diff < 0 then 1 else 0)
+      pocdiff := pocdiff.set! i (av1Iclip (av1GetPocDiff nb poc rp) (-31) 31)
+  let mut mfmvRef : Array Nat := #[]
+  let mut mfmvRef2Cur : Array Int := #[]
+  let mut mfmvRef2Ref : Array (Array Nat) := #[]
+  if hdr.useRefFrameMvs && nb != 0 then
+    let hasTmvs (idx : Nat) : Bool :=
+      match refs.getD (hdr.refidx.getD idx 0) none with
+      | none => false
+      | some rfE =>
+        match rfE.tmvs with
+        | none => false
+        | some _ =>
+          let rw := ((rfE.hdr.width0 + 7) >>> 3) <<< 1
+          let rh := ((rfE.hdr.height + 7) >>> 3) <<< 1
+          rw == iw4 && rh == ih4
+    let mut total : Nat := 2
+    if hasTmvs 0 then
+      match refs.getD (hdr.refidx.getD 0 0) none, refs.getD (hdr.refidx.getD 3 0) none with
+      | some rf0, some rf3 =>
+        if rf0.refpoc.getD 6 0 != rf3.hdr.frameOffset then
+          mfmvRef := mfmvRef.push 0
+          total := 3
+      | _, _ => pure ()
+    for r in #[4, 5] do
+      if hasTmvs r then
+        match refs.getD (hdr.refidx.getD r 0) none with
+        | none => pure ()
+        | some rf =>
+          if av1GetPocDiff nb (Int.ofNat rf.hdr.frameOffset) poc > 0 then
+            mfmvRef := mfmvRef.push r
+    if mfmvRef.size < total && hasTmvs 6 then
+      match refs.getD (hdr.refidx.getD 6 0) none with
+      | none => pure ()
+      | some rf =>
+        if av1GetPocDiff nb (Int.ofNat rf.hdr.frameOffset) poc > 0 then
+          mfmvRef := mfmvRef.push 6
+    if mfmvRef.size < total && hasTmvs 1 then
+      mfmvRef := mfmvRef.push 1
+    for r in mfmvRef do
+      match refs.getD (hdr.refidx.getD r 0) none with
+      | none =>
+        mfmvRef2Cur := mfmvRef2Cur.push av1InvalidRef2Cur
+        mfmvRef2Ref := mfmvRef2Ref.push (Array.replicate 7 0)
+      | some rf =>
+        let rpoc : Int := Int.ofNat rf.hdr.frameOffset
+        let diff1 := av1GetPocDiff nb rpoc poc
+        if diff1.natAbs > 31 then
+          mfmvRef2Cur := mfmvRef2Cur.push av1InvalidRef2Cur
+          mfmvRef2Ref := mfmvRef2Ref.push (Array.replicate 7 0)
+        else
+          mfmvRef2Cur := mfmvRef2Cur.push (if r < 4 then -diff1 else diff1)
+          let mut row : Array Nat := Array.mkEmpty 7
+          for m in [:7] do
+            let rrpoc : Int := Int.ofNat (rf.refpoc.getD m 0)
+            let diff2 := av1GetPocDiff nb rpoc rrpoc
+            row := row.push (if diff2 < 0 || diff2 > 31 then 0 else diff2.toNat)
+          mfmvRef2Ref := mfmvRef2Ref.push row
+  return {
+    hdr := hdr, seq := seq, iw8 := iw8, ih8 := ih8, iw4 := iw4, ih4 := ih4,
+    rStride := rStride, sbsz := sbsz, rpStride := rpStride, r := rArr, rpProj := rpArr,
+    signBias := signBias, mfmvSign := mfmvSign, pocdiff := pocdiff,
+    mfmvRef := mfmvRef, mfmvRef2Cur := mfmvRef2Cur, mfmvRef2Ref := mfmvRef2Ref,
+    useRefFrameMvs := !mfmvRef.isEmpty
+  }
+
+def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1RefMvFrame := Id.run do
+  let mut rpProj := Array.replicate (rf.ih8 * rf.rpStride) (none : Option Av1TmvEntry)
+  if !rf.useRefFrameMvs then
+    return { rf with rpProj := rpProj }
+  for n in [:rf.mfmvRef.size] do
+    let r := rf.mfmvRef.getD n 0
+    let ref2cur := rf.mfmvRef2Cur.getD n av1InvalidRef2Cur
+    if ref2cur != av1InvalidRef2Cur then
+      match refs.getD (rf.hdr.refidx.getD r 0) none with
+      | none => pure ()
+      | some rSlot =>
+        match rSlot.tmvs with
+        | none => pure ()
+        | some src =>
+          for y in [:rf.ih8] do
+            let ySb := (y / 8) * 8
+            let y0 := ySb
+            let y1 := Nat.min (ySb + 8) rf.ih8
+            let srcRow := src.getD y #[]
+            let mut x : Nat := 0
+            while x < rf.iw8 do
+              let rbOpt := if y < src.size && x < srcRow.size then srcRow.getD x none else none
+              match rbOpt with
+              | none => x := x + 1
+              | some rb =>
+                let bRef := rb.ref
+                let ref2ref := (rf.mfmvRef2Ref.getD n #[]).getD (bRef - 1) 0
+                if ref2ref == 0 then
+                  x := x + 1
+                else
+                  let (offY, offX) := av1MvProjection rb.mvY rb.mvX ref2cur ref2ref
+                  let sx := if r < 4 then -offX else offX
+                  let sy := if r < 4 then -offY else offY
+                  let px0 : Int := Int.ofNat x + av1ApplySign (Int.ofNat (offX.natAbs >>> 6)) sx
+                  let py : Int := Int.ofNat y + av1ApplySign (Int.ofNat (offY.natAbs >>> 6)) sy
+                  if Int.ofNat y0 <= py && py < Int.ofNat y1 then
+                    let pyNat := py.toNat
+                    let mut curX := x
+                    let mut px := px0
+                    let mut keepGoing := true
+                    while keepGoing do
+                      let xSb := (curX / 8) * 8
+                      let xLo : Int := Int.ofNat (xSb - 8)
+                      let xHi : Int := Int.ofNat (Nat.min (xSb + 16) rf.iw8)
+                      if xLo <= px && px < xHi then
+                        let pxNat := px.toNat
+                        if pyNat < rf.ih8 && pxNat < rf.iw8 then
+                          rpProj := rpProj.set! (pyNat * rf.rpStride + pxNat) (some { mvY := rb.mvY, mvX := rb.mvX, ref := ref2ref })
+                      curX := curX + 1
+                      if curX >= rf.iw8 then
+                        keepGoing := false
+                      else
+                        let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
+                        match nxtOpt with
+                        | none => keepGoing := false
+                        | some nxt =>
+                          if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
+                            keepGoing := false
+                          else
+                            px := px + 1
+                    x := curX
+                  else
+                    let mut curX := x
+                    let mut keepGoing := true
+                    while keepGoing do
+                      curX := curX + 1
+                      if curX >= rf.iw8 then
+                        keepGoing := false
+                      else
+                        let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
+                        match nxtOpt with
+                        | none => keepGoing := false
+                        | some nxt =>
+                          if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
+                            keepGoing := false
+                    x := curX
+  return { rf with rpProj := rpProj }
+
+def av1SaveTmvs (rf : Av1RefMvFrame) : Array (Array (Option Av1TmvEntry)) := Id.run do
+  let mut out : Array (Array (Option Av1TmvEntry)) := Array.mkEmpty rf.ih8
+  for y in [:rf.ih8] do
+    let mut rowOut : Array (Option Av1TmvEntry) := Array.replicate rf.iw8 none
+    let rOff := (y * 2 + 1) * rf.rStride
+    let mut x : Nat := 0
+    while x < rf.iw8 do
+      let b := rf.r.getD (rOff + x * 2 + 1) {}
+      let bw8 := Nat.max 1 ((av1BlockDim.getD (b.bs * 4) 1 + 1) >>> 1)
+      let r1 := b.ref1
+      let r0 := b.ref0
+      let recOpt : Option Av1TmvEntry :=
+        if r1 > 0 && rf.mfmvSign.getD (r1.toNat - 1) 0 != 0 && (b.mv1.1.natAbs ||| b.mv1.2.natAbs) < 4096 then
+          some { mvY := b.mv1.1, mvX := b.mv1.2, ref := r1.toNat }
+        else if r0 > 0 && rf.mfmvSign.getD (r0.toNat - 1) 0 != 0 && (b.mv0.1.natAbs ||| b.mv0.2.natAbs) < 4096 then
+          some { mvY := b.mv0.1, mvX := b.mv0.2, ref := r0.toNat }
+        else
+          none
+      for n in [:bw8] do
+        if x + n < rf.iw8 then
+          rowOut := rowOut.set! (x + n) recOpt
+      x := x + bw8
+    out := out.push rowOut
+  return out
+
+@[inline]
+private def av1Bdim (bs : Nat) : Nat × Nat :=
+  (av1BlockDim.getD (bs * 4) 1, av1BlockDim.getD (bs * 4 + 1) 1)
+
+private def av1AddSpatial (stack0 : Array Av1MvCand) (weight : Nat) (b : Av1RefMvCell)
+    (ref0 ref1 : Int) (gmv0 gmv1 : Option (Int × Int)) (refmvFlag newmvFlag : Nat) :
+    Array Av1MvCand × Nat × Nat := Id.run do
+  if b.mv0.1 == av1InvalidMv then
+    return (stack0, refmvFlag, newmvFlag)
+  let mut stack := stack0
+  let mut rfF := refmvFlag
+  let mut nmF := newmvFlag
+  if ref1 == -1 then
+    for n in [:2] do
+      let br := if n == 0 then b.ref0 else b.ref1
+      let bmv := if n == 0 then b.mv0 else b.mv1
+      if br == ref0 then
+        let cand := match gmv0 with
+          | some g => if (b.mf &&& 1) != 0 then g else bmv
+          | none => bmv
+        rfF := 1
+        nmF := nmF ||| (b.mf >>> 1)
+        for idx in [:stack.size] do
+          let e := stack.getD idx {}
+          if e.mv0 == cand then
+            stack := stack.set! idx { e with w := e.w + weight }
+            return (stack, rfF, nmF)
+        if stack.size < 8 then
+          stack := stack.push { mv0 := cand, mv1 := (0, 0), w := weight }
+        return (stack, rfF, nmF)
+    return (stack, rfF, nmF)
+  else if b.ref0 == ref0 && b.ref1 == ref1 then
+    let c0 := match gmv0 with
+      | some g => if (b.mf &&& 1) != 0 then g else b.mv0
+      | none => b.mv0
+    let c1 := match gmv1 with
+      | some g => if (b.mf &&& 1) != 0 then g else b.mv1
+      | none => b.mv1
+    rfF := 1
+    nmF := nmF ||| (b.mf >>> 1)
+    for idx in [:stack.size] do
+      let e := stack.getD idx {}
+      if e.mv0 == c0 && e.mv1 == c1 then
+        stack := stack.set! idx { e with w := e.w + weight }
+        return (stack, rfF, nmF)
+    if stack.size < 8 then
+      stack := stack.push { mv0 := c0, mv1 := c1, w := weight }
+    return (stack, rfF, nmF)
+  else
+    return (stack, rfF, nmF)
+
+private def av1ScanRow (stack0 : Array Av1MvCand) (ref0 ref1 : Int) (gmv0 gmv1 : Option (Int × Int))
+    (rf : Av1RefMvFrame) (rowY bx bw4 w4 maxRows step refmvFlag newmvFlag : Nat) :
+    Array Av1MvCand × Nat × Nat × Nat := Id.run do
+  let rowOff := rowY * rf.rStride
+  let cand0 := rf.r.getD (rowOff + bx) {}
+  let (candBw4_0, candBh4_0) := av1Bdim cand0.bs
+  let mut length := Nat.max step (Nat.min bw4 candBw4_0)
+  if bw4 <= candBw4_0 then
+    let weight := if bw4 == 1 then 2 else Nat.max 2 (Nat.min (2 * maxRows) candBh4_0)
+    let (st1, rf1, nm1) := av1AddSpatial stack0 (length * weight) cand0 ref0 ref1 gmv0 gmv1 refmvFlag newmvFlag
+    return (st1, rf1, nm1, weight >>> 1)
+  let mut stack := stack0
+  let mut rfF := refmvFlag
+  let mut nmF := newmvFlag
+  let mut cand := cand0
+  let mut x : Nat := 0
+  while true do
+    let (stNext, rfNext, nmNext) := av1AddSpatial stack (length * 2) cand ref0 ref1 gmv0 gmv1 rfF nmF
+    stack := stNext; rfF := rfNext; nmF := nmNext
+    x := x + length
+    if x >= w4 then
+      return (stack, rfF, nmF, 1)
+    cand := rf.r.getD (rowOff + bx + x) {}
+    let (cbw, _) := av1Bdim cand.bs
+    length := Nat.max step cbw
+  return (stack, rfF, nmF, 1)
+
+private def av1ScanCol (stack0 : Array Av1MvCand) (ref0 ref1 : Int) (gmv0 gmv1 : Option (Int × Int))
+    (rf : Av1RefMvFrame) (by4 bx bh4 h4 maxCols step refmvFlag newmvFlag : Nat) :
+    Array Av1MvCand × Nat × Nat × Nat := Id.run do
+  let cand0 := rf.r.getD (by4 * rf.rStride + bx) {}
+  let (candBw4_0, candBh4_0) := av1Bdim cand0.bs
+  let mut length := Nat.max step (Nat.min bh4 candBh4_0)
+  if bh4 <= candBh4_0 then
+    let weight := if bh4 == 1 then 2 else Nat.max 2 (Nat.min (2 * maxCols) candBw4_0)
+    let (st1, rf1, nm1) := av1AddSpatial stack0 (length * weight) cand0 ref0 ref1 gmv0 gmv1 refmvFlag newmvFlag
+    return (st1, rf1, nm1, weight >>> 1)
+  let mut stack := stack0
+  let mut rfF := refmvFlag
+  let mut nmF := newmvFlag
+  let mut cand := cand0
+  let mut y : Nat := 0
+  while true do
+    let (stNext, rfNext, nmNext) := av1AddSpatial stack (length * 2) cand ref0 ref1 gmv0 gmv1 rfF nmF
+    stack := stNext; rfF := rfNext; nmF := nmNext
+    y := y + length
+    if y >= h4 then
+      return (stack, rfF, nmF, 1)
+    cand := rf.r.getD ((by4 + y) * rf.rStride + bx) {}
+    let (_, cbh) := av1Bdim cand.bs
+    length := Nat.max step cbh
+  return (stack, rfF, nmF, 1)
+
+private def av1AddTemporal (rf : Av1RefMvFrame) (stack0 : Array Av1MvCand) (rbOpt : Option Av1TmvEntry)
+    (ref0 ref1 : Int) (updGmvCtx : Bool) (gmvCtx0 : Nat) (tgmv0 : Int × Int) (weight : Nat) :
+    Array Av1MvCand × Nat := Id.run do
+  match rbOpt with
+  | none => return (stack0, gmvCtx0)
+  | some rb =>
+    let mut stack := stack0
+    let mut gctx := gmvCtx0
+    let (my0, mx0) := av1MvProjection rb.mvY rb.mvX (rf.pocdiff.getD (ref0.toNat - 1) 0) rb.ref
+    let (my, mx) := av1FixMvPrecision rf.hdr my0 mx0
+    if ref1 == -1 then
+      if updGmvCtx then
+        gctx := if ((mx - tgmv0.2).natAbs ||| (my - tgmv0.1).natAbs) >= 16 then 1 else 0
+      for idx in [:stack.size] do
+        let e := stack.getD idx {}
+        if e.mv0 == (my, mx) then
+          stack := stack.set! idx { e with w := e.w + weight }
+          return (stack, gctx)
+      if stack.size < 8 then
+        stack := stack.push { mv0 := (my, mx), mv1 := (0, 0), w := weight }
+      return (stack, gctx)
+    else
+      let (my2_0, mx2_0) := av1MvProjection rb.mvY rb.mvX (rf.pocdiff.getD (ref1.toNat - 1) 0) rb.ref
+      let (my2, mx2) := av1FixMvPrecision rf.hdr my2_0 mx2_0
+      for idx in [:stack.size] do
+        let e := stack.getD idx {}
+        if e.mv0 == (my, mx) && e.mv1 == (my2, mx2) then
+          stack := stack.set! idx { e with w := e.w + weight }
+          return (stack, gctx)
+      if stack.size < 8 then
+        stack := stack.push { mv0 := (my, mx), mv1 := (my2, mx2), w := weight }
+      return (stack, gctx)
+
+private def av1BubbleSortStack (stack0 : Array Av1MvCand) (lo hi : Nat) : Array Av1MvCand := Id.run do
+  let mut stack := stack0
+  let mut length := hi
+  while length > lo do
+    let mut last := lo
+    for n in [lo + 1 : length] do
+      let prev := stack.getD (n - 1) {}
+      let cur := stack.getD n {}
+      if prev.w < cur.w then
+        stack := stack.set! (n - 1) cur
+        stack := stack.set! n prev
+        last := n
+    length := last
+  return stack
+
+def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 : Nat) :
+    Array Av1MvCand × Nat × Nat := Id.run do
+  let (bw4, bh4) := av1Bdim bs
+  let w4 := Nat.min (Nat.min bw4 16) (rf.iw4 - bx4)
+  let h4 := Nat.min (Nat.min bh4 16) (rf.ih4 - by4)
+  let hdr := rf.hdr
+  let gmvFor (r : Int) : (Int × Int) × Option (Int × Int) :=
+    if r <= 0 then ((0, 0), none)
+    else
+      let wm := hdr.gmv.getD (r.toNat - 1) {}
+      let tg := av1GetGmv2d wm bx4 by4 bw4 bh4 hdr
+      let gm := if wm.wmType > 1 then some tg else none
+      (tg, gm)
+  let (tgmv0, gmv0) := gmvFor ref0
+  let (tgmv1, gmv1) := if ref1 > 0 then gmvFor ref1 else ((0, 0), none)
+  let mut stack : Array Av1MvCand := #[]
+  let mut rowRefmv : Nat := 0
+  let mut rowNewmv : Nat := 0
+  let mut colRefmv : Nat := 0
+  let mut colNewmv : Nat := 0
+  let mut maxRows : Nat := 0
+  let mut nRowsOpt : Option Nat := none
+  if by4 > 0 then
+    maxRows := Nat.min ((by4 + 1) >>> 1) (2 + (if bh4 > 1 then 1 else 0))
+    let (st1, rf1, nm1, nr) := av1ScanRow stack ref0 ref1 gmv0 gmv1 rf (by4 - 1) bx4 bw4 w4 maxRows (if bw4 >= 16 then 4 else 1) rowRefmv rowNewmv
+    stack := st1; rowRefmv := rf1; rowNewmv := nm1; nRowsOpt := some nr
+  let mut maxCols : Nat := 0
+  let mut nColsOpt : Option Nat := none
+  if bx4 > 0 then
+    maxCols := Nat.min ((bx4 + 1) >>> 1) (2 + (if bw4 > 1 then 1 else 0))
+    let (st1, rf1, nm1, nc) := av1ScanCol stack ref0 ref1 gmv0 gmv1 rf by4 (bx4 - 1) bh4 h4 maxCols (if bh4 >= 16 then 4 else 1) colRefmv colNewmv
+    stack := st1; colRefmv := rf1; colNewmv := nm1; nColsOpt := some nc
+  if nRowsOpt.isSome && (edgeFlags &&& av1EdgeI444TopHasRight) != 0 && Nat.max bw4 bh4 <= 16 && bw4 + bx4 < rf.iw4 then
+    let cTr := rf.r.getD ((by4 - 1) * rf.rStride + bx4 + bw4) {}
+    let (st1, rf1, nm1) := av1AddSpatial stack 4 cTr ref0 ref1 gmv0 gmv1 rowRefmv rowNewmv
+    stack := st1; rowRefmv := rf1; rowNewmv := nm1
+  let haveNewmv := rowNewmv ||| colNewmv
+  let nearestMatch := (if colRefmv != 0 then 1 else 0) + (if rowRefmv != 0 then 1 else 0)
+  let nearestCnt := stack.size
+  for i in [:nearestCnt] do
+    let e := stack.getD i {}
+    stack := stack.set! i { e with w := e.w + 640 }
+  let mut gmvCtx : Nat := if hdr.useRefFrameMvs then 1 else 0
+  if rf.useRefFrameMvs then
+    let by8 := by4 >>> 1
+    let bx8 := bx4 >>> 1
+    let stepH := if bw4 >= 16 then 2 else 1
+    let stepV := if bh4 >= 16 then 2 else 1
+    let w8 := Nat.min ((w4 + 1) >>> 1) 8
+    let h8 := Nat.min ((h4 + 1) >>> 1) 8
+    let mut run := rf.rpProj.getD (by8 * rf.rpStride + bx8) none
+    let mut runLen : Nat := 1
+    let mut updCtx := true
+    let mut y : Nat := 0
+    while y < h8 do
+      let mut x : Nat := if y == 0 then stepH else 0
+      while x < w8 do
+        let cur := rf.rpProj.getD ((by8 + y) * rf.rpStride + (bx8 + x)) none
+        if cur == run then
+          runLen := runLen + 1
+        else
+          let (st1, gc1) := av1AddTemporal rf stack run ref0 ref1 updCtx gmvCtx tgmv0 (2 * runLen)
+          stack := st1; gmvCtx := gc1
+          updCtx := false
+          run := cur
+          runLen := 1
+        x := x + stepH
+      y := y + stepV
+    let (stLast, gcLast) := av1AddTemporal rf stack run ref0 ref1 updCtx gmvCtx tgmv0 (2 * runLen)
+    stack := stLast; gmvCtx := gcLast
+    if Nat.min bw4 bh4 >= 2 && Nat.max bw4 bh4 < 16 then
+      let bh8 := bh4 >>> 1
+      let bw8 := bw4 >>> 1
+      let yBound := Nat.min rf.ih8 ((by8 / 8) * 8 + 8)
+      let xBound := Nat.min rf.iw8 ((bx8 / 8) * 8 + 8)
+      let hasBottom := by8 + bh8 < yBound
+      if hasBottom && bx8 >= (bx8 / 8) * 8 + 1 then
+        let (stB, _) := av1AddTemporal rf stack (rf.rpProj.getD ((by8 + bh8) * rf.rpStride + (bx8 - 1)) none) ref0 ref1 false gmvCtx tgmv0 2
+        stack := stB
+      if bx8 + bw8 < xBound then
+        if hasBottom then
+          let (stBR, _) := av1AddTemporal rf stack (rf.rpProj.getD ((by8 + bh8) * rf.rpStride + (bx8 + bw8)) none) ref0 ref1 false gmvCtx tgmv0 2
+          stack := stBR
+        if bh8 > 0 && by8 + bh8 - 1 < yBound then
+          let (stR, _) := av1AddTemporal rf stack (rf.rpProj.getD ((by8 + bh8 - 1) * rf.rpStride + (bx8 + bw8)) none) ref0 ref1 false gmvCtx tgmv0 2
+          stack := stR
+  let mut dummyRowRefmv := rowRefmv
+  let mut dummyRowNewmv : Nat := 0
+  let mut dummyColRefmv := colRefmv
+  let mut dummyColNewmv : Nat := 0
+  if nRowsOpt.isSome && nColsOpt.isSome then
+    let cTl := rf.r.getD ((by4 - 1) * rf.rStride + (bx4 - 1)) {}
+    let (st1, rf1, nm1) := av1AddSpatial stack 4 cTl ref0 ref1 gmv0 gmv1 dummyRowRefmv dummyRowNewmv
+    stack := st1; dummyRowRefmv := rf1; dummyRowNewmv := nm1
+  for n in #[2, 3] do
+    match nRowsOpt with
+    | none => pure ()
+    | some nr =>
+      if n > nr && n <= maxRows then
+        let ry := (by4 + 1 - 2 * n) ||| 1
+        let (st1, rf1, nm1, addR) := av1ScanRow stack ref0 ref1 gmv0 gmv1 rf ry (bx4 ||| 1) bw4 w4 (1 + maxRows - n) (if bw4 >= 16 then 4 else 2) dummyRowRefmv dummyRowNewmv
+        stack := st1; dummyRowRefmv := rf1; dummyRowNewmv := nm1; nRowsOpt := some (nr + addR)
+    match nColsOpt with
+    | none => pure ()
+    | some nc =>
+      if n > nc && n <= maxCols then
+        let cx := (bx4 + 1 - 2 * n) ||| 1
+        let (st1, rf1, nm1, addC) := av1ScanCol stack ref0 ref1 gmv0 gmv1 rf (by4 ||| 1) cx bh4 h4 (1 + maxCols - n) (if bh4 >= 16 then 4 else 2) dummyColRefmv dummyColNewmv
+        stack := st1; dummyColRefmv := rf1; dummyColNewmv := nm1; nColsOpt := some (nc + addC)
+  let refMatch := (if dummyColRefmv != 0 then 1 else 0) + (if dummyRowRefmv != 0 then 1 else 0)
+  let (refmvCtx, newmvCtx) :=
+    if nearestMatch == 0 then
+      (Nat.min 2 refMatch, if refMatch > 0 then 1 else 0)
+    else if nearestMatch == 1 then
+      (Nat.min (refMatch * 3) 4, 3 - haveNewmv)
+    else
+      (5, 5 - haveNewmv)
+  stack := av1BubbleSortStack stack 0 nearestCnt
+  stack := av1BubbleSortStack stack nearestCnt stack.size
+  let leftB : Int := -(Int.ofNat (bx4 + bw4 + 4) * 32)
+  let rightB : Int := (Int.ofNat rf.iw4 - Int.ofNat bx4 + 4) * 32
+  let topB : Int := -(Int.ofNat (by4 + bh4 + 4) * 32)
+  let bottomB : Int := (Int.ofNat rf.ih4 - Int.ofNat by4 + 4) * 32
+  if ref1 > 0 then
+    if stack.size < 2 then
+      let sign0 := rf.signBias.getD (ref0.toNat - 1) 0
+      let sign1 := rf.signBias.getD (ref1.toNat - 1) 0
+      let sz4 := Nat.min w4 h4
+      let mut same0 : Array (Int × Int) := #[(0, 0), (0, 0)]
+      let mut same1 : Array (Int × Int) := #[(0, 0), (0, 0)]
+      let mut diff0 : Array (Int × Int) := #[(0, 0), (0, 0)]
+      let mut diff1 : Array (Int × Int) := #[(0, 0), (0, 0)]
+      let mut sc0 : Nat := 0
+      let mut sc1 : Nat := 0
+      let mut dc0 : Nat := 0
+      let mut dc1 : Nat := 0
+      let addExtCell (cb : Av1RefMvCell)
+          (s0 s1 d0 d1 : Array (Int × Int)) (cS0 cS1 cD0 cD1 : Nat) :
+          Array (Int × Int) × Array (Int × Int) × Array (Int × Int) × Array (Int × Int) × Nat × Nat × Nat × Nat := Id.run do
+        let mut s0' := s0; let mut s1' := s1; let mut d0' := d0; let mut d1' := d1
+        let mut sc0' := cS0; let mut sc1' := cS1; let mut dc0' := cD0; let mut dc1' := cD1
+        for nn in [:2] do
+          let cr := if nn == 0 then cb.ref0 else cb.ref1
+          if cr <= 0 then
+            break
+          let cm := if nn == 0 then cb.mv0 else cb.mv1
+          let inv := (-cm.1, -cm.2)
+          let crBias := rf.signBias.getD (cr.toNat - 1) 0
+          if cr == ref0 then
+            if sc0' < 2 then s0' := s0'.set! sc0' cm; sc0' := sc0' + 1
+            if dc1' < 2 then d1' := d1'.set! dc1' (if sign1 != crBias then inv else cm); dc1' := dc1' + 1
+          else if cr == ref1 then
+            if sc1' < 2 then s1' := s1'.set! sc1' cm; sc1' := sc1' + 1
+            if dc0' < 2 then d0' := d0'.set! dc0' (if sign0 != crBias then inv else cm); dc0' := dc0' + 1
+          else
+            if dc0' < 2 then d0' := d0'.set! dc0' (if sign0 != crBias then inv else cm); dc0' := dc0' + 1
+            if dc1' < 2 then d1' := d1'.set! dc1' (if sign1 != crBias then inv else cm); dc1' := dc1' + 1
+        return (s0', s1', d0', d1', sc0', sc1', dc0', dc1')
+      if nRowsOpt.isSome then
+        let mut x : Nat := 0
+        while x < sz4 do
+          let cb := rf.r.getD ((by4 - 1) * rf.rStride + bx4 + x) {}
+          let (s0', s1', d0', d1', c0, c1, e0, e1) := addExtCell cb same0 same1 diff0 diff1 sc0 sc1 dc0 dc1
+          same0 := s0'; same1 := s1'; diff0 := d0'; diff1 := d1'
+          sc0 := c0; sc1 := c1; dc0 := e0; dc1 := e1
+          x := x + (av1Bdim cb.bs).1
+      if nColsOpt.isSome then
+        let mut y : Nat := 0
+        while y < sz4 do
+          let cb := rf.r.getD ((by4 + y) * rf.rStride + (bx4 - 1)) {}
+          let (s0', s1', d0', d1', c0, c1, e0, e1) := addExtCell cb same0 same1 diff0 diff1 sc0 sc1 dc0 dc1
+          same0 := s0'; same1 := s1'; diff0 := d0'; diff1 := d1'
+          sc0 := c0; sc1 := c1; dc0 := e0; dc1 := e1
+          y := y + (av1Bdim cb.bs).2
+      let fillComp (sArr dArr : Array (Int × Int)) (sc dc : Nat) (tg : Int × Int) : Array (Int × Int) := Id.run do
+        let mut out := sArr
+        let mut m := sc
+        if m >= 2 then return out
+        if dc > 0 then
+          out := out.set! m (dArr.getD 0 (0, 0))
+          m := m + 1
+          if m == 2 then return out
+          if dc == 2 then
+            out := out.set! 1 (dArr.getD 1 (0, 0))
+            return out
+        while m < 2 do
+          out := out.set! m tg
+          m := m + 1
+        return out
+      same0 := fillComp same0 diff0 sc0 dc0 tgmv0
+      same1 := fillComp same1 diff1 sc1 dc1 tgmv1
+      if stack.size == 1 && (stack.getD 0 {}).mv0 == same0.getD 0 (0, 0) && (stack.getD 0 {}).mv1 == same1.getD 0 (0, 0) then
+        stack := stack.push { mv0 := same0.getD 1 (0, 0), mv1 := same1.getD 1 (0, 0), w := 2 }
+      else
+        while stack.size < 2 do
+          let idx := stack.size
+          stack := stack.push { mv0 := same0.getD idx (0, 0), mv1 := same1.getD idx (0, 0), w := 2 }
+      stack := stack.extract 0 2
+      stack := stack.set! 0 { (stack.getD 0 {}) with w := 2 }
+      stack := stack.set! 1 { (stack.getD 1 {}) with w := 2 }
+    for idx in [:stack.size] do
+      let e := stack.getD idx {}
+      let c0 := (av1Iclip e.mv0.1 topB bottomB, av1Iclip e.mv0.2 leftB rightB)
+      let c1 := (av1Iclip e.mv1.1 topB bottomB, av1Iclip e.mv1.2 leftB rightB)
+      stack := stack.set! idx { e with mv0 := c0, mv1 := c1 }
+    let half := refmvCtx >>> 1
+    let ctx :=
+      if half == 0 then Nat.min newmvCtx 1
+      else if half == 1 then 1 + Nat.min newmvCtx 3
+      else Nat.max 4 (Nat.min 7 (3 + newmvCtx))
+    return (stack, stack.size, ctx)
+  if stack.size < 2 && ref0 > 0 then
+    let sign := rf.signBias.getD (ref0.toNat - 1) 0
+    let sz4 := Nat.min w4 h4
+    let addSingle (cb : Av1RefMvCell) (st0 : Array Av1MvCand) : Array Av1MvCand := Id.run do
+      let mut st := st0
+      for nn in [:2] do
+        let cr := if nn == 0 then cb.ref0 else cb.ref1
+        if cr <= 0 then
+          break
+        let cm := if nn == 0 then cb.mv0 else cb.mv1
+        if cm.1 != av1InvalidMv then
+          let crBias := rf.signBias.getD (cr.toNat - 1) 0
+          let mv := if sign != crBias then (-cm.1, -cm.2) else cm
+          let mut dup := false
+          for e in st do
+            if e.mv0 == mv then dup := true
+          if !dup then
+            st := st.push { mv0 := mv, mv1 := (0, 0), w := 2 }
+          if st.size >= 2 then
+            return st
+      return st
+    if nRowsOpt.isSome then
+      let mut x : Nat := 0
+      while x < sz4 && stack.size < 2 do
+        let cb := rf.r.getD ((by4 - 1) * rf.rStride + bx4 + x) {}
+        stack := addSingle cb stack
+        x := x + (av1Bdim cb.bs).1
+    if nColsOpt.isSome then
+      let mut y : Nat := 0
+      while y < sz4 && stack.size < 2 do
+        let cb := rf.r.getD ((by4 + y) * rf.rStride + (bx4 - 1)) {}
+        stack := addSingle cb stack
+        y := y + (av1Bdim cb.bs).2
+  let nMvs := stack.size
+  for idx in [:stack.size] do
+    let e := stack.getD idx {}
+    let c0 := (av1Iclip e.mv0.1 topB bottomB, av1Iclip e.mv0.2 leftB rightB)
+    stack := stack.set! idx { e with mv0 := c0 }
+  while stack.size < 2 do
+    stack := stack.push { mv0 := tgmv0, mv1 := (0, 0), w := 0 }
+  let ctx := (refmvCtx <<< 4) ||| (gmvCtx <<< 3) ||| newmvCtx
+  return (stack, nMvs, ctx)
+
+def av1SplatMv (rf : Av1RefMvFrame) (bs by4 bx4 bw4 bh4 : Nat)
+    (ref0 ref1 : Int) (mv0 mv1 : Int × Int) (mf : Nat) : Av1RefMvFrame := Id.run do
+  let recCell : Av1RefMvCell := { bs := bs, ref0 := ref0, ref1 := ref1, mv0 := mv0, mv1 := mv1, mf := mf }
+  let mut rArr := rf.r
+  for y in [:bh4] do
+    let rowOff := (by4 + y) * rf.rStride + bx4
+    for x in [:bw4] do
+      rArr := rArr.set! (rowOff + x) recCell
+  return { rf with r := rArr }
 
 end LeanAV.Av1Main
 
