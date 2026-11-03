@@ -1547,8 +1547,8 @@ namespace Av1BitReader
 
 def init (data : ByteArray) (offset : Nat := 0) (lenOpt : Option Nat := none) : Av1BitReader :=
   let endIdx := match lenOpt with
-    | none => data.size
-    | some l => Nat.min data.size (offset + l)
+    | none => data.data.size
+    | some l => Nat.min data.data.size (offset + l)
   { data := data, endIdx := endIdx, bitPos := offset * 8, err := false }
 
 @[inline]
@@ -1563,17 +1563,17 @@ def getBit (br : Av1BitReader) : Nat × Av1BitReader :=
   else
     let byteIdx := br.bitPos >>> 3
     let bitIdx := 7 - (br.bitPos &&& 7)
-    let b := ((br.data.get! byteIdx).toNat >>> bitIdx) &&& 1
+    let b := ((br.data.data.getD byteIdx 0).toNat >>> bitIdx) &&& 1
     (b, { br with bitPos := br.bitPos + 1 })
 
-def getBits (br : Av1BitReader) (n : Nat) : Nat × Av1BitReader := Id.run do
-  let mut cur := br
-  let mut v : Nat := 0
-  for _ in [:n] do
-    let (b, next) := cur.getBit
-    cur := next
-    v := (v <<< 1) ||| b
-  return (v, cur)
+def getBits (br : Av1BitReader) (n : Nat) : Nat × Av1BitReader :=
+  let rec go (k v : Nat) (cur : Av1BitReader) : Nat × Av1BitReader :=
+    match k with
+    | 0 => (v, cur)
+    | k' + 1 =>
+      let (b, next) := cur.getBit
+      go k' ((v <<< 1) ||| b) next
+  go n 0 br
 
 def getSBits (br : Av1BitReader) (n : Nat) : Int × Av1BitReader :=
   if n == 0 then (0, br)
@@ -1692,12 +1692,13 @@ def empty : Av1BitWriter := { bits := #[] }
 def putBit (bw : Av1BitWriter) (b : Nat) : Av1BitWriter :=
   { bits := bw.bits.push (b &&& 1).toUInt8 }
 
-def putBits (bw : Av1BitWriter) (v n : Nat) : Av1BitWriter := Id.run do
-  let mut arr := bw.bits
-  for k in [:n] do
-    let shift := n - 1 - k
-    arr := arr.push (((v >>> shift) &&& 1).toUInt8)
-  return { bits := arr }
+def putBits (bw : Av1BitWriter) (v n : Nat) : Av1BitWriter :=
+  let rec go (k : Nat) (arr : Array UInt8) : Array UInt8 :=
+    match k with
+    | 0 => arr
+    | k' + 1 =>
+      arr.push (((v >>> k') &&& 1).toUInt8) |> go k'
+  { bits := go n bw.bits }
 
 def putSBits (bw : Av1BitWriter) (v : Int) (n : Nat) : Av1BitWriter :=
   if n == 0 then bw
@@ -1752,26 +1753,31 @@ def putSubexpSigned (bw : Av1BitWriter) (refVal : Int) (v : Int) (n : Nat) : Av1
 def putSubexp (bw : Av1BitWriter) (refVal v n : Nat) : Av1BitWriter :=
   putSubexpSigned bw (Int.ofNat refVal) (Int.ofNat v) n
 
-def byteAlignZero (bw : Av1BitWriter) : Av1BitWriter := Id.run do
-  let mut arr := bw.bits
-  while (arr.size &&& 7) != 0 do
-    arr := arr.push 0
-  return { bits := arr }
+def byteAlignZero (bw : Av1BitWriter) : Av1BitWriter :=
+  let rec go (fuel : Nat) (arr : Array UInt8) : Array UInt8 :=
+    match fuel with
+    | 0 => arr
+    | f + 1 => if (arr.size &&& 7) == 0 then arr else go f (arr.push 0)
+  { bits := go 8 bw.bits }
 
 def addTrailingBits (bw : Av1BitWriter) : Av1BitWriter :=
   (bw.putBit 1).byteAlignZero
 
-def toBytes (bw : Av1BitWriter) : ByteArray := Id.run do
+def toBytes (bw : Av1BitWriter) : ByteArray :=
   let aligned := bw.byteAlignZero.bits
   let nBytes := aligned.size >>> 3
-  let mut out := ByteArray.emptyWithCapacity nBytes
-  for i in [:nBytes] do
-    let mut b : UInt8 := 0
-    for j in [:8] do
-      if aligned.getD (i * 8 + j) 0 != 0 then
-        b := b ||| ((1 : UInt8) <<< (7 - j).toUInt8)
-    out := out.push b
-  return out
+  let rec packByte (i j : Nat) (b : UInt8) : UInt8 :=
+    match j with
+    | 0 => b
+    | j' + 1 =>
+      let idx := i * 8 + (7 - j')
+      let b' := if aligned.getD idx 0 != 0 then b ||| ((1 : UInt8) <<< j'.toUInt8) else b
+      packByte i j' b'
+  let rec go (fuel i : Nat) (out : Array UInt8) : Array UInt8 :=
+    match fuel with
+    | 0 => out
+    | f + 1 => go f (i + 1) (out.push (packByte i 8 0))
+  { data := go nBytes 0 #[] }
 
 end Av1BitWriter
 
@@ -1792,31 +1798,33 @@ structure Av1MsacDecoder where
 
 namespace Av1MsacDecoder
 
-def refill (s : Av1MsacDecoder) : Av1MsacDecoder := Id.run do
-  let mut c : Int := av1EcWinSize - s.cnt - 24
-  let mut dif : UInt64 := s.dif
-  let mut pos : Nat := s.pos
+def refill (s : Av1MsacDecoder) : Av1MsacDecoder :=
   let endIdx := s.endIdx
-  for _ in [:16] do
-    if pos >= endIdx then
-      if c >= 64 then
-        dif := av1EcWinMask
-      else if c >= 0 then
+  let rec go (fuel : Nat) (c : Int) (dif : UInt64) (pos : Nat) : Av1MsacDecoder :=
+    match fuel with
+    | 0 => { s with dif := dif, cnt := av1EcWinSize - c - 24, pos := pos }
+    | f + 1 =>
+      if pos >= endIdx then
+        let dif' :=
+          if c >= 64 then av1EcWinMask
+          else if c >= 0 then
+            let cu := c.toNat.toUInt64
+            let mask : UInt64 := (av1EcWinMask ^^^ (0xFF : UInt64)) <<< cu
+            dif ||| (av1EcWinMask ^^^ mask)
+          else dif
+        { s with dif := dif', cnt := av1EcWinSize - c - 24, pos := pos }
+      else
+        let byteXor : UInt64 := ((s.data.data.getD pos 0) ^^^ 0xFF).toUInt64
         let cu := c.toNat.toUInt64
-        let mask : UInt64 := (av1EcWinMask ^^^ (0xFF : UInt64)) <<< cu
-        dif := dif ||| (av1EcWinMask ^^^ mask)
-      return { s with dif := dif, cnt := av1EcWinSize - c - 24, pos := pos }
-    let byteXor : UInt64 := ((s.data.get! pos) ^^^ 0xFF).toUInt64
-    let cu := c.toNat.toUInt64
-    dif := dif ||| (byteXor <<< cu)
-    pos := pos + 1
-    c := c - 8
-    if c < 0 then
-      return { s with dif := dif, cnt := av1EcWinSize - c - 24, pos := pos }
-  return { s with dif := dif, cnt := av1EcWinSize - c - 24, pos := pos }
+        let dif' := dif ||| (byteXor <<< cu)
+        let pos' := pos + 1
+        let c' := c - 8
+        if c' < 0 then { s with dif := dif', cnt := av1EcWinSize - c' - 24, pos := pos' }
+        else go f c' dif' pos'
+  go 16 (av1EcWinSize - s.cnt - 24) s.dif s.pos
 
 def init (data : ByteArray) (offset sz : Nat) (disableCdfUpdate : Bool) : Av1MsacDecoder :=
-  let endIdx := Nat.min data.size (offset + sz)
+  let endIdx := Nat.min data.data.size (offset + sz)
   let s0 : Av1MsacDecoder := {
     data := data
     pos := offset
@@ -1873,37 +1881,42 @@ def decodeBoolAdapt (s : Av1MsacDecoder) (cdf : Array Nat) (base : Nat) :
     (bit, s1, cdf2)
 
 def decodeSymbolAdapt (s : Av1MsacDecoder) (cdf : Array Nat) (base nSymbols : Nat) :
-    Nat × Av1MsacDecoder × Array Nat := Id.run do
+    Nat × Av1MsacDecoder × Array Nat :=
   let c : Nat := (s.dif >>> 48).toNat
   let r : Nat := s.rng >>> 8
-  let mut v : Nat := s.rng
-  let mut u : Nat := s.rng
-  let mut val : Nat := 0
-  for k in [:nSymbols + 1] do
-    val := k
-    u := v
-    if k == nSymbols then
-      v := 0
-      break
-    let fk := cdf.getD (base + k) 0
-    v := ((r * (fk >>> av1EcProbShift)) >>> (7 - av1EcProbShift)) + av1EcMinProb * (nSymbols - k)
-    if c >= v then
-      break
+  let rec findSym (fuel k v : Nat) : Nat × Nat × Nat :=
+    match fuel with
+    | 0 => (k, v, 0)
+    | f + 1 =>
+      if k >= nSymbols then (nSymbols, v, 0)
+      else
+        let fk := cdf.getD (base + k) 0
+        let vNext := ((r * (fk >>> av1EcProbShift)) >>> (7 - av1EcProbShift)) + av1EcMinProb * (nSymbols - k)
+        if c >= vNext then (k, v, vNext)
+        else findSym f (k + 1) vNext
+  let (val, u, v) := findSym (nSymbols + 1) 0 s.rng
   let s1 := s.norm (s.dif - (v.toUInt64 <<< 48)) (u - v)
   if !s1.allowUpdateCdf then
-    return (val, s1, cdf)
-  let mut cdf' := cdf
-  let count := cdf'.getD (base + nSymbols) 0
-  let rate := 4 + (count >>> 4) + (if nSymbols > 2 then 1 else 0)
-  for i in [:val] do
-    let fi := cdf'.getD (base + i) 0
-    cdf' := cdf'.set! (base + i) (fi + ((32768 - fi) >>> rate))
-  for i in [val:nSymbols] do
-    let fi := cdf'.getD (base + i) 0
-    cdf' := cdf'.set! (base + i) (fi - (fi >>> rate))
-  if count < 32 then
-    cdf' := cdf'.set! (base + nSymbols) (count + 1)
-  return (val, s1, cdf')
+    (val, s1, cdf)
+  else
+    let count := cdf.getD (base + nSymbols) 0
+    let rate := 4 + (count >>> 4) + (if nSymbols > 2 then 1 else 0)
+    let rec updLo (fuel i : Nat) (arr : Array Nat) : Array Nat :=
+      match fuel with
+      | 0 => arr
+      | f + 1 =>
+        let fi := arr.getD (base + i) 0
+        updLo f (i + 1) (arr.set! (base + i) (fi + ((32768 - fi) >>> rate)))
+    let rec updHi (fuel i : Nat) (arr : Array Nat) : Array Nat :=
+      match fuel with
+      | 0 => arr
+      | f + 1 =>
+        let fi := arr.getD (base + i) 0
+        updHi f (i + 1) (arr.set! (base + i) (fi - (fi >>> rate)))
+    let cdf1 := updLo val 0 cdf
+    let cdf2 := updHi (nSymbols - val) val cdf1
+    let cdf3 := if count < 32 then cdf2.set! (base + nSymbols) (count + 1) else cdf2
+    (val, s1, cdf3)
 
 def decodeHiTok (s : Av1MsacDecoder) (cdf : Array Nat) (base : Nat) :
     Nat × Av1MsacDecoder × Array Nat :=
@@ -1922,14 +1935,14 @@ def decodeHiTok (s : Av1MsacDecoder) (cdf : Array Nat) (base : Nat) :
         let (br3, s4, cdf4) := s3.decodeSymbolAdapt cdf3 base 3
         (12 + br3, s4, cdf4)
 
-def decodeBools (s : Av1MsacDecoder) (n : Nat) : Nat × Av1MsacDecoder := Id.run do
-  let mut cur := s
-  let mut v : Nat := 0
-  for _ in [:n] do
-    let (b, next) := cur.decodeBoolEqui
-    cur := next
-    v := (v <<< 1) ||| b
-  return (v, cur)
+def decodeBools (s : Av1MsacDecoder) (n : Nat) : Nat × Av1MsacDecoder :=
+  let rec go (k v : Nat) (cur : Av1MsacDecoder) : Nat × Av1MsacDecoder :=
+    match k with
+    | 0 => (v, cur)
+    | k' + 1 =>
+      let (b, next) := cur.decodeBoolEqui
+      go k' ((v <<< 1) ||| b) next
+  go n 0 s
 
 def decodeUniform (s : Av1MsacDecoder) (n : Nat) : Nat × Av1MsacDecoder :=
   if n <= 1 then (0, s)
@@ -1978,7 +1991,7 @@ def norm (e : Av1MsacEncoder) (low rng : Nat) : Av1MsacEncoder :=
   let d := 15 - av1Ulog2 rng
   { e with low := low <<< d, rng := rng <<< d, cnt := e.cnt + d }
 
-def finalize (enc : Av1MsacEncoder) : ByteArray := Id.run do
+def finalize (enc : Av1MsacEncoder) : ByteArray :=
   let e0 : Nat := (((enc.low + 0x4000) >>> 15) <<< 15) ||| 0x3FFF
   let nbytes : Nat := (enc.cnt + 8) >>> 3
   let rem : Int := Int.ofNat (nbytes <<< 3) - Int.ofNat (15 + enc.cnt)
@@ -1990,12 +2003,14 @@ def finalize (enc : Av1MsacEncoder) : ByteArray := Id.run do
       let r := (-rem).toNat
       e0 >>> r
     else e0
-  let mut out := ByteArray.emptyWithCapacity nbytes
-  for i in [:nbytes] do
-    let shift := (nbytes - 1 - i) * 8
-    let invByte : UInt8 := ((eFinal >>> shift) &&& 0xFF).toUInt8
-    out := out.push (invByte ^^^ 0xFF)
-  return out
+  let rec go (fuel i : Nat) (out : Array UInt8) : Array UInt8 :=
+    match fuel with
+    | 0 => out
+    | f + 1 =>
+      let shift := (nbytes - 1 - i) * 8
+      let invByte : UInt8 := ((eFinal >>> shift) &&& 0xFF).toUInt8
+      go f (i + 1) (out.push (invByte ^^^ 0xFF))
+  { data := go nbytes 0 #[] }
 
 def encodeBool (enc : Av1MsacEncoder) (val f : Nat) : Av1MsacEncoder :=
   let r := enc.rng
@@ -2023,7 +2038,7 @@ def encodeBoolAdapt (enc : Av1MsacEncoder) (val : Nat) (cdf : Array Nat) (base :
     (enc1, cdf2)
 
 def encodeSymbolAdapt (enc : Av1MsacEncoder) (val : Nat) (cdf : Array Nat) (base nSymbols : Nat) :
-    Av1MsacEncoder × Array Nat := Id.run do
+    Av1MsacEncoder × Array Nat :=
   let r := enc.rng >>> 8
   let u :=
     if val > 0 then
@@ -2036,26 +2051,33 @@ def encodeSymbolAdapt (enc : Av1MsacEncoder) (val : Nat) (cdf : Array Nat) (base
       let fCur := cdf.getD (base + val) 0
       ((r * (fCur >>> av1EcProbShift)) >>> (7 - av1EcProbShift)) + av1EcMinProb * (nSymbols - val)
   let enc1 := enc.norm (enc.low + v) (u - v)
-  if !enc1.allowUpdateCdf then return (enc1, cdf)
-  let mut cdf' := cdf
-  let count := cdf'.getD (base + nSymbols) 0
-  let rate := 4 + (count >>> 4) + (if nSymbols > 2 then 1 else 0)
-  for i in [:val] do
-    let fi := cdf'.getD (base + i) 0
-    cdf' := cdf'.set! (base + i) (fi + ((32768 - fi) >>> rate))
-  for i in [val:nSymbols] do
-    let fi := cdf'.getD (base + i) 0
-    cdf' := cdf'.set! (base + i) (fi - (fi >>> rate))
-  if count < 32 then
-    cdf' := cdf'.set! (base + nSymbols) (count + 1)
-  return (enc1, cdf')
+  if !enc1.allowUpdateCdf then (enc1, cdf)
+  else
+    let count := cdf.getD (base + nSymbols) 0
+    let rate := 4 + (count >>> 4) + (if nSymbols > 2 then 1 else 0)
+    let rec updLo (fuel i : Nat) (arr : Array Nat) : Array Nat :=
+      match fuel with
+      | 0 => arr
+      | f + 1 =>
+        let fi := arr.getD (base + i) 0
+        updLo f (i + 1) (arr.set! (base + i) (fi + ((32768 - fi) >>> rate)))
+    let rec updHi (fuel i : Nat) (arr : Array Nat) : Array Nat :=
+      match fuel with
+      | 0 => arr
+      | f + 1 =>
+        let fi := arr.getD (base + i) 0
+        updHi f (i + 1) (arr.set! (base + i) (fi - (fi >>> rate)))
+    let cdf1 := updLo val 0 cdf
+    let cdf2 := updHi (nSymbols - val) val cdf1
+    let cdf3 := if count < 32 then cdf2.set! (base + nSymbols) (count + 1) else cdf2
+    (enc1, cdf3)
 
-def encodeBools (enc : Av1MsacEncoder) (v n : Nat) : Av1MsacEncoder := Id.run do
-  let mut cur := enc
-  for k in [:n] do
-    let shift := n - 1 - k
-    cur := cur.encodeBoolEqui ((v >>> shift) &&& 1)
-  return cur
+def encodeBools (enc : Av1MsacEncoder) (v n : Nat) : Av1MsacEncoder :=
+  let rec go (k : Nat) (cur : Av1MsacEncoder) : Av1MsacEncoder :=
+    match k with
+    | 0 => cur
+    | k' + 1 => go k' (cur.encodeBoolEqui ((v >>> k') &&& 1))
+  go n enc
 
 def encodeUniform (enc : Av1MsacEncoder) (v n : Nat) : Av1MsacEncoder :=
   if n <= 1 then enc
@@ -2100,40 +2122,45 @@ end Av1MsacEncoder
 @[inline] def av1PrimaryRefNone : Nat := 7
 @[inline] def av1Adaptive : Nat := 2
 
-def av1EncodeLeb128 (val : Nat) : ByteArray := Id.run do
+def av1EncodeLeb128 (val : Nat) : ByteArray :=
   if val == 0 then
-    return ByteArray.mk #[0]
-  let mut out := ByteArray.emptyWithCapacity 5
-  let mut v := val
-  for _ in [:8] do
-    if v == 0 then
-      return out
-    let b := v &&& 0x7F
-    v := v >>> 7
-    let byteVal : UInt8 := (if v > 0 then b ||| 0x80 else b).toUInt8
-    out := out.push byteVal
-  return out
+    { data := #[0] }
+  else
+    let rec go (fuel v : Nat) (out : Array UInt8) : Array UInt8 :=
+      match fuel with
+      | 0 => out
+      | f + 1 =>
+        if v == 0 then out
+        else
+          let b := v &&& 0x7F
+          let v' := v >>> 7
+          let byteVal : UInt8 := (if v' > 0 then b ||| 0x80 else b).toUInt8
+          go f v' (out.push byteVal)
+    { data := go 8 val #[] }
 
-def av1DecodeLeb128 (data : ByteArray) (pos : Nat) : Option (Nat × Nat) := Id.run do
-  let mut val : Nat := 0
-  for i in [:8] do
-    if pos + i >= data.size then
-      return none
-    let b := (data.get! (pos + i)).toNat
-    val := val ||| ((b &&& 0x7F) <<< (7 * i))
-    if (b &&& 0x80) == 0 then
-      if val >= (1 <<< 32) then
-        return none
-      return some (val, pos + i + 1)
-  return none
+def av1DecodeLeb128 (data : ByteArray) (pos : Nat) : Option (Nat × Nat) :=
+  let n := data.data.size
+  let rec go (fuel i val : Nat) : Option (Nat × Nat) :=
+    match fuel with
+    | 0 => none
+    | f + 1 =>
+      if pos + i >= n then none
+      else
+        let b := (data.data.getD (pos + i) 0).toNat
+        let val' := val ||| ((b &&& 0x7F) <<< (7 * i))
+        if (b &&& 0x80) == 0 then
+          if val' >= (1 <<< 32) then none
+          else some (val', pos + i + 1)
+        else go f (i + 1) val'
+  go 8 0 0
 
 def av1WrapObu (obuType : Nat) (payload : ByteArray) (hasSize : Bool := true) : ByteArray :=
   let hdrByte : UInt8 := (((obuType &&& 0xF) <<< 3) ||| (if hasSize then 0x02 else 0x00)).toUInt8
-  let head := ByteArray.mk #[hdrByte]
+  let head : Array UInt8 := #[hdrByte]
   if hasSize then
-    head ++ av1EncodeLeb128 payload.size ++ payload
+    { data := head ++ (av1EncodeLeb128 payload.data.size).data ++ payload.data }
   else
-    head ++ payload
+    { data := head ++ payload.data }
 
 structure Av1ObuPacket where
   obuType    : Nat
@@ -2143,45 +2170,50 @@ structure Av1ObuPacket where
   payload    : ByteArray
   deriving Inhabited, DecidableEq
 
-def av1ParseObus (data : ByteArray) : Option (Array Av1ObuPacket) := Id.run do
-  let mut obus : Array Av1ObuPacket := #[]
-  let mut pos : Nat := 0
-  let n := data.size
-  while pos < n do
-    let hdr := (data.get! pos).toNat
-    pos := pos + 1
-    if (hdr &&& 0x80) != 0 then
-      return none
-    let obuType := (hdr >>> 3) &&& 0xF
-    let hasExt := ((hdr >>> 2) &&& 1) != 0
-    let hasSize := ((hdr >>> 1) &&& 1) != 0
-    if (hdr &&& 1) != 0 then
-      return none
-    let mut temporalId : Nat := 0
-    let mut spatialId : Nat := 0
-    if hasExt then
-      if pos >= n then
-        return none
-      let ext := (data.get! pos).toNat
-      pos := pos + 1
-      temporalId := (ext >>> 5) &&& 7
-      spatialId := (ext >>> 3) &&& 3
-      if (ext &&& 7) != 0 then
-        return none
-    if hasSize then
-      match av1DecodeLeb128 data pos with
-      | none => return none
-      | some (sz, nextPos) =>
-        if nextPos + sz > n then
-          return none
-        let payload := data.extract nextPos (nextPos + sz)
-        pos := nextPos + sz
-        obus := obus.push { obuType := obuType, temporalId := temporalId, spatialId := spatialId, hasSize := true, payload := payload }
-    else
-      let payload := data.extract pos n
-      pos := n
-      obus := obus.push { obuType := obuType, temporalId := temporalId, spatialId := spatialId, hasSize := false, payload := payload }
-  return some obus
+def av1ParseObus (data : ByteArray) : Option (Array Av1ObuPacket) :=
+  let n := data.data.size
+  let rec go (fuel pos : Nat) (obus : Array Av1ObuPacket) : Option (Array Av1ObuPacket) :=
+    match fuel with
+    | 0 => if pos >= n then some obus else none
+    | f + 1 =>
+      if pos >= n then some obus
+      else
+        let hdr := (data.data.getD pos 0).toNat
+        let pos1 := pos + 1
+        if (hdr &&& 0x80) != 0 || (hdr &&& 1) != 0 then none
+        else
+          let obuType := (hdr >>> 3) &&& 0xF
+          let hasExt := ((hdr >>> 2) &&& 1) != 0
+          let hasSize := ((hdr >>> 1) &&& 1) != 0
+          let extOpt : Option (Nat × Nat × Nat) :=
+            if hasExt then
+              if pos1 >= n then none
+              else
+                let ext := (data.data.getD pos1 0).toNat
+                if (ext &&& 7) != 0 then none
+                else some ((ext >>> 5) &&& 7, (ext >>> 3) &&& 3, pos1 + 1)
+            else some (0, 0, pos1)
+          match extOpt with
+          | none => none
+          | some (temporalId, spatialId, pos2) =>
+            if hasSize then
+              match av1DecodeLeb128 data pos2 with
+              | none => none
+              | some (sz, nextPos) =>
+                if nextPos + sz > n then none
+                else
+                  let payload : ByteArray :=
+                    { data := (data.data.toList.drop nextPos |>.take sz).toArray }
+                  go f (nextPos + sz) (obus.push {
+                    obuType := obuType, temporalId := temporalId,
+                    spatialId := spatialId, hasSize := true, payload := payload })
+            else
+              let payload : ByteArray :=
+                { data := (data.data.toList.drop pos2).toArray }
+              some (obus.push {
+                obuType := obuType, temporalId := temporalId,
+                spatialId := spatialId, hasSize := false, payload := payload })
+  go n 0 #[]
 
 def av1GetPocDiff (orderHintNBits : Nat) (poc0 poc1 : Int) : Int :=
   if orderHintNBits == 0 then 0
@@ -2259,7 +2291,7 @@ structure Av1SeqHdr where
   deriving Inhabited, Repr, DecidableEq
 
 def av1ParseSeqHdr (payload : ByteArray) (strict : Bool := true) : Option Av1SeqHdr := Id.run do
-  if payload.isEmpty then
+  if payload.data.size == 0 then
     return none
   let mut gb := Av1BitReader.init payload
   let (profile, gb1) := gb.getBits 3; gb := gb1
@@ -2311,32 +2343,39 @@ def av1ParseSeqHdr (payload : ByteArray) (strict : Bool := true) : Option Av1Seq
     let (dispMip, gbk) := gb.getBit; gb := gbk
     let (nopM1, gbl) := gb.getBits 5; gb := gbl
     let nop := nopM1 + 1
-    let mut ops : Array Av1OperatingPoint := Array.mkEmpty nop
-    for _ in [:nop] do
-      let (idc, gbm) := gb.getBits 12; gb := gbm
-      if idc != 0 && ((idc &&& 0xFF) == 0 || (idc &&& 0xF00) == 0) then
-        return none
-      let (majM2, gbn) := gb.getBits 3; gb := gbn
-      let maj := 2 + majM2
-      let (mnr, gbo) := gb.getBits 2; gb := gbo
-      let mut tier : Nat := 0
-      if maj > 3 then
-        let (tb, gbp) := gb.getBit; gb := gbp
-        tier := tb
-      let mut dmp := false
-      if h.decoderModelInfoPresent then
-        let (dmpB, gbq) := gb.getBit; gb := gbq
-        dmp := dmpB != 0
-        if dmp then
-          let (_, gbr1) := gb.getBits h.encoderDecoderBufferDelayLength; gb := gbr1
-          let (_, gbr2) := gb.getBits h.encoderDecoderBufferDelayLength; gb := gbr2
-          let (_, gbr3) := gb.getBit; gb := gbr3
-      if dispMip != 0 then
-        let (dp, gbs) := gb.getBit; gb := gbs
-        if dp != 0 then
-          let (_, gbt) := gb.getBits 4; gb := gbt
-      ops := ops.push { idc := idc, majorLevel := maj, minorLevel := mnr, tier := tier, decoderModelParamPresent := dmp }
-    h := { h with displayModelInfoPresent := dispMip != 0, numOperatingPoints := nop, operatingPoints := ops }
+    let rec parseOps (fuel : Nat) (cur : Av1BitReader) (ops : Array Av1OperatingPoint) :
+        Option (Array Av1OperatingPoint × Av1BitReader) :=
+      match fuel with
+      | 0 => some (ops, cur)
+      | f + 1 =>
+        let (idc, gbm) := cur.getBits 12
+        if idc != 0 && ((idc &&& 0xFF) == 0 || (idc &&& 0xF00) == 0) then none
+        else
+          let (majM2, gbn) := gbm.getBits 3
+          let maj := 2 + majM2
+          let (mnr, gbo) := gbn.getBits 2
+          let (tier, gbp) := if maj > 3 then gbo.getBit else (0, gbo)
+          let (dmp, gbq) :=
+            if h.decoderModelInfoPresent then
+              let (dmpB, gbq0) := gbp.getBit
+              if dmpB != 0 then
+                let (_, gbr1) := gbq0.getBits h.encoderDecoderBufferDelayLength
+                let (_, gbr2) := gbr1.getBits h.encoderDecoderBufferDelayLength
+                let (_, gbr3) := gbr2.getBit
+                (true, gbr3)
+              else (false, gbq0)
+            else (false, gbp)
+          let gbt :=
+            if dispMip != 0 then
+              let (dp, gbs) := gbq.getBit
+              if dp != 0 then (gbs.getBits 4).2 else gbs
+            else gbq
+          parseOps f gbt (ops.push { idc := idc, majorLevel := maj, minorLevel := mnr, tier := tier, decoderModelParamPresent := dmp })
+    match parseOps nop gb #[] with
+    | none => return none
+    | some (ops, gbNext) =>
+      gb := gbNext
+      h := { h with displayModelInfoPresent := dispMip != 0, numOperatingPoints := nop, operatingPoints := ops }
   let (wnb, gb4) := gb.getBits 4; gb := gb4
   let (hnb, gb5) := gb.getBits 4; gb := gb5
   let widthNBits := wnb + 1
@@ -2463,10 +2502,16 @@ def av1ParseSeqHdr (payload : ByteArray) (strict : Bool := true) : Option Av1Seq
     let (okTrail, gb30) := gb.checkTrailingBits; gb := gb30
     if !okTrail then
       return none
-    while gb.bitPos < gb.endIdx * 8 do
-      let (z, gb31) := gb.getBits 8; gb := gb31
-      if z != 0 then
-        return none
+    let rec checkZeroTail (fuel : Nat) (cur : Av1BitReader) : Bool :=
+      match fuel with
+      | 0 => cur.bitPos >= cur.endIdx * 8
+      | f + 1 =>
+        if cur.bitPos >= cur.endIdx * 8 then true
+        else
+          let (z, next) := cur.getBits 8
+          if z != 0 then false else checkZeroTail f next
+    if !checkZeroTail gb.endIdx gb then
+      return none
   else if gb.err then
     return none
   let isMain8 := h.profile == 0 && hbd == 0 && !mono && ssHor == 1 && ssVer == 1
@@ -2648,7 +2693,7 @@ structure Av1RefSlot where
   cdf    : Array Nat := #[]
   deriving Inhabited
 
-private def av1ArithShiftRight (x : Int) (sh : Nat) : Int :=
+def av1ArithShiftRight (x : Int) (sh : Nat) : Int :=
   Int.fdiv x (Int.ofNat (1 <<< sh))
 
 private def av1ReadFrameSize (seq : Av1SeqHdr) (hdr0 : Av1FrameHdr) (gb0 : Av1BitReader)
@@ -13847,7 +13892,7 @@ private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Arra
   let cfg := cfg0
   let mut bw := av1EncBuildFrameHdrBits cfg frameNum inter 4
   bw := bw.byteAlignZero
-  let gb := Av1BitReader.mk bw.toBytes 0 0 false
+  let gb := Av1BitReader.init bw.toBytes
   let some (fh0, _) := av1ParseFrameHdr cfg.seq gb refs0 | return none
   let fh := fh0
   let w := cfg.width
@@ -13870,7 +13915,14 @@ private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Arra
   let mut flatU : Array Nat := Array.replicate (uvStride * uvRows) 128
   let mut flatV : Array Nat := Array.replicate (uvStride * uvRows) 128
   let keyOrIntra := !inter
-  let inCdf := av1InitDefaultCdf (av1Qcat cfg.qidx)
+  let inCdf : Array Nat :=
+    if fh.primaryRefFrame == av1PrimaryRefNone then
+      av1InitDefaultCdf (av1Qcat cfg.qidx)
+    else
+      let priIdx := fh.refidx.getD fh.primaryRefFrame 0
+      match refs0.getD priIdx none with
+      | some priSlot => priSlot.cdf
+      | none => av1InitDefaultCdf (av1Qcat cfg.qidx)
   let cols := fh.tiling.cols
   let rows := fh.tiling.rows
   let nTiles := cols * rows
@@ -13878,7 +13930,7 @@ private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Arra
   let initAbove := av1ResetContext {} keyOrIntra
   let mut aboveRows : Array (Array Av1BlockContext) :=
     Array.replicate rows (Array.replicate sb128w initAbove)
-  let rf : Option Av1RefMvFrame :=
+  let mut rf : Option Av1RefMvFrame :=
     if inter then some (av1InitRefMvFrame fh cfg.seq refs0) else none
   let mut lfMasks : Array Av1LfMask := Array.replicate (sb128w * ((sbh + 1) >>> 1)) {}
   let level0 := av1CalcLfValues fh #[0, 0, 0, 0]
@@ -13935,6 +13987,7 @@ private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Arra
         flatU := ctxOut.flatU
         flatV := ctxOut.flatV
         aboveRows := aboveRows.set! tileRow ctxOut.above
+        rf := ctxOut.rf
         lfMasks := ctxOut.lfMasks
         levelY := ctxOut.levelY
         levelUv := ctxOut.levelUv
