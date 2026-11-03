@@ -129,7 +129,7 @@ def av1MaxTxfmForBs : Array Nat := #[
 ]
 
 def av1TxtpFromUvmode : Array Nat := #[
-  0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 1, 2, 3, 0
+  0, 1, 2, 0, 3, 1, 2, 2, 1, 0, 1, 2, 0, 0
 ]
 
 def av1CompInterPredModes : Array Nat := #[
@@ -1478,7 +1478,7 @@ def av1IclipU8 (v : Int) : Nat :=
 
 @[inline]
 def av1ApplySign (v s : Int) : Int :=
-  if s < 0 then -v else if s > 0 then v else 0
+  if s < 0 then -v else v
 
 def av1LastNonzeroColFromEob : Array (Array Nat) := Id.run do
   let mut out : Array (Array Nat) := Array.mkEmpty 19
@@ -2976,8 +2976,9 @@ private def av1ShortSignalingRefIdx (seq : Av1SeqHdr) (frameOffset : Nat) (r0 r3
       let mut lU : Nat := 0xFFFFFF00
       let mut chosen : Int := -1
       for j in [:8] do
-        let hu := toU32 (fo.getD j usedMark)
-        if hu >= lU then
+        let fv := fo.getD j usedMark
+        let hu := toU32 fv
+        if fv != usedMark && hu >= lU then
           lU := hu
           chosen := Int.ofNat j
       if chosen >= 0 then
@@ -4198,78 +4199,83 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot)) : Av1Ref
   let mut rpProj := Array.replicate (rf.ih8 * rf.rpStride) (none : Option Av1TmvEntry)
   if !rf.useRefFrameMvs then
     return { rf with rpProj := rpProj }
-  for n in [:rf.mfmvRef.size] do
-    let r := rf.mfmvRef.getD n 0
-    let ref2cur := rf.mfmvRef2Cur.getD n av1InvalidRef2Cur
-    if ref2cur != av1InvalidRef2Cur then
-      match refs.getD (rf.hdr.refidx.getD r 0) none with
-      | none => pure ()
-      | some rSlot =>
-        match rSlot.tmvs with
+  let sbStep8 := 8 <<< rf.seq.sb128
+  let mut rowStart8 : Nat := 0
+  while rowStart8 < rf.ih8 do
+    let rowEnd8 := Nat.min (rowStart8 + sbStep8) rf.ih8
+    for n in [:rf.mfmvRef.size] do
+      let r := rf.mfmvRef.getD n 0
+      let ref2cur := rf.mfmvRef2Cur.getD n av1InvalidRef2Cur
+      if ref2cur != av1InvalidRef2Cur then
+        match refs.getD (rf.hdr.refidx.getD r 0) none with
         | none => pure ()
-        | some src =>
-          for y in [:rf.ih8] do
-            let ySb := (y / 8) * 8
-            let y0 := ySb
-            let y1 := Nat.min (ySb + 8) rf.ih8
-            let srcRow := src.getD y #[]
-            let mut x : Nat := 0
-            while x < rf.iw8 do
-              let rbOpt := if y < src.size && x < srcRow.size then srcRow.getD x none else none
-              match rbOpt with
-              | none => x := x + 1
-              | some rb =>
-                let bRef := rb.ref
-                let ref2ref := (rf.mfmvRef2Ref.getD n #[]).getD (bRef - 1) 0
-                if ref2ref == 0 then
-                  x := x + 1
-                else
-                  let (offY, offX) := av1MvProjection rb.mvY rb.mvX ref2cur ref2ref
-                  let sx := if r < 4 then -offX else offX
-                  let sy := if r < 4 then -offY else offY
-                  let px0 : Int := Int.ofNat x + av1ApplySign (Int.ofNat (offX.natAbs >>> 6)) sx
-                  let py : Int := Int.ofNat y + av1ApplySign (Int.ofNat (offY.natAbs >>> 6)) sy
-                  if Int.ofNat y0 <= py && py < Int.ofNat y1 then
-                    let pyNat := py.toNat
-                    let mut curX := x
-                    let mut px := px0
-                    let mut keepGoing := true
-                    while keepGoing do
-                      let xSb := (curX / 8) * 8
-                      let xLo : Int := Int.ofNat (xSb - 8)
-                      let xHi : Int := Int.ofNat (Nat.min (xSb + 16) rf.iw8)
-                      if xLo <= px && px < xHi then
-                        let pxNat := px.toNat
-                        if pyNat < rf.ih8 && pxNat < rf.iw8 then
-                          rpProj := rpProj.set! (pyNat * rf.rpStride + pxNat) (some { mvY := rb.mvY, mvX := rb.mvX, ref := ref2ref })
-                      curX := curX + 1
-                      if curX >= rf.iw8 then
-                        keepGoing := false
-                      else
-                        let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
-                        match nxtOpt with
-                        | none => keepGoing := false
-                        | some nxt =>
-                          if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
-                            keepGoing := false
-                          else
-                            px := px + 1
-                    x := curX
+        | some rSlot =>
+          match rSlot.tmvs with
+          | none => pure ()
+          | some src =>
+            for y in [rowStart8:rowEnd8] do
+              let ySb := (y / 8) * 8
+              let y0 := Nat.max ySb rowStart8
+              let y1 := Nat.min (ySb + 8) rowEnd8
+              let srcRow := src.getD y #[]
+              let mut x : Nat := 0
+              while x < rf.iw8 do
+                let rbOpt := if y < src.size && x < srcRow.size then srcRow.getD x none else none
+                match rbOpt with
+                | none => x := x + 1
+                | some rb =>
+                  let bRef := rb.ref
+                  let ref2ref := (rf.mfmvRef2Ref.getD n #[]).getD (bRef - 1) 0
+                  if ref2ref == 0 then
+                    x := x + 1
                   else
-                    let mut curX := x
-                    let mut keepGoing := true
-                    while keepGoing do
-                      curX := curX + 1
-                      if curX >= rf.iw8 then
-                        keepGoing := false
-                      else
-                        let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
-                        match nxtOpt with
-                        | none => keepGoing := false
-                        | some nxt =>
-                          if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
-                            keepGoing := false
-                    x := curX
+                    let (offY, offX) := av1MvProjection rb.mvY rb.mvX ref2cur ref2ref
+                    let sx := if r < 4 then (if offX >= 0 then -1 else 1) else (if offX < 0 then -1 else 1)
+                    let sy := if r < 4 then (if offY >= 0 then -1 else 1) else (if offY < 0 then -1 else 1)
+                    let px0 : Int := Int.ofNat x + av1ApplySign (Int.ofNat (offX.natAbs >>> 6)) sx
+                    let py : Int := Int.ofNat y + av1ApplySign (Int.ofNat (offY.natAbs >>> 6)) sy
+                    if Int.ofNat y0 <= py && py < Int.ofNat y1 then
+                      let pyNat := py.toNat
+                      let mut curX := x
+                      let mut px := px0
+                      let mut keepGoing := true
+                      while keepGoing do
+                        let xSb := (curX / 8) * 8
+                        let xLo : Int := Int.ofNat (xSb - 8)
+                        let xHi : Int := Int.ofNat (Nat.min (xSb + 16) rf.iw8)
+                        if xLo <= px && px < xHi then
+                          let pxNat := px.toNat
+                          if pyNat < rf.ih8 && pxNat < rf.iw8 then
+                            rpProj := rpProj.set! (pyNat * rf.rpStride + pxNat) (some { mvY := rb.mvY, mvX := rb.mvX, ref := ref2ref })
+                        curX := curX + 1
+                        if curX >= rf.iw8 then
+                          keepGoing := false
+                        else
+                          let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
+                          match nxtOpt with
+                          | none => keepGoing := false
+                          | some nxt =>
+                            if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
+                              keepGoing := false
+                            else
+                              px := px + 1
+                      x := curX
+                    else
+                      let mut curX := x
+                      let mut keepGoing := true
+                      while keepGoing do
+                        curX := curX + 1
+                        if curX >= rf.iw8 then
+                          keepGoing := false
+                        else
+                          let nxtOpt := if y < src.size && curX < srcRow.size then srcRow.getD curX none else none
+                          match nxtOpt with
+                          | none => keepGoing := false
+                          | some nxt =>
+                            if nxt.ref != bRef || nxt.mvY != rb.mvY || nxt.mvX != rb.mvX then
+                              keepGoing := false
+                      x := curX
+    rowStart8 := rowStart8 + sbStep8
   return { rf with rpProj := rpProj }
 
 def av1SaveTmvs (rf : Av1RefMvFrame) : Array (Array (Option Av1TmvEntry)) := Id.run do
@@ -4449,11 +4455,15 @@ private def av1BubbleSortStack (stack0 : Array Av1MvCand) (lo hi : Nat) : Array 
     length := last
   return stack
 
-def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 : Nat) :
+def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 : Nat)
+    (tileColStart4 : Nat := 0) (tileColEnd4 : Int := -1)
+    (tileRowStart4 : Nat := 0) (tileRowEnd4 : Int := -1) :
     Array Av1MvCand × Nat × Nat := Id.run do
   let (bw4, bh4) := av1Bdim bs
-  let w4 := Nat.min (Nat.min bw4 16) (rf.iw4 - bx4)
-  let h4 := Nat.min (Nat.min bh4 16) (rf.ih4 - by4)
+  let tileColEnd4 := if tileColEnd4 < 0 then rf.iw4 else Nat.min tileColEnd4.toNat rf.iw4
+  let tileRowEnd4 := if tileRowEnd4 < 0 then rf.ih4 else Nat.min tileRowEnd4.toNat rf.ih4
+  let w4 := Nat.min (Nat.min bw4 16) (tileColEnd4 - bx4)
+  let h4 := Nat.min (Nat.min bh4 16) (tileRowEnd4 - by4)
   let hdr := rf.hdr
   let gmvFor (r : Int) : (Int × Int) × Option (Int × Int) :=
     if r <= 0 then ((0, 0), none)
@@ -4471,17 +4481,17 @@ def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 :
   let mut colNewmv : Nat := 0
   let mut maxRows : Nat := 0
   let mut nRowsOpt : Option Nat := none
-  if by4 > 0 then
-    maxRows := Nat.min ((by4 + 1) >>> 1) (2 + (if bh4 > 1 then 1 else 0))
+  if by4 > tileRowStart4 then
+    maxRows := Nat.min ((by4 - tileRowStart4 + 1) >>> 1) (2 + (if bh4 > 1 then 1 else 0))
     let (st1, rf1, nm1, nr) := av1ScanRow stack ref0 ref1 gmv0 gmv1 rf (by4 - 1) bx4 bw4 w4 maxRows (if bw4 >= 16 then 4 else 1) rowRefmv rowNewmv
     stack := st1; rowRefmv := rf1; rowNewmv := nm1; nRowsOpt := some nr
   let mut maxCols : Nat := 0
   let mut nColsOpt : Option Nat := none
-  if bx4 > 0 then
-    maxCols := Nat.min ((bx4 + 1) >>> 1) (2 + (if bw4 > 1 then 1 else 0))
+  if bx4 > tileColStart4 then
+    maxCols := Nat.min ((bx4 - tileColStart4 + 1) >>> 1) (2 + (if bw4 > 1 then 1 else 0))
     let (st1, rf1, nm1, nc) := av1ScanCol stack ref0 ref1 gmv0 gmv1 rf by4 (bx4 - 1) bh4 h4 maxCols (if bh4 >= 16 then 4 else 1) colRefmv colNewmv
     stack := st1; colRefmv := rf1; colNewmv := nm1; nColsOpt := some nc
-  if nRowsOpt.isSome && (edgeFlags &&& av1EdgeI444TopHasRight) != 0 && Nat.max bw4 bh4 <= 16 && bw4 + bx4 < rf.iw4 then
+  if nRowsOpt.isSome && (edgeFlags &&& av1EdgeI444TopHasRight) != 0 && Nat.max bw4 bh4 <= 16 && bw4 + bx4 < tileColEnd4 then
     let cTr := rf.r.getD ((by4 - 1) * rf.rStride + bx4 + bw4) {}
     let (st1, rf1, nm1) := av1AddSpatial stack 4 cTr ref0 ref1 gmv0 gmv1 rowRefmv rowNewmv
     stack := st1; rowRefmv := rf1; rowNewmv := nm1
@@ -4522,13 +4532,14 @@ def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 :
     if Nat.min bw4 bh4 >= 2 && Nat.max bw4 bh4 < 16 then
       let bh8 := bh4 >>> 1
       let bw8 := bw4 >>> 1
-      let yBound := Nat.min rf.ih8 ((by8 / 8) * 8 + 8)
-      let xBound := Nat.min rf.iw8 ((bx8 / 8) * 8 + 8)
+      let yBound := Nat.min (tileRowEnd4 >>> 1) ((by8 / 8) * 8 + 8)
+      let xLoBound := Nat.max (tileColStart4 >>> 1) ((bx8 / 8) * 8)
+      let xHiBound := Nat.min (tileColEnd4 >>> 1) ((bx8 / 8) * 8 + 8)
       let hasBottom := by8 + bh8 < yBound
-      if hasBottom && bx8 >= (bx8 / 8) * 8 + 1 then
+      if hasBottom && bx8 >= xLoBound + 1 then
         let (stB, _) := av1AddTemporal rf stack (rf.rpProj.getD ((by8 + bh8) * rf.rpStride + (bx8 - 1)) none) ref0 ref1 false gmvCtx tgmv0 2
         stack := stB
-      if bx8 + bw8 < xBound then
+      if bx8 + bw8 < xHiBound then
         if hasBottom then
           let (stBR, _) := av1AddTemporal rf stack (rf.rpProj.getD ((by8 + bh8) * rf.rpStride + (bx8 + bw8)) none) ref0 ref1 false gmvCtx tgmv0 2
           stack := stBR
@@ -4642,10 +4653,11 @@ def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 :
       same1 := fillComp same1 diff1 sc1 dc1 tgmv1
       if stack.size == 1 && (stack.getD 0 {}).mv0 == same0.getD 0 (0, 0) && (stack.getD 0 {}).mv1 == same1.getD 0 (0, 0) then
         stack := stack.push { mv0 := same0.getD 1 (0, 0), mv1 := same1.getD 1 (0, 0), w := 2 }
+      else if stack.size == 1 then
+        stack := stack.push { mv0 := same0.getD 0 (0, 0), mv1 := same1.getD 0 (0, 0), w := 2 }
       else
-        while stack.size < 2 do
-          let idx := stack.size
-          stack := stack.push { mv0 := same0.getD idx (0, 0), mv1 := same1.getD idx (0, 0), w := 2 }
+        stack := stack.push { mv0 := same0.getD 0 (0, 0), mv1 := same1.getD 0 (0, 0), w := 2 }
+        stack := stack.push { mv0 := same0.getD 1 (0, 0), mv1 := same1.getD 1 (0, 0), w := 2 }
       stack := stack.extract 0 2
       stack := stack.set! 0 { (stack.getD 0 {}) with w := 2 }
       stack := stack.set! 1 { (stack.getD 1 {}) with w := 2 }
