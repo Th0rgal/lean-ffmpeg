@@ -2206,10 +2206,12 @@ def av1ParseObus (data : ByteArray) : Option (Array Av1ObuPacket) :=
                   go f (nextPos + sz) (obus.push {
                     obuType := obuType, temporalId := temporalId,
                     spatialId := spatialId, hasSize := true, payload := payload })
+            else if obus.toList.any (fun o => !o.hasSize) then
+              none
             else
               let payload : ByteArray :=
                 { data := (data.data.toList.drop pos2).toArray }
-              some (obus.push {
+              go f n (obus.push {
                 obuType := obuType, temporalId := temporalId,
                 spatialId := spatialId, hasSize := false, payload := payload })
   go n 0 #[]
@@ -3655,8 +3657,9 @@ def av1WriteSeqHdrObu (width height : Nat) (enableCdef : Bool := true) (enableRe
 
 def av1BuildAv1C (seqHdrObu : ByteArray) (seq : Av1SeqHdr) : ByteArray :=
   let op0 := seq.operatingPoints.getD 0 {}
+  let seqLevelIdx0 : Nat := if op0.majorLevel >= 2 then (op0.majorLevel - 2) * 4 + op0.minorLevel else op0.minorLevel
   let b0 : UInt8 := 0x81
-  let b1 : UInt8 := (((seq.profile &&& 7) <<< 5) ||| (op0.majorLevel &&& 0x1F)).toUInt8
+  let b1 : UInt8 := (((seq.profile &&& 7) <<< 5) ||| (seqLevelIdx0 &&& 0x1F)).toUInt8
   let b2 : UInt8 :=
     (((op0.tier &&& 1) <<< 7) |||
      ((seq.hbd &&& 1) <<< 6) |||
@@ -3668,11 +3671,56 @@ def av1BuildAv1C (seqHdrObu : ByteArray) (seq : Av1SeqHdr) : ByteArray :=
   let b3 : UInt8 := 0x00
   ByteArray.mk #[b0, b1, b2, b3] ++ seqHdrObu
 
-def av1ParseAv1C (cfg : ByteArray) : Option Av1SeqHdr := Id.run do
-  if cfg.size < 4 then
+def av1SeqFromAv1CHeaderBytes (cfg : ByteArray) : Option Av1SeqHdr :=
+  if cfg.data.size < 4 || cfg.data.getD 0 0 != 0x81 then
+    none
+  else
+    let b3 := (cfg.data.getD 3 0).toNat
+    let initialPresentationDelayPresent := ((b3 >>> 4) &&& 1) != 0
+    if ((b3 >>> 5) &&& 7) != 0 || (!initialPresentationDelayPresent && (b3 &&& 0x0F) != 0) then
+      none
+    else
+      let b1 := (cfg.data.getD 1 0).toNat
+      let b2 := (cfg.data.getD 2 0).toNat
+      let profile := b1 >>> 5
+      let seqLevelIdx0 := b1 &&& 0x1F
+      let tier := b2 >>> 7
+      let highBitDepth := (b2 >>> 6) &&& 1
+      let twelveBit := (b2 >>> 5) &&& 1
+      let monochrome := ((b2 >>> 4) &&& 1) != 0
+      let ssHor := (b2 >>> 3) &&& 1
+      let ssVer := (b2 >>> 2) &&& 1
+      let chr := b2 &&& 3
+      if profile > 2 || (highBitDepth == 0 && twelveBit != 0) || (twelveBit != 0 && profile != 2) then
+        none
+      else
+        let hbd := if highBitDepth == 0 then 0 else if twelveBit == 0 then 1 else 2
+        let layout := if monochrome then 0 else if ssHor != 0 then (if ssVer != 0 then 1 else 2) else 3
+        let op0 : Av1OperatingPoint := {
+          idc := 0
+          majorLevel := 2 + seqLevelIdx0 / 4
+          minorLevel := seqLevelIdx0 % 4
+          tier := tier
+          decoderModelParamPresent := false
+        }
+        some {
+          profile := profile
+          operatingPoints := #[op0]
+          hbd := hbd
+          monochrome := monochrome
+          ssHor := ssHor
+          ssVer := ssVer
+          layout := layout
+          chr := chr
+          isMain8Bit420 := profile == 0 && hbd == 0 && !monochrome && ssHor == 1 && ssVer == 1
+        }
+
+def av1ParseAv1C (cfg : ByteArray) : Option (Option Av1SeqHdr) := Id.run do
+  let some hdrSeq := av1SeqFromAv1CHeaderBytes cfg | return none
+  if !hdrSeq.isMain8Bit420 then
     return none
-  if cfg.get! 0 != 0x81 || ((cfg.get! 3) &&& 0xE0) != 0 then
-    return none
+  if cfg.size == 4 then
+    return some none
   let rest := cfg.extract 4 cfg.size
   match av1ParseObus rest with
   | none => return none
@@ -3684,8 +3732,14 @@ def av1ParseAv1C (cfg : ByteArray) : Option Av1SeqHdr := Id.run do
         | none => seqPayload := some o.payload
         | some _ => return none
     match seqPayload with
-    | none => return none
-    | some p => av1ParseSeqHdr p
+    | none => return some none
+    | some p =>
+      let some seq := av1ParseSeqHdr p | return none
+      if !seq.isMain8Bit420 || seq.profile != hdrSeq.profile || seq.hbd != hdrSeq.hbd ||
+          seq.monochrome != hdrSeq.monochrome || seq.ssHor != hdrSeq.ssHor ||
+          seq.ssVer != hdrSeq.ssVer then
+        return none
+      return some (some seq)
 
 structure Av1IvfInfo where
   fourcc    : ByteArray
@@ -12517,6 +12571,234 @@ def av1DecodeObuPacket (st0 : Av1DecodeState) (pkt : ByteArray) :
           outs := outs.push pic
   return some (st, outs)
 
+def av1DemuxTrakAv1 (buf : ByteArray) (mdatRanges : Array (Nat × Nat))
+    (trakPos trakEnd : Nat) : Option (Option (ByteArray × Array ByteArray)) := Id.run do
+  let trakBody := mp4BoxPayloadOffset buf trakPos trakEnd
+  let some (mdiaPos, mdiaSz) := mp4FindChildBox buf trakBody trakEnd 0x6D646961 | return none
+  let mdiaEnd := mdiaPos + mdiaSz
+  let mdiaBody := mp4BoxPayloadOffset buf mdiaPos mdiaEnd
+  let some (hdlrPos, hdlrSz) := mp4FindChildBox buf mdiaBody mdiaEnd 0x68646C72 | return none
+  let hdlrEnd := hdlrPos + hdlrSz
+  let hdlrBody := mp4BoxPayloadOffset buf hdlrPos hdlrEnd
+  if hdlrBody + 12 > hdlrEnd then
+    return none
+  if baRdU32BE buf (hdlrBody + 8) != 0x76696465 then
+    return some none
+  let some (minfPos, minfSz) := mp4FindChildBox buf mdiaBody mdiaEnd 0x6D696E66 | return none
+  let minfEnd := minfPos + minfSz
+  let minfBody := mp4BoxPayloadOffset buf minfPos minfEnd
+  let some (stblPos, stblSz) := mp4FindChildBox buf minfBody minfEnd 0x7374626C | return none
+  let stblEnd := stblPos + stblSz
+  let stblBody := mp4BoxPayloadOffset buf stblPos stblEnd
+  let some (stsdPos, stsdSz) := mp4FindChildBox buf stblBody stblEnd 0x73747364 | return none
+  let stsdEnd := stsdPos + stsdSz
+  let stsdBody := mp4BoxPayloadOffset buf stsdPos stsdEnd
+  if stsdBody + 8 > stsdEnd then
+    return none
+  let entryCount := (baRdU32BE buf (stsdBody + 4)).toNat
+  if entryCount == 0 then
+    return none
+  let mut sePos := stsdBody + 8
+  let mut idx : Nat := 0
+  let mut av01Idx : Nat := 0
+  let mut av1CBytes : Option ByteArray := none
+  while idx < entryCount && sePos + 8 <= stsdEnd do
+    let some (seHdr, seSz) := mp4NextBox buf sePos stsdEnd | return none
+    let seEnd := sePos + seSz
+    if baRdU32BE buf (sePos + 4) == 0x61763031 && av01Idx == 0 then
+      if sePos + seHdr + 78 > seEnd then
+        return none
+      let childStart := sePos + seHdr + 78
+      let some (cfgPos, cfgSz) := mp4FindChildBox buf childStart seEnd 0x61763143 | return none
+      let cfgEnd := cfgPos + cfgSz
+      let cfgBody := mp4BoxPayloadOffset buf cfgPos cfgEnd
+      if cfgEnd < cfgBody + 4 || cfgEnd > buf.size then
+        return none
+      av01Idx := idx + 1
+      av1CBytes := some (buf.extract cfgBody cfgEnd)
+    sePos := seEnd
+    idx := idx + 1
+  let some cfg := av1CBytes | return some none
+  let mut sampleSizes : Array Nat := #[]
+  if let some (stszPos, stszSz) := mp4FindChildBox buf stblBody stblEnd 0x7374737A then
+    let stszEnd := stszPos + stszSz
+    let stszBody := mp4BoxPayloadOffset buf stszPos stszEnd
+    if stszBody + 12 > stszEnd then
+      return none
+    let uniform := (baRdU32BE buf (stszBody + 4)).toNat
+    let count := (baRdU32BE buf (stszBody + 8)).toNat
+    if count == 0 then
+      return none
+    if uniform != 0 then
+      sampleSizes := Array.replicate count uniform
+    else
+      if stszBody + 12 + count * 4 != stszEnd then
+        return none
+      sampleSizes := Array.mkEmpty count
+      for i in [:count] do
+        let sz := (baRdU32BE buf (stszBody + 12 + i * 4)).toNat
+        if sz == 0 then
+          return none
+        sampleSizes := sampleSizes.push sz
+  else if let some (stz2Pos, stz2Sz) := mp4FindChildBox buf stblBody stblEnd 0x73747A32 then
+    let stz2End := stz2Pos + stz2Sz
+    let stz2Body := mp4BoxPayloadOffset buf stz2Pos stz2End
+    if stz2Body + 12 > stz2End then
+      return none
+    let fieldSize := (buf.get! (stz2Body + 7)).toNat
+    let count := (baRdU32BE buf (stz2Body + 8)).toNat
+    if count == 0 then
+      return none
+    sampleSizes := Array.mkEmpty count
+    if fieldSize == 4 then
+      let neededBytes := (count + 1) / 2
+      if stz2Body + 12 + neededBytes > stz2End then
+        return none
+      for i in [:count] do
+        let b := (buf.get! (stz2Body + 12 + i / 2)).toNat
+        let sz := if i % 2 == 0 then (b >>> 4) &&& 0xF else b &&& 0xF
+        if sz == 0 then
+          return none
+        sampleSizes := sampleSizes.push sz
+    else if fieldSize == 8 then
+      if stz2Body + 12 + count > stz2End then
+        return none
+      for i in [:count] do
+        let sz := (buf.get! (stz2Body + 12 + i)).toNat
+        if sz == 0 then
+          return none
+        sampleSizes := sampleSizes.push sz
+    else if fieldSize == 16 then
+      if stz2Body + 12 + count * 2 > stz2End then
+        return none
+      for i in [:count] do
+        let hi := (buf.get! (stz2Body + 12 + i * 2)).toNat
+        let lo := (buf.get! (stz2Body + 12 + i * 2 + 1)).toNat
+        let sz := (hi <<< 8) ||| lo
+        if sz == 0 then
+          return none
+        sampleSizes := sampleSizes.push sz
+    else
+      return none
+  else
+    return none
+  let count := sampleSizes.size
+  let some (stscPos, stscSz) := mp4FindChildBox buf stblBody stblEnd 0x73747363 | return none
+  let stscEnd := stscPos + stscSz
+  let stscBody := mp4BoxPayloadOffset buf stscPos stscEnd
+  if stscBody + 8 > stscEnd then
+    return none
+  let stscCount := (baRdU32BE buf (stscBody + 4)).toNat
+  if stscCount == 0 || stscBody + 8 + stscCount * 12 > stscEnd then
+    return none
+  let mut chunkOffsets : Array Nat := #[]
+  if let some (co64Pos, co64Sz) := mp4FindChildBox buf stblBody stblEnd 0x636F3634 then
+    let co64End := co64Pos + co64Sz
+    let co64Body := mp4BoxPayloadOffset buf co64Pos co64End
+    if co64Body + 8 > co64End then
+      return none
+    let nChunks := (baRdU32BE buf (co64Body + 4)).toNat
+    if nChunks == 0 || co64Body + 8 + nChunks * 8 > co64End then
+      return none
+    chunkOffsets := Array.mkEmpty nChunks
+    for i in [:nChunks] do
+      chunkOffsets := chunkOffsets.push (baRdU64BE buf (co64Body + 8 + i * 8)).toNat
+  else if let some (stcoPos, stcoSz) := mp4FindChildBox buf stblBody stblEnd 0x7374636F then
+    let stcoEnd := stcoPos + stcoSz
+    let stcoBody := mp4BoxPayloadOffset buf stcoPos stcoEnd
+    if stcoBody + 8 > stcoEnd then
+      return none
+    let nChunks := (baRdU32BE buf (stcoBody + 4)).toNat
+    if nChunks == 0 || stcoBody + 8 + nChunks * 4 > stcoEnd then
+      return none
+    chunkOffsets := Array.mkEmpty nChunks
+    for i in [:nChunks] do
+      chunkOffsets := chunkOffsets.push (baRdU32BE buf (stcoBody + 8 + i * 4)).toNat
+  else
+    return none
+  let nChunks := chunkOffsets.size
+  let mut runs : Array (Nat × Nat × Nat) := Array.mkEmpty stscCount
+  let mut prevFirst : Nat := 0
+  for i in [:stscCount] do
+    let p := stscBody + 8 + i * 12
+    let first := (baRdU32BE buf p).toNat
+    let spc := (baRdU32BE buf (p + 4)).toNat
+    let sdi := (baRdU32BE buf (p + 8)).toNat
+    if first <= prevFirst || first > nChunks || spc == 0 then
+      return none
+    if i == 0 && first != 1 then
+      return none
+    prevFirst := first
+    runs := runs.push (first, spc, sdi)
+  let mut ri : Nat := 0
+  let mut sampleIdx : Nat := 0
+  let mut pkts : Array ByteArray := Array.mkEmpty count
+  for cIdx in [:nChunks] do
+    if sampleIdx < count then
+      if ri + 1 < runs.size && (runs.getD (ri + 1) (0, 0, 0)).1 <= cIdx + 1 then
+        ri := ri + 1
+      let (_, spc, sdi) := runs.getD ri (0, 0, 0)
+      if sdi != av01Idx then
+        return none
+      if spc > count - sampleIdx then
+        return none
+      let mut off := chunkOffsets.getD cIdx 0
+      for _ in [:spc] do
+        let sz := sampleSizes.getD sampleIdx 0
+        if sz == 0 || off + sz > buf.size ||
+           !(mdatRanges.any (fun (mStart, mEnd) => off >= mStart && off + sz <= mEnd)) then
+          return none
+        pkts := pkts.push (buf.extract off (off + sz))
+        off := off + sz
+        sampleIdx := sampleIdx + 1
+  if sampleIdx != count then
+    return none
+  return some (some (cfg, pkts))
+
+def av1DemuxIsoMp4Av1Samples (buf : ByteArray) : Option (ByteArray × Array ByteArray) := Id.run do
+  let mut pos : Nat := 0
+  let mut fuel := buf.size / 8 + 1
+  let mut moovRange : Option (Nat × Nat) := none
+  let mut hasMoof : Bool := false
+  let mut mdatRanges : Array (Nat × Nat) := #[]
+  while fuel > 0 && pos < buf.size do
+    fuel := fuel - 1
+    let some (hdr, sz) := mp4NextBox buf pos buf.size | return none
+    let boxEnd := pos + sz
+    let fourcc := baRdU32BE buf (pos + 4)
+    if fourcc == 0x6D6F6F76 then
+      if moovRange.isSome then
+        return none
+      moovRange := some (pos + hdr, boxEnd)
+    else if fourcc == 0x6D6F6F66 then
+      hasMoof := true
+    else if fourcc == 0x6D646174 then
+      mdatRanges := mdatRanges.push (pos + hdr, boxEnd)
+    pos := boxEnd
+  if pos != buf.size || hasMoof || mdatRanges.isEmpty then
+    return none
+  let some (moovBody, moovEnd) := moovRange | return none
+  if (mp4FindChildBox buf moovBody moovEnd 0x6D766578).isSome then
+    return none
+  let mut tPos := moovBody
+  let mut tFuel := (moovEnd - moovBody) / 8 + 1
+  let mut found : Option (ByteArray × Array ByteArray) := none
+  while tFuel > 0 && tPos < moovEnd do
+    tFuel := tFuel - 1
+    let some (_, tSz) := mp4NextBox buf tPos moovEnd | return none
+    let tEnd := tPos + tSz
+    if baRdU32BE buf (tPos + 4) == 0x7472616B then
+      let some res? := av1DemuxTrakAv1 buf mdatRanges tPos tEnd | return none
+      if let some hit := res? then
+        if found.isNone then
+          found := some hit
+        else
+          return none
+    tPos := tEnd
+  if tPos != moovEnd then
+    return none
+  return found
+
 def av1ExtractContainerPackets (data : ByteArray) : Option (String × Option Av1SeqHdr × Array ByteArray) := Id.run do
   if data.isEmpty then
     return none
@@ -12533,16 +12815,8 @@ def av1ExtractContainerPackets (data : ByteArray) : Option (String × Option Av1
     return some ("ivf", none, rawPkts)
   if data.size >= 8 && data.get! 4 == 'f'.toNat.toUInt8 && data.get! 5 == 't'.toNat.toUInt8 &&
      data.get! 6 == 'y'.toNat.toUInt8 && data.get! 7 == 'p'.toNat.toUInt8 then
-    let some dm := demuxIsoMp4Track (ByteSlice.ofByteArray data) | return none
-    let mut cfgSeq? : Option Av1SeqHdr := none
-    if !dm.avcCBytes.isEmpty then
-      let some sq := av1ParseAv1C dm.avcCBytes | return none
-      if !sq.isMain8Bit420 then
-        return none
-      cfgSeq? := some sq
-    let mut rawPkts : Array ByteArray := Array.mkEmpty dm.samples.size
-    for s in dm.samples do
-      rawPkts := rawPkts.push (s.slice.ba.extract s.slice.off (s.slice.off + s.slice.len))
+    let some (cfg, rawPkts) := av1DemuxIsoMp4Av1Samples data | return none
+    let some cfgSeq? := av1ParseAv1C cfg | return none
     return some ("mp4", cfgSeq?, rawPkts)
   return some ("obu", none, #[data])
 
@@ -14039,6 +14313,196 @@ private def av1EncFrame (cfg0 : Av1EncoderCfg) (y u v : Array Nat) (refs0 : Arra
   let frameObu := av1WrapObu av1ObuFrame body true
   return some (frameObu, av1StoreRefs refs0 fh slot)
 
+def av1MuxIsoMp4Track (width height : Nat) (timescale : UInt32)
+    (av1C : ByteArray) (samples : Array IsoMp4SampleDesc) : ByteArray := Id.run do
+  let nSamples := samples.size
+  let sampleDur : UInt32 := if h : 0 < nSamples then (samples[0]'h).duration.toUInt32 else 512
+  let totalDur : UInt32 := (nSamples * sampleDur.toNat).toUInt32
+  let effCfg := if av1C.size >= 4 then av1C else defaultAv1C1080pBytes
+  let cfgBox := wrapMp4Box 'a' 'v' '1' 'C' effCfg
+  let mut vseBody := ByteArray.emptyWithCapacity (78 + cfgBox.size)
+  vseBody := pushZeros vseBody 6
+  vseBody := pushU16BE vseBody 1
+  vseBody := pushZeros vseBody 16
+  vseBody := pushU16BE vseBody width.toUInt16
+  vseBody := pushU16BE vseBody height.toUInt16
+  vseBody := pushU32BE vseBody 0x00480000
+  vseBody := pushU32BE vseBody 0x00480000
+  vseBody := pushU32BE vseBody 0
+  vseBody := pushU16BE vseBody 1
+  vseBody := pushZeros vseBody 32
+  vseBody := pushU16BE vseBody 0x0018
+  vseBody := pushU16BE vseBody 0xFFFF
+  vseBody := ByteArray.copySlice cfgBox 0 vseBody vseBody.size cfgBox.size false
+  let vseBox := wrapMp4Box 'a' 'v' '0' '1' vseBody
+  let mut stsdBody := ByteArray.emptyWithCapacity (8 + vseBox.size)
+  stsdBody := pushU32BE stsdBody 0
+  stsdBody := pushU32BE stsdBody 1
+  stsdBody := ByteArray.copySlice vseBox 0 stsdBody stsdBody.size vseBox.size false
+  let stsdBox := wrapMp4Box 's' 't' 's' 'd' stsdBody
+
+  let mut sttsBody := ByteArray.emptyWithCapacity 16
+  sttsBody := pushU32BE sttsBody 0
+  sttsBody := pushU32BE sttsBody 1
+  sttsBody := pushU32BE sttsBody nSamples.toUInt32
+  sttsBody := pushU32BE sttsBody (if sampleDur == 0 then 512 else sampleDur)
+  let sttsBox := wrapMp4Box 's' 't' 't' 's' sttsBody
+
+  let mut syncIndices : Array UInt32 := #[]
+  for idx in [:nSamples] do
+    if (samples[idx]!).frameType == IsoVideoFrameType.iFrame then
+      syncIndices := syncIndices.push (idx + 1).toUInt32
+  let mut stssBody := ByteArray.emptyWithCapacity (8 + syncIndices.size * 4)
+  stssBody := pushU32BE stssBody 0
+  stssBody := pushU32BE stssBody syncIndices.size.toUInt32
+  for sIdx in syncIndices do
+    stssBody := pushU32BE stssBody sIdx
+  let stssBox := wrapMp4Box 's' 't' 's' 's' stssBody
+
+  let mut stscBody := ByteArray.emptyWithCapacity 20
+  stscBody := pushU32BE stscBody 0
+  stscBody := pushU32BE stscBody 1
+  stscBody := pushU32BE stscBody 1
+  stscBody := pushU32BE stscBody (Nat.max 1 nSamples).toUInt32
+  stscBody := pushU32BE stscBody 1
+  let stscBox := wrapMp4Box 's' 't' 's' 'c' stscBody
+
+  let mut stszBody := ByteArray.emptyWithCapacity (12 + nSamples * 4)
+  stszBody := pushU32BE stszBody 0
+  stszBody := pushU32BE stszBody 0
+  stszBody := pushU32BE stszBody nSamples.toUInt32
+  let mut totalMdatPayload : Nat := 0
+  for s in samples do
+    stszBody := pushU32BE stszBody s.slice.len.toUInt32
+    totalMdatPayload := totalMdatPayload + s.slice.len
+  let stszBox := wrapMp4Box 's' 't' 's' 'z' stszBody
+
+  let mut mdhdBody := ByteArray.emptyWithCapacity 24
+  mdhdBody := pushU32BE mdhdBody 0
+  mdhdBody := pushU32BE mdhdBody 0
+  mdhdBody := pushU32BE mdhdBody 0
+  mdhdBody := pushU32BE mdhdBody (if timescale == 0 then 15360 else timescale)
+  mdhdBody := pushU32BE mdhdBody totalDur
+  mdhdBody := pushU32BE mdhdBody 0x55C40000
+  let mdhdBox := wrapMp4Box 'm' 'd' 'h' 'd' mdhdBody
+
+  let mut hdlrBody := ByteArray.emptyWithCapacity 37
+  hdlrBody := pushU32BE hdlrBody 0
+  hdlrBody := pushU32BE hdlrBody 0
+  hdlrBody := pushFourCC hdlrBody 'v' 'i' 'd' 'e'
+  hdlrBody := pushZeros hdlrBody 12
+  for ch in "VideoHandler".toList do
+    hdlrBody := hdlrBody.push ch.toNat.toUInt8
+  hdlrBody := hdlrBody.push 0
+  let hdlrBox := wrapMp4Box 'h' 'd' 'l' 'r' hdlrBody
+
+  let mut vmhdBody := ByteArray.emptyWithCapacity 12
+  vmhdBody := pushU32BE vmhdBody 1
+  vmhdBody := pushZeros vmhdBody 8
+  let vmhdBox := wrapMp4Box 'v' 'm' 'h' 'd' vmhdBody
+
+  let mut urlBody := ByteArray.emptyWithCapacity 4
+  urlBody := pushU32BE urlBody 1
+  let urlBox := wrapMp4Box 'u' 'r' 'l' ' ' urlBody
+  let mut drefBody := ByteArray.emptyWithCapacity (8 + urlBox.size)
+  drefBody := pushU32BE drefBody 0
+  drefBody := pushU32BE drefBody 1
+  drefBody := ByteArray.copySlice urlBox 0 drefBody drefBody.size urlBox.size false
+  let drefBox := wrapMp4Box 'd' 'r' 'e' 'f' drefBody
+  let dinfBox := wrapMp4Box 'd' 'i' 'n' 'f' drefBox
+
+  let mut tkhdBody := ByteArray.emptyWithCapacity 84
+  tkhdBody := pushU32BE tkhdBody 3
+  tkhdBody := pushU32BE tkhdBody 0
+  tkhdBody := pushU32BE tkhdBody 0
+  tkhdBody := pushU32BE tkhdBody 1
+  tkhdBody := pushU32BE tkhdBody 0
+  tkhdBody := pushU32BE tkhdBody totalDur
+  tkhdBody := pushZeros tkhdBody 16
+  tkhdBody := pushU32BE tkhdBody 0x00010000
+  tkhdBody := pushZeros tkhdBody 12
+  tkhdBody := pushU32BE tkhdBody 0x00010000
+  tkhdBody := pushZeros tkhdBody 12
+  tkhdBody := pushU32BE tkhdBody 0x40000000
+  tkhdBody := pushU32BE tkhdBody ((width <<< 16).toUInt32)
+  tkhdBody := pushU32BE tkhdBody ((height <<< 16).toUInt32)
+  let tkhdBox := wrapMp4Box 't' 'k' 'h' 'd' tkhdBody
+
+  let mut mvhdBody := ByteArray.emptyWithCapacity 100
+  mvhdBody := pushU32BE mvhdBody 0
+  mvhdBody := pushU32BE mvhdBody 0
+  mvhdBody := pushU32BE mvhdBody 0
+  mvhdBody := pushU32BE mvhdBody (if timescale == 0 then 15360 else timescale)
+  mvhdBody := pushU32BE mvhdBody totalDur
+  mvhdBody := pushU32BE mvhdBody 0x00010000
+  mvhdBody := pushU16BE mvhdBody 0x0100
+  mvhdBody := pushZeros mvhdBody 10
+  mvhdBody := pushU32BE mvhdBody 0x00010000
+  mvhdBody := pushZeros mvhdBody 12
+  mvhdBody := pushU32BE mvhdBody 0x00010000
+  mvhdBody := pushZeros mvhdBody 12
+  mvhdBody := pushU32BE mvhdBody 0x40000000
+  mvhdBody := pushZeros mvhdBody 24
+  mvhdBody := pushU32BE mvhdBody 2
+  let mvhdBox := wrapMp4Box 'm' 'v' 'h' 'd' mvhdBody
+
+  let stcoBoxSize := 20
+  let stblBodySize := stsdBox.size + sttsBox.size + stssBox.size + stscBox.size + stszBox.size + stcoBoxSize
+  let stblBoxSize := 8 + stblBodySize
+  let minfBoxSize := 8 + vmhdBox.size + dinfBox.size + stblBoxSize
+  let mdiaBoxSize := 8 + mdhdBox.size + hdlrBox.size + minfBoxSize
+  let trakBoxSize := 8 + tkhdBox.size + mdiaBoxSize
+  let moovBoxSize := 8 + mvhdBox.size + trakBoxSize
+  let ftypSize := 24
+  let mdatDataOffset : UInt32 := (ftypSize + moovBoxSize + 8).toUInt32
+
+  let mut stcoBody := ByteArray.emptyWithCapacity 12
+  stcoBody := pushU32BE stcoBody 0
+  stcoBody := pushU32BE stcoBody 1
+  stcoBody := pushU32BE stcoBody mdatDataOffset
+  let stcoBox := wrapMp4Box 's' 't' 'c' 'o' stcoBody
+
+  let mut stblBody := ByteArray.emptyWithCapacity stblBodySize
+  for bx in #[stsdBox, sttsBox, stssBox, stscBox, stszBox, stcoBox] do
+    stblBody := ByteArray.copySlice bx 0 stblBody stblBody.size bx.size false
+  let stblBox := wrapMp4Box 's' 't' 'b' 'l' stblBody
+
+  let mut minfBody := ByteArray.emptyWithCapacity (vmhdBox.size + dinfBox.size + stblBox.size)
+  for bx in #[vmhdBox, dinfBox, stblBox] do
+    minfBody := ByteArray.copySlice bx 0 minfBody minfBody.size bx.size false
+  let minfBox := wrapMp4Box 'm' 'i' 'n' 'f' minfBody
+
+  let mut mdiaBody := ByteArray.emptyWithCapacity (mdhdBox.size + hdlrBox.size + minfBox.size)
+  for bx in #[mdhdBox, hdlrBox, minfBox] do
+    mdiaBody := ByteArray.copySlice bx 0 mdiaBody mdiaBody.size bx.size false
+  let mdiaBox := wrapMp4Box 'm' 'd' 'i' 'a' mdiaBody
+
+  let mut trakBody := ByteArray.emptyWithCapacity (tkhdBox.size + mdiaBox.size)
+  for bx in #[tkhdBox, mdiaBox] do
+    trakBody := ByteArray.copySlice bx 0 trakBody trakBody.size bx.size false
+  let trakBox := wrapMp4Box 't' 'r' 'a' 'k' trakBody
+
+  let mut moovBody := ByteArray.emptyWithCapacity (mvhdBox.size + trakBox.size)
+  for bx in #[mvhdBox, trakBox] do
+    moovBody := ByteArray.copySlice bx 0 moovBody moovBody.size bx.size false
+  let moovBox := wrapMp4Box 'm' 'o' 'o' 'v' moovBody
+
+  let mdatBoxSize := 8 + totalMdatPayload
+  let totalFileBytes := ftypSize + moovBox.size + mdatBoxSize
+  let mut out := ByteArray.emptyWithCapacity totalFileBytes
+  out := pushU32BE out 24
+  out := pushFourCC out 'f' 't' 'y' 'p'
+  out := pushFourCC out 'i' 's' 'o' 'm'
+  out := pushU32BE out 512
+  out := pushFourCC out 'i' 's' 'o' 'm'
+  out := pushFourCC out 'a' 'v' '0' '1'
+  out := ByteArray.copySlice moovBox 0 out out.size moovBox.size false
+  out := pushU32BE out mdatBoxSize.toUInt32
+  out := pushFourCC out 'm' 'd' 'a' 't'
+  for s in samples do
+    out := ByteArray.copySlice s.slice.ba s.slice.off out out.size s.slice.len false
+  return out
+
 def encodeAv1FromYuv420p (width height : Nat) (yuv : ByteArray) (qidx : Nat := 60)
     (fmt : String := "ivf") (tilesLog2Cols : Nat := 0) (tilesLog2Rows : Nat := 0) :
     Option ByteArray := Id.run do
@@ -14090,7 +14554,7 @@ def encodeAv1FromYuv420p (width height : Nat) (yuv : ByteArray) (qidx : Nat := 6
       slice := ByteSlice.ofByteArray mp4Payload
     }
   if fmt == "mp4" then
-    return some (muxIsoMp4TrackCodec .av1 width height 15360 (av1BuildAv1C seqHdrObu seq0) mp4Samples)
+    return some (av1MuxIsoMp4Track width height 15360 (av1BuildAv1C seqHdrObu seq0) mp4Samples)
   if fmt == "obu" then
     let mut cat := ByteArray.empty
     for s in ivfSamples do cat := cat ++ s

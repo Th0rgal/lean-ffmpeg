@@ -3321,4 +3321,7 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Av1MainProofs.av1Ref_poc_reorder_monotone_and_slot_capacity
 #print axioms LeanAV.Av1MainProofs.av1Refmv_single_extended_uncapped_compound_neighbor
 #print axioms LeanAV.Av1MainProofs.av1GetUniCtx_p0_bwd_vs_fwd_partition
+#print axioms LeanAV.Av1MainProofs.av1CHeaderMain8Bit420Spec
+#print axioms LeanAV.Av1MainProofs.av1CHeaderMain8Bit420Spec_iff
+#print axioms LeanAV.Av1MainProofs.av1Rav1e_4byte_av1C_and_unsized_trailing_obu_verified
 

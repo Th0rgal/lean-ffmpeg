@@ -416,4 +416,89 @@ theorem av1GetUniCtx_p0_bwd_vs_fwd_partition :
     av1GetUniCtx a l 0 0 true true 2 = av1GetFwdRef2Ctx a l 0 0 true true := by
   decide
 
+structure Av1CHeaderBytes where
+  b0 : UInt8
+  b1 : UInt8
+  b2 : UInt8
+  b3 : UInt8
+  deriving Repr, DecidableEq
+
+def av1CHeaderMain8Bit420Safe (h : Av1CHeaderBytes) : Prop :=
+  h.b0 = 0x81 ∧
+  (h.b1.toNat >>> 5) = 0 ∧
+  ((h.b2.toNat >>> 6) &&& 1) = 0 ∧
+  ((h.b2.toNat >>> 5) &&& 1) = 0 ∧
+  ((h.b2.toNat >>> 4) &&& 1) = 0 ∧
+  ((h.b2.toNat >>> 3) &&& 1) = 1 ∧
+  ((h.b2.toNat >>> 2) &&& 1) = 1 ∧
+  ((h.b3.toNat >>> 5) &&& 7) = 0 ∧
+  (((h.b3.toNat >>> 4) &&& 1) ≠ 0 ∨ (h.b3.toNat &&& 0x0F) = 0)
+
+def av1CHeaderMain8Bit420Gate (h : Av1CHeaderBytes) : Bool :=
+  (h.b0 == 0x81) &&
+  ((h.b1.toNat >>> 5) == 0) &&
+  (((h.b2.toNat >>> 6) &&& 1) == 0) &&
+  (((h.b2.toNat >>> 5) &&& 1) == 0) &&
+  (((h.b2.toNat >>> 4) &&& 1) == 0) &&
+  (((h.b2.toNat >>> 3) &&& 1) == 1) &&
+  (((h.b2.toNat >>> 2) &&& 1) == 1) &&
+  (((h.b3.toNat >>> 5) &&& 7) == 0) &&
+  ((((h.b3.toNat >>> 4) &&& 1) != 0) || ((h.b3.toNat &&& 0x0F) == 0))
+
+def av1CHeaderMain8Bit420Spec :
+    AVGateSpec Av1CHeaderBytes av1CHeaderMain8Bit420Safe where
+  gate := av1CHeaderMain8Bit420Gate
+  sound h hg := by
+    unfold av1CHeaderMain8Bit420Gate av1CHeaderMain8Bit420Safe at *
+    simp only [Bool.and_eq_true, Bool.or_eq_true, bne_iff_ne, beq_iff_eq] at hg
+    exact ⟨hg.1.1.1.1.1.1.1.1, hg.1.1.1.1.1.1.1.2, hg.1.1.1.1.1.1.2,
+           hg.1.1.1.1.1.2, hg.1.1.1.1.2, hg.1.1.1.2, hg.1.1.2, hg.1.2, hg.2⟩
+  complete h hs := by
+    rcases hs with ⟨hb0, hp, hhb, h12, hm, hsh, hsv, hr, hd⟩
+    unfold av1CHeaderMain8Bit420Gate
+    simp only [Bool.and_eq_true, Bool.or_eq_true, bne_iff_ne, beq_iff_eq]
+    exact ⟨⟨⟨⟨⟨⟨⟨⟨hb0, hp⟩, hhb⟩, h12⟩, hm⟩, hsh⟩, hsv⟩, hr⟩, hd⟩
+  posWitness := { b0 := 0x81, b1 := 0x1F, b2 := 0x0C, b3 := 0x00 }
+  negWitness := { b0 := 0x81, b1 := 0x1F, b2 := 0x4C, b3 := 0x00 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1CHeaderMain8Bit420Spec_iff (h : Av1CHeaderBytes) :
+    av1CHeaderMain8Bit420Spec.gate h = true ↔ av1CHeaderMain8Bit420Safe h :=
+  av1CHeaderMain8Bit420Spec.iff_safe h
+
+def checkAv1Rav1e4ByteAv1CAndUnsizedTrailingObu : Bool :=
+  let rav1eAv1C : ByteArray := { data := #[0x81, 0x1F, 0x0C, 0x00] }
+  let nonMain10Av1C : ByteArray := { data := #[0x81, 0x1F, 0x4C, 0x00] }
+  let highProfAv1C : ByteArray := { data := #[0x81, 0x20, 0x00, 0x00] }
+  let monoAv1C : ByteArray := { data := #[0x81, 0x1F, 0x1C, 0x00] }
+  let badRsvdAv1C : ByteArray := { data := #[0x81, 0x1F, 0x0C, 0x01] }
+  let tdSized := av1WrapObu av1ObuTd { data := #[] } true
+  let frameUnsized := av1WrapObu av1ObuFrame { data := #[0x12, 0x00, 0x00, 0x80] } false
+  let combined : ByteArray := { data := tdSized.data ++ frameUnsized.data }
+  let twoUnsized : ByteArray := { data := frameUnsized.data ++ frameUnsized.data }
+  (match av1SeqFromAv1CHeaderBytes rav1eAv1C with
+   | some s => s.isMain8Bit420 && s.profile == 0 && s.hbd == 0 && !s.monochrome && s.ssHor == 1 && s.ssVer == 1
+   | none => false) &&
+  (match av1SeqFromAv1CHeaderBytes nonMain10Av1C with | some s => !s.isMain8Bit420 | none => true) &&
+  (match av1SeqFromAv1CHeaderBytes highProfAv1C with | some s => !s.isMain8Bit420 | none => true) &&
+  (match av1SeqFromAv1CHeaderBytes monoAv1C with | some s => !s.isMain8Bit420 | none => true) &&
+  (av1SeqFromAv1CHeaderBytes badRsvdAv1C).isNone &&
+  (match av1ParseObus combined with
+   | some obus => obus.size == 2 &&
+       (obus.getD 0 default).hasSize &&
+       !(obus.getD 1 default).hasSize &&
+       (obus.getD 1 default).payload.data == #[0x12, 0x00, 0x00, 0x80]
+   | none => false) &&
+  (match av1ParseObus twoUnsized with
+   | some obus => obus.size == 1 && !(obus.getD 0 default).hasSize &&
+       (obus.getD 0 default).payload.data.size == 1 + 2 * 4
+   | none => false) &&
+  (av1ParseObus { data := #[0x80] }).isNone &&
+  (av1ParseObus { data := #[0x01] }).isNone
+
+theorem av1Rav1e_4byte_av1C_and_unsized_trailing_obu_verified :
+    checkAv1Rav1e4ByteAv1CAndUnsizedTrailingObu = true := by
+  decide
+
 end LeanAV.Av1MainProofs

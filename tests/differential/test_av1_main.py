@@ -178,6 +178,57 @@ def libsvtav1_available():
     return "libsvtav1" in out
 
 
+def librav1e_available():
+    try:
+        out = run(FFMPEG, "-hide_banner", "-encoders").stdout.decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return "librav1e" in out
+
+
+def aac_encoder_available():
+    try:
+        out = run(FFMPEG, "-hide_banner", "-encoders").stdout.decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return " aac " in out
+
+
+def isobmff_box_types(data):
+    containers = {
+        b"moov", b"trak", b"mdia", b"minf", b"dinf", b"stbl",
+        b"edts", b"udta", b"mvex", b"moof", b"traf", b"mfra",
+    }
+    found = []
+
+    def walk(buf, start, end):
+        pos = start
+        while pos + 8 <= end:
+            sz = int.from_bytes(buf[pos:pos + 4], "big")
+            typ = bytes(buf[pos + 4:pos + 8])
+            hdr = 8
+            if sz == 1:
+                if pos + 16 > end:
+                    break
+                sz = int.from_bytes(buf[pos + 8:pos + 16], "big")
+                hdr = 16
+            elif sz == 0:
+                sz = end - pos
+            if sz < hdr or pos + sz > end:
+                break
+            found.append(typ)
+            if typ in containers:
+                walk(buf, pos + hdr, pos + sz)
+            elif typ == b"stsd" and pos + hdr + 8 <= pos + sz:
+                walk(buf, pos + hdr + 8, pos + sz)
+            elif typ == b"av01" and pos + hdr + 78 <= pos + sz:
+                walk(buf, pos + hdr + 78, pos + sz)
+            pos += sz
+
+    walk(data, 0, len(data))
+    return found
+
+
 def ffprobe_available():
     try:
         out = run(FFPROBE, "-version").stdout.decode(errors="replace")
@@ -388,6 +439,11 @@ class TestAv1Main(unittest.TestCase):
                 self.assertEqual(enc_meta["frames"], nf)
                 self.assertGreater(out_bs.stat().st_size, 0)
 
+                if fmt == "mp4":
+                    mp4_boxes = isobmff_box_types(out_bs.read_bytes())
+                    self.assertIn(b"av1C", mp4_boxes)
+                    self.assertNotIn(b"ctts", mp4_boxes)
+
                 run(LFFMPEG, "av1-decode-raw", out_bs, lean_dec, env=ISO_ENV)
                 ff_yuv = self._ffmpeg_decode_yuv420p(out_bs)
                 lean_bytes = lean_dec.read_bytes()
@@ -573,6 +629,116 @@ class TestAv1Main(unittest.TestCase):
             execves = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if "execve(" in ln]
             self.assertEqual(len(execves), 1, execves)
             self.assertIn("lffmpeg", execves[0])
+
+    def test_rav1e_mp4_4byte_av1c_and_unsized_trailing_obu(self):
+        if not librav1e_available():
+            self.skipTest("ffmpeg with librav1e unavailable")
+        mp4_path = self.dir / "rav1e_128x96.mp4"
+        run(
+            FFMPEG, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25",
+            "-frames:v", "2", "-c:v", "librav1e", "-pix_fmt", "yuv420p",
+            mp4_path,
+        )
+        raw_mp4 = mp4_path.read_bytes()
+        av1c_pos = raw_mp4.find(b"av1C")
+        self.assertGreaterEqual(av1c_pos, 4)
+        av1c_box_sz = int.from_bytes(raw_mp4[av1c_pos - 4:av1c_pos], "big")
+        self.assertEqual(av1c_box_sz, 12)
+
+        probe = json.loads(run(LFFMPEG, "av1-probe", mp4_path, env=ISO_ENV).stdout.decode())
+        self.assertTrue(probe["ok"])
+        self.assertEqual(probe["container"], "mp4")
+        self.assertEqual(probe["profile"], 0)
+        self.assertEqual(probe["width"], 128)
+        self.assertEqual(probe["height"], 96)
+        self.assertEqual(probe["bit_depth"], 8)
+        self.assertEqual(probe["chroma_subsampling"], "4:2:0")
+        self.assertEqual(probe["frames"], 2)
+
+        lean_yuv = self.dir / "rav1e_lean.yuv"
+        dec = json.loads(run(LFFMPEG, "av1-decode-raw", mp4_path, lean_yuv, env=ISO_ENV).stdout.decode())
+        self.assertTrue(dec["ok"])
+        self.assertEqual(dec["frames"], 2)
+        self.assertEqual(lean_yuv.read_bytes(), self._ffmpeg_decode_yuv420p(mp4_path))
+
+        bad_headers = {
+            "bad_marker.mp4": bytes([0x01, 0x1F, 0x0C, 0x00]),
+            "bad_profile1.mp4": bytes([0x81, 0x3F, 0x0C, 0x00]),
+            "bad_10bit.mp4": bytes([0x81, 0x1F, 0x4C, 0x00]),
+            "bad_422.mp4": bytes([0x81, 0x1F, 0x08, 0x00]),
+            "bad_mono.mp4": bytes([0x81, 0x1F, 0x1C, 0x00]),
+            "bad_reserved_b3.mp4": bytes([0x81, 0x1F, 0x0C, 0x80]),
+        }
+        for tag, hdr4 in bad_headers.items():
+            mutated = bytearray(raw_mp4)
+            mutated[av1c_pos + 4:av1c_pos + 8] = hdr4
+            bad_path = self.dir / tag
+            bad_path.write_bytes(bytes(mutated))
+            self.assertNotEqual(
+                run(LFFMPEG, "av1-probe", bad_path, env=ISO_ENV, check=False).returncode,
+                0,
+                tag,
+            )
+            self.assertNotEqual(
+                run(LFFMPEG, "av1-decode-raw", bad_path, "-", env=ISO_ENV, check=False).returncode,
+                0,
+                tag,
+            )
+
+    def test_multitrack_mp4_audio_video_interleaved_and_fmp4_fail_closed(self):
+        if not (libaom_av1_available() and aac_encoder_available()):
+            self.skipTest("ffmpeg with libaom-av1 + aac unavailable")
+        for tag, map_args in (
+            ("video_first.mp4", ["-map", "0:v:0", "-map", "1:a:0"]),
+            ("audio_first.mp4", ["-map", "1:a:0", "-map", "0:v:0"]),
+        ):
+            with self.subTest(case=tag):
+                mp4_path = self.dir / tag
+                run(
+                    FFMPEG, "-y", "-v", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25:duration=0.4",
+                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.4",
+                    *map_args,
+                    "-c:v", "libaom-av1", "-cpu-used", "8", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "64k", "-shortest",
+                    mp4_path,
+                )
+                ref_yuv = self._ffmpeg_decode_yuv420p(mp4_path)
+                expected_frames = len(ref_yuv) // (128 * 96 * 3 // 2)
+                self.assertGreater(expected_frames, 0)
+
+                probe = json.loads(run(LFFMPEG, "av1-probe", mp4_path, env=ISO_ENV).stdout.decode())
+                self.assertTrue(probe["ok"])
+                self.assertEqual(probe["container"], "mp4")
+                self.assertEqual(probe["width"], 128)
+                self.assertEqual(probe["height"], 96)
+                self.assertEqual(probe["frames"], expected_frames)
+
+                lean_yuv = self.dir / f"lean_{tag}.yuv"
+                dec = json.loads(run(LFFMPEG, "av1-decode-raw", mp4_path, lean_yuv, env=ISO_ENV).stdout.decode())
+                self.assertTrue(dec["ok"])
+                self.assertEqual(dec["frames"], expected_frames)
+                self.assertEqual(lean_yuv.read_bytes(), ref_yuv)
+
+        fmp4_path = self.dir / "frag_av1.mp4"
+        run(
+            FFMPEG, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25",
+            "-frames:v", "4", "-c:v", "libaom-av1", "-cpu-used", "8", "-pix_fmt", "yuv420p",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            fmp4_path,
+        )
+        fmp4_boxes = isobmff_box_types(fmp4_path.read_bytes())
+        self.assertTrue(b"moof" in fmp4_boxes or b"mvex" in fmp4_boxes)
+        self.assertNotEqual(
+            run(LFFMPEG, "av1-probe", fmp4_path, env=ISO_ENV, check=False).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            run(LFFMPEG, "av1-decode-raw", fmp4_path, "-", env=ISO_ENV, check=False).returncode,
+            0,
+        )
 
 
 if __name__ == "__main__":
