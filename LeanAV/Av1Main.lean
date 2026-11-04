@@ -9963,7 +9963,7 @@ def av1ReadPalIndices (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (pl sz bwPx bhP
   idx := idx.set! 0 i0
   let mut dec := d0
   let mut cdf := cdf0
-  let base := cdfOff_m_color_map + (pl * 7 + (sz - 2)) * 40
+  let base := cdfOff_m_color_map + (pl * 280) + (sz - 2) * 40
   if sz == 2 then
     if wPx + hPx >= 2 then
       for diag in [1 : wPx + hPx - 1] do
