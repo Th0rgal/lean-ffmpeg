@@ -3292,6 +3292,8 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Format.synthMp4TrackGateSpec
 #print axioms LeanAV.Av1MainProofs.av1Main8Bit420SeqSpec
 #print axioms LeanAV.Av1MainProofs.av1Main8Bit420SeqSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1Main8BitFrameScopeSpec
+#print axioms LeanAV.Av1MainProofs.av1Main8BitFrameScopeSpec_iff
 #print axioms LeanAV.Av1MainProofs.av1EncoderGeomSpec
 #print axioms LeanAV.Av1MainProofs.av1EncoderGeomSpec_iff
 #print axioms LeanAV.Av1MainProofs.av1QidxRangeSpec

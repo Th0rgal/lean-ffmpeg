@@ -36,6 +36,33 @@ theorem av1Main8Bit420SeqSpec_iff (seq : Av1SeqHdr) :
     av1Main8Bit420SeqSpec.gate seq = true ↔ av1Main8Bit420SeqSafe seq :=
   av1Main8Bit420SeqSpec.iff_safe seq
 
+def av1Main8BitFrameScopeSafe (fh : Av1FrameHdr) : Prop :=
+  fh.filmGrainPresent = false ∧ fh.width0 > 0 ∧ fh.width1 > 0 ∧ fh.height > 0
+
+def av1Main8BitFrameScopeGate (fh : Av1FrameHdr) : Bool :=
+  !fh.filmGrainPresent && decide (fh.width0 > 0) && decide (fh.width1 > 0) && decide (fh.height > 0)
+
+def av1Main8BitFrameScopeSpec :
+    AVGateSpec Av1FrameHdr av1Main8BitFrameScopeSafe where
+  gate := av1Main8BitFrameScopeGate
+  sound fh hg := by
+    unfold av1Main8BitFrameScopeGate av1Main8BitFrameScopeSafe at *
+    simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hg
+    exact ⟨hg.1.1.1, hg.1.1.2, hg.1.2, hg.2⟩
+  complete fh hs := by
+    rcases hs with ⟨hfg, hw0, hw1, hh⟩
+    unfold av1Main8BitFrameScopeGate
+    simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq]
+    exact ⟨⟨⟨hfg, hw0⟩, hw1⟩, hh⟩
+  posWitness := { filmGrainPresent := false, width0 := 64, width1 := 64, height := 48 }
+  negWitness := { filmGrainPresent := true, width0 := 64, width1 := 64, height := 48 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1Main8BitFrameScopeSpec_iff (fh : Av1FrameHdr) :
+    av1Main8BitFrameScopeSpec.gate fh = true ↔ av1Main8BitFrameScopeSafe fh :=
+  av1Main8BitFrameScopeSpec.iff_safe fh
+
 structure Av1EncoderGeom where
   width    : Nat
   height   : Nat

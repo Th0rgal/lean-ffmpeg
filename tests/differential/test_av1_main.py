@@ -36,6 +36,14 @@ def libaom_av1_available():
     return "libaom-av1" in out
 
 
+def libsvtav1_available():
+    try:
+        out = run(FFMPEG, "-hide_banner", "-encoders").stdout.decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return "libsvtav1" in out
+
+
 def ffprobe_available():
     try:
         out = run(FFPROBE, "-version").stdout.decode(errors="replace")
@@ -155,6 +163,40 @@ class TestAv1Main(unittest.TestCase):
                 self.assertEqual(probe["height"], h)
                 self.assertEqual(probe["bit_depth"], 8)
                 self.assertEqual(probe["chroma_subsampling"], "4:2:0")
+                self.assertEqual(probe["frames"], nf)
+
+    def test_svtav1_superres_to_lffmpeg_bit_exact(self):
+        if not libsvtav1_available():
+            self.skipTest("ffmpeg with libsvtav1 unavailable")
+        cases = [
+            ("sr_kf_d12.ivf", 128, 96, 1, "lp=2:superres-mode=1:superres-denom=8:superres-kf-denom=12"),
+            ("sr_kf_d16.ivf", 128, 96, 1, "lp=2:superres-mode=1:superres-denom=8:superres-kf-denom=16"),
+            ("sr_kf_d14_lr.ivf", 256, 192, 1, "lp=2:superres-mode=1:superres-denom=8:superres-kf-denom=14:enable-restoration-filtering=1"),
+            ("sr_kf_d12_inter.ivf", 128, 96, 4, "lp=2:superres-mode=1:superres-denom=8:superres-kf-denom=12"),
+            ("sr_kf_d14_inter_lr.ivf", 256, 192, 6, "lp=2:superres-mode=1:superres-denom=8:superres-kf-denom=14:enable-restoration-filtering=1"),
+        ]
+        for name, w, h, nf, svt_params in cases:
+            with self.subTest(case=name):
+                stream_path = self.dir / name
+                run(
+                    FFMPEG, "-y", "-v", "error",
+                    "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=25:duration=1",
+                    "-c:v", "libsvtav1", "-preset", "10", "-pix_fmt", "yuv420p",
+                    "-svtav1-params", svt_params,
+                    "-frames:v", str(nf), "-f", "ivf", stream_path,
+                )
+                ref_yuv = self._ffmpeg_decode_yuv420p(stream_path)
+                lean_yuv_path = self.dir / f"lean_{name}.yuv"
+                dec_proc = run(LFFMPEG, "av1-decode-raw", stream_path, lean_yuv_path, env=ISO_ENV)
+                dec_meta = json.loads(dec_proc.stdout.decode())
+                self.assertTrue(dec_meta["ok"])
+                self.assertEqual(dec_meta["width"], w)
+                self.assertEqual(dec_meta["height"], h)
+                self.assertEqual(dec_meta["frames"], nf)
+                self.assertEqual(lean_yuv_path.read_bytes(), ref_yuv)
+                probe = json.loads(run(LFFMPEG, "av1-probe", stream_path, env=ISO_ENV).stdout.decode())
+                self.assertTrue(probe["ok"])
+                self.assertTrue(probe["superres"])
                 self.assertEqual(probe["frames"], nf)
 
     def test_lffmpeg_encode_to_ffmpeg_and_ffprobe_parity(self):
@@ -282,6 +324,46 @@ class TestAv1Main(unittest.TestCase):
                 run(LFFMPEG, "av1-probe", neg_path, env=ISO_ENV, check=False).returncode,
                 0,
                 tag,
+            )
+
+        fg_path = self.dir / "film_grain_active.ivf"
+        run(
+            FFMPEG, "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "64x48", "-r", "25",
+            "-i", src_yuv,
+            "-c:v", "libaom-av1", "-cpu-used", "8", "-pix_fmt", "yuv420p",
+            "-aom-params", "film-grain-test=1",
+            "-frames:v", "1", "-f", "ivf", fg_path,
+        )
+        self.assertNotEqual(
+            run(LFFMPEG, "av1-decode-raw", fg_path, "-", env=ISO_ENV, check=False).returncode,
+            0,
+            "film_grain_active.ivf",
+        )
+        self.assertNotEqual(
+            run(LFFMPEG, "av1-probe", fg_path, env=ISO_ENV, check=False).returncode,
+            0,
+            "film_grain_active.ivf",
+        )
+
+        if libsvtav1_available():
+            scaled_path = self.dir / "scaled_inter_superres.ivf"
+            run(
+                FFMPEG, "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25:duration=0.2",
+                "-c:v", "libsvtav1", "-preset", "12", "-pix_fmt", "yuv420p",
+                "-svtav1-params", "lp=2:superres-mode=1:superres-denom=12:superres-kf-denom=8",
+                "-frames:v", "4", "-f", "ivf", scaled_path,
+            )
+            self.assertNotEqual(
+                run(LFFMPEG, "av1-decode-raw", scaled_path, "-", env=ISO_ENV, check=False).returncode,
+                0,
+                "scaled_inter_superres.ivf",
+            )
+            self.assertNotEqual(
+                run(LFFMPEG, "av1-probe", scaled_path, env=ISO_ENV, check=False).returncode,
+                0,
+                "scaled_inter_superres.ivf",
             )
 
     def test_strace_execve_zero_children(self):

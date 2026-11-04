@@ -3198,6 +3198,13 @@ def av1ParseFrameHdr (seq : Av1SeqHdr) (gb0 : Av1BitReader) (refs : Array (Optio
     | none => return none
     | some (hdr1, gb21) =>
       hdr := hdr1; gb := gb21
+    for i in [:7] do
+      let rIdx := hdr.refidx.getD i 0
+      match refs.getD rIdx none with
+      | none => return none
+      | some rSlot =>
+        if hdr.width0 != rSlot.w || hdr.height != rSlot.h then
+          return none
     let mut hp := false
     if !hdr.forceIntegerMv then
       let (hpB, gb22) := gb.getBit; gb := gb22
@@ -3534,7 +3541,7 @@ def av1ParseFrameHdr (seq : Av1SeqHdr) (gb0 : Av1BitReader) (refs : Array (Optio
           if numUv.getD pl 0 != 0 then
             let (_, gb88) := gb.getBits 25; gb := gb88
         let (_, gb89) := gb.getBits 2; gb := gb89
-  if gb.err then
+  if gb.err || fgPresent then
     return none
   hdr := { hdr with
     quant := quant
@@ -12154,7 +12161,7 @@ def av1DecodeFrame (seq : Av1SeqHdr) (refs0 : Array (Option Av1RefSlot)) (fhIn :
     match refs0.getD fhIn.existingFrameIdx none with
     | none => return none
     | some src =>
-      if !src.hdr.showableFrame then
+      if !src.hdr.showableFrame || src.hdr.filmGrainPresent then
         return none
       let yRef := src.planes.getD 0 #[]
       let uRef := src.planes.getD 1 #[]
@@ -12163,6 +12170,8 @@ def av1DecodeFrame (seq : Av1SeqHdr) (refs0 : Array (Option Av1RefSlot)) (fhIn :
       let refs1 := av1StoreRefs refs0 fhIn src
       return some (refs1, some (src.w, src.h, yuv))
   let mut fh := fhIn
+  if fh.filmGrainPresent then
+    return none
   if fh.frameType == av1FrameInter || fh.frameType == av1FrameSwitch then
     let mut gmvUpd := fh.gmv
     for ri in [:7] do
@@ -12187,7 +12196,7 @@ def av1DecodeFrame (seq : Av1SeqHdr) (refs0 : Array (Option Av1RefSlot)) (fhIn :
       match refs0.getD ridx none with
       | none => return none
       | some rSlot =>
-        if w0 * 2 < rSlot.w || h * 2 < rSlot.h || w0 > rSlot.w * 16 || h > rSlot.h * 16 then
+        if w0 != rSlot.w || h != rSlot.h then
           return none
   let cols := fh.tiling.cols
   let rows := fh.tiling.rows
