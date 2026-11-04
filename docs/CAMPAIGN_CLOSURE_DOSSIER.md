@@ -3,12 +3,12 @@
 The 2026-11-04 M3-B AV1 Main 8-bit 4:2:0 standalone codec qualification
 (`campaign/m3-b-av1-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
-**19,874 declarations with zero sorryAx/custom axioms** (`73,277` LOC across 33
-formal `LeanAV/*.lean` modules) and **740/740 `non_vacuous_and_tight`
+**19,875 declarations with zero sorryAx/custom axioms** (`73,281` LOC across 33
+formal `LeanAV/*.lean` modules) and **741/741 `non_vacuous_and_tight`
 specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
 `H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
 46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
-`Bitstream`: 27, `H264SyntaxProofs`: 26, `Av1MainProofs`: 23, `Spec`: 23,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `Av1MainProofs`: 24, `Spec`: 23,
 `PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
 `Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 AV1
 Main profile 8-bit YUV420p OBU + IVF + ISO 14496-15 `av1C` MP4 probing,

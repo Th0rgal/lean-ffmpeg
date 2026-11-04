@@ -399,4 +399,21 @@ theorem av1Refmv_single_extended_uncapped_compound_neighbor :
     av1RefmvSingleExtNoCapGate 2 true true = 4 := by
   decide
 
+theorem av1GetUniCtx_p0_bwd_vs_fwd_partition :
+    let a : Av1BlockContext := {
+      intra := #[0],
+      ref := #[#[2], #[4]],
+      compType := #[1]
+    }
+    let l : Av1BlockContext := {
+      intra := #[0],
+      ref := #[#[0], #[5]],
+      compType := #[1]
+    }
+    av1GetUniCtx a l 0 0 true true 0 = av1GetRefCtx a l 0 0 true true ∧
+    av1GetUniCtx a l 0 0 true true 0 = 1 ∧
+    av1GetUniCtx a l 0 0 true true 1 = av1GetUniP1Ctx a l 0 0 true true ∧
+    av1GetUniCtx a l 0 0 true true 2 = av1GetFwdRef2Ctx a l 0 0 true true := by
+  decide
+
 end LeanAV.Av1MainProofs

@@ -9469,26 +9469,12 @@ def av1DrlNearest (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (mvstack : Array Av
   else (0, dec0, cdf0)
 
 def av1GetUniCtx (a l : Av1BlockContext) (yb4 xb4 : Nat) (haveTop haveLeft : Bool) (idx : Nat) : Nat :=
-  if idx == 1 then
+  if idx == 0 then
+    av1GetRefCtx a l yb4 xb4 haveTop haveLeft
+  else if idx == 1 then
     av1GetUniP1Ctx a l yb4 xb4 haveTop haveLeft
-  else Id.run do
-    let mut cnt : Array Nat := #[0, 0, 0, 0]
-    let bump (r : Int) (ct : Array Nat) : Array Nat :=
-      if 0 <= r && r < 4 then ct.set! r.toNat (ct.getD r.toNat 0 + 1)
-      else if idx == 0 && r >= 4 then ct.set! 3 (ct.getD 3 0 + 1)
-      else ct
-    if haveTop && a.intra.getD xb4 0 == 0 then
-      cnt := bump (av1CtxRefAt a 0 xb4) cnt
-      if a.compType.getD xb4 0 != 0 then
-        cnt := bump (av1CtxRefAt a 1 xb4) cnt
-    if haveLeft && l.intra.getD yb4 0 == 0 then
-      cnt := bump (av1CtxRefAt l 0 yb4) cnt
-      if l.compType.getD yb4 0 != 0 then
-        cnt := bump (av1CtxRefAt l 1 yb4) cnt
-    return if idx == 0 then
-      av1CmpCnt (cnt.getD 0 0 + cnt.getD 1 0) (cnt.getD 2 0 + cnt.getD 3 0)
-    else
-      av1CmpCnt (cnt.getD 2 0) (cnt.getD 3 0)
+  else
+    av1GetFwdRef2Ctx a l yb4 xb4 haveTop haveLeft
 
 def av1FrameDq (fh : Av1FrameHdr) : Array (Array (Nat × Nat)) := Id.run do
   let q := fh.quant
