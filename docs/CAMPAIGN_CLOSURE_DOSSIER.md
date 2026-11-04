@@ -1,5 +1,24 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-04 M3-B AV1 Main 8-bit 4:2:0 standalone codec qualification
+(`campaign/m3-b-av1-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**19,864 declarations with zero sorryAx/custom axioms** (`73,231` LOC across 33
+formal `LeanAV/*.lean` modules) and **738/738 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `Av1MainProofs`: 21,
+`PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
+`Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 AV1
+Main profile 8-bit YUV420p OBU + IVF + ISO 14496-15 `av1C` MP4 probing,
+MSAC/CDF entropy coding, intra/inter/compound/warped motion compensation,
+DCT/ADST/IDTX/WHT transforms, deblocking + CDEF + superres + Wiener/SGR loop
+restoration, multi-tile decoding, and lossless/lossy I+P encoding
+(`LeanAV/Av1Main.lean`, `LeanAV/Av1MainProofs.lean`, `av1-probe`,
+`av1-decode-raw`, `av1-encode-raw`) with zero `ffmpeg` subprocesses and
+fail-closed rejection of non-Main / 10-bit / 4:4:4 / malformed inputs.
+
 The 2026-11-01 M2-D in-process H.264 + AAC-LC MP4 transcode qualification
 (`campaign/m2-complete-20261031` over `77c6ca9`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited

@@ -14050,7 +14050,8 @@ def encodeAv1FromYuv420p (width height : Nat) (yuv : ByteArray) (qidx : Nat := 6
     (fmt : String := "ivf") (tilesLog2Cols : Nat := 0) (tilesLog2Rows : Nat := 0) :
     Option ByteArray := Id.run do
   let frameBytes := (width * height * 3) / 2
-  if width == 0 || height == 0 || frameBytes == 0 || yuv.size == 0 || yuv.size % frameBytes != 0 then
+  if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 ||
+     frameBytes == 0 || yuv.size == 0 || yuv.size % frameBytes != 0 then
     return none
   let nFrames := yuv.size / frameBytes
   let qClamped := Nat.min qidx 255
