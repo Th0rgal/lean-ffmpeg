@@ -4291,8 +4291,8 @@ def av1LoadTmvs (rf : Av1RefMvFrame) (refs : Array (Option Av1RefSlot))
                     x := x + 1
                   else
                     let (offY, offX) := av1MvProjection rb.mvY rb.mvX ref2cur ref2ref
-                    let sx := if r < 4 then (if offX >= 0 then -1 else 1) else (if offX < 0 then -1 else 1)
-                    let sy := if r < 4 then (if offY >= 0 then -1 else 1) else (if offY < 0 then -1 else 1)
+                    let sx : Int := if r < 4 then -(offX + 1) else offX
+                    let sy : Int := if r < 4 then -(offY + 1) else offY
                     let px0 : Int := Int.ofNat x + av1ApplySign (Int.ofNat (offX.natAbs >>> 6)) sx
                     let py : Int := Int.ofNat y + av1ApplySign (Int.ofNat (offY.natAbs >>> 6)) sy
                     if Int.ofNat y0 <= py && py < Int.ofNat y1 then
@@ -4747,8 +4747,6 @@ def av1FindRefMvs (rf : Av1RefMvFrame) (ref0 ref1 : Int) (bs edgeFlags by4 bx4 :
             if e.mv0 == mv then dup := true
           if !dup then
             st := st.push { mv0 := mv, mv1 := (0, 0), w := 2 }
-          if st.size >= 2 then
-            return st
       return st
     if nRowsOpt.isSome then
       let mut x : Nat := 0

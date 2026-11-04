@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import math
 import os
@@ -6,6 +8,33 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+REFMV_COMPOUND_UNCAP_M11_IVF_B64 = (
+    "REtJRgAAIABBVjAxIAAgABkAAAABAAAABQAAAAAAAADmAQAAAAAAAAAAAAASAAoKAAAAAif+bXyAIDLVAxAAnQAA"
+    "AgAAgM8MBG7Dij4myyXeK9qrIvQMxT3Ps8SQMzuAtbEr1PwXIuhniyZKyOAU+aTBtcnZdSgR94zx4vujT97sr8VW"
+    "Fo4kutFctn30F/7WyoWExsOk//+EFs6ZprbCzAhCwd/xTEOcH0i4ikhS+QMFnvBDmKsEZd2Z0uNI3rkxTl+01GQm"
+    "KGF0XN8k/x9OnqjuxcMGioOED1cEgDg45NXiI7LqHxFCv4Z+SI8MStuIwgUw8O9YGsvVJ05W5O6s2pjVfh7UfRv8"
+    "ruosmeJWMmN4f3Gu/Ez28CrrfAGXBiErZkBmCCRrat51Rx22pyvFLrbH8Q28NGxSFmWPEiUSjnzZ17Aw1q8QGV2m"
+    "MD1tiiLox2rYUHBFHZZHlVnRTJHvE2hrLNHTuFnsk7tmgfKcED6xOY1woFr+RWte6JZcmZQUQePDs8f033D7NpPv"
+    "QmN5VndXISf8Kbkxe87OExJasA8rnfMWDvYLKawL7Nyj9eyLkbaYoBxExJLD8ZDTJkTsCBY8M14lBL4ig2SuM/Ab"
+    "r56H06f9Q/YKkuw1h60O+JyJbeOnA3hFYO0dRXClNpqRrXUlngq6ZYk1l54ElOJUVcWMcGpIKFmgrx2DgC0GHP9v"
+    "QWBrAgAAAQAAAAAAAAASADKnAygE4EAAACNZAAABJZdQAM8RuAZ11yU+eBMM5t0iZb4WquTF1MtdO/JHyGyM8F0O"
+    "TKAT1RPFiBWlEFHPpY2aeCY2AIIES4yX5gykte1P9LkUqPK+Ze4tAzlbwzqWlaFNiv6pfn5zdNBn74B6nLxkkkqs"
+    "UFwM/os+VwiX+IpMFU5t8Swc11Ml39V/Tz4ZbAmFoeoZjt5M3zetWw0JGsWSSprs5nhAK9873FlLpUMUadBBgTsz"
+    "hFUjg61/XFtXICglLHkFfOY9P0KCBZnPOC98Q6LpKEsciPQjue2D3GqLAfCOINDQ3u0tjdX0aBUuY6S7nyZIjILV"
+    "CILQcnIVWLpJwrKpUnk8K+UKuedbFnJv1qwGjZuMyGNFb11qz4U6ybvhoMdEM0I2bWqSbjQwTZux1QCk3FvczJWn"
+    "UtG/mrvkBcImaWhhJAbT1uiBnmJAS7gFpljDADqQXFqjEjZpC6PYPMPlipmhQV34AxBOMKI3SMu1GCFVaxF4MngH"
+    "HKc4qPGLRw4IdOxUEXwNqMpQyKnaHJEUu1ySZG1QTA+ITiDDSWAme+7rydRVQDJaKALggAAAo16AAAEgAVAAz0ma"
+    "u8m4P+0AzHvltwspQrwnHrLOfIt7Ne1BcdOgpMjSUzQHJbmoOYZ/Gc5RLd1YZLCWK5aU6cj2JTVkcWJbj+tnLlsR"
+    "S5fUS9aXMmEwA8IAAIEGyAAAAoss0ADPovSwnXG6NQLEYADgfhFUIjmulqH9mwIh6Ep2sUyEOXh/NknNLuXdciZM"
+    "Mx5fn1Rb9bTbr5rpelOCH4efH2Y9QCZhCH+HkGO45TSX9rMTHCetBQAAAAIAAAAAAAAAEgAaAahiAAAAAwAAAAAA"
+    "AAASADJeMAZECYABBsgAAAKALtAAwEYLZ4hJj61ISKJAWAwnfzOY4KQAY+MFD8YKzuF887uH2JTG5E1fs3Gf7fcd"
+    "jG2uLgNyQMgBCtu+2Yw+B43T8AmjZzBT8nvQBpz8l2RUOhUAAAAEAAAAAAAAABIAMhEwCAgRABk7IAAACgAAgACH"
+    "CQ=="
+)
+REFMV_COMPOUND_UNCAP_M11_YUV_SHA256 = (
+    "79ec3fde567bce380b89bf6d9d321f66a64ca114024e3b17b0acb0aac1067365"
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 LFFMPEG = Path(os.environ.get("LFFMPEG", ROOT / ".lake/build/bin/lffmpeg"))
@@ -365,6 +394,22 @@ class TestAv1Main(unittest.TestCase):
                 0,
                 "scaled_inter_superres.ivf",
             )
+
+    def test_embedded_tmv_and_compound_extended_refmv_fixture(self):
+        ivf_path = self.dir / "refmv_compound_uncap_m11_32x32.ivf"
+        ivf_path.write_bytes(base64.b64decode(REFMV_COMPOUND_UNCAP_M11_IVF_B64))
+        lean_yuv = self.dir / "refmv_compound_uncap_m11_32x32.yuv"
+        dec_proc = run(LFFMPEG, "av1-decode-raw", ivf_path, lean_yuv, env=ISO_ENV)
+        dec_meta = json.loads(dec_proc.stdout.decode())
+        self.assertTrue(dec_meta["ok"])
+        self.assertEqual(dec_meta["width"], 32)
+        self.assertEqual(dec_meta["height"], 32)
+        self.assertEqual(dec_meta["frames"], 5)
+        lean_bytes = lean_yuv.read_bytes()
+        self.assertEqual(len(lean_bytes), 32 * 32 * 3 // 2 * 5)
+        self.assertEqual(hashlib.sha256(lean_bytes).hexdigest(), REFMV_COMPOUND_UNCAP_M11_YUV_SHA256)
+        if libaom_av1_available():
+            self.assertEqual(lean_bytes, self._ffmpeg_decode_yuv420p(ivf_path))
 
     def test_strace_execve_zero_children(self):
         in_path = self.dir / "iso_in.yuv"

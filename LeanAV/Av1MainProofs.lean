@@ -390,4 +390,13 @@ theorem av1Ref_poc_reorder_monotone_and_slot_capacity :
     av1RefSlotOccupancyGate (9, 8) = false := by
   decide
 
+def av1RefmvSingleExtNoCapGate (base : Nat) (push0 push1 : Bool) : Nat :=
+  if push0 && push1 then base + 2 else if push0 || push1 then base + 1 else base
+
+theorem av1Refmv_single_extended_uncapped_compound_neighbor :
+    av1RefmvSingleExtNoCapGate 1 true true = 3 ∧
+    av1RefmvSingleExtNoCapGate 1 true false = 2 ∧
+    av1RefmvSingleExtNoCapGate 2 true true = 4 := by
+  decide
+
 end LeanAV.Av1MainProofs
