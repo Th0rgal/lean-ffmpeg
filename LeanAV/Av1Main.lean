@@ -9816,28 +9816,6 @@ def av1ReadTxTree (fuel : Nat) (ctx0 : Av1TileDecodeCtx) (fromTx bx by4 depth : 
       ctx := { ctx with above := ctx.above.set! sb128x a, left := l }
       return (ctx, masks)
 
-private def av1PalFreeOffsets2 : Array Nat := #[
-  0x00, 0x00, 0x50, 0x15, 0x40, 0x15, 0xA0, 0x0A, 0x00, 0x15, 0x90, 0x0A,
-  0x80, 0x0A, 0xF0, 0x03, 0x00, 0x14, 0x50, 0x0A, 0x40, 0x0A, 0xE0, 0x03,
-  0x00, 0x0A, 0xD0, 0x03, 0xC0, 0x03, 0x00, 0x00, 0x00, 0x10, 0x50, 0x09,
-  0x40, 0x09, 0xA0, 0x03, 0x00, 0x09, 0x90, 0x03, 0x80, 0x03, 0x00, 0x00,
-  0x00, 0x08, 0x50, 0x03, 0x40, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x05, 0x40, 0x05, 0xA0, 0x02,
-  0x00, 0x05, 0x90, 0x02, 0x80, 0x02, 0x00, 0x00, 0x00, 0x04, 0x50, 0x02,
-  0x40, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x50, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-]
-
-@[inline] private def av1ResolvePalColor (colorIdx : Nat) (p : Array Nat) (prioCount mask : Nat) : Nat :=
-  if colorIdx < prioCount then
-    p.getD colorIdx 0
-  else
-    let rank0 := colorIdx - prioCount + (mask &&& 1)
-    let rank := if rank0 > 0 && ((mask >>> 1) &&& 1) != 0 then rank0 + 1 else rank0
-    let byteIdx := 2 * (mask >>> 2) + (rank >>> 2)
-    rank + ((av1PalFreeOffsets2.getD byteIdx 0 >>> (2 * (rank &&& 3))) &&& 3)
-
 def av1ReadPalPlane (ctx0 : Av1TileDecodeCtx) (pl bs : Nat) (a l : Av1BlockContext) (xb4 yb4 : Nat)
     : Nat × Array (Array Nat) × Av1TileDecodeCtx := Id.run do
   let mut dec := ctx0.dec
@@ -9964,86 +9942,62 @@ def av1ReadPalIndices (dec0 : Av1MsacDecoder) (cdf0 : Array Nat) (pl sz bwPx bhP
   let mut dec := d0
   let mut cdf := cdf0
   let base := cdfOff_m_color_map + (pl * 280) + (sz - 2) * 40
-  if sz == 2 then
-    if wPx + hPx >= 2 then
-      for diag in [1 : wPx + hPx - 1] do
-        let first := Nat.min diag (wPx - 1)
-        let last := if diag + 1 >= hPx then diag + 1 - hPx else 0
-        let mut haveTop : Bool := decide (diag > first)
-        let cnt := first + 1 - last
-        for step in [:cnt] do
-          let j := first - step
-          let y := diag - j
-          let x := j
-          let haveLeft : Bool := decide (j > 0)
-          let mut cctx : Nat := 0
-          let mut p0 : Nat := 0
-          if !haveLeft then
-            cctx := 0
-            p0 := idx.getD ((y - 1) * bwPx + x) 0
-          else if !haveTop then
-            cctx := 0
-            p0 := idx.getD (y * bwPx + (x - 1)) 0
+  if wPx + hPx >= 2 then
+    for diag in [1 : wPx + hPx - 1] do
+      let first := Nat.min diag (wPx - 1)
+      let last := if diag + 1 >= hPx then diag + 1 - hPx else 0
+      let mut haveTop : Bool := decide (diag > first)
+      let cnt := first + 1 - last
+      for step in [:cnt] do
+        let j := first - step
+        let y := diag - j
+        let x := j
+        let haveLeft : Bool := decide (j > 0)
+        let mut cctx : Nat := 0
+        let mut order : Array Nat := #[0, 0, 0, 0, 0, 0, 0, 0]
+        let mut oIdx : Nat := 0
+        let mut mask : Nat := 0
+        if !haveLeft then
+          let v := idx.getD ((y - 1) * bwPx + x) 0
+          cctx := 0; order := order.set! oIdx v; oIdx := oIdx + 1; mask := 1 <<< v
+        else if !haveTop then
+          let v := idx.getD (y * bwPx + (x - 1)) 0
+          cctx := 0; order := order.set! oIdx v; oIdx := oIdx + 1; mask := 1 <<< v
+        else
+          let lv := idx.getD (y * bwPx + (x - 1)) 0
+          let tp := idx.getD ((y - 1) * bwPx + x) 0
+          let tl := idx.getD ((y - 1) * bwPx + (x - 1)) 0
+          let sameTL := tp == lv
+          let sameTTl := tp == tl
+          let sameLTl := lv == tl
+          if sameTL && sameTTl && sameLTl then
+            cctx := 4; order := order.set! oIdx tp; oIdx := oIdx + 1; mask := 1 <<< tp
+          else if sameTL then
+            cctx := 3
+            order := order.set! oIdx tp; oIdx := oIdx + 1
+            order := order.set! oIdx tl; oIdx := oIdx + 1
+            mask := (1 <<< tp) ||| (1 <<< tl)
+          else if sameTTl || sameLTl then
+            cctx := 2
+            order := order.set! oIdx tl; oIdx := oIdx + 1
+            order := order.set! oIdx (if sameTTl then lv else tp); oIdx := oIdx + 1
+            mask := (1 <<< tl) ||| (1 <<< (if sameTTl then lv else tp))
           else
-            let lv := idx.getD (y * bwPx + (x - 1)) 0
-            let tp := idx.getD ((y - 1) * bwPx + x) 0
-            let tl := idx.getD ((y - 1) * bwPx + (x - 1)) 0
-            let sameTl : Nat := if tp == lv then 1 else 0
-            let sameTtl : Nat := if tp == tl then 1 else 0
-            cctx := 2 + sameTl + (sameTl &&& sameTtl)
-            p0 := if sameTl != 0 then tp else tl
-          let (bit, d1, c1) := dec.decodeBoolAdapt cdf (base + cctx * 8)
-          dec := d1; cdf := c1
-          idx := idx.set! (y * bwPx + x) (bit ^^^ p0)
-          haveTop := true
-  else
-    if wPx + hPx >= 2 then
-      for diag in [1 : wPx + hPx - 1] do
-        let first := Nat.min diag (wPx - 1)
-        let last := if diag + 1 >= hPx then diag + 1 - hPx else 0
-        let mut haveTop : Bool := decide (diag > first)
-        let cnt := first + 1 - last
-        for step in [:cnt] do
-          let j := first - step
-          let y := diag - j
-          let x := j
-          let haveLeft : Bool := decide (j > 0)
-          let mut cctx : Nat := 0
-          let mut prioCount : Nat := 1
-          let mut p : Array Nat := #[0, 0, 0]
-          let mut mask : Nat := 0
-          if !haveLeft then
-            let v := idx.getD ((y - 1) * bwPx + x) 0
-            cctx := 0; prioCount := 1; p := p.set! 0 v; mask := 1 <<< v
-          else if !haveTop then
-            let v := idx.getD (y * bwPx + (x - 1)) 0
-            cctx := 0; prioCount := 1; p := p.set! 0 v; mask := 1 <<< v
-          else
-            let lv := idx.getD (y * bwPx + (x - 1)) 0
-            let tp := idx.getD ((y - 1) * bwPx + x) 0
-            let tl := idx.getD ((y - 1) * bwPx + (x - 1)) 0
-            let sameTL := tp == lv
-            let sameTTl := tp == tl
-            let sameLTl := lv == tl
-            if sameTL && sameTTl then
-              cctx := 4; prioCount := 1; p := p.set! 0 tp; mask := 1 <<< tp
-            else if sameTL then
-              cctx := 3; prioCount := 2; p := p.set! 0 tp; p := p.set! 1 tl
-              mask := (1 <<< tp) ||| (1 <<< tl)
-            else if sameTTl || sameLTl then
-              let p1 := if sameTTl then lv else tp
-              cctx := 2; prioCount := 2; p := p.set! 0 tl; p := p.set! 1 p1
-              mask := (1 <<< tl) ||| (1 <<< p1)
-            else
-              cctx := 1; prioCount := 3
-              p := p.set! 0 (Nat.min tp lv)
-              p := p.set! 1 (Nat.max tp lv)
-              p := p.set! 2 tl
-              mask := (1 <<< tp) ||| (1 <<< lv) ||| (1 <<< tl)
-          let (cidx, d1, c1) := dec.decodeSymbolAdapt cdf (base + cctx * 8) (sz - 1)
-          dec := d1; cdf := c1
-          idx := idx.set! (y * bwPx + x) (av1ResolvePalColor cidx p prioCount mask)
-          haveTop := true
+            cctx := 1
+            order := order.set! oIdx (Nat.min tp lv); oIdx := oIdx + 1
+            order := order.set! oIdx (Nat.max tp lv); oIdx := oIdx + 1
+            order := order.set! oIdx tl; oIdx := oIdx + 1
+            mask := (1 <<< tp) ||| (1 <<< lv) ||| (1 <<< tl)
+        let mut bit : Nat := 1
+        for v in [:8] do
+          if (mask &&& bit) == 0 then
+            order := order.set! oIdx v
+            oIdx := oIdx + 1
+          bit := bit <<< 1
+        let (cidx, d1, c1) := dec.decodeSymbolAdapt cdf (base + cctx * 8) (sz - 1)
+        dec := d1; cdf := c1
+        idx := idx.set! (y * bwPx + x) (order.getD cidx 0)
+        haveTop := true
   for y in [:hPx] do
     for x in [wPx:bwPx] do
       idx := idx.set! (y * bwPx + x) (idx.getD (y * bwPx + wPx - 1) 0)
@@ -10342,7 +10296,7 @@ def av1DecodeIntraB (ctx0 : Av1TileDecodeCtx) (bs bx by4 bw4 bh4 bwLog2 bhLog2 w
   let mut uvAngle : Int := 0
   let mut cflAlpha : Array Int := #[0, 0]
   if hasChroma then
-    let cflOk := if lossless then (cbw4 == 1 && cbh4 == 1) else (cbw4 <= 8 && cbh4 <= 8)
+    let cflOk := if lossless then (cbw4 == 1 && cbh4 == 1) else (bw4 <= 8 && bh4 <= 8)
     let ubase := cdfOff_m_uv_mode + ((if cflOk then 13 else 0) + yMode) * 16
     let (uvm, d3, c3) := dec.decodeSymbolAdapt cdf ubase (if cflOk then 13 else 12)
     uvMode := uvm; dec := d3; cdf := c3
@@ -13228,7 +13182,7 @@ private def av1EncIntraB (ctx0 : Av1TileEncodeCtx)
     enc := e1; cdf := c1
   let uvMode := av1DcPred
   if hasChroma then
-    let cflOk : Bool := if cfg.lossless then (cbw4 == 1 && cbh4 == 1) else (cbw4 <= 8 && cbh4 <= 8)
+    let cflOk : Bool := if cfg.lossless then (cbw4 == 1 && cbh4 == 1) else (bw4 <= 8 && bh4 <= 8)
     let ubase := cdfOff_m_uv_mode + ((if cflOk then 13 else 0) + yMode) * 16
     let (e2, c2) := enc.encodeSymbolAdapt uvMode cdf ubase (if cflOk then 13 else 12)
     enc := e2; cdf := c2
