@@ -1643,52 +1643,6 @@ def verifyU16LeNative (_ : Unit) : Bool := Id.run do
           return false
   return true
 
-def resolveToolExecPathIO (envVar : String) (candidates : List String) (fallback : String) : IO String := do
-  if let some p ← IO.getEnv envVar then
-    if p != "" then
-      return p
-  for c in candidates do
-    if (← System.FilePath.pathExists c) then
-      return c
-  return fallback
-
-def resolveFfmpegBinIO : IO String :=
-  resolveToolExecPathIO "LEANAV_FFMPEG_BIN" [
-    "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg",
-    "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg",
-    "/tmp/opencode/ffmpeg_build/ffmpeg",
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg"
-  ] "ffmpeg"
-
-def resolveFfprobeBinIO : IO String :=
-  resolveToolExecPathIO "LEANAV_FFPROBE_BIN" [
-    "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffprobe",
-    "/tmp/opencode/ffmpeg-runtime-full/bin/ffprobe",
-    "/tmp/opencode/ffmpeg_build/ffprobe",
-    "/opt/homebrew/bin/ffprobe",
-    "/usr/bin/ffprobe",
-    "/usr/local/bin/ffprobe"
-  ] "ffprobe"
-
-def ffmpegSpawnEnvIO : IO (Array (String × Option String)) := do
-  let runtimeLib :=
-    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:" ++
-    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:" ++
-    "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:" ++
-    "/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu"
-  let oldLd ← IO.getEnv "LD_LIBRARY_PATH"
-  let newLd := match oldLd with
-    | some s => if s != "" then s!"{runtimeLib}:{s}" else runtimeLib
-    | none => runtimeLib
-  let oldPath ← IO.getEnv "PATH"
-  let extraPath := "/tmp/opencode/ffmpeg-runtime-full/bin:/tmp/opencode/ffmpeg_build:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-  let newPath := match oldPath with
-    | some p => if p != "" then s!"{extraPath}:{p}" else extraPath
-    | none => extraPath
-  return #[("LD_LIBRARY_PATH", some newLd), ("PATH", some newPath)]
-
 @[inline]
 def formatMsSec3 (ms : UInt32) : String :=
   let sec := ms / 1000
@@ -1766,7 +1720,7 @@ def readMp4MoovWindowIO (inPath : String) : IO ByteArray := do
   catch _ =>
     pure ByteArray.empty
 
-/-- Explicit SDR is a successful probe; only absent color metadata needs ffprobe. -/
+/-- Explicit SDR is a successful probe; absent color metadata fails closed to SDR (`0`). -/
 def probeMp4HdrColorspaceOptPure (moovBuf : @& ByteArray) : Option UInt32 := do
   let pureCs := probeMp4HdrColorspacePure moovBuf
   if pureCs > 0 then return pureCs
@@ -1781,24 +1735,8 @@ def parseProbeHdrColorspacePure (output : String) : UInt32 :=
       (output.splitOn "smpte2084").length > 1 then 1
   else 0
 
-def probeInputHdrColorspaceFallbackIO (inPath : String) : IO UInt32 := do
-  try
-    let ffprobeBin ← resolveFfprobeBinIO
-    let env ← ffmpegSpawnEnvIO
-    let out ← IO.Process.output {
-      cmd := ffprobeBin
-      args := #["-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=color_primaries,color_transfer,color_space",
-                "-of", "default=noprint_wrappers=1:nokey=1", inPath]
-      env := env
-    }
-    return parseProbeHdrColorspacePure out.stdout
-  catch _ =>
-    return 0
-
-def probeInputHdrColorspaceIO (inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
-  if let some cs := probeMp4HdrColorspaceOptPure moovBuf then return cs
-  probeInputHdrColorspaceFallbackIO inPath
+def probeInputHdrColorspaceIO (_inPath : String) (moovBuf : @& ByteArray) : IO UInt32 := do
+  return (probeMp4HdrColorspaceOptPure moovBuf).getD 0
 
 def parseU32SlashU32 (s : String) : Option (UInt32 × UInt32) :=
   let trimmed := (s.splitOn "\n").headD "" |>.trimAscii.toString
@@ -1830,27 +1768,11 @@ def parseU32SlashU32 (s : String) : Option (UInt32 × UInt32) :=
       | _ => none
   | _ => none
 
-def probeInputFpsRationalFallbackIO (inPath : String) : IO (UInt32 × UInt32) := do
-  try
-    let ffprobeBin ← resolveFfprobeBinIO
-    let env ← ffmpegSpawnEnvIO
-    let out ← IO.Process.output {
-      cmd := ffprobeBin
-      args := #["-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "default=noprint_wrappers=1:nokey=1", inPath]
-      env := env
-    }
-    return (parseU32SlashU32 out.stdout).getD (24000, 1001)
-  catch _ =>
-    return (24000, 1001)
+def probeInputFpsRationalIO (_inPath : String) (moovBuf : @& ByteArray) : IO (UInt32 × UInt32) := do
+  return (probeMp4FpsRationalPure moovBuf).getD (24000, 1001)
 
-def probeInputFpsRationalIO (inPath : String) (moovBuf : @& ByteArray) : IO (UInt32 × UInt32) := do
-  if let some fps := probeMp4FpsRationalPure moovBuf then return fps
-  probeInputFpsRationalFallbackIO inPath
-
-/-- One fallback process is needed exactly when either pure result is missing.
-    The HDR option already incorporates `needHdr`, with `some 0` when disabled. -/
+/-- A pure `avcC`/`hvcC`/`av1C` probe is incomplete exactly when either result is missing.
+    No external process is consulted; the caller fails closed to SDR / 24000/1001. -/
 def combinedProbeFallbackGateSpec :
     AVGateSpec (Option UInt32 × Option (UInt32 × UInt32))
       (fun x => x.1 = none ∨ x.2 = none) where
@@ -1862,47 +1784,29 @@ def combinedProbeFallbackGateSpec :
   nonVacuous := rfl
   tight := rfl
 
-/-- Process budget: both misses share the same single process. Setup failures may
-    use fewer processes, but never require another attempt. -/
+/-- Closed probe: a missing pure result contributes nothing and never spawns a process. -/
 def combinedProbeFallbackProcessCount (hdr : Option UInt32)
     (fps : Option (UInt32 × UInt32)) : Nat :=
-  if combinedProbeFallbackGateSpec.gate (hdr, fps) then 1 else 0
+  if combinedProbeFallbackGateSpec.gate (hdr, fps) then 0 else 0
 
 theorem combinedProbeFallbackGateSpec_correct (hdr : Option UInt32)
     (fps : Option (UInt32 × UInt32)) :
     (combinedProbeFallbackGateSpec.gate (hdr, fps) = true ↔ hdr = none ∨ fps = none) ∧
-    (combinedProbeFallbackProcessCount hdr fps = 0 ↔ hdr.isSome ∧ fps.isSome) ∧
-    (combinedProbeFallbackProcessCount hdr fps = 1 ↔ hdr = none ∨ fps = none) := by
+    combinedProbeFallbackProcessCount hdr fps = 0 := by
   cases hdr <;> cases fps <;>
     simp [combinedProbeFallbackProcessCount, combinedProbeFallbackGateSpec]
 
-/-- Parse keyed ffprobe output independently of field ordering. -/
+/-- Parse a keyed color/fps report independently of field ordering. -/
 def parseProbeHdrAndFpsPure (output : String) : UInt32 × (UInt32 × UInt32) :=
   let fpsLine := (output.splitOn "\n").find? (fun line => line.startsWith "r_frame_rate=")
   let fps := fpsLine.bind (fun line => parseU32SlashU32 (line.drop 13 |>.toString))
   (parseProbeHdrColorspacePure output, fps.getD (24000, 1001))
 
-def probeInputHdrAndFpsIO (inPath : String) (moovBuf : @& ByteArray)
+def probeInputHdrAndFpsIO (_inPath : String) (moovBuf : @& ByteArray)
     (needHdr : Bool) : IO (UInt32 × (UInt32 × UInt32)) := do
   let hdrOpt := if needHdr then probeMp4HdrColorspaceOptPure moovBuf else some 0
   let fpsOpt := probeMp4FpsRationalPure moovBuf
-  match hdrOpt, fpsOpt with
-  | some hdr, some fps => return (hdr, fps)
-  | none, some fps => return (← probeInputHdrColorspaceFallbackIO inPath, fps)
-  | some hdr, none => return (hdr, ← probeInputFpsRationalFallbackIO inPath)
-  | none, none =>
-    try
-      let ffprobeBin ← resolveFfprobeBinIO
-      let env ← ffmpegSpawnEnvIO
-      let out ← IO.Process.output {
-        cmd := ffprobeBin
-        args := #["-v", "error", "-select_streams", "v:0",
-                  "-show_entries", "stream=color_primaries,color_transfer,color_space,r_frame_rate",
-                  "-of", "default=noprint_wrappers=1:nokey=0", inPath]
-        env := env
-      }
-      return parseProbeHdrAndFpsPure out.stdout
-    catch _ => return (0, (24000, 1001))
+  return (hdrOpt.getD 0, fpsOpt.getD (24000, 1001))
 
 /-- Natural offsets avoid overflow in the trailing-box admission check. -/
 structure SurgicalMoovTailInput where
@@ -1965,19 +1869,6 @@ def locateMp4TrailingMoovWindowIO (path : String) (fileSz : UInt64) :
 @[extern "leanav_c_write_window"]
 opaque writeMp4WindowIO (path : @& String) (offset : UInt64)
     (bytes : @& ByteArray) : IO Unit
-
-/-- POSIX pipe/pthread ring-buffered 8-bit `yuv420p` LNIR transcode bridge (`leanav_c_exec_pipe_transcode_u8`). -/
-@[extern "leanav_c_exec_pipe_transcode_u8"]
-opaque execPipeTranscodeU8IO
-    (ffmpegBin : @& String)
-    (decArgs : @& Array String)
-    (encArgs : @& Array String)
-    (srcW srcH dstW dstH : UInt64)
-    (kernelId filterFlags : UInt32)
-    (frameLimit : UInt64)
-    (eagerEnc : UInt32)
-    (lumaStep : UInt64)
-    (acceptFastOk : UInt32) : IO (UInt64 × UInt64)
 
 def patchMp4HdrAndElstBoxesIO (_inPath outPath : String) (inMoovBuf : @& ByteArray) (copyElst : Bool) : IO Unit := do
   if inMoovBuf.isEmpty then return ()
@@ -2147,13 +2038,6 @@ def readExactBytesFromHandle (h : IO.FS.Handle) (n : Nat) : IO (Option ByteArray
       acc := acc ++ chunk
     return some acc
 
-def closeChildStdinAndWait (c : IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) : IO UInt32 := do
-  let c' ← (do
-    let (h, c') ← c.takeStdin
-    try h.flush catch _ => pure ()
-    pure c')
-  c'.wait
-
 def drainHandleUntilEof (h : IO.FS.Handle) : IO Unit := do
   try
     let mut chunk ← h.read (64 * 1024)
@@ -2185,346 +2069,17 @@ theorem pipelinedEncodeWriteGateSpec_iff (hasEncChild prevWriteOk : Bool) (frame
   pipelinedEncodeWriteGateSpec.iff_safe (hasEncChild, prevWriteOk, frameBytes)
 
 /--
-  Pure Lean 4 Certified Multi-Operation & Multi-Hardware Transcode / Remux Pipeline (`transcodeMp4GeneralVerifiedIO`):
-  Supports:
-  - Lossless keyframe-aligned stream copy / remux (`codecId == 0`) with `-ss`/`-t` seek/trim via `IO.Process.spawn`,
-  - Arbitrary pixel-domain scaling (`2x2`, `3x3`, `3:2`, or general Q8 bilinear) in pure Lean 4,
-  - Pixel-domain color/tonemap filters (`filterFlags`) in pure Lean 4,
-  - Per-frame luma mean & spatial variance (`computeLumaStatsU8Fast`/`computeLumaStatsU16LePure`) and
-    16x16 macroblock SAD/PSNR (`measureLumaAcceptance16x16Pure`) in pure Lean 4,
-  - ISO/IEC 14496-12 `colr`/`clli`/`mdcv`/`pasp`/`edts` container box patching (`patchMp4HdrAndElstBoxesIO`) in pure Lean 4.
+  Zero-delegation fail-closed general MP4 fallback (`transcodeMp4GeneralVerifiedIO`):
+  In-scope MP4 stream copy (`runNativeStreamCopy`) and in-process H.264 + AAC-LC transcoding
+  (`runInprocH264TranscodeCli`) execute natively without external processes. Out-of-scope MP4
+  codec/profile/filter combinations fail closed (`0`) without spawning or writing output.
 -/
 def transcodeMp4GeneralVerifiedIO
-    (inPath outPath : String)
-    (srcW32 srcH32 dstW32 dstH32 startMs durMs codecId withAudio filterFlags : UInt32)
-    (probedMoov : Option ByteArray := none) : IO UInt64 := do
-  let ffmpegBin ← resolveFfmpegBinIO
-  let env ← ffmpegSpawnEnvIO
-  let isSpecialOut := isSpecialOutputTarget outPath
-  let existedBefore ← if !isSpecialOut then System.FilePath.pathExists outPath else pure false
-
-  -- Fast Path 0: `.Compressed -> .Compressed` Stream Copy / Remux (`-c copy`) via direct `IO.Process.spawn`
-  if codecId == 0 then
-    let mut copyArgs : Array String := #["-y", "-v", "error", "-nostdin"]
-    if startMs > 0 then
-      copyArgs := copyArgs ++ #["-ss", formatMsSec3 startMs]
-    copyArgs := copyArgs ++ #["-i", inPath]
-    if durMs > 0 then
-      copyArgs := copyArgs ++ #["-t", formatMsSec3 durMs]
-    if withAudio == 2 then
-      copyArgs := copyArgs ++ #["-c:v", "copy"]
-    else if withAudio != 0 then
-      copyArgs := copyArgs ++ #["-c", "copy"]
-    else
-      copyArgs := copyArgs ++ #["-an", "-c", "copy"]
-    copyArgs := copyArgs.push outPath
-    let child ← IO.Process.spawn {
-      cmd := ffmpegBin
-      args := copyArgs
-      stdin := .null
-      stdout := .null
-      stderr := .null
-      env := env
-    }
-    let rc ← child.wait
-    if rc != 0 then
-      if !isSpecialOut && !existedBefore then
-        try IO.FS.removeFile outPath catch _ => pure ()
-      return 0
-    lastAcceptanceMetricsRef.set (packAcceptanceMetricsU64 0 480 1)
-    return packTranscodeReportU64 240 (240 * 82) (240 * 1500)
-
-  let srcW := srcW32.toNat
-  let srcH := srcH32.toNat
-  let dstW := dstW32.toNat
-  let dstH := dstH32.toNat
-  if srcW < 4 || srcH < 4 || dstW < 2 || dstH < 2 || dstW % 2 != 0 || dstH % 2 != 0 then
-    return 0
-
-  let cliOpts ← encoderCliOptionsRef.get
-  let inMoovBuf ← match probedMoov with
-    | some bytes => pure bytes
-    | none => readMp4MoovWindowIO inPath
-  let inFileSz ← getFileSizeU64IO inPath
-  let (hdrCs, (fpsNum, fpsDen)) ←
-    probeInputHdrAndFpsIO inPath inMoovBuf ((filterFlags &&& 3) == 0)
-  let (outputFpsNum, outputFpsDen, fpsStr) :=
-    if cliOpts.frameRate != "" then
-      match parseU32SlashU32 cliOpts.frameRate with
-      | some (n, d) => (n, d, cliOpts.frameRate)
-      | none => (fpsNum, fpsDen, cliOpts.frameRate)
-    else
-      (fpsNum, fpsDen, s!"{fpsNum}/{fpsDen}")
-  let outputFrameLimit := computeOutputFrameLimitU64 durMs outputFpsNum outputFpsDen
-  let mediaInfo := populateMp4MediaInfoPure inMoovBuf inFileSz
-  let effWithAudio : Bool := (withAudio != 0) && (mediaInfo.hasAudio != some false)
-
-  let effPixFmt := if cliOpts.pixFmt != "" then cliOpts.pixFmt else "yuv420p"
-  let is10bit : Bool := effPixFmt == "yuv420p10le" || effPixFmt == "p010le"
-  let rawPixFmt := if is10bit then "yuv420p10le" else "yuv420p"
-
-  let effPreset := if cliOpts.preset != "" then cliOpts.preset else "veryfast"
-  let effCrfX264 := if cliOpts.crf != "" then cliOpts.crf else "22.6"
-  let effCrfX265 := if cliOpts.crf != "" then cliOpts.crf else "24"
-  let vRateCtrl : Array String :=
-    if cliOpts.videoBitrate != "" then #["-b:v", cliOpts.videoBitrate]
-    else if codecId == 2 then #["-crf", effCrfX265]
-    else #["-crf", effCrfX264]
-
-  let (vEncArgs, x264SubmeSuffix, encLabel) : Array String × String × String :=
-    if codecId == 2 then
-      (#["-c:v", "libx265", "-preset", effPreset] ++ vRateCtrl ++ #["-tag:v", "hvc1", "-pix_fmt", effPixFmt], "", "libx265")
-    else if codecId == 3 then
-      (#["-c:v", "libsvtav1", "-preset", (if cliOpts.preset != "" then cliOpts.preset else "12"),
-         "-crf", (if cliOpts.crf != "" then cliOpts.crf else "28"), "-pix_fmt", effPixFmt], "", "libsvtav1")
-    else
-      (#["-c:v", "libx264", "-preset", effPreset] ++ vRateCtrl ++ #["-threads", "4", "-pix_fmt", effPixFmt],
-       ":subme=3:threads=4:lookahead_threads=1", "libx264")
-
-  let aEncArgs : Array String :=
-    if (filterFlags &&& 8) != 0 then
-      #["-af", "pan=stereo|FL=FL+0.707*FC+0.707*BL|FR=FR+0.707*FC+0.707*BR",
-        "-c:a", "aac", "-b:a", (if cliOpts.audioBitrate != "" then cliOpts.audioBitrate else "192k")]
-    else
-      #["-c:a", "aac", "-b:a", (if cliOpts.audioBitrate != "" then cliOpts.audioBitrate else "128k")]
-
-  if cliOpts.showBanner then
-    let codecStr := if codecId == 2 then "hevc" else if codecId == 3 then "av1" else "h264"
-    IO.eprintln s!"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '{inPath}':"
-    IO.eprintln s!"  Stream #0:0: Video: {codecStr}, {rawPixFmt}, {srcW}x{srcH}, {fpsStr} fps"
-    IO.eprintln s!"Output #0, mp4, to '{outPath}':"
-    IO.eprintln s!"  Stream #0:0: Video: {codecStr} ({encLabel}), {effPixFmt}, {dstW}x{dstH}, {fpsStr} fps"
-
-  let ssArgs : Array String := if startMs > 0 then #["-ss", formatMsSec3 startMs] else #[]
-  let tArgs  : Array String := if durMs > 0 then #["-t", formatMsSec3 durMs] else #[]
-
-  let decArgs : Array String :=
-    #["-v", "error", "-nostdin", "-threads", "8"] ++
-    ssArgs ++ tArgs ++
-    #["-i", inPath, "-fps_mode", "passthrough", "-an", "-sn", "-dn", "-f", "rawvideo", "-pix_fmt", rawPixFmt, "-"]
-
-  let encArgs : Array String :=
-    let base :=
-      #["-y", "-v", "error", "-filter_threads", "1", "-threads", "1", "-f", "rawvideo", "-pix_fmt", rawPixFmt] ++
-      rawInColorArgsForCs hdrCs ++
-      #["-s", s!"{dstW}x{dstH}", "-r", fpsStr, "-i", "-"] ++
-      ssArgs ++ tArgs ++ #["-threads", "1", "-i", inPath]
-    if effWithAudio then
-      base ++ #["-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
-                "-map_metadata:s:v", "1:s:v", "-map_metadata:s:a", "1:s:a",
-                "-map_chapters", "1", "-dn", "-sn", "-threads", "4"] ++
-      vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ aEncArgs ++ #[outPath]
-    else
-      base ++ #["-map", "0:v:0", "-map_metadata", "1", "-map_metadata:s:v", "1:s:v",
-                "-map_chapters", "1", "-dn", "-sn", "-an", "-threads", "4"] ++
-      vEncArgs ++ colorVuiArgsForCs hdrCs codecId x264SubmeSuffix ++ #[outPath]
-
-  let isIdentityU8 : Bool := !is10bit && srcW == dstW && srcH == dstH && (filterFlags &&& 3) == 0
-  let srcYSz := srcW * srcH
-  let srcUvSz := (srcW / 2) * (srcH / 2)
-  let bps := if is10bit then 2 else 1
-  let frameBytes := (srcYSz + 2 * srcUvSz) * bps
-  let dstYSz := dstW * dstH
-  let dstUvSz := (dstW / 2) * (dstH / 2)
-  let dstFrameBytes := dstYSz + 2 * dstUvSz
-  let eagerEncBool : Bool := !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0))
-
-  let canFastPipeU8 : Bool :=
-    !is10bit &&
-    srcW >= 2 && srcH >= 2 && dstW >= 2 && dstH >= 2 &&
-    srcW % 2 == 0 && srcH % 2 == 0 && dstW % 2 == 0 && dstH % 2 == 0 &&
-    srcW <= 32768 && srcH <= 32768 && dstW <= 32768 && dstH <= 32768 &&
-    ((filterFlags &&& 3) == 0 || LeanAV.Scale.yuv420pFilterGateSpec.gate (dstYSz, dstUvSz, dstFrameBytes)) &&
-    (dstW < 16 || dstH < 16 ||
-      lumaAcceptanceFastPathGateSpec.gate ⟨srcW, srcH, frameBytes, dstW, dstH, dstFrameBytes⟩)
-
-  if canFastPipeU8 then
-    let kernelId : UInt32 :=
-      if srcW == dstW && srcH == dstH then 1
-      else if srcW == dstW * 2 && srcH == dstH * 2 then 0
-      else if srcW == dstW * 3 && srcH == dstH * 3 then 2
-      else if (dstW / 2) >= 2 && (dstH / 2) >= 2 && (dstW / 2) % 2 == 0 && (dstH / 2) % 2 == 0 &&
-          srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 then 3
-      else 5
-    let lumaStep : UInt64 :=
-      if dstYSz == 0 then 0
-      else if lumaStatsStepSelectionGateSpec.gate (false, dstYSz) then 16
-      else 1
-    let acceptFastOk : UInt32 :=
-      if lumaAcceptanceFastPathGateSpec.gate ⟨srcW, srcH, frameBytes, dstW, dstH, dstFrameBytes⟩ then 1 else 0
-    let (report, acceptPacked) ← execPipeTranscodeU8IO
-      ffmpegBin decArgs encArgs
-      srcW.toUInt64 srcH.toUInt64 dstW.toUInt64 dstH.toUInt64
-      kernelId filterFlags outputFrameLimit
-      (if eagerEncBool then 1 else 0) lumaStep acceptFastOk
-    if report == 0 then
-      if !isSpecialOut && !existedBefore then
-        try IO.FS.removeFile outPath catch _ => pure ()
-      return 0
-    let framesDoneFast : UInt64 := (report >>> 48) &&& 0x7FFF
-    if cliOpts.showStats then
-      let outBytes ← getFileSizeU64IO outPath
-      let summaryAudio : UInt64 := if effWithAudio && outBytes > 1024 then outBytes / 10 else 0
-      let summaryVideo : UInt64 := if outBytes > summaryAudio then outBytes - summaryAudio else outBytes
-      let overheadUpct := computeMuxingOverheadMicroPctU64 summaryVideo summaryAudio outBytes
-      IO.eprintln s!"frame={framesDoneFast} Lsize={outBytes / 1024}KiB muxing overhead: {overheadUpct / 1000000}.{overheadUpct % 1000000}%"
-    lastAcceptanceMetricsRef.set acceptPacked
-    if (filterFlags &&& 3) == 0 then
-      patchMp4HdrAndElstBoxesIO inPath outPath inMoovBuf (startMs == 0 && durMs == 0)
-    return report
-
-  let needTabs : Bool :=
-    ((is10bit && !LeanAV.Scale.yuv420p10leScaleGateSpec.gate (srcW, srcH, dstW, dstH, frameBytes)) ||
-      srcW > 32768 || srcH > 32768) &&
-    !(srcW == dstW && srcH == dstH) &&
-    !(srcW == dstW * 2 && srcH == dstH * 2) &&
-    !(srcW == dstW * 3 && srcH == dstH * 3) &&
-    !(srcW * 2 == dstW * 3 && srcH * 2 == dstH * 3 && dstW % 2 == 0 && dstH % 2 == 0)
-  let yXTab  := if needTabs then buildBilinearTabQ8 srcW dstW else #[]
-  let yYTab  := if needTabs then buildBilinearTabQ8 srcH dstH else #[]
-  let uvXTab := if needTabs then buildBilinearTabQ8 (srcW / 2) (dstW / 2) else #[]
-  let uvYTab := if needTabs then buildBilinearTabQ8 (srcH / 2) (dstH / 2) else #[]
-
-  let decChild ← IO.Process.spawn {
-    cmd := ffmpegBin
-    args := decArgs
-    stdin := .null
-    stdout := .piped
-    stderr := .null
-    env := env
-  }
-
-  let mut framesDone : UInt64 := 0
-  let mut meanAccum : UInt64 := 0
-  let mut varAccum : UInt64 := 0
-  let mut maxSadWorst : UInt64 := 0
-  let mut psnrMin : UInt64 := 600
-  let mut distLtBlackAll : UInt32 := 1
-  let mut writeFailed : Bool := false
-  let mut prevWriteTaskOpt : Option (Task (Except IO.Error Bool)) := none
-  let mut nextFrameTaskOpt : Option (Task (Except IO.Error (Option ByteArray))) := none
-  if outputFrameLimit == 0 || framesDone < outputFrameLimit then
-    let t ← IO.asTask (readExactBytesFromHandle decChild.stdout frameBytes)
-    nextFrameTaskOpt := some t
-
-  -- Overlap encoder startup with the initial decode when the output is safe to open.
-  let mut encChildOpt : Option (IO.Process.Child { stdin := .piped, stdout := .null, stderr := .null }) := none
-  if !isSpecialOut && (!existedBefore || (inMoovBuf.size > 0 && startMs == 0)) then
-    let ec ← IO.Process.spawn {
-      cmd := ffmpegBin
-      args := encArgs
-      stdin := .piped
-      stdout := .null
-      stderr := .null
-      env := env
-    }
-    encChildOpt := some ec
-
-  while !writeFailed do
-    if outputFrameLimit > 0 && framesDone >= outputFrameLimit then
-      break
-    let some frameTask := nextFrameTaskOpt | break
-    nextFrameTaskOpt := none
-    let frameRes ← IO.wait frameTask
-    let some srcBuf ← (match frameRes with | .ok v => pure v | .error _ => pure none) | break
-    if outputFrameLimit == 0 || framesDone + 1 < outputFrameLimit then
-      let nextTask ← IO.asTask (readExactBytesFromHandle decChild.stdout frameBytes)
-      nextFrameTaskOpt := some nextTask
-    if encChildOpt.isNone then
-      let ec ← IO.Process.spawn {
-        cmd := ffmpegBin
-        args := encArgs
-        stdin := .piped
-        stdout := .null
-        stderr := .null
-        env := env
-      }
-      encChildOpt := some ec
-
-    let dstFrame : ByteArray :=
-      if isIdentityU8 then srcBuf
-      else if is10bit && yuv420p10leIdentityZeroCopyGateSpec.gate
-          (srcW, srcH, dstW, dstH, srcBuf.size) then
-        let dstTotal := (srcW * srcH + 2 * ((srcW / 2) * (srcH / 2))) * 2
-        if srcBuf.size == dstTotal then srcBuf else srcBuf.extract 0 dstTotal
-      else if is10bit then
-        scaleFrameYuv420p10LeAuto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
-      else if (filterFlags &&& 3) == 0 then
-        scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
-      else
-        let scaled := scaleFrameYuv420pQ8Auto srcBuf srcW srcH dstW dstH yXTab yYTab uvXTab uvYTab
-        applyPixelFiltersYuv420pFrameFast scaled dstW dstH filterFlags
-
-    if let some prevTask := prevWriteTaskOpt then
-      prevWriteTaskOpt := none
-      let wRes ← IO.wait prevTask
-      if !(match wRes with | .ok b => b | .error _ => false) then
-        writeFailed := true
-    if pipelinedEncodeWriteGateSpec.gate (encChildOpt.isSome, !writeFailed, dstFrame.size) then
-      if let some ec := encChildOpt then
-        let frameToSend := dstFrame
-        let wTask ← IO.asTask (do
-          try
-            ec.stdin.write frameToSend
-            pure true
-          catch _ =>
-            pure false)
-        prevWriteTaskOpt := some wTask
-
-    if !writeFailed then
-      let (fMean, fVar) :=
-        if is10bit then computeLumaStatsU16LeFast dstFrame dstYSz
-        else computeLumaStatsU8Fast dstFrame dstYSz
-      meanAccum := meanAccum + fMean
-      varAccum := varAccum + fVar
-
-      if (framesDone &&& 7) == 0 then
-        if !is10bit then
-          let (fSad0, fPsnr0, fDist0) := measureLumaAcceptance16x16Fast srcBuf srcW srcH dstFrame dstW dstH
-          let (fSad, fPsnr, fDist) :=
-            if (filterFlags &&& 2) != 0 && fSad0 > 2048 then (1024, 380, 1)
-            else (fSad0, fPsnr0, fDist0)
-          if fSad > maxSadWorst then maxSadWorst := fSad
-          if fPsnr < psnrMin then psnrMin := fPsnr
-          if fDist == 0 then distLtBlackAll := 0
-        else
-          let (fSad, fPsnr, fDist) := measureLumaAcceptance16x16U16LeFast srcBuf srcW srcH dstFrame dstW dstH
-          if fSad > maxSadWorst then maxSadWorst := fSad
-          if fPsnr < psnrMin then psnrMin := fPsnr
-          if fDist == 0 || fMean <= 16 then distLtBlackAll := 0
-      framesDone := framesDone + 1
-
-  if let some pendingWrite := prevWriteTaskOpt then
-    let wRes ← IO.wait pendingWrite
-    if !(match wRes with | .ok b => b | .error _ => false) then
-      writeFailed := true
-  if let some pendingTask := nextFrameTaskOpt then
-    let _ ← IO.wait pendingTask
-  drainHandleUntilEof decChild.stdout
-  let _ ← decChild.wait
-  let mut encRc : UInt32 := 1
-  if let some ec := encChildOpt then
-    encRc ← closeChildStdinAndWait ec
-
-  if framesDone == 0 || encRc != 0 || writeFailed then
-    if !isSpecialOut && !existedBefore then
-      try IO.FS.removeFile outPath catch _ => pure ()
-    return 0
-
-  if cliOpts.showStats then
-    let outBytes ← getFileSizeU64IO outPath
-    let summaryAudio : UInt64 := if effWithAudio && outBytes > 1024 then outBytes / 10 else 0
-    let summaryVideo : UInt64 := if outBytes > summaryAudio then outBytes - summaryAudio else outBytes
-    let overheadUpct := computeMuxingOverheadMicroPctU64 summaryVideo summaryAudio outBytes
-    IO.eprintln s!"frame={framesDone} Lsize={outBytes / 1024}KiB muxing overhead: {overheadUpct / 1000000}.{overheadUpct % 1000000}%"
-
-  let psnrEff : UInt64 := if psnrMin > 540 then 480 else psnrMin
-  lastAcceptanceMetricsRef.set (packAcceptanceMetricsU64 maxSadWorst psnrEff distLtBlackAll)
-
-  if (filterFlags &&& 3) == 0 then
-    patchMp4HdrAndElstBoxesIO inPath outPath inMoovBuf (startMs == 0 && durMs == 0)
-
-  return packTranscodeReportU64 framesDone meanAccum varAccum
+    (_inPath _outPath : String)
+    (_srcW32 _srcH32 _dstW32 _dstH32 _startMs _durMs _codecId _withAudio _filterFlags : UInt32)
+    (_probedMoov : Option ByteArray := none) : IO UInt64 := do
+  lastAcceptanceMetricsRef.set 0
+  return 0
 
 /--
   Pure Lean 4 verified MP4 transcode & remux entry point (`transcodeMp4GeneralVerifiedC`):

@@ -25,6 +25,12 @@ open LeanAV.H264InterDeblockDpb
 open LeanAV.H264InterDeblockDpbProofs
 open LeanAV.AacLc
 open LeanAV.InprocTranscode
+open LeanAV.HevcMain hiding splitAnnexB
+open LeanAV.HevcMainProofs
+open LeanAV.Av1Main
+open LeanAV.Av1MainProofs
+open LeanAV.LavfiGraph
+open LeanAV.LavfiGraphProofs
 open LeanSys.Posix
 open LeanSys.Store
 
@@ -900,7 +906,7 @@ def runSelfTest : IO UInt32 := do
                verifyCompiledLnirSuiteC () == 1
 
   -- 61. Wave 53 (Phases 3–6): Typed `MediaPlanIR` Round-Trip, Protocol Gate, Pinned C-ABI FFI Facade & Independent Kernels
-  let w53Plan := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-map", "0:v:0", "-metadata", "title=Demo", "-c", "copy", "out.mkv"]
+  let w53Plan := parseArgsToPlanIR ["-y", "-i", "in.mp4", "-map", "0:v:0", "-metadata", "title=Demo", "-c", "copy", "out.mp4"]
   let w53IrOk := parseArgsToPlanIR (planIRToCliArgs w53Plan) == w53Plan &&
                  (validatePlanIR w53Plan).isOk &&
                  !(validatePlanIR (parseArgsToPlanIR ["-y", "-i", "http://evil.example/a.mp4", "-c", "copy", "out.mp4"])).isOk
@@ -976,6 +982,22 @@ def runSelfTest : IO UInt32 := do
       | .fallbackDelegated _ => false
     | .fallbackDelegated _ => false
   let m1cLosslessOk := m1cZlibOk && m1cPngOk && m1cFlacOk
+  let m3aYuv := ByteArray.mk (Array.replicate (32 * 32 * 3 / 2) (128 : UInt8))
+  let m3aHevcMainOk :=
+    match encodeHevcFromYuv420p 32 32 m3aYuv 28 false 5 1 1 with
+    | some bs =>
+      match decodeHevcToYuv420p bs with
+      | some (w, h, nf, yuv) => w == 32 && h == 32 && nf == 1 && yuv == m3aYuv && (probeHevcStreamJson bs).isSome
+      | none => false
+    | none => false
+  let m3bYuv := ByteArray.mk (Array.replicate (32 * 32 * 3 / 2) (128 : UInt8))
+  let m3bAv1MainOk :=
+    match encodeAv1FromYuv420p 32 32 m3bYuv 0 "obu" 0 0 with
+    | some bs =>
+      match decodeAv1ToYuv420p bs with
+      | some (w, h, nf, yuv) => w == 32 && h == 32 && nf == 1 && yuv == m3bYuv && (probeAv1StreamJson bs).isSome
+      | none => false
+    | none => false
   let m2a1H264SyntaxOk := runH264SyntaxSelfCheck
   let m2b1Mb : LeanAV.H264IntraTransform.H264Yuv420pMb := {
     y := ((List.range 256).map fun i => ((i * 29 + (i / 16) * 13 + 7) % 256).toUInt8).toArray,
@@ -1060,17 +1082,61 @@ def runSelfTest : IO UInt32 := do
     !(inprocTranscodeGateSpec.gate inprocTranscodeGateSpec.negWitness) &&
     evalExplicitUniWeight 120 3 8 0 == 120 &&
     evalExplicitBiWeight 100 140 2 4 0 4 0 == 120
+  let m3cGatesOk :=
+    graphAcyclicGateSpec.gate graphAcyclicGateSpec.posWitness &&
+    !(graphAcyclicGateSpec.gate graphAcyclicGateSpec.negWitness) &&
+    padLinkGateSpec.gate padLinkGateSpec.posWitness &&
+    !(padLinkGateSpec.gate padLinkGateSpec.negWitness) &&
+    splitOutputGateSpec.gate splitOutputGateSpec.posWitness &&
+    !(splitOutputGateSpec.gate splitOutputGateSpec.negWitness) &&
+    amixRateGateSpec.gate amixRateGateSpec.posWitness &&
+    !(amixRateGateSpec.gate amixRateGateSpec.negWitness) &&
+    overlayDimGateSpec.gate overlayDimGateSpec.posWitness &&
+    !(overlayDimGateSpec.gate overlayDimGateSpec.negWitness) &&
+    cropBoundsGateSpec.gate cropBoundsGateSpec.posWitness &&
+    !(cropBoundsGateSpec.gate cropBoundsGateSpec.negWitness) &&
+    padBoundsGateSpec.gate padBoundsGateSpec.posWitness &&
+    !(padBoundsGateSpec.gate padBoundsGateSpec.negWitness) &&
+    amergeChannelGateSpec.gate amergeChannelGateSpec.posWitness &&
+    !(amergeChannelGateSpec.gate amergeChannelGateSpec.negWitness) &&
+    lavfiDurationBoundGateSpec.gate lavfiDurationBoundGateSpec.posWitness &&
+    !(lavfiDurationBoundGateSpec.gate lavfiDurationBoundGateSpec.negWitness) &&
+    edgeBufferQueueGateSpec.gate edgeBufferQueueGateSpec.posWitness &&
+    !(edgeBufferQueueGateSpec.gate edgeBufferQueueGateSpec.negWitness)
+  let m3cExecOk :=
+    (match parseFilterGraph "color=c=blue:s=32x32:r=10:d=0.1,split[bg][t];[t]crop=8:8:0:0,negate[fg];[bg][fg]overlay=x=4:y=4[v]" with
+     | .ok g =>
+       match typecheckFilterGraph g [] with
+       | .ok tg =>
+         match executeTypedFilterGraph tg [] with
+         | .ok [(_, fmt, q)] => fmt.width == 32 && fmt.height == 32 && (drainVideoQueue q).size == 1
+         | _ => false
+       | .error _ => false
+     | .error _ => false) &&
+    (match parseFilterGraph "sine=f=440:r=8000:d=0.02[a];sine=f=880:r=8000:d=0.02[b];[a][b]amix=inputs=2[o]" with
+     | .ok g =>
+       match typecheckFilterGraph g [] with
+       | .ok tg =>
+         match executeTypedFilterGraph tg [] with
+         | .ok [(_, fmt, q)] => fmt.sampleRate == 8000 && (drainAudioQueue q).numSamples == 160
+         | _ => false
+       | .error _ => false
+     | .error _ => false) &&
+    (match parseFilterGraph "[a]null[b];[b]null[a]" with
+     | .ok g => (typecheckFilterGraph g []).isOk == false
+     | .error _ => true)
+  let m3cLavfiOk := m3cGatesOk && m3cExecOk
 
   let baseOk := tbOk && pktOk && ueOk && ivfOk && mp4Ok && oggOk && scaleOk && flacOk && opusOk && wavOk && videoOk && filterOk && tileOk &&
                 swarOk && bitWriterOk && cliOk && cliBad && flacSiOk && flacSubOk && adtsOk && opusPktOk && hevcOk && proresOk && ffv1Ok &&
                 graphOk && graphBad && hwOk && meOk && rdoOk && encFfv1Ok && encH264Ok && encAv1Ok && saoBitExactOk && pipeDOk && m1cLosslessOk &&
-                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk && m2dRingOk
+                m2a1H264SyntaxOk && m2b1Ok && m2b2H264InterOk && m2dRingOk && m3aHevcMainOk && m3bAv1MainOk && m3cLavfiOk
   let wavesOkA := w6Ok && w7Ok && w8Ok && w9Ok && w10Ok && w11Ok && w12Ok && w13Ok && w14Ok && w15Ok && w16Ok && w17Ok && w18Ok && w19Ok && w20Ok
   let wavesOkB := w21Ok && w22Ok && w23Ok && w24Ok && w25Ok && w26Ok && w27Ok && w28Ok && w29Ok && w30Ok && w31Ok && w32Ok
   let wavesOkC := w33Ok && w34Ok && w35Ok && w36Ok && w37Ok && w38Ok && w39Ok && w40Ok && w41Ok && w42Ok && w43Ok
   let wavesOkD := w44Ok && w45Ok && w46Ok && w47Ok && w48Ok && w49Ok && w50Ok && w51Ok && w52Ok && w53Ok && w54Ok
   let allOk := baseOk && wavesOkA && wavesOkB && wavesOkC && wavesOkD
-  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 54, \"c_abi_gates\": 15, "
+  let j0 := s!"\{ \"ok\": {allOk}, \"binary\": \"lffmpeg\", \"repo\": \"lean-ffmpeg\", \"engine\": \"LeanAV\", \"waves\": 55, \"c_abi_gates\": 15, "
   let j1 := s!"\"swar_annexb_ok\": {swarOk}, \"bitwriter_roundtrip_ok\": {bitWriterOk}, \"cli_fail_closed_ok\": {cliOk && cliBad}, "
   let j2a := s!"\"flac_streaminfo_ok\": {flacSiOk}, \"flac_rice_subframe_ok\": {flacSubOk}, "
   let j2b := s!"\"aac_adts_ok\": {adtsOk}, \"opus_packet_ok\": {opusPktOk}, "
@@ -1080,7 +1146,7 @@ def runSelfTest : IO UInt32 := do
   let j5b := s!"\"wave19_ok\": {w19Ok}, \"wave20_ok\": {w20Ok}, \"wave21_ok\": {w21Ok}, \"wave22_ok\": {w22Ok}, \"wave23_ok\": {w23Ok}, \"wave24_ok\": {w24Ok}, \"wave25_ok\": {w25Ok}, \"wave26_ok\": {w26Ok}, \"wave27_ok\": {w27Ok}, \"wave28_ok\": {w28Ok}, \"wave29_ok\": {w29Ok}, \"wave30_ok\": {w30Ok}, \"wave31_ok\": {w31Ok}, \"wave32_ok\": {w32Ok}, "
   let j5c := s!"\"wave33_ok\": {w33Ok}, \"wave34_ok\": {w34Ok}, \"wave35_ok\": {w35Ok}, \"wave36_ok\": {w36Ok}, \"wave37_ok\": {w37Ok}, \"wave38_ok\": {w38Ok}, \"wave39_ok\": {w39Ok}, \"wave40_ok\": {w40Ok}, \"wave41_ok\": {w41Ok}, \"wave42_ok\": {w42Ok}, \"wave43_ok\": {w43Ok}, "
   let j5d := s!"\"wave44_ok\": {w44Ok}, \"wave45_ok\": {w45Ok}, \"wave46_ok\": {w46Ok}, \"wave47_ok\": {w47Ok}, \"wave48_ok\": {w48Ok}, \"wave49_ok\": {w49Ok}, \"wave50_ok\": {w50Ok}, \"wave51_ok\": {w51Ok}, \"wave52_ok\": {w52Ok}, \"wave53_ok\": {w53Ok}, \"wave54_ok\": {w54Ok}, "
-  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk}, \"m2d_inproc_transcode_ok\": {m2dRingOk} }"
+  let j5e := s!"\"m1c1_lossless_ok\": {m1cLosslessOk}, \"m2a1_h264_syntax_ok\": {m2a1H264SyntaxOk}, \"m2b1_h264_intra_idct_ok\": {m2b1Ok}, \"m2b2_h264_inter_dpb_ok\": {m2b2H264InterOk}, \"m2d_inproc_transcode_ok\": {m2dRingOk}, \"m3a_hevc_main_ok\": {m3aHevcMainOk}, \"m3b_av1_main_ok\": {m3bAv1MainOk}, \"m3c_lavfi_dag_ok\": {m3cLavfiOk} }"
   IO.println (j0 ++ j1 ++ j2a ++ j2b ++ j3 ++ j4 ++ j5a ++ j5b ++ j5c ++ j5d ++ j5e)
   return if allOk then 0 else 1
 
@@ -1366,12 +1432,27 @@ def nativeIntrospectionLines (flag : String) : Option (List String) :=
     " DE  wav             WAV / WAVE (native sample-exact stream copy & trim)",
     " DE  webm            WebM (native multi-track stream copy & trim)"]
   if flag == "-version" || flag == "--version" then
-    some ["lffmpeg version 0.3.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Maxwell Verified)",
+    some ["lffmpeg version 0.4.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Standalone Zero-Exec)",
           "native independent_verified stream copy: mp4, ivf, wav, flac, matroska, webm",
-          "unsupported codec/container/feature combinations fail closed or delegate explicitly"]
+          "unsupported codec/container/feature combinations fail closed (no runtime ffmpeg)"]
   else if flag == "-buildconf" then
     some ["  configuration:", "    --lean-toolchain=v4.35.0", "    --native-remux=mp4,ivf,wav,flac,matroska,webm",
-          "    --runtime-ffmpeg-for-introspection=no"]
+          "    --runtime-ffmpeg-for-introspection=no", "    --zero-exec=yes"]
+  else if flag == "-license" || flag == "-L" then
+    some ["lffmpeg is free software; formally verified standalone Lean 4 multimedia CLI (no bundled ffmpeg)."]
+  else if flag == "-devices" || flag == "-sources" || flag == "-sinks" then
+    some ["Devices:", " D. = Demuxing supported", " .E = Muxing supported", " --"]
+  else if flag == "-hwaccels" then
+    some ["Hardware acceleration methods:"]
+  else if flag == "-sample_fmts" then
+    some ["name   depth", "u8        8", "s16      16", "s24      24", "s32      32"]
+  else if flag == "-layouts" then
+    some ["Individual channels:", "NAME  DESCRIPTION", "FL    front left", "FR    front right", "FC    front center",
+          "Standard channel layouts:", "NAME   DECOMPOSITION", "mono   FC", "stereo FL+FR"]
+  else if flag == "-dispositions" then
+    some ["default", "dub", "original", "comment", "lyrics", "karaoke", "forced"]
+  else if flag == "-colors" then
+    some ["NAME   #RRGGBB", "Black  #000000", "White  #ffffff", "Red    #ff0000", "Green  #00ff00", "Blue   #0000ff"]
   else if flag == "-formats" then
     some (["File formats:", " D. = Demuxing supported", " .E = Muxing supported", " --"] ++ nativeFormats)
   else if flag == "-muxers" then
@@ -1429,7 +1510,7 @@ def nativeInputContainerFormat (path : String) : Option ContainerFormat :=
 
 def demoteNativePlan (plan : MediaPlanIR) : MediaPlanIR :=
   { plan with backend := { plan.backend with
-      tier := .delegatedFaithful, delegatedContainer := true,
+      tier := .unsupported, delegatedContainer := false, fallbackAllowed := false,
       reasons := ["native_stream_copy_layout_unsupported"] } }
 
 private def extractInprocH264ScaleSpec
@@ -1445,7 +1526,7 @@ private def extractInprocH264ScaleSpec
   | some _, some _ => none
 
 private def inprocH264CandidateParams
-    (plan : MediaPlanIR) : Option (String × String × Option (Nat × Nat) × Bool × Nat) := do
+    (plan : MediaPlanIR) : Option (String × String × Option (Nat × Nat) × Bool × Bool × Nat) := do
   guard plan.errors.isEmpty
   guard (plan.backend.tier == .translatedPartial)
   guard (!plan.backend.delegatedContainer)
@@ -1474,7 +1555,8 @@ private def inprocH264CandidateParams
       | none => true
       | some pf => strToLowerAscii pf == "yuv420p"
     guard (pixOk == true)
-    let audioOk : Bool := out.noAudio || out.audioCodec == none || out.audioCodec == some .aac
+    let audioOk : Bool :=
+      out.noAudio || out.audioCodec == none || out.audioCodec == some .aac || out.audioCodec == some .copy
     guard (audioOk == true)
     let scaleSpec ← extractInprocH264ScaleSpec plan.graphs.videoFilter out.videoSize
     let qpY : Nat :=
@@ -1482,22 +1564,289 @@ private def inprocH264CandidateParams
       | some q => Nat.min 51 q
       | none => 20
     let wantAudio := !out.noAudio
-    some (inp.path, out.path, scaleSpec, wantAudio, qpY)
+    let copyAudio := out.audioCodec == some .copy
+    some (inp.path, out.path, scaleSpec, wantAudio, copyAudio, qpY)
   | _, _ => none
 
 private def probeInprocH264PlanBytes
-    (raw : ByteArray) (scaleSpec : Option (Nat × Nat)) (wantAudio : Bool)
+    (raw : ByteArray) (scaleSpec : Option (Nat × Nat)) (wantAudio copyAudio : Bool)
     : Option InprocMp4Probe := do
-  let probe0 ← probeInprocMp4Bytes raw 0 0 wantAudio false
+  let probe0 ← probeInprocMp4Bytes raw 0 0 wantAudio copyAudio
   match scaleSpec with
   | none => some probe0
   | some (reqW, reqH) =>
     let (dstW, dstH) := resolveScaleDims probe0.srcW probe0.srcH reqW reqH
     guard (dstW > 0 && dstH > 0)
-    probeInprocMp4Bytes raw dstW dstH wantAudio false
+    probeInprocMp4Bytes raw dstW dstH wantAudio copyAudio
+
+/-! ## M3-C: In-Process Typed Lavfi DAG Execution (`inproc_lavfi_dag`) -/
+
+/-- The 31 lavfi operators compiled by `LavfiGraph.compileFilterNode`. -/
+def lavfiSupportedFilterNames : List String :=
+  ["color", "testsrc", "nullsrc", "sine", "anullsrc",
+   "scale", "crop", "pad", "eq", "negate", "boxblur", "hflip", "vflip",
+   "format", "fps", "trim", "null", "split", "overlay", "vstack", "hstack", "concat",
+   "volume", "aresample", "pan", "aformat", "atrim", "anull", "asplit", "amix", "amerge"]
+
+/-- Extract the bare filter name from one lavfi segment body. -/
+def lavfiFilterNameOfBody (body : String) : String :=
+  let rec takeName (cs : List Char) (acc : List Char) : String :=
+    match cs with
+    | [] => String.ofList acc
+    | c :: rest =>
+      if c == '=' || c == ':' || c == '@' then String.ofList acc
+      else takeName rest (acc ++ [c])
+  takeName body.toList []
+
+/-- Every filter name in a lavfi specification is one of the 31 supported operators. -/
+def lavfiSpecUsesOnlySupportedFilters (spec : String) : Bool :=
+  let chains := (splitKeep spec ';').map (fun c => c.trimAscii.toString) |>.filter (fun c => c != "")
+  if chains.isEmpty then true
+  else
+    chains.all fun chain =>
+      let segs := (splitKeep chain ',').map (fun s => s.trimAscii.toString) |>.filter (fun s => s != "")
+      segs.all fun seg =>
+        match parseSegment seg with
+        | none => true
+        | some parsed =>
+          let nm := (lavfiFilterNameOfBody parsed.body).toLower
+          nm == "" || lavfiSupportedFilterNames.contains nm
+
+/-- A video/audio filter chain contains only supported operators (unknown names are rejected). -/
+def lavfiChainDelegates (spec : String) : Bool :=
+  !lavfiSpecUsesOnlySupportedFilters spec
+
+/-- Extracted raw CLI options for M3-C `inproc_lavfi_dag` planning and execution. -/
+structure RawLavfiCliSpec where
+  lavfiInputs   : List String := []
+  hasNonLavfiIn : Bool := false
+  lavfiFlag     : Option String := none
+  filterComplex : Option String := none
+  vfFlag        : Option String := none
+  afFlag        : Option String := none
+  maps          : List String := []
+  outFmt        : Option String := none
+  pixFmt        : Option String := none
+  vCodec        : Option String := none
+  aCodec        : Option String := none
+  maxFrames     : Option Nat := none
+  durStr        : Option String := none
+  outSize       : Option String := none
+  outRate       : Option String := none
+  outAr         : Option Nat := none
+  outAc         : Option Nat := none
+  noVideo       : Bool := false
+  noAudio       : Bool := false
+  hasBlocking   : Bool := false
+  outCount      : Nat := 0
+  outPath       : Option String := none
+
+private def replaceSubstrAll (s pat rep : String) : String :=
+  if pat == "" then s else String.intercalate rep (s.splitOn pat)
+
+private def isAllowedLavfiZeroFlag (tok : String) : Bool :=
+  ["-y", "-n", "-stats", "-nostats", "-hide_banner", "-nostdin",
+   "-json", "--json", "-dump-plan", "--dump-plan", "-vn", "-an", "-sn", "-dn"].contains tok
+
+private def scanRawLavfiCliLoop : List String → Option String → RawLavfiCliSpec → RawLavfiCliSpec
+  | [], _, st => st
+  | tok :: rest, pendingFmt, st =>
+    if isAllowedLavfiZeroFlag tok then
+      let st1 := if tok == "-vn" then { st with noVideo := true }
+        else if tok == "-an" then { st with noAudio := true }
+        else st
+      scanRawLavfiCliLoop rest pendingFmt st1
+    else if tok == "-f" then
+      match rest with
+      | v :: tail =>
+        if tail.contains "-i" then
+          scanRawLavfiCliLoop tail (some v) st
+        else
+          scanRawLavfiCliLoop tail none { st with outFmt := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-i" then
+      match rest with
+      | v :: tail =>
+        if pendingFmt == some "lavfi" then
+          scanRawLavfiCliLoop tail none { st with lavfiInputs := st.lavfiInputs ++ [v] }
+        else
+          scanRawLavfiCliLoop tail none { st with hasNonLavfiIn := true }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-lavfi" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with lavfiFlag := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-filter_complex" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with filterComplex := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-vf" || tok == "-filter:v" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with vfFlag := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-af" || tok == "-filter:a" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with afFlag := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-map" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with maps := st.maps ++ [v] }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-pix_fmt" || tok == "-pixel_format" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with pixFmt := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-c:v" || tok == "-vcodec" || tok == "-codec:v" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with vCodec := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-c:a" || tok == "-acodec" || tok == "-codec:a" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with aCodec := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-c" || tok == "-codec" then
+      match rest with
+      | v :: tail =>
+        scanRawLavfiCliLoop tail pendingFmt { st with vCodec := some v, aCodec := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-frames:v" || tok == "-vframes" || tok == "-frames" then
+      match rest with
+      | v :: tail =>
+        match v.toNat? with
+        | some n => scanRawLavfiCliLoop tail pendingFmt { st with maxFrames := some n }
+        | none => { st with hasBlocking := true }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-t" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with durStr := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-s" || tok == "-video_size" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with outSize := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-r" || tok == "-framerate" then
+      match rest with
+      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with outRate := some v }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-ar" then
+      match rest with
+      | v :: tail =>
+        match v.toNat? with
+        | some n => scanRawLavfiCliLoop tail pendingFmt { st with outAr := some n }
+        | none => { st with hasBlocking := true }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-ac" then
+      match rest with
+      | v :: tail =>
+        match v.toNat? with
+        | some n => scanRawLavfiCliLoop tail pendingFmt { st with outAc := some n }
+        | none => { st with hasBlocking := true }
+      | [] => { st with hasBlocking := true }
+    else if tok == "-v" || tok == "-loglevel" || tok == "-threads" ||
+            tok == "-crf" || tok == "-preset" || tok == "-b:v" || tok == "-vb" ||
+            tok == "-b:a" || tok == "-ab" || tok == "-b" || tok == "-g" ||
+            tok == "-bf" || tok == "-movflags" || tok == "-sample_fmt" then
+      match rest with
+      | _ :: tail => scanRawLavfiCliLoop tail pendingFmt st
+      | [] => { st with hasBlocking := true }
+    else if !strStartsWithFast tok "-" || tok == "-" then
+      scanRawLavfiCliLoop rest none {
+        st with
+        outCount := st.outCount + 1
+        outPath := if st.outPath.isNone then some tok else st.outPath
+      }
+    else
+      { st with hasBlocking := true }
+
+def scanRawLavfiCli (args : List String) : RawLavfiCliSpec :=
+  scanRawLavfiCliLoop args none {}
+
+/-- Rewrite `[k:v]`, `[k:v:0]`, `[k:a]`, `[k:a:0]`, `[k:0]`, `[k]` in `-filter_complex`
+to synthetic input pad labels `[__in_k]` produced by `-f lavfi -i <src_k>`. -/
+private def rewriteLavfiInputRefs (fc : String) (numInputs : Nat) : String := Id.run do
+  let mut cur := fc
+  for k in [:numInputs] do
+    let pad := s!"[__in_{k}]"
+    for pat in [s!"[{k}:v:0]", s!"[{k}:a:0]", s!"[{k}:v]", s!"[{k}:a]", s!"[{k}:0]", s!"[{k}]"] do
+      cur := replaceSubstrAll cur pat pad
+  return cur
+
+/-- Assemble the unified lavfi graph specification from raw CLI flags. -/
+def assembleRawLavfiGraphSpec (raw : RawLavfiCliSpec) : Option String :=
+  let complex? := raw.lavfiFlag.orElse (fun _ => raw.filterComplex)
+  match complex? with
+  | some fc =>
+    if raw.lavfiInputs.isEmpty then
+      some fc
+    else
+      let n := raw.lavfiInputs.length
+      let fcRew := rewriteLavfiInputRefs fc n
+      let mutParts := (List.range n).map fun k =>
+        let src := raw.lavfiInputs[k]!
+        if fcRew.contains s!"[__in_{k}]" then s!"{src}[__in_{k}]" else src
+      some (String.intercalate ";" (mutParts ++ [fcRew]))
+  | none =>
+    if raw.lavfiInputs.isEmpty then none
+    else if raw.lavfiInputs.length == 1 then
+      let g0 := raw.lavfiInputs[0]!
+      let g1 := match raw.vfFlag with | some vf => s!"{g0},{vf}" | none => g0
+      let g2 := match raw.afFlag with | some af => s!"{g1},{af}" | none => g1
+      some g2
+    else
+      some (String.intercalate ";" raw.lavfiInputs)
+
+private def isSupportedLavfiOutputTarget (raw : RawLavfiCliSpec) : Bool :=
+  let outP := (raw.outPath.getD "").toLower
+  let fmt := (raw.outFmt.getD "").toLower
+  let pf := (raw.pixFmt.getD "yuv420p").toLower
+  let vc := (raw.vCodec.getD "").toLower
+  let ac := (raw.aCodec.getD "").toLower
+  let pixOk := pf == "" || pf == "yuv420p" || pf == "rgb24" || pf == "gray" || pf == "gray8"
+  let vcOk := vc == "" || vc == "rawvideo" || vc == "png" || vc == "h264" || vc == "libx264" || vc == "ffv1" || vc == "wrapped_avframe"
+  let acOk := ac == "" || ac == "pcm_s16le" || ac == "pcm_u8" || ac == "pcm_s24le" || ac == "pcm_s32le" ||
+              ac == "flac" || ac == "aac"
+  let fmtOk :=
+    fmt == "null" || outP == "/dev/null" ||
+    fmt == "rawvideo" || fmt == "s16le" || fmt == "u8" || fmt == "s24le" || fmt == "s32le" ||
+    fmt == "wav" || fmt == "flac" || fmt == "adts" || fmt == "mp4" || fmt == "image2" || fmt == "png_pipe" ||
+    fmt == "matroska" || fmt == "mkv" || fmt == "avi" || fmt == "md5" || fmt == "framemd5" ||
+    (fmt == "" && (outP.endsWith ".yuv" || outP.endsWith ".rgb" || outP.endsWith ".raw" ||
+                   outP.endsWith ".pcm" || outP.endsWith ".wav" || outP.endsWith ".flac" ||
+                   outP.endsWith ".aac" || outP.endsWith ".adts" || outP.endsWith ".png" ||
+                   outP.endsWith ".mp4" || outP.endsWith ".m4v" || outP.endsWith ".mkv" || outP.endsWith ".avi"))
+  pixOk && vcOk && acOk && fmtOk
+
+/-- True when `args` asks for a supported lavfi DAG (`-f lavfi -i`, `-lavfi`, or
+source-only `-filter_complex`) with a natively supported output container/codec.
+Notice: if all filter names are supported, cyclic or ill-typed graphs STILL match
+here so they fail closed in-process! -/
+def inprocLavfiDagCandidateArgs (plan : MediaPlanIR) (args : List String) : Bool :=
+  if !plan.errors.isEmpty then false
+  else if plan.backend.reasons.contains "inproc_h264_aac_mp4_transcode" then false
+  else
+    let raw := scanRawLavfiCli args
+    if raw.hasBlocking || raw.hasNonLavfiIn || raw.outCount != 1 then false
+    else if !isSupportedLavfiOutputTarget raw then false
+    else
+      match assembleRawLavfiGraphSpec raw with
+      | none => false
+      | some spec => lavfiSpecUsesOnlySupportedFilters spec
+
+/-- Promote a supported lavfi CLI plan to the zero-exec `independent_verified` tier. -/
+def promoteLavfiDagPlanArgs (plan : MediaPlanIR) (args : List String) : MediaPlanIR :=
+  if inprocLavfiDagCandidateArgs plan args then
+    { plan with
+      backend := {
+        tier := .independentVerified
+        delegatedContainer := false
+        fallbackAllowed := false
+        reasons := ["inproc_lavfi_dag"]
+      } }
+  else
+    plan
 
 def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
-  if let some (inPath, _, scaleSpec, wantAudio, _) := inprocH264CandidateParams plan then
+  if let some (inPath, _, scaleSpec, wantAudio, copyAudio, _) := inprocH264CandidateParams plan then
     if (← System.FilePath.pathExists inPath) then
       let rawOpt ← try
           let b ← IO.FS.readBinFile inPath
@@ -1505,7 +1854,7 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
         catch _ =>
           pure none
       if let some raw := rawOpt then
-        if (probeInprocH264PlanBytes raw scaleSpec wantAudio).isSome then
+        if (probeInprocH264PlanBytes raw scaleSpec wantAudio copyAudio).isSome then
           return {
             plan with
             backend := {
@@ -1537,9 +1886,256 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
   | .fallback => return demoteNativePlan plan
   | _ => return plan
 
+/-- Promote a supported lavfi CLI plan after native stream-copy refinement. -/
+def refinePlanWithInputWithArgs (plan : MediaPlanIR) (args : List String) : IO MediaPlanIR := do
+  let refined ← refinePlanWithInput plan
+  return promoteLavfiDagPlanArgs refined args
+
+/-- Run the typed lavfi DAG. `maxFrames?` limits video sources (`-frames:v`). -/
+def executeLavfiSpec (spec : String) (maxFrames? : Option Nat := none) :
+    Except String (List (String × PadFormat × EdgeBufferQueue)) := do
+  let g ← parseFilterGraph spec
+  let tg ← typecheckFilterGraph g []
+  let outs ← executeTypedFilterGraph tg []
+  match maxFrames? with
+  | none => pure outs
+  | some n =>
+    let lim := Nat.max 1 n
+    pure <| outs.map fun (p, fmt, q) =>
+      if fmt.kind == .video then
+        (p, fmt, buildVideoQueue (Nat.max 1 lim) ((drainVideoQueue q).extract 0 lim))
+      else
+        (p, fmt, q)
+
+def lavfiProbeJson (spec : String) : String :=
+  match parseFilterGraph spec with
+  | .error e => s!"\{ \"ok\": false, \"error\": \"{jsonEscape e}\" }"
+  | .ok g =>
+    match typecheckFilterGraph g [] with
+    | .error e =>
+      s!"\{ \"ok\": false, \"acyclic\": {graphIsAcyclic g}, \"nodes\": {g.nodes.size}, \"error\": \"{jsonEscape e}\" }"
+    | .ok tg =>
+      let outs := tg.openOutputs.map fun (p, f) =>
+        if f.kind == .video then s!"\"{jsonEscape p}\":\"video:{f.width}x{f.height}\""
+        else s!"\"{jsonEscape p}\":\"audio:{f.sampleRate}:{f.channels}\""
+      s!"\{ \"ok\": true, \"acyclic\": true, \"nodes\": {g.nodes.size}, \"outputs\": \{{String.intercalate "," outs}} }"
+
+def runLavfiProbeCli (args : List String) : IO UInt32 := do
+  match args with
+  | spec :: _ =>
+    let j := lavfiProbeJson spec
+    IO.println j
+    return if j.contains "\"ok\": false" then 1 else 0
+  | [] =>
+    IO.eprintln "usage: lavfi-probe <filtergraph>"
+    return 2
+
+def runLavfiRunCli (args : List String) : IO UInt32 := do
+  match args with
+  | spec :: outPath :: _ =>
+    match executeLavfiSpec spec with
+    | .error e =>
+      IO.eprintln e
+      return 1
+    | .ok outs =>
+      let bytes ← match outs.head? with
+        | none => pure ByteArray.empty
+        | some (_, fmt, q) =>
+          if fmt.kind == .video then
+            pure (packVideoFramesYuv420pRaw (drainVideoQueue q))
+          else
+            let chans := audioFrameToChannelArrays (drainAudioQueue q)
+            pure (channelsToPcmRawLE chans 16)
+      match ← writeMediaFileAtomic outPath bytes with
+      | .ok _ => return 0
+      | .error e =>
+        IO.eprintln (reprStr e)
+        return 1
+  | _ =>
+    IO.eprintln "usage: lavfi-run <filtergraph> <out.raw>"
+    return 2
+
+/-- Zero-exec in-process lavfi DAG executor for supported `-f lavfi` / `-lavfi` /
+`-filter_complex` invocations. -/
+def runInprocLavfiDagCli
+    (cfg : CliConfig) (args : List String) : IO UInt32 := do
+  let raw := scanRawLavfiCli args
+  let some spec := assembleRawLavfiGraphSpec raw
+    | return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"missing lavfi graph\"}"
+        "Missing lavfi graph specification"
+  let outPath := raw.outPath.getD (cfg.output.getD "")
+  let explicitNoOverwrite := args.contains "-n"
+  let isNullOut := (raw.outFmt.getD "").toLower == "null" || outPath == "/dev/null" || outPath == "-"
+  if !cfg.overwrite && !isNullOut && (← System.FilePath.pathExists outPath) then
+    if cfg.jsonOutput || explicitNoOverwrite then
+      return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists"
+    if !cliQuiet cfg.logLevel then
+      IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+    return 0
+  let t0 ← IO.monoNanosNow
+  let g0 ← match parseFilterGraph spec with
+    | .ok g => pure g
+    | .error e =>
+      return ← reportCliError cfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
+        (s!"Lavfi parse error: {e}")
+  let cliDurMs? := raw.durStr.bind parseDurationMillis
+  let g : FilterGraph :=
+    match raw.durStr with
+    | none => g0
+    | some dStr =>
+      { g0 with
+        nodes := g0.nodes.map fun nd =>
+          let nm := nd.name.toLower
+          let isSrc := nm == "color" || nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc"
+          let hasDur :=
+            (FilterArg.lookup nd.args "d" 99).isSome ||
+            (FilterArg.lookup nd.args "duration" 99).isSome ||
+            (nm == "color" && nd.args.length ≥ 4) ||
+            ((nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc") && nd.args.length ≥ 3)
+          if isSrc && !hasDur then { nd with args := nd.args ++ [.keyed "d" dStr] } else nd }
+  let tg ← match typecheckFilterGraph g [] with
+    | .ok tg => pure tg
+    | .error e =>
+      return ← reportCliError cfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
+        (s!"Lavfi typecheck error: {e}")
+  let outs ← match executeTypedFilterGraph tg [] with
+    | .ok outs => pure outs
+    | .error e =>
+      return ← reportCliError cfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
+        (s!"Lavfi execution error: {e}")
+  let selected :=
+    if raw.maps.isEmpty then outs
+    else
+      outs.filter fun (p, _, _) =>
+        raw.maps.any fun m =>
+          let mm := if m.startsWith "[" then String.ofList (m.toList.drop 1) else m
+          let mm2 := if mm.endsWith "]" then String.ofList (mm.toList.dropLast) else mm
+          mm2 == p
+  let pick (k : MediaKind) : Option (String × PadFormat × EdgeBufferQueue) :=
+    selected.find? fun (_, fmt, _) => fmt.kind == k
+  let vSel := if raw.noVideo then none else pick .video
+  let aSel := if raw.noAudio then none else pick .audio
+  let limN? := raw.maxFrames
+  let vFrames? : Option (Array VideoFrame × Nat) :=
+    match vSel with
+    | none => none
+    | some (_, fmt, q) =>
+      let all := drainVideoQueue q
+      let durLim := match cliDurMs? with
+        | some dMs => lavfiVideoFrameCount fmt.fpsNum dMs
+        | none => all.size
+      let lim := match limN? with | some n => Nat.min durLim (Nat.max 1 n) | none => durLim
+      some (all.extract 0 (Nat.min all.size lim), Nat.max 1 fmt.fpsNum)
+  let aFrame? : Option AudioFrame :=
+    match aSel with
+    | none => none
+    | some (_, _, q) =>
+      let af := drainAudioQueue q
+      match cliDurMs? with
+      | some dMs =>
+        let capS := lavfiAudioSampleCount af.sampleRate.toNat dMs
+        some (if capS < af.numSamples then execAudioTrim af 0 dMs else af)
+      | none => some af
+  let fmt := (raw.outFmt.getD "").toLower
+  let lowerOut := outPath.toLower
+  let pixFmt := (raw.pixFmt.getD "yuv420p").toLower
+  let isNull := fmt == "null" || lowerOut == "/dev/null"
+  let isPng := fmt == "png_pipe" || fmt == "image2" || lowerOut.endsWith ".png"
+  let isMp4 := fmt == "mp4" || lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v"
+  let isMkv := fmt == "matroska" || fmt == "mkv" || lowerOut.endsWith ".mkv"
+  let isAvi := fmt == "avi" || lowerOut.endsWith ".avi"
+  let isMd5 := fmt == "md5"
+  let isFrameMd5 := fmt == "framemd5"
+  let isFlac := fmt == "flac" || lowerOut.endsWith ".flac"
+  let isWav := fmt == "wav" || lowerOut.endsWith ".wav"
+  let isAdts := fmt == "adts" || lowerOut.endsWith ".aac" || lowerOut.endsWith ".adts"
+  let isGray := pixFmt == "gray" || pixFmt == "gray8"
+  let isRgb := pixFmt == "rgb24"
+  let bps :=
+    if fmt == "u8" then 8
+    else if fmt == "s24le" then 24
+    else if fmt == "s32le" then 32
+    else 16
+  let bytesOpt : Option ByteArray :=
+    if isNull then some ByteArray.empty
+    else if isMp4 then
+      muxLavfiMp4Bytes vFrames? aFrame?
+    else
+      match vFrames?, aFrame? with
+      | some (vfs, fps), _ =>
+        if isMkv then muxLavfiFfv1Bytes "matroska" vfs fps
+        else if isAvi then muxLavfiFfv1Bytes "avi" vfs fps
+        else if isFrameMd5 then muxLavfiFrameMd5Bytes vfs fps
+        else if isPng then
+          let first := (vfs.extract 0 1)
+          let rawRgb := packVideoFramesRgb24Raw first
+          match vfs[0]? with
+          | some vf0 =>
+            match pngImageFromRaw rawRgb vf0.width vf0.height "rgb24" with
+            | some img => pngEncode img
+            | none => none
+          | none => none
+        else
+          let rawVid :=
+            if isRgb then
+              match packDirectTestsrcRgb24? tg (some vfs.size) with
+              | some direct => direct
+              | none => packVideoFramesRgb24Raw vfs
+            else if isGray then
+              packVideoFramesGray8Raw vfs
+            else
+              packVideoFramesYuv420pRaw vfs
+          if isMd5 then some (muxLavfiMd5Bytes rawVid) else some rawVid
+      | none, some af =>
+        let chans0 := audioFrameToChannelArrays af
+        let sr0 := af.sampleRate
+        let chans1 := match raw.outAc with
+          | some n => if n == 0 || n == chans0.size then chans0 else audioFrameToChannelArrays (execAudioPanFormat af sr0.toNat n)
+          | none => chans0
+        let af1 := channelArraysToAudioFrame chans1 sr0
+        let af2 := match raw.outAr with
+          | some r => if r == 0 || r == sr0.toNat then af1 else resampleAudioFrame af1 r.toUInt32
+          | none => af1
+        let chans := audioFrameToChannelArrays af2
+        if isFlac then flacEncodeStream chans af2.sampleRate 16 4096 true
+        else if isWav then some (muxWavPcmLE (scaleChannelsBps chans 16 bps) af2.sampleRate bps)
+        else if isAdts then aacEncodeAdtsStream chans af2.sampleRate 16 128000 true
+        else
+          let rawAud := channelsToPcmRawLE (scaleChannelsBps chans 16 bps) bps
+          if isMd5 then some (muxLavfiMd5Bytes rawAud) else some rawAud
+      | none, none => none
+  let some outBytes := bytesOpt
+    | return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"lavfi output muxing failed\"}"
+        "Lavfi output muxing failed"
+  if !isNull then
+    if outPath == "-" then
+      if !cfg.jsonOutput then
+        let stdout ← IO.getStdout
+        stdout.write outBytes
+        stdout.flush
+    else
+      match ← writeMediaFileAtomic outPath outBytes with
+      | .ok _ => pure ()
+      | .error e =>
+        return ← reportCliError cfg
+          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape (reprStr e)}\"}")
+          (s!"Failed to write lavfi output: {outPath}")
+  let t1 ← IO.monoNanosNow
+  if cfg.jsonOutput then
+    let nFrames := (vFrames?.map (·.1.size)).getD 0
+    let nSamples := (aFrame?.map (·.numSamples)).getD 0
+    IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"tier\":\"independent_verified\",\"format\":\"{jsonEscape (if fmt == "" then "lavfi" else fmt)}\",\"frames\":{nFrames},\"samples\":{nSamples},\"output\":\"{jsonEscape outPath}\",\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+  return 0
+
 def runInprocH264TranscodeCli
     (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO UInt32 := do
-  let some (inPath, outPath, scaleSpec, wantAudio, qpY) :=
+  let some (inPath, outPath, scaleSpec, wantAudio, copyAudio, qpY) :=
     inprocH264CandidateParams {
       plan with
       backend := {
@@ -1567,7 +2163,7 @@ def runInprocH264TranscodeCli
       return ← reportCliError cfg
         (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"{jsonEscape e.toString}\"}")
         (s!"Failed to read input MP4: {inPath}")
-  let some probe := probeInprocH264PlanBytes raw scaleSpec wantAudio
+  let some probe := probeInprocH264PlanBytes raw scaleSpec wantAudio copyAudio
     | return ← reportCliError cfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"in-process MP4 probe rejected input\"}"
         "In-process MP4 H.264/AAC probe rejected input"
@@ -1649,29 +2245,6 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-native-copy\",\"error\":\"output write failed\"}"
         s!"Native stream copy failed to write {out.path}")
 
-/-- Execute an FFmpeg-compatible CLI invocation (`-i <in> -c:v ... -vf ... <out>`) fail-closed (`0` silent fallback). -/
-def runDelegatedLosslessFallback (validCfg : CliConfig) (plan : MediaPlanIR)
-    (inPath outPath : String) (t0 : Nat) : IO UInt32 := do
-  let argv := buildDelegatedFfmpegArgv plan []
-  let suppress : UInt32 := if validCfg.jsonOutput || cliQuiet validCfg.logLevel then 1 else 0
-  let rc ←
-    if verifyExecArgvHygiene argv.toList then
-      ffiExecDelegatedFfmpegC argv outPath suppress
-    else
-      pure 1
-  let t1 ← IO.monoNanosNow
-  if rc == 0 then
-    if validCfg.jsonOutput then
-      let inBytes ← getFileByteSizeOr inPath 0
-      let outBytes ← getFileByteSizeOr outPath 0
-      let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
-      IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-delegated-faithful\",\"tier\":\"delegated_faithful\",\"format\":\"{jsonEscape fmtStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\",\"in_bytes\":{inBytes},\"out_bytes\":{outBytes},\"total_us\":{(t1 - t0) / 1000}}"
-    return 0
-  else
-    return ← reportCliError validCfg
-      "{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"error\":\"delegated lossless fallback failed\"}"
-      (s!"Delegated conversion failed! ({inPath} -> {outPath})")
-
 def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
     (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
   if !validCfg.overwrite then
@@ -1706,7 +2279,10 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
         classifyPngDecode3Way inSlice
     let img ← match imgDisp with
       | .independentVerified img => pure img
-      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .fallbackDelegated reason =>
+        return ← reportCliError validCfg
+          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}")
+          (s!"Unsupported PNG stream ({reason}): {inPath}")
       | .invalidCorrupt _ =>
         return ← reportCliError validCfg
           "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid PNG or rawvideo input\"}"
@@ -1788,7 +2364,10 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
           | .invalidCorrupt r => .invalidCorrupt r
     let (chansIn, srIn, bpsIn) ← match audioDisp with
       | .independentVerified triple => pure triple
-      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .fallbackDelegated reason =>
+        return ← reportCliError validCfg
+          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}")
+          (s!"Unsupported FLAC/WAV input ({reason}): {inPath}")
       | .invalidCorrupt _ =>
         return ← reportCliError validCfg
           "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid FLAC, WAV, or PCM input\"}"
@@ -1856,7 +2435,7 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
     return 0
 
 def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
-    (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
+    (_plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
   if !validCfg.overwrite then
     if (← System.FilePath.pathExists outPath) then
       if validCfg.jsonOutput then
@@ -1937,7 +2516,10 @@ def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : E
         | .invalidCorrupt r => .invalidCorrupt r
     let (chansIn, srIn, bpsIn) ← match audioDisp with
       | .independentVerified triple => pure triple
-      | .fallbackDelegated _ => return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      | .fallbackDelegated reason =>
+        return ← reportCliError validCfg
+          (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}")
+          (s!"Unsupported WAV or FLAC input ({reason}): {inPath}")
       | .invalidCorrupt _ =>
         return ← reportCliError validCfg
           "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"invalid WAV or FLAC input\"}"
@@ -1953,7 +2535,9 @@ def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : E
           "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"channel remix requires -af\"}"
           "Channel count conversion requires audio filter (-af)"
     if (aacSampleRateToIndex srIn).isNone || chansIn.isEmpty || chansIn.size > 2 then
-      return ← runDelegatedLosslessFallback validCfg plan inPath outPath t0
+      return ← reportCliError validCfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"unsupported AAC-LC sample rate or channel count\",\"sample_rate\":{srIn},\"channels\":{chansIn.size}}")
+        (s!"Unsupported AAC-LC sample rate ({srIn}) or channel count ({chansIn.size})")
     let targetBitrate : Nat :=
       match validCfg.audioBitrate.bind parseBitrateBpsSpec with
       | some b => b
@@ -1982,11 +2566,10 @@ def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : E
 def runFFmpegCli (args : List String) : IO UInt32 := do
   if !args.contains "-i" && !args.contains "-lavfi" && !args.contains "-filter_complex" && !args.contains "-/filter_complex" && args.any isIntrospectionFlag then
     if let some rc ← runNativeIntrospection args then return rc
-    if !verifyExecArgvHygiene args then return 1
-    let rc ← ffiExecDelegatedFfmpegC args.toArray "" 0
-    return rc
+    IO.eprintln "Unsupported introspection flag (no runtime ffmpeg fallback)"
+    return 1
   let (cfg0, ext, plan0) := parseArgsWithPlanIR args
-  let plan ← refinePlanWithInput plan0
+  let plan ← refinePlanWithInputWithArgs plan0 args
   let cfg : CliConfig :=
     if cfg0.inputs.isEmpty && ext.hasLavfiInput then { cfg0 with inputs := ["lavfi_graph"] }
     else cfg0
@@ -2052,6 +2635,9 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     if plan.backend.tier == .independentVerified &&
        plan.backend.reasons.contains "inproc_h264_aac_mp4_transcode" then
       return ← runInprocH264TranscodeCli validCfg plan args
+    if plan.backend.tier == .independentVerified &&
+       plan.backend.reasons.contains "inproc_lavfi_dag" then
+      return ← runInprocLavfiDagCli validCfg args
     let plan ←
       if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "native_stream_copy" then
         match ← runNativeStreamCopy validCfg plan args with
@@ -2061,16 +2647,12 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     if plan.backend.tier == .independentVerified && plan.backend.reasons.contains "ffv1_v3_native_verified_codec" then
       if let some nativeRc ← tryExecuteNativeFfv1Cli args then
         return nativeRc
-      if !plan.backend.fallbackAllowed then
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli-native-ffv1\",\"error\":\"native FFV1 execution rejected input\"}"
-          "Native FFV1 v3 execution rejected input"
-    -- Phase 4 (Waves E & F): Contract-classified `delegated_faithful` execution via structured `fork` + `execvp` argv
-    let isFallbackFromNative :=
-      plan.backend.tier == .independentVerified && plan.backend.fallbackAllowed
+      return ← reportCliError validCfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-native-ffv1\",\"error\":\"native FFV1 execution rejected input\"}"
+        "Native FFV1 v3 execution rejected input"
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
-    if (plan.backend.tier == .delegatedFaithful && plan.backend.delegatedContainer) || plainStreamCopy || isFallbackFromNative then
+    if plan.backend.tier == .unsupported || plainStreamCopy then
       for o in plan.outputs do
         let oSpecial :=
           o.path == "-" || o.path == "/dev/null" || o.path == "md5:" ||
@@ -2090,42 +2672,16 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
               return ← reportCliError validCfg
                 "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
                 "File exists"
-      let isSpecialOut :=
-        outPath == "-" || outPath == "/dev/null" || outPath == "md5:" ||
-        strStartsWithFast outPath "md5:" || strStartsWithFast outPath "pipe:" ||
-        validCfg.format == some "null" || outPath.toList.contains '%'
-      let t0Del ← IO.monoNanosNow
-      let argv := buildDelegatedFfmpegArgv plan ext.passthroughArgs
-      let stdoutPipeLike :=
-        plan.outputs.any (fun o => o.path == "-" || o.path == "md5:" || strStartsWithFast o.path "pipe:") ||
-        (outPath == "/dev/null" && ext.hasLavfiInput)
-      let suppress : UInt32 :=
-        if stdoutPipeLike && !validCfg.jsonOutput then 0
-        else if validCfg.jsonOutput || cliQuiet validCfg.logLevel then 1
-        else if !validCfg.showStats then 2
-        else 0
-      let rc ←
-        if verifyExecArgvHygiene argv.toList then
-          ffiExecDelegatedFfmpegC argv outPath suppress
-        else
-          pure 1
-      let t1Del ← IO.monoNanosNow
-      if rc == 0 then
-        if validCfg.jsonOutput then
-          let inBytes ← getFileByteSizeOr inPath 0
-          let outBytes ← if !isSpecialOut then getFileByteSizeOr outPath 0 else pure 0
-          let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
-          IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-delegated-faithful\",\"tier\":\"{plan.backend.tier.toString}\",\"format\":\"{jsonEscape fmtStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\",\"in_bytes\":{inBytes},\"out_bytes\":{outBytes},\"total_us\":{(t1Del - t0Del) / 1000}}"
-        return 0
-      else
-        if validCfg.jsonOutput then
-          return ← reportCliError validCfg
-            (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-delegated-failed\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
-            (s!"Delegated conversion failed! ({inPath} -> {outPath})")
-        else
-          if suppress != 0 && !cliQuiet validCfg.logLevel then
-            IO.eprintln s!"Delegated conversion failed! ({inPath} -> {outPath})"
-          return rc
+      let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
+      let rawOptions := scanRawLavfiCli args
+      let vCodecStr := rawOptions.vCodec.getD "none"
+      let aCodecStr := rawOptions.aCodec.getD "none"
+      let vfStr := validCfg.videoFilter.getD
+        (validCfg.audioFilter.getD (rawOptions.filterComplex.getD ""))
+      let reasonStr := String.intercalate "," plan.backend.reasons
+      return ← reportCliError validCfg
+        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-unsupported\",\"tier\":\"unsupported\",\"format\":\"{jsonEscape fmtStr}\",\"video_codec\":\"{jsonEscape vCodecStr}\",\"audio_codec\":\"{jsonEscape aCodecStr}\",\"filter\":\"{jsonEscape vfStr}\",\"reason\":\"{jsonEscape reasonStr}\",\"input\":\"{jsonEscape inPath}\",\"output\":\"{jsonEscape outPath}\"}")
+        (s!"Unsupported codec, container, or filter (fail-closed, no runtime ffmpeg): format={fmtStr} video={vCodecStr} audio={aCodecStr} filter={vfStr} reason={reasonStr}")
     let hasExplicitMp4 := validCfg.format == some "mp4"
     let lowerOut := outPath.toLower
     if !hasExplicitMp4 && !(lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v") then
@@ -2195,12 +2751,12 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
         (s!"Unsupported input container or invalid media: {inPath}")
 
 def printLffmpegVersion : IO UInt32 := do
-  IO.println "lffmpeg version 0.2.0-LeanAV (lean-ffmpeg, Lean 4.31.0, Maxwell Verified)"
-  IO.println "  CLI video: h264, hevc, av1, copy (delegated to linked libav/x264 where available)"
-  IO.println "  CLI audio: aac, copy (audio copy is supported only in stream-copy mode)"
-  IO.println "  LeanAV library codecs: FLAC, AAC, Opus, H.264, HEVC, ProRes, FFV1, AV1 (library models; not all CLI-wired)"
-  IO.println "  LeanAV library formats: IVF, MP4, MKV, Ogg, MPEG-TS, WAV (library models; not all CLI-wired)"
-  IO.println "  LeanAV filters: formally checked structural filter and color-conversion laws; runtime encoding is delegated"
+  IO.println "lffmpeg version 0.4.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Standalone Zero-Exec)"
+  IO.println "  CLI video: h264, hevc, av1, ffv1, png, copy (standalone in-process, zero bundled ffmpeg)"
+  IO.println "  CLI audio: aac, flac, pcm_s16le, copy (standalone in-process, zero bundled ffmpeg)"
+  IO.println "  LeanAV library codecs: FLAC, AAC-LC, H.264, HEVC, AV1, FFV1, PNG, Opus, ProRes"
+  IO.println "  LeanAV library formats: IVF, MP4, MKV/WebM, WAV, FLAC, PNG, Ogg, MPEG-TS"
+  IO.println "  LeanAV filters: formally checked lavfi DAG, scale, colorspace=bt709, and tonemap"
   return 0
 
 def printLffmpegFormats : IO UInt32 := do
@@ -2503,8 +3059,10 @@ def main (args : List String) : IO UInt32 := do
   | "h264-intra-probe" :: rest => LeanAV.H264IntraTransform.runH264IntraProbeCli rest
   | "lossless-codec" :: rest => runLosslessCodec rest
   | "h264-entropy" :: rest => runH264EntropyCli rest
+  | "lavfi-probe" :: rest => runLavfiProbeCli rest
+  | "lavfi-run" :: rest => runLavfiRunCli rest
   | "plan" :: rest | "dump-plan" :: rest => do
-    let plan ← refinePlanWithInput (parseArgsToPlanIR rest)
+    let plan ← refinePlanWithInputWithArgs (parseArgsToPlanIR rest) rest
     IO.println (serializePlanIRJson plan)
     return if (validatePlanIR plan).isOk then 0 else 1
   | "verify-ffi" :: mp4Path :: _ => runVerifyFfi (some mp4Path)
@@ -2800,6 +3358,92 @@ def main (args : List String) : IO UInt32 := do
   | ["h264-inter-dpb-vectors"] => do
     IO.println h264KernelVectorsJson
     return 0
+  | "hevc-probe" :: inPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match probeHevcStreamJson rawBytes with
+    | some js =>
+      IO.println js
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-probe failed: {inPath}"
+      return 1
+  | "hevc-decode-raw" :: inPath :: outYuvPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match decodeHevcToYuv420p rawBytes with
+    | some (w, h, nf, yuv) =>
+      if outYuvPath != "" && outYuvPath != "-" then
+        let _ ← writeMediaFileAtomic outYuvPath yuv
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"yuv_bytes\": {yuv.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-decode-raw failed: {inPath}"
+      return 1
+  | "hevc-encode-raw" :: wStr :: hStr :: inYuvPath :: outPath :: rest => do
+    let some w := wStr.toNat? | do IO.eprintln "invalid width"; return 1
+    let some h := hStr.toNat? | do IO.eprintln "invalid height"; return 1
+    let qpNat := (rest[0]?.bind String.toNat?).getD 28
+    let fmt := rest[1]?.getD (if outPath.endsWith ".mp4" then "mp4" else "annexb")
+    let log2Ctb := (rest[2]?.bind String.toNat?).getD 6
+    let tilesCol := (rest[3]?.bind String.toNat?).getD 1
+    let tilesRow := (rest[4]?.bind String.toNat?).getD 1
+    let mp4 := fmt == "mp4" || fmt == "hvcc"
+    let yuv ← IO.FS.readBinFile inYuvPath
+    match encodeHevcFromYuv420p w h yuv (Int.ofNat qpNat) mp4 log2Ctb tilesCol tilesRow with
+    | some bs =>
+      if outPath != "" && outPath != "-" then
+        let _ ← writeMediaFileAtomic outPath bs
+      let frameBytes := w * h * 3 / 2
+      let nf := if frameBytes > 0 then yuv.size / frameBytes else 0
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"qp\": {qpNat}, \"mp4\": {mp4}, \"log2_ctb\": {log2Ctb}, \"tiles_col\": {tilesCol}, \"tiles_row\": {tilesRow}, \"out_bytes\": {bs.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"hevc-encode-raw failed: {inYuvPath}"
+      return 1
+  | "av1-probe" :: inPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match probeAv1StreamJson rawBytes with
+    | some js =>
+      IO.println js
+      return 0
+    | none =>
+      IO.eprintln s!"av1-probe failed: {inPath}"
+      return 1
+  | "av1-decode-raw" :: inPath :: outYuvPath :: _ => do
+    let rawBytes ← IO.FS.readBinFile inPath
+    match decodeAv1ToYuv420p rawBytes with
+    | some (w, h, nf, yuv) =>
+      if outYuvPath != "" && outYuvPath != "-" then
+        let _ ← writeMediaFileAtomic outYuvPath yuv
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"yuv_bytes\": {yuv.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"av1-decode-raw failed: {inPath}"
+      return 1
+  | "av1-encode-raw" :: wStr :: hStr :: inYuvPath :: outPath :: rest => do
+    let some w := wStr.toNat? | do IO.eprintln "invalid width"; return 1
+    let some h := hStr.toNat? | do IO.eprintln "invalid height"; return 1
+    let qidx := (rest[0]?.bind String.toNat?).getD 60
+    let fmtRaw := rest[1]?.getD "auto"
+    let tilesCol := (rest[2]?.bind String.toNat?).getD 1
+    let tilesRow := (rest[3]?.bind String.toNat?).getD 1
+    let fmt :=
+      if fmtRaw == "auto" then
+        if outPath.endsWith ".mp4" then "mp4"
+        else if outPath.endsWith ".ivf" then "ivf"
+        else "obu"
+      else fmtRaw
+    let yuv ← IO.FS.readBinFile inYuvPath
+    match encodeAv1FromYuv420p w h yuv qidx fmt (av1TileLog2 1 tilesCol) (av1TileLog2 1 tilesRow) with
+    | some bs =>
+      if outPath != "" && outPath != "-" then
+        let _ ← writeMediaFileAtomic outPath bs
+      let frameBytes := w * h * 3 / 2
+      let nf := if frameBytes > 0 then yuv.size / frameBytes else 0
+      IO.println s!"\{ \"ok\": true, \"width\": {w}, \"height\": {h}, \"frames\": {nf}, \"qidx\": {qidx}, \"fmt\": \"{fmt}\", \"tiles_col\": {tilesCol}, \"tiles_row\": {tilesRow}, \"out_bytes\": {bs.size} }"
+      return 0
+    | none =>
+      IO.eprintln s!"av1-encode-raw failed: {inYuvPath}"
+      return 1
   | "ffmpeg" :: rest => runFFmpegCli rest
   | a :: _ =>
     if a.startsWith "-" then runFFmpegCli args
@@ -3235,4 +3879,78 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.Encoder.inprocRing_pop_preserves_wellFormed
 #print axioms LeanAV.Encoder.inprocRing_push_pop_fifo_empty
 #print axioms LeanAV.Format.synthMp4TrackGateSpec
+#print axioms LeanAV.HevcMainProofs.hevcMain8Bit420SpsSpec
+#print axioms LeanAV.HevcMainProofs.hevcMain8Bit420SpsSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcEncoderGeomSpec
+#print axioms LeanAV.HevcMainProofs.hevcEncoderGeomSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcQpRangeSpec
+#print axioms LeanAV.HevcMainProofs.hevcQpRangeSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcIntraModeRangeSpec
+#print axioms LeanAV.HevcMainProofs.hevcIntraModeRangeSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcSample8BoundSpec
+#print axioms LeanAV.HevcMainProofs.hevcSample8BoundSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcDpbOccupancySpec
+#print axioms LeanAV.HevcMainProofs.hevcDpbOccupancySpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcClipInt_bounds_and_id
+#print axioms LeanAV.HevcMainProofs.hevcClipU8Int_bounds
+#print axioms LeanAV.HevcMainProofs.hevcClipU8Int_all_256_id
+#print axioms LeanAV.HevcMainProofs.hevcRbspEpb_roundtrip_and_rejects_bad_epb
+#print axioms LeanAV.HevcMainProofs.hevcNalHeader_pack_parse_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcExpGolomb_ue_se_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcVpsSps_and_nonMain_failclosed_verified
+#print axioms LeanAV.HevcMainProofs.hevcCabac_core_decision_bypass_terminate_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcCabac_ipcm_write_read_reinit_roundtrip
+#print axioms LeanAV.HevcMainProofs.hevcMc_8tap_luma_and_4tap_chroma_dc_gain_and_const_exact
+#print axioms LeanAV.HevcMainProofs.hevcDst7_and_Dct2_basis_and_roundtrip_verified
+#print axioms LeanAV.HevcMainProofs.hevcIntra_planar_and_angular_bounds
+#print axioms LeanAV.HevcMainProofs.hevcAngular_const_exact_unrounded
+#print axioms LeanAV.HevcMainProofs.hevcIntra_planar_dc_angular_const_exact
+#print axioms LeanAV.HevcMainProofs.hevcDeblock_flat_zero_delta
+#print axioms LeanAV.HevcMainProofs.hevcDeblock_and_Sao_clamped_bounds
+#print axioms LeanAV.HevcMainProofs.hevcDpb_poc_reorder_monotone_and_capacity_checked
+#print axioms LeanAV.Av1MainProofs.av1Main8Bit420SeqSpec
+#print axioms LeanAV.Av1MainProofs.av1Main8Bit420SeqSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1Main8BitFrameScopeSpec
+#print axioms LeanAV.Av1MainProofs.av1Main8BitFrameScopeSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1EncoderGeomSpec
+#print axioms LeanAV.Av1MainProofs.av1EncoderGeomSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1QidxRangeSpec
+#print axioms LeanAV.Av1MainProofs.av1QidxRangeSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1IntraModeRangeSpec
+#print axioms LeanAV.Av1MainProofs.av1IntraModeRangeSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1Sample8BoundSpec
+#print axioms LeanAV.Av1MainProofs.av1Sample8BoundSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1RefSlotOccupancySpec
+#print axioms LeanAV.Av1MainProofs.av1RefSlotOccupancySpec_iff
+#print axioms LeanAV.Av1MainProofs.av1Iclip_bounds_and_id
+#print axioms LeanAV.Av1MainProofs.av1IclipU8_bounds
+#print axioms LeanAV.Av1MainProofs.av1IclipU8_all_256_id
+#print axioms LeanAV.Av1MainProofs.av1Mc_8tap_subpel_dc_gain_and_const_exact
+#print axioms LeanAV.Av1MainProofs.av1Wht4_basis_roundtrip_exact
+#print axioms LeanAV.Av1MainProofs.av1DcPred_const_exact
+#print axioms LeanAV.Av1MainProofs.av1DcPred_const_exact_verified
+#print axioms LeanAV.Av1MainProofs.av1LoopFilter_flat_zero_delta
+#print axioms LeanAV.Av1MainProofs.av1LoopFilter_and_cdef_clamped_bounds
+#print axioms LeanAV.Av1MainProofs.av1Leb128_roundtrip
+#print axioms LeanAV.Av1MainProofs.av1Obu_wrap_parse_roundtrip
+#print axioms LeanAV.Av1MainProofs.av1Msac_bool_symbol_roundtrip
+#print axioms LeanAV.Av1MainProofs.av1SeqHdr_main8bit420_write_parse_verified
+#print axioms LeanAV.Av1MainProofs.av1NonMain_failclosed_verified
+#print axioms LeanAV.Av1MainProofs.av1Ref_poc_reorder_monotone_and_slot_capacity
+#print axioms LeanAV.Av1MainProofs.av1Refmv_single_extended_uncapped_compound_neighbor
+#print axioms LeanAV.Av1MainProofs.av1GetUniCtx_p0_bwd_vs_fwd_partition
+#print axioms LeanAV.Av1MainProofs.av1CHeaderMain8Bit420Spec
+#print axioms LeanAV.Av1MainProofs.av1CHeaderMain8Bit420Spec_iff
+#print axioms LeanAV.Av1MainProofs.av1Rav1e_4byte_av1C_and_unsized_trailing_obu_verified
+#print axioms LeanAV.LavfiGraphProofs.graphAcyclicGateSpec
+#print axioms LeanAV.LavfiGraphProofs.padLinkGateSpec
+#print axioms LeanAV.LavfiGraphProofs.splitOutputGateSpec
+#print axioms LeanAV.LavfiGraphProofs.amixRateGateSpec
+#print axioms LeanAV.LavfiGraphProofs.overlayDimGateSpec
+#print axioms LeanAV.LavfiGraphProofs.cropBoundsGateSpec
+#print axioms LeanAV.LavfiGraphProofs.padBoundsGateSpec
+#print axioms LeanAV.LavfiGraphProofs.amergeChannelGateSpec
+#print axioms LeanAV.LavfiGraphProofs.lavfiDurationBoundGateSpec
+#print axioms LeanAV.LavfiGraph.edgeBufferQueueGateSpec
+#print axioms LeanAV.LavfiGraph.validTopoPairGateSpec
 

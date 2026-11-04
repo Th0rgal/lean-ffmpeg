@@ -1,8 +1,4 @@
-"""Portable production CLI routing checks; the backend shim does not read media.
-
-Staged only. After review and an authorized build, install in tests/ or set
-LFFMPEG_BINARY to the frozen candidate. These checks confer no FATE/media credit.
-"""
+"""Portable SPDIF CLI grammar and fail-closed zero-delegation checks."""
 import json
 import os
 from pathlib import Path
@@ -29,48 +25,42 @@ class SpdifRoutingTests(unittest.TestCase):
         self.source.write_bytes(b"routing placeholder; not media")
         self.output = self.root / "output with spaces.mp4"
         self.log = self.root / "argv.json"
-        shim = self.root / "backend.py"
+        shim = self.root / "ffmpeg"
         shim.write_text(
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
-            "args = sys.argv[1:]\n"
             "with open(os.environ['SPDIF_ROUTING_LOG'], 'w') as stream:\n"
-            "    json.dump({'argv': args, 'argv_hex': [os.fsencode(a).hex() for a in args]}, stream)\n"
-            "sys.exit(int(os.environ['SPDIF_ROUTING_EXIT']))\n"
+            "    json.dump(sys.argv[1:], stream)\n"
+            "sys.exit(0)\n"
         )
         shim.chmod(0o755)
-        self.env = dict(os.environ, LEANAV_FFMPEG_BIN=str(shim),
-                        SPDIF_ROUTING_LOG=str(self.log), SPDIF_ROUTING_EXIT="0")
+        self.env = dict(os.environ, PATH="/nonexistent",
+                        SPDIF_ROUTING_LOG=str(self.log))
 
     def plan(self, args):
         result = subprocess.run([str(BINARY), "plan", *args], capture_output=True,
                                 text=True, timeout=10, env=self.env)
         return result, json.loads(result.stdout)
 
-    def invoke(self, args, code=0):
+    def invoke(self, args):
         self.log.unlink(missing_ok=True)
         argv = ["-nostdin", "-y", "-v", "error", *args]
         result = subprocess.run([str(BINARY), *argv], capture_output=True,
-                                text=True, timeout=10,
-                                env=dict(self.env, SPDIF_ROUTING_EXIT=str(code)))
+                                text=True, timeout=10, env=self.env)
         return result, argv
 
-    def assert_exact_argv(self, argv):
-        record = json.loads(self.log.read_text())
-        self.assertEqual(record["argv"], argv)
-        self.assertEqual(record["argv_hex"], [os.fsencode(a).hex() for a in argv])
-
-    def assert_delegated(self, args, output_format):
+    def assert_parsed_unsupported_fail_closed(self, args, output_format):
         result, plan = self.plan(args)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(plan["error_count"], 0)
-        self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
-        self.assertTrue(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["backend"]["fallback_allowed"])
         self.assertEqual(plan["outputs"][0]["format"], output_format)
-        actual, argv = self.invoke(args)
-        self.assertEqual(actual.returncode, 0, actual.stderr)
-        self.assert_exact_argv(argv)
-        self.assertEqual(actual.stdout, "")
+        actual, _ = self.invoke(args)
+        self.assertNotEqual(actual.returncode, 0)
+        self.assertFalse(self.log.exists())
         self.assertFalse(self.output.exists())
         if args[-1] != "-":
             self.assertFalse(Path(args[-1]).exists())
@@ -79,19 +69,22 @@ class SpdifRoutingTests(unittest.TestCase):
         result, plan = self.plan(args)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
+        self.assertGreater(plan["error_count"], 0)
         actual, _ = self.invoke(args)
         self.assertNotEqual(actual.returncode, 0)
         self.assertFalse(self.log.exists())
         self.assertFalse(self.output.exists())
 
-    def test_explicit_output_format_delegates_for_file_and_stdout(self):
+    def test_explicit_output_format_parses_and_fails_closed_for_file_and_stdout(self):
         for output in (str(self.output), str(self.root / "output.spdif"),
                        str(self.root / "output.bin"), "-"):
             with self.subTest(output=output):
-                self.assert_delegated(["-i", str(self.source), "-c", "copy",
-                                       "-f", "spdif", output], "spdif")
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-c", "copy", "-f", "spdif", output],
+                    "spdif")
 
-    def test_format_token_before_input_preserves_order_and_delegates(self):
+    def test_format_token_before_input_parses_and_fails_closed(self):
         cases = [
             (["-f", "spdif", "-i", str(self.source), "-c", "copy",
               str(self.output)], "mp4"),
@@ -102,32 +95,33 @@ class SpdifRoutingTests(unittest.TestCase):
         ]
         for args, output_format in cases:
             with self.subTest(args=args):
-                self.assert_delegated(args, output_format)
+                self.assert_parsed_unsupported_fail_closed(args, output_format)
 
-    def test_repeated_formats_preserve_original_order_and_final_output_format(self):
+    def test_repeated_formats_preserve_final_output_format_and_fail_closed(self):
         for first, second in (("wav", "spdif"), ("spdif", "wav")):
             with self.subTest(first=first, second=second):
-                self.assert_delegated(["-i", str(self.source), "-c", "copy",
-                                       "-f", first, "-f", second,
-                                       str(self.output)], second)
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-c", "copy",
+                     "-f", first, "-f", second, str(self.output)], second)
 
-    def test_backend_failure_propagates_for_input_and_output_formats(self):
+    def test_json_fail_closed_diagnostics_for_input_and_output_formats(self):
         cases = [
             ["-f", "spdif", "-i", str(self.source), "-c", "copy", str(self.output)],
             ["-i", str(self.source), "-c", "copy", "-f", "spdif", str(self.output)],
         ]
-        for code in (1, 73):
-            for args in cases:
-                with self.subTest(code=code, args=args):
-                    result, plan = self.plan(args)
-                    self.assertEqual(result.returncode, 0, result.stdout)
-                    self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
-                    actual, argv = self.invoke(args, code=code)
-                    self.assertEqual(actual.returncode, code, actual.stderr)
-                    self.assert_exact_argv(argv)
-                    self.assertFalse(self.output.exists())
+        for args in cases:
+            with self.subTest(args=args):
+                actual = subprocess.run([str(BINARY), "-json", "-y", *args],
+                                        capture_output=True, text=True,
+                                        timeout=10, env=self.env)
+                self.assertNotEqual(actual.returncode, 0)
+                doc = json.loads(actual.stdout.strip())
+                self.assertFalse(doc["ok"])
+                self.assertEqual(doc["tier"], "unsupported")
+                self.assertFalse(self.log.exists())
+                self.assertFalse(self.output.exists())
 
-    def test_missing_empty_unknown_and_malformed_formats_fail_before_backend(self):
+    def test_missing_empty_unknown_and_malformed_formats_fail_parse(self):
         self.assert_rejected(["-i", str(self.source), str(self.output), "-f"])
         for value in ("", "SPDIF", "spdifx", "iec61937", " spdif", "spdif ",
                       "spdif,ac3", "spdif -i extra.mp4"):
@@ -147,7 +141,7 @@ class SpdifRoutingTests(unittest.TestCase):
                                       str(self.output)])
                 self.assertFalse(marker.exists())
 
-    def test_unsafe_input_and_output_paths_fail_before_backend(self):
+    def test_unsafe_input_and_output_paths_fail_closed(self):
         for unsafe in ("https://invalid.example/input", "file:input", "pipe:0",
                        "/dev/audio", "/proc/self/mem", "fixtures/../outside"):
             for position in ("input", "output"):
@@ -165,26 +159,23 @@ class SpdifRoutingTests(unittest.TestCase):
                     self.assertFalse(self.output.exists())
 
     def test_implicit_spdif_output_extension_remains_unknown_in_plan(self):
-        # Plan-only: no media execution and no expansion of extension inference.
         result, plan = self.plan(["-i", str(self.source),
                                   str(self.root / "output.spdif")])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized_output_container_format",
                       plan["backend"]["reasons"])
 
-    def test_spdif_flags_and_dtshd_rate_delegate_and_unknown_flag_rejected(self):
+    def test_spdif_flags_and_dtshd_rate_parse_and_unknown_flag_rejected(self):
         for flag, value in (("-spdif_flags", "+be"), ("-dtshd_rate", "192000"),
                             ("-dtshd_rate", "96000")):
             with self.subTest(flag=flag, value=value):
-                result, plan = self.plan(["-i", str(self.source), "-c", "copy",
-                                          flag, value, "-f", "spdif", str(self.output)])
-                self.assertEqual(result.returncode, 0, result.stdout)
-                self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-c", "copy", flag, value,
+                     "-f", "spdif", str(self.output)], "spdif")
         self.assert_rejected(["-i", str(self.source), "-c", "copy",
                               "-spdif_unknown_flag", "1", "-f", "spdif", str(self.output)])
 
     def test_native_plan_without_explicit_spdif_remains_unchanged(self):
-        # Never execute the native route on a placeholder input.
         for codec in ("h264", "hevc", "av1"):
             with self.subTest(codec=codec):
                 result, plan = self.plan(["-i", str(self.source), "-c:v", codec,

@@ -3,10 +3,11 @@
   - Phase 3 (Wave D): Typed Streams / Maps / Graphs / Timeline / Metadata / Resource / Backend Policy IR (`MediaPlanIR`),
     pre-execution validation (`validatePlanIR`), inspectable JSON serialization (`serializePlanIRJson`),
     and proven CLI <-> IR round-trip (`planIR_cli_roundtrip_verified`).
-  - Phase 4 (Waves E & F): Contract-classified delegated compatibility (`-map`, `-metadata`, `-map_metadata`,
+  - Phase 4 (Waves E & F): Contract-classified option parsing (`-map`, `-metadata`, `-map_metadata`,
     `-map_chapters`, `-bsf:v`, `-bsf:a`, `-c:s`, multi-container muxing, and protocol/device security allowlist).
-  - Phase 5 (Wave G): Pinned C-ABI FFI facade (`ffiAbiVersionC`, `ffiProbeMp4ContractC`, `ffiCancelGateC`,
-    `ffiExecDelegatedFfmpegC`) with explicit borrowed-buffer ownership and cancellation gate.
+    Out-of-scope routes classify as `unsupported` and fail closed; nothing is delegated to an external encoder.
+  - Phase 5 (Wave G): Pinned C-ABI FFI facade (`ffiAbiVersionC`, `ffiProbeMp4ContractC`, `ffiCancelGateC`)
+    with explicit borrowed-buffer ownership and cancellation gate.
   - Phase 6 (Wave H): Bounded independent verified kernels (`rescalePtsIndependentOrFallback`,
     `scalePlane2x2IndependentOrFallback`, `demuxIvfIndependentOrFallback`) with explicit fallback policy.
 -/
@@ -35,7 +36,6 @@ open LeanAV.Cli
 inductive BackendTier where
   | independentVerified
   | independentTested
-  | delegatedFaithful
   | translatedPartial
   | approximate
   | unsupported
@@ -45,7 +45,6 @@ inductive BackendTier where
 def BackendTier.toString : BackendTier → String
   | .independentVerified => "independent_verified"
   | .independentTested   => "independent_tested"
-  | .delegatedFaithful   => "delegated_faithful"
   | .translatedPartial   => "translated_partial"
   | .approximate         => "approximate"
   | .unsupported         => "unsupported"
@@ -718,7 +717,7 @@ def isValidPixFmtStreamQualifier (qual : String) : Bool :=
   qual == "v" ||
   (strStartsWithFast qual "v:" && (parseNonNegNatSpec (String.ofList (qual.toList.drop 2))).isSome)
 
-/-- Extended 1-argument FFmpeg & FATE flags routed to `delegated_faithful`. -/
+/-- Extended 1-argument FFmpeg & FATE flags parsed for fail-closed classification. -/
 def isExtendedDelegatedValueFlag (tok : String) : Bool :=
   if tok == "-y" || tok == "-n" || tok == "-vn" || tok == "-an" || tok == "-sn" ||
      tok == "-hide_banner" || tok == "-stats" || tok == "-nostats" || tok == "-nostdin" ||
@@ -1386,8 +1385,9 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
   let unknownFormat := outputSpecs.any (fun o => o.format == "unknown")
 
   let isMixedCopyTranscode : Bool :=
-    (cfgAudioCodec == some .copy && cfgVideoCodec != some .copy) ||
-    (cfgVideoCodec == some .copy && cfgAudioCodec.isSome && cfgAudioCodec != some .copy)
+    (cfgVideoCodec == some .copy && cfgAudioCodec.isSome && cfgAudioCodec != some .copy) ||
+    (cfgAudioCodec == some .copy && cfgVideoCodec != some .copy &&
+     cfgVideoCodec != some .h264 && cfgVideoCodec != none)
 
   let isSingleMp4Input : Bool :=
     match inputSpecs with
@@ -1627,11 +1627,11 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     else if isStandaloneFlacRoute then
       (.independentVerified, ["standalone_flac_lossless_codec"])
     else if isDelegatedContainerOrOption then
-      (.delegatedFaithful, ["phase4_structured_argv_delegation"])
+      (.unsupported, ["out_of_scope_codec_container_or_option"])
     else if cfgStartSec.isSome || cfgDurationSec.isSome || cfgVideoCodec != some .copy then
       (.translatedPartial, ["mp4_seek_or_pixel_simd_transcode"])
     else
-      (.delegatedFaithful, ["mp4_stream_copy"])
+      (.unsupported, ["out_of_scope_codec_container_or_option"])
 
   { inputs := inputSpecs
     outputs := outputSpecs
@@ -1670,8 +1670,8 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     errors := allErrors
     backend := {
       tier := tier
-      delegatedContainer := isDelegatedContainerOrOption && !isNativeStreamCopy
-      fallbackAllowed := true
+      delegatedContainer := false
+      fallbackAllowed := false
       reasons := reasons
     } }
 
@@ -1769,8 +1769,7 @@ def splitAtFirstInput : List String → List String → Option (List String × S
   | tok :: rest, revPre => splitAtFirstInput rest (tok :: revPre)
 
 def resolveNativeFfv1PlanFormat (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : Option String :=
-  if !plan.errors.isEmpty || plan.backend.tier == .unsupported ||
-     plan.inputs.length != 1 || plan.outputs.length != 1 then none
+  if !plan.errors.isEmpty || plan.inputs.length != 1 || plan.outputs.length != 1 then none
   else
     match splitAtFirstInput args [], plan.outputs.head? with
     | some (preArgs, inPath, postArgs), some outSpec =>
@@ -1825,14 +1824,13 @@ def promoteNativeFfv1Plan (args : List String) (cfg : CliConfig) (plan : MediaPl
         backend := {
           tier := .independentVerified
           delegatedContainer := false
-          fallbackAllowed := cfg.videoCodec != some .ffv1 && !(args.contains "ffv1")
+          fallbackAllowed := false
           reasons := ["ffv1_v3_native_verified_codec"]
         } }
     | none => plan
 
 def resolveStandaloneAacAdtsPlan (args : List String) (cfg : CliConfig) (plan : MediaPlanIR) : Option String :=
-  if !plan.errors.isEmpty || plan.backend.tier == .unsupported ||
-     plan.inputs.length != 1 || plan.outputs.length != 1 then none
+  if !plan.errors.isEmpty || plan.inputs.length != 1 || plan.outputs.length != 1 then none
   else
     match plan.inputs.head?, plan.outputs.head? with
     | some inSpec, some outSpec =>
@@ -1902,7 +1900,7 @@ def promoteStandaloneAacAdtsPlan (args : List String) (cfg : CliConfig) (plan : 
         backend := {
           tier := .independentVerified
           delegatedContainer := false
-          fallbackAllowed := true
+          fallbackAllowed := false
           reasons := ["standalone_aac_lc_adts_codec"]
         } }
     | none => plan
@@ -1955,7 +1953,7 @@ def extractNativeRemuxSelectors (plan : MediaPlanIR) : List NativeStreamSelector
 /--
   Unified argv renderer for `MediaPlanIR`:
   - `forDelegation = false`: renders canonical `lffmpeg` CLI arguments (round-trip inverse of `parseArgsToPlanIR`).
-  - `forDelegation = true`: renders structured `ffmpeg` argv for `fork` + `execvp` (`-nostdin`, encoder names).
+  - `forDelegation = true`: renders normalized canonical CLI arguments (`-nostdin`, canonical encoder names).
 -/
 def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :=
   MediaPlanIR.casesOn plan fun planInputs planOutputs planStreams _planPrograms planMaps
@@ -2112,7 +2110,7 @@ def serializePlanIRJson (plan : MediaPlanIR) : String :=
   let p7 := s!"\"mpeg_options\":[{mpegJson}],\"error_count\":{plan.errors.length}}"
   p0 ++ p1a ++ p1b ++ p2 ++ p3 ++ p4 ++ p5a ++ p5b ++ p6a ++ p6b ++ p7
 
-/-- Shell-free `execvp` argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
+/-- Shell-free CLI argv hygiene gate: guarantees non-empty token list with zero empty `""` tokens or embedded NUL bytes. -/
 def verifyExecArgvHygiene (argv : List String) : Bool :=
   !argv.isEmpty && argv.all (fun tok => !tok.isEmpty && !(tok.contains '\x00'))
 
@@ -2121,33 +2119,6 @@ def isNoFileOutputFormat (fmt : String) (outPath : String) : Bool :=
   fmt == "null" || fmt == "hls" || fmt == "dash" || fmt == "segment" ||
   fmt == "stream_segment" || fmt == "ssegment" ||
   (fmt == "image2" && outPath.toList.contains '%')
-
-/-- Build the structured `Array String` argv for `delegated_faithful` FFmpeg execution (zero shell interpolation), gated by `verifyExecArgvHygiene`. -/
-def buildDelegatedFfmpegArgv (plan : MediaPlanIR) (passthroughArgs : List String := []) : Array String :=
-  if plan.outputs.isEmpty then #[]
-  else
-    let rawList : List String :=
-      if passthroughArgs.isEmpty then
-        renderPlanIRArgv plan true
-      else
-        let hasYorN := passthroughArgs.contains "-y" || passthroughArgs.contains "-n"
-        let hasLogLevel := passthroughArgs.contains "-v" || passthroughArgs.contains "-loglevel"
-        let hasNostdin := passthroughArgs.contains "-nostdin"
-        let allNoFile := !plan.outputs.isEmpty && plan.outputs.all (fun o => isNoFileOutputFormat o.format o.path)
-        let pre : List String :=
-          (if hasNostdin then [] else ["-nostdin"]) ++
-          (if hasYorN then [] else
-            match plan.outputs.head? with
-            | some o =>
-              if o.overwrite then ["-y"]
-              else if allNoFile then []
-              else ["-n"]
-            | none   => []) ++
-          (if plan.resources.jsonOutput && !passthroughArgs.contains "-hide_banner" then ["-hide_banner"] else []) ++
-          (if plan.resources.jsonOutput && !passthroughArgs.contains "-nostats" then ["-nostats"] else []) ++
-          (if plan.resources.jsonOutput && !hasLogLevel then ["-v", "error"] else [])
-        pre ++ passthroughArgs
-    if verifyExecArgvHygiene rawList then rawList.toArray else #[]
 
 /-! ## 4. Phase 5 Targeted C-ABI FFI Facade & Cancellation Contract (Direct Lean 4 `@[export]` + Borrowed C-ABI Shim) -/
 
@@ -2291,10 +2262,6 @@ def ffiProbeMp4ContractExport (ba : ByteArray) (maxReadBytes : USize) : UInt64 :
 /-- Bounded, zero-allocation C-ABI MP4 header probe over borrowed `@& ByteArray`. -/
 @[extern "leanav_c_ffi_probe_mp4_contract"]
 opaque ffiProbeMp4ContractC : (@& ByteArray) → USize → UInt64
-
-/-- Structured-argv `fork` + `execvp` delegated FFmpeg runner in C-ABI (zero shell interpolation). -/
-@[extern "leanav_c_exec_delegated_ffmpeg"]
-opaque ffiExecDelegatedFfmpegC : (@& Array String) → (@& String) → UInt32 → BaseIO UInt32
 
 /-- Decoded result of `ffiProbeMp4ContractC`. -/
 structure FfiMp4ProbeResult where
@@ -2649,9 +2616,11 @@ theorem planIR_cli_roundtrip_verified :
     formatCliSeconds { num := 10005, den := 10000 } = "1.0005" ∧
     pCopy.backend.tier = .independentVerified ∧
     pCopy.backend.delegatedContainer = false ∧
+    pCopy.backend.fallbackAllowed = false ∧
     pTrans.backend.tier = .translatedPartial ∧
-    pPhase4.backend.tier = .delegatedFaithful ∧
-    pPhase4.backend.delegatedContainer = true := by
+    pPhase4.backend.tier = .unsupported ∧
+    pPhase4.backend.delegatedContainer = false ∧
+    pPhase4.backend.fallbackAllowed = false := by
   decide
 
 /--
@@ -2670,7 +2639,7 @@ theorem validatePlanIR_sound_universal (plan plan' : MediaPlanIR)
     exact ⟨hEq.symm, hCond.1, hCond.2⟩
 
 /--
-  Theorem (Phase 3 & Phase 4 Validation Gate): `validatePlanIR` accepts valid `delegatedFaithful`,
+  Theorem (Phase 3 & Phase 4 Validation Gate): `validatePlanIR` accepts native stream copy,
   `translatedPartial`, and mixed `-vf scale=... -c:v h264 -c:a copy` plans, and rejects plans with
   same-stream `copyWithFilter`, invalid `-map`, disallowed `http://` URLs, or `-ss` millisecond overflow.
 -/
@@ -2809,7 +2778,7 @@ theorem standaloneLossless_routing_and_kernels_verified :
     pFlacCopyAll.backend.tier = .independentVerified ∧
     pFlacWav.backend.tier = .independentVerified ∧
     pFlacS24.backend.tier = .independentVerified ∧
-    pFlacAf.backend.tier = .delegatedFaithful ∧
+    pFlacAf.backend.tier = .unsupported ∧
     encodePngIndependentOrFallback badImg = .fallbackDelegated "invalid_png_image_geometry_or_pixels" ∧
     encodeFlacIndependentOrFallback #[] 48000 = .fallbackDelegated "invalid_flac_audio_parameters" := by
   decide

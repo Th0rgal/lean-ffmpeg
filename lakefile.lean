@@ -54,8 +54,16 @@ lean_lib «LeanAV» where
   roots := #[`LeanAV]
   precompileModules := false
 
+target leanav_zero_exec_stub_o pkg : FilePath := do
+  let stubOFile := pkg.buildDir / "c" / "leanav_zero_exec_stub.o"
+  let stubSrcJob ← inputTextFile <| pkg.dir / "c" / "leanav_simd_kernels.c"
+  let leanIncludeDir ← getLeanIncludeDir
+  let cDir := pkg.dir / "c"
+  buildO stubOFile stubSrcJob #["-I", leanIncludeDir.toString, "-I", cDir.toString, "-DLEANAV_ZERO_EXEC_STUB_ONLY"] #["-O3", "-fPIC"] "cc"
+
 @[default_target]
 lean_exe «lffmpeg» where
   root := `LeanAV.Main
   supportInterpreter := false
-  moreLinkArgs := if System.Platform.isOSX then #[] else #["-lpthread"]
+  moreLinkObjs := #[leanav_zero_exec_stub_o]
+  moreLinkArgs := if System.Platform.isOSX then #["-Wl,-dead_strip"] else #["-lpthread"]

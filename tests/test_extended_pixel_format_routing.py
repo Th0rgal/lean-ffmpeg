@@ -1,4 +1,4 @@
-"""Production CLI routing for extended pixel formats; the shim reads no media."""
+"""Production CLI grammar and fail-closed zero-delegation checks for extended pixel formats."""
 import json
 import os
 from pathlib import Path
@@ -42,30 +42,28 @@ class ExtendedPixelFormatRoutingTests(unittest.TestCase):
         self.source.write_bytes(b"routing placeholder; not media")
         self.output = self.root / "output with spaces.mp4"
         self.log = self.root / "argv.json"
-        shim = self.root / "backend.py"
+        shim = self.root / "ffmpeg"
         shim.write_text(
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
-            "args = sys.argv[1:]\n"
             "with open(os.environ['PIXEL_ROUTING_LOG'], 'w') as stream:\n"
-            "    json.dump({'argv': args, 'argv_hex': [os.fsencode(a).hex() for a in args]}, stream)\n"
-            "sys.exit(int(os.environ['PIXEL_ROUTING_EXIT']))\n"
+            "    json.dump(sys.argv[1:], stream)\n"
+            "sys.exit(0)\n"
         )
         shim.chmod(0o755)
-        self.env = dict(os.environ, LEANAV_FFMPEG_BIN=str(shim),
-                        PIXEL_ROUTING_LOG=str(self.log), PIXEL_ROUTING_EXIT="0")
+        self.env = dict(os.environ, PATH="/nonexistent",
+                        PIXEL_ROUTING_LOG=str(self.log))
 
     def plan(self, args):
         result = subprocess.run([str(BINARY), "plan", *args], capture_output=True,
                                 text=True, timeout=10, env=self.env)
         return result, json.loads(result.stdout)
 
-    def invoke(self, args, code=0):
+    def invoke(self, args):
         self.log.unlink(missing_ok=True)
         argv = ["-nostdin", "-y", "-v", "error", *args]
         result = subprocess.run([str(BINARY), *argv], capture_output=True,
-                                text=True, timeout=10,
-                                env=dict(self.env, PIXEL_ROUTING_EXIT=str(code)))
+                                text=True, timeout=10, env=self.env)
         return result, argv
 
     def args_for(self, value, flag, position):
@@ -73,41 +71,42 @@ class ExtendedPixelFormatRoutingTests(unittest.TestCase):
             return [flag, value, "-i", str(self.source), "-c:v", "h264", str(self.output)]
         return ["-i", str(self.source), "-c:v", "h264", flag, value, str(self.output)]
 
-    def assert_exact_argv(self, argv):
-        record = json.loads(self.log.read_text())
-        self.assertEqual(record["argv"], argv)
-        self.assertEqual(record["argv_hex"], [os.fsencode(a).hex() for a in argv])
-
-    def assert_delegated(self, args, code=0):
+    def assert_parsed_unsupported_fail_closed(self, args):
         result, plan = self.plan(args)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(plan["error_count"], 0)
-        self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
-        actual, argv = self.invoke(args, code)
-        self.assertEqual(actual.returncode, code, actual.stderr)
-        self.assert_exact_argv(argv)
-        self.assertEqual(actual.stdout, "")
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["backend"]["fallback_allowed"])
+        actual, _ = self.invoke(args)
+        self.assertNotEqual(actual.returncode, 0)
+        self.assertFalse(self.log.exists())
         self.assertFalse(self.output.exists())
 
     def assert_rejected(self, args, reason=None):
         result, plan = self.plan(args)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
         if reason is not None:
             self.assertIn(reason, plan["backend"]["reasons"])
+        else:
+            self.assertGreater(plan["error_count"], 0)
         actual, _ = self.invoke(args)
         self.assertNotEqual(actual.returncode, 0)
         self.assertFalse(self.log.exists())
         self.assertFalse(self.output.exists())
 
-    def test_all_formats_both_flags_and_positions_preserve_exact_argv(self):
+    def test_all_formats_both_flags_and_positions_parse_and_fail_closed(self):
         for value in FORMATS:
             for flag in FLAGS:
                 for position in ("input", "output"):
                     with self.subTest(value=value, flag=flag, position=position):
-                        self.assert_delegated(self.args_for(value, flag, position))
+                        self.assert_parsed_unsupported_fail_closed(
+                            self.args_for(value, flag, position))
 
-    def test_mixed_input_output_formats_and_alias_spellings_preserve_order(self):
+    def test_mixed_input_output_formats_and_alias_spellings_parse_and_fail_closed(self):
         for first, second in (("yuv440p10be", "yuv440p12le"),
                               ("yuva444p16le", "yuva420p9be"),
                               ("gbrapf32be", "grayf32le"), ("xv48be", "p012le")):
@@ -115,27 +114,21 @@ class ExtendedPixelFormatRoutingTests(unittest.TestCase):
                 for output_flag in FLAGS:
                     with self.subTest(first=first, second=second,
                                       input_flag=input_flag, output_flag=output_flag):
-                        self.assert_delegated([input_flag, first, "-i", str(self.source),
-                                               "-c:v", "h264", output_flag, second,
-                                               str(self.output)])
+                        self.assert_parsed_unsupported_fail_closed(
+                            [input_flag, first, "-i", str(self.source),
+                             "-c:v", "h264", output_flag, second,
+                             str(self.output)])
 
-    def test_repeated_pixel_formats_preserve_order(self):
+    def test_repeated_pixel_formats_parse_and_fail_closed(self):
         for first, second in (("yuv420p", "ayuv"), ("ayuv", "yuv440p10be"),
                               ("gbrap14be", "gbrap14le")):
             for flag in FLAGS:
                 with self.subTest(first=first, second=second, flag=flag):
-                    self.assert_delegated(["-i", str(self.source), "-c:v", "h264",
-                                           flag, first, flag, second, str(self.output)])
+                    self.assert_parsed_unsupported_fail_closed(
+                        ["-i", str(self.source), "-c:v", "h264",
+                         flag, first, flag, second, str(self.output)])
 
-    def test_backend_failure_propagates_for_both_flags_and_positions(self):
-        for value in ("yuv440p10be", "gbrapf32le", "yuva444p16be", "p212le"):
-            for flag in FLAGS:
-                for position in ("input", "output"):
-                    for code in (1, 73):
-                        with self.subTest(value=value, flag=flag, position=position, code=code):
-                            self.assert_delegated(self.args_for(value, flag, position), code)
-
-    def test_missing_empty_and_malformed_values_fail_before_backend(self):
+    def test_missing_empty_and_malformed_values_fail_parse(self):
         for flag in FLAGS:
             self.assert_rejected(["-i", str(self.source), str(self.output), flag])
             for value in ("", "AYUV", " yuv440p10le", "yuv440p10le ", "yuv440p10",
@@ -176,7 +169,6 @@ class ExtendedPixelFormatRoutingTests(unittest.TestCase):
                 self.assert_rejected(self.args_for("ayuv", flag, "output"))
 
     def test_native_pixel_format_boundary_is_unchanged(self):
-        # Plan-only: never send a placeholder input through the native pipeline.
         for value in ("yuv420p", "yuv420p10le", "p010le"):
             for codec in ("h264", "hevc", "av1"):
                 with self.subTest(value=value, codec=codec):
@@ -185,6 +177,7 @@ class ExtendedPixelFormatRoutingTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout)
                     self.assertEqual(plan["error_count"], 0)
                     self.assertEqual(plan["backend"]["tier"], "translated_partial")
+                    self.assertFalse(plan["backend"]["delegated_container"])
                     self.assertFalse(self.log.exists())
                     self.assertFalse(self.output.exists())
 

@@ -1,8 +1,4 @@
-"""FITS/WBMP production CLI routing checks with a non-media backend shim.
-
-A successful shim invocation proves delegation and argv preservation, not that
-FFmpeg encoded an image or that an upstream FATE case passed.
-"""
+"""FITS/WBMP/PFM CLI grammar and fail-closed zero-delegation checks."""
 import json
 import os
 from pathlib import Path
@@ -29,45 +25,42 @@ class ImageOutputRoutingTests(unittest.TestCase):
         self.source = self.root / "input with spaces.mp4"
         self.source.write_bytes(b"routing placeholder; not media")
         self.log = self.root / "argv.json"
-        shim = self.root / "backend.py"
+        shim = self.root / "ffmpeg"
         shim.write_text(
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
-            "args = sys.argv[1:]\n"
             "with open(os.environ['IMAGE_ROUTING_LOG'], 'w') as stream:\n"
-            "    json.dump({'argv': args, 'argv_hex': [os.fsencode(a).hex() for a in args]}, stream)\n"
-            "sys.exit(int(os.environ['IMAGE_ROUTING_EXIT']))\n"
+            "    json.dump(sys.argv[1:], stream)\n"
+            "sys.exit(0)\n"
         )
         shim.chmod(0o755)
-        self.env = dict(os.environ, LEANAV_FFMPEG_BIN=str(shim),
-                        IMAGE_ROUTING_LOG=str(self.log), IMAGE_ROUTING_EXIT="0")
+        self.env = dict(os.environ, PATH="/nonexistent",
+                        IMAGE_ROUTING_LOG=str(self.log))
 
     def plan(self, args):
         result = subprocess.run([str(BINARY), "plan", *args], capture_output=True,
                                 text=True, timeout=10, env=self.env)
         return result, json.loads(result.stdout)
 
-    def invoke(self, args, code=0):
+    def invoke(self, args):
         self.log.unlink(missing_ok=True)
         argv = ["-nostdin", "-y", "-v", "error", *args]
         result = subprocess.run([str(BINARY), *argv], capture_output=True,
-                                text=True, timeout=10,
-                                env=dict(self.env, IMAGE_ROUTING_EXIT=str(code)))
+                                text=True, timeout=10, env=self.env)
         return result, argv
 
-    def assert_delegated(self, args, output_format, code=0):
+    def assert_parsed_unsupported_fail_closed(self, args, output_format):
         result, plan = self.plan(args)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(plan["error_count"], 0)
-        self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
-        self.assertTrue(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["backend"]["fallback_allowed"])
         self.assertEqual(plan["outputs"][0]["format"], output_format)
-        actual, argv = self.invoke(args, code)
-        self.assertEqual(actual.returncode, code, actual.stderr)
-        record = json.loads(self.log.read_text())
-        self.assertEqual(record["argv"], argv)
-        self.assertEqual(record["argv_hex"], [os.fsencode(a).hex() for a in argv])
-        self.assertEqual(actual.stdout, "")
+        actual, _ = self.invoke(args)
+        self.assertNotEqual(actual.returncode, 0)
+        self.assertFalse(self.log.exists())
         if args[-1] != "-":
             self.assertFalse(Path(args[-1]).exists())
 
@@ -75,8 +68,11 @@ class ImageOutputRoutingTests(unittest.TestCase):
         result, plan = self.plan(args)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
         if reason:
             self.assertIn(reason, plan["backend"]["reasons"])
+        else:
+            self.assertGreater(plan["error_count"], 0)
         actual, _ = self.invoke(args)
         self.assertNotEqual(actual.returncode, 0)
         self.assertFalse(self.log.exists())
@@ -87,27 +83,31 @@ class ImageOutputRoutingTests(unittest.TestCase):
                             ("WBMP", "image2"), ("WbMp", "image2")):
             with self.subTest(suffix=suffix):
                 output = self.root / ("output with spaces." + suffix)
-                self.assert_delegated(["-y", "-i", str(self.source), str(output)], fmt)
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-y", "-i", str(self.source), str(output)], fmt)
 
-    def test_explicit_fits_overrides_suffix_and_supports_stdout(self):
+    def test_explicit_fits_overrides_suffix_and_supports_stdout_grammar(self):
         for output in (str(self.root / "image.wbmp"),
                        str(self.root / "image.unknown"), "-"):
             with self.subTest(output=output):
-                self.assert_delegated(["-i", str(self.source), "-f", "fits", output], "fits")
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-f", "fits", output], "fits")
 
     def test_explicit_other_formats_override_fits_and_wbmp_suffixes(self):
         for fmt, suffix in (("image2", "fits"), ("nut", "fits"), ("nut", "wbmp")):
             with self.subTest(fmt=fmt, suffix=suffix):
                 output = str(self.root / ("output." + suffix))
-                self.assert_delegated(["-i", str(self.source), "-f", fmt, output], fmt)
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-f", fmt, output], fmt)
 
-    def test_repeated_formats_preserve_order_and_use_last_output_format(self):
+    def test_repeated_formats_preserve_last_output_format(self):
         for first, last in (("image2", "fits"), ("fits", "image2")):
             with self.subTest(first=first, last=last):
-                self.assert_delegated(["-i", str(self.source), "-f", first,
-                                       "-f", last, str(self.root / "output.fits")], last)
+                self.assert_parsed_unsupported_fail_closed(
+                    ["-i", str(self.source), "-f", first,
+                     "-f", last, str(self.root / "output.fits")], last)
 
-    def test_seven_historical_lavf_command_shapes_preserve_argv(self):
+    def test_seven_historical_lavf_command_shapes_parse_and_fail_closed(self):
         source = str(self.root / "input frames" / "%02d.pgm")
         shared = ["-nostdin", "-nostats", "-noauto_conversion_filters", "-y",
                   "-cpuflags", "all", "-filter_threads", "1"]
@@ -120,25 +120,26 @@ class ImageOutputRoutingTests(unittest.TestCase):
                         ["-dct", "fastint", "-metadata", "title=lavftest", "-t", "1",
                          "-qscale", "10", "-pix_fmt", pixfmt,
                          str(self.root / ("lavf." + pixfmt + ".fits"))])
-                self.assert_delegated(args, "fits")
+                self.assert_parsed_unsupported_fail_closed(args, "fits")
         args = (shared + bitexact + ["-f", "image2", "-c:v", "pgmyuv", "-i", source] +
                 bitexact + ["-dct", "fastint", "-metadata", "title=lavftest", "-vf", "scale",
                             "-frames", "13", "-y", "-qscale", "10",
                             str(self.root / "output frames" / "%02d.wbmp")])
-        self.assert_delegated(args, "image2")
+        self.assert_parsed_unsupported_fail_closed(args, "image2")
 
-    def test_pfm_routes_float_pixel_formats_to_image2(self):
+    def test_pfm_parses_float_pixel_formats_to_image2_and_fails_closed(self):
         for suffix in ("pfm", "PFM", "PfM"):
             for pixfmt in ("gbrpf32be", "gbrpf32le", "grayf32be", "grayf32le"):
                 with self.subTest(suffix=suffix, pixfmt=pixfmt):
-                    self.assert_delegated(["-i", str(self.source), "-pix_fmt", pixfmt,
-                                           str(self.root / ("output." + suffix))], "image2")
+                    self.assert_parsed_unsupported_fail_closed(
+                        ["-i", str(self.source), "-pix_fmt", pixfmt,
+                         str(self.root / ("output." + suffix))], "image2")
 
-    def test_pfm_explicit_format_precedence_and_backend_error(self):
-        self.assert_delegated(["-i", str(self.source), "-f", "nut",
-                               str(self.root / "output.pfm")], "nut")
-        self.assert_delegated(["-i", str(self.source),
-                               str(self.root / "output.pfm")], "image2", 73)
+    def test_pfm_explicit_format_precedence_and_rejections(self):
+        self.assert_parsed_unsupported_fail_closed(
+            ["-i", str(self.source), "-f", "nut", str(self.root / "output.pfm")], "nut")
+        self.assert_parsed_unsupported_fail_closed(
+            ["-i", str(self.source), str(self.root / "output.pfm")], "image2")
         self.assert_rejected(["-i", str(self.source), "-f", "pfm",
                               str(self.root / "output.pfm")])
         self.assert_rejected(["-i", str(self.source), str(self.root / "output.pfmx")],
@@ -146,14 +147,21 @@ class ImageOutputRoutingTests(unittest.TestCase):
         self.assert_rejected(["-i", str(self.source), "frames/../output.pfm"],
                              "unsafe_protocol_or_path_traversal")
 
-    def test_backend_error_status_is_preserved(self):
+    def test_json_fail_closed_diagnostics(self):
         cases = [(["-i", str(self.source), str(self.root / "out.fits")], "fits"),
                  (["-i", str(self.source), str(self.root / "%02d.wbmp")], "image2"),
                  (["-i", str(self.source), "-f", "fits", "-"], "fits")]
-        for code in (1, 73):
-            for args, fmt in cases:
-                with self.subTest(code=code, args=args):
-                    self.assert_delegated(args, fmt, code)
+        for args, fmt in cases:
+            with self.subTest(args=args):
+                actual = subprocess.run([str(BINARY), "-json", "-y", *args],
+                                        capture_output=True, text=True,
+                                        timeout=10, env=self.env)
+                self.assertNotEqual(actual.returncode, 0)
+                doc = json.loads(actual.stdout.strip())
+                self.assertFalse(doc["ok"])
+                self.assertEqual(doc["tier"], "unsupported")
+                self.assertEqual(doc["format"], fmt)
+                self.assertFalse(self.log.exists())
 
     def test_unknown_suffix_and_invalid_explicit_format_remain_rejected(self):
         for suffix in ("fitsx", "wbmpx", "unknown"):

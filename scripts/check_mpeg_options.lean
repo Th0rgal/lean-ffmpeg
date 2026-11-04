@@ -44,17 +44,16 @@ def main : IO Unit := do
   check "parse errors" plan.errors.isEmpty
   check "ordered ext" (ext.mpegOptions == pairs)
   check "ordered plan" (plan.mpegOptions == pairs)
-  check "delegation marker" ext.hasExtraDelegatedFlags
-  check "delegated tier" (plan.backend.tier == .delegatedFaithful)
+  check "out-of-scope marker" ext.hasExtraDelegatedFlags
+  check "unsupported fail-closed tier" (plan.backend.tier == .unsupported)
+  check "delegated container disabled" (!plan.backend.delegatedContainer)
+  check "fallback disabled" (!plan.backend.fallbackAllowed)
   let rendered := renderPlanIRArgv plan true
   check "rendered MPEG pair order" (mpegPairs rendered == pairs)
   check "exact canonical argv"
     (rendered == ["-nostdin", "-n", "-v", "info", "-i", "input.mp4", "-c:v", "libx264"] ++
       optionArgs ++ ["output.mp4"])
   check "canonical round trip" ((parseArgsToPlanIR (planIRToCliArgs plan)).mpegOptions == pairs)
-  check "no-passthrough builder" ((buildDelegatedFfmpegArgv plan).toList == rendered)
-  check "original-argv builder"
-    ((buildDelegatedFfmpegArgv plan ext.passthroughArgs).toList == ["-nostdin", "-n"] ++ args)
   let native := parseArgsToPlanIR (baseArgs ++ ["output.mp4"])
   check "native absent" (native.backend.tier == .translatedPartial && native.mpegOptions.isEmpty)
   for flag in ["-mpv_flags", "-intra_vlc", "-data_partitioning"] do
@@ -65,6 +64,4 @@ def main : IO Unit := do
   check "empty argv rejected" (!verifyExecArgvHygiene [])
   check "empty token rejected" (!verifyExecArgvHygiene ["-i", ""])
   check "NUL rejected" (!verifyExecArgvHygiene ["-i", "input\x00.mp4"])
-  check "builder empty token gate" ((buildDelegatedFfmpegArgv plan ["-i", ""]).isEmpty)
-  check "builder NUL gate" ((buildDelegatedFfmpegArgv plan ["-i", "bad\x00.mp4"]).isEmpty)
   IO.println "MPEG PlanIR checks passed"

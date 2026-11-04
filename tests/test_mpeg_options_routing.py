@@ -1,9 +1,4 @@
-"""Portable production CLI checks using a synthetic backend; no media decoding.
-
-Author-prepared and not executed during staging. After independent review and a
-separately authorized build, install under tests/ or set LFFMPEG_BINARY to the
-reviewed candidate. The shim records argv and returns the requested status.
-"""
+"""Portable production CLI checks for MPEG option grammar and fail-closed zero-delegation."""
 import json
 import os
 from pathlib import Path
@@ -27,17 +22,17 @@ class MpegOptionsRoutingTests(unittest.TestCase):
         self.source.write_bytes(b"routing-only placeholder; not media")
         self.output = self.root / "output.mp4"
         self.log = self.root / "backend-argv.json"
-        shim = self.root / "backend.py"
+        shim = self.root / "ffmpeg"
         shim.write_text(
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
             "with open(os.environ['MPEG_OPTIONS_LOG'], 'w') as stream:\n"
             "    json.dump(sys.argv[1:], stream)\n"
-            "sys.exit(int(os.environ['MPEG_OPTIONS_EXIT']))\n"
+            "sys.exit(0)\n"
         )
         shim.chmod(0o755)
-        self.env = dict(os.environ, LEANAV_FFMPEG_BIN=str(shim),
-                        MPEG_OPTIONS_LOG=str(self.log), MPEG_OPTIONS_EXIT="0")
+        self.env = dict(os.environ, PATH="/nonexistent",
+                        MPEG_OPTIONS_LOG=str(self.log))
 
     def args(self, options):
         return ["-i", str(self.source), "-c:v", "h264", *options, str(self.output)]
@@ -47,31 +42,33 @@ class MpegOptionsRoutingTests(unittest.TestCase):
                                 text=True, timeout=10, env=self.env)
         return result, json.loads(result.stdout)
 
-    def invoke(self, args, code=0):
+    def invoke(self, args):
         self.log.unlink(missing_ok=True)
         argv = ["-nostdin", "-y", "-v", "error", *args]
         result = subprocess.run([str(BINARY), *argv], capture_output=True,
-                                text=True, timeout=10,
-                                env=dict(self.env, MPEG_OPTIONS_EXIT=str(code)))
+                                text=True, timeout=10, env=self.env)
         return result, argv
 
-    def assert_delegated(self, args, pairs):
+    def assert_parsed_unsupported_fail_closed(self, args, pairs):
         result, plan = self.plan(args)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(plan["error_count"], 0)
-        self.assertEqual(plan["backend"]["tier"], "delegated_faithful")
-        self.assertTrue(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
+        self.assertFalse(plan["backend"]["fallback_allowed"])
         self.assertEqual(plan["mpeg_options"],
                          [{"flag": flag, "value": value} for flag, value in pairs])
-        result, argv = self.invoke(args)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.log.read_text()), argv)
+        result, _ = self.invoke(args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.log.exists())
         self.assertFalse(self.output.exists())
 
     def assert_rejected(self, args):
         result, plan = self.plan(args)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(plan["backend"]["tier"], "unsupported")
+        self.assertFalse(plan["backend"]["delegated_container"])
         result, _ = self.invoke(args)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.log.exists())
@@ -83,37 +80,39 @@ class MpegOptionsRoutingTests(unittest.TestCase):
                   "-cbp_rd+qp_rd-mv0", "+" + "+".join(ATOMS), "mv0+mv0"]
         for value in values:
             with self.subTest(value=value):
-                self.assert_delegated(self.args(["-mpv_flags", value]),
-                                      [("-mpv_flags", value)])
+                self.assert_parsed_unsupported_fail_closed(
+                    self.args(["-mpv_flags", value]), [("-mpv_flags", value)])
 
-    def test_both_boolean_values_force_delegation(self):
+    def test_both_boolean_values_parse_and_fail_closed(self):
         for flag in FLAGS[1:]:
             for value in ("0", "1"):
                 with self.subTest(flag=flag, value=value):
-                    self.assert_delegated(self.args([flag, value]), [(flag, value)])
+                    self.assert_parsed_unsupported_fail_closed(
+                        self.args([flag, value]), [(flag, value)])
 
-    def test_repeated_interleaved_options_preserve_exact_argv_and_plan_order(self):
+    def test_repeated_interleaved_options_preserve_plan_order_and_fail_closed(self):
         pairs = [("-mpv_flags", "+qp_rd"), ("-intra_vlc", "0"),
                  ("-mpv_flags", "-qp_rd+mv0"), ("-data_partitioning", "1"),
                  ("-intra_vlc", "1"), ("-mpv_flags", "0"),
                  ("-data_partitioning", "0")]
         options = [token for pair in pairs for token in pair]
-        self.assert_delegated(self.args(options), pairs)
-        # Original CLI order, including placement around -i and other options.
+        self.assert_parsed_unsupported_fail_closed(self.args(options), pairs)
         args = [*options[:4], "-i", str(self.source), *options[4:8],
                 "-c:v", "mpeg4", *options[8:], str(self.output)]
-        self.assert_delegated(args, pairs)
+        self.assert_parsed_unsupported_fail_closed(args, pairs)
 
-    def test_backend_nonzero_propagates(self):
+    def test_json_fail_closed_diagnostics(self):
         for flag, value in (("-mpv_flags", "+mv0"), ("-intra_vlc", "1"),
                             ("-data_partitioning", "0")):
-            for code in (1, 73):
-                with self.subTest(flag=flag, code=code):
-                    result, argv = self.invoke(self.args([flag, value]), code)
-                    self.assertEqual(result.returncode, code, result.stderr)
-                    self.assertEqual(json.loads(self.log.read_text()), argv)
-                    self.assertIn("Delegated conversion failed!", result.stderr)
-                    self.assertFalse(self.output.exists())
+            with self.subTest(flag=flag):
+                result = subprocess.run([str(BINARY), "-json", "-y", *self.args([flag, value])],
+                                        capture_output=True, text=True, timeout=10, env=self.env)
+                self.assertNotEqual(result.returncode, 0)
+                doc = json.loads(result.stdout.strip())
+                self.assertFalse(doc["ok"])
+                self.assertEqual(doc["tier"], "unsupported")
+                self.assertFalse(self.log.exists())
+                self.assertFalse(self.output.exists())
 
     def test_native_routes_without_options(self):
         for codec in ("h264", "hevc", "av1"):
@@ -125,7 +124,7 @@ class MpegOptionsRoutingTests(unittest.TestCase):
                 self.assertFalse(plan["backend"]["delegated_container"])
                 self.assertEqual(plan["mpeg_options"], [])
 
-    def test_mpv_invalid_values_fail_before_backend(self):
+    def test_mpv_invalid_values_fail_parse(self):
         values = ("", "unknown", "MV0", "all", "none", "default", "1", "32", "63",
                   "0x20", "00", "+0", "-0", "0+mv0", "mv0+0", "1<<5", "2*16",
                   "+", "-", "++mv0", "--mv0", "+-mv0", "-+mv0", "mv0++naq",
@@ -134,13 +133,17 @@ class MpegOptionsRoutingTests(unittest.TestCase):
                   "mv0\t", "mv0\n", "mv0\r", "mv0 naq", "mv0\u00a0", "＋mv0")
         for value in values:
             with self.subTest(value=value):
+                _, plan = self.plan(self.args(["-mpv_flags", value]))
+                self.assertGreater(plan["error_count"], 0)
                 self.assert_rejected(self.args(["-mpv_flags", value]))
 
-    def test_boolean_invalid_values_fail_before_backend(self):
+    def test_boolean_invalid_values_fail_parse(self):
         for flag in FLAGS[1:]:
             for value in ("", "true", "false", "yes", "no", "on", "off", "2", "-1",
                           "01", "00", "+1", "1.0", "0x1", "1+0", " 1", "1 ", "1\n"):
                 with self.subTest(flag=flag, value=value):
+                    _, plan = self.plan(self.args([flag, value]))
+                    self.assertGreater(plan["error_count"], 0)
                     self.assert_rejected(self.args([flag, value]))
 
     def test_missing_values_and_malformed_option_spellings(self):
@@ -163,7 +166,7 @@ class MpegOptionsRoutingTests(unittest.TestCase):
                     self.assert_rejected(self.args([flag, value]))
                     self.assertFalse(marker.exists())
 
-    def test_unsafe_paths_still_fail_before_backend(self):
+    def test_unsafe_paths_still_fail_closed(self):
         for flag, value in (("-mpv_flags", "mv0"), ("-intra_vlc", "0"),
                             ("-data_partitioning", "1")):
             for unsafe in ("https://invalid.example/a.mp4", "/dev/video0",

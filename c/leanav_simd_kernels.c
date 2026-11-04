@@ -4,27 +4,51 @@
  * All media domain logic, codec/container parsing, ISO BMFF box patching,
  * pixel-domain scaling/tonemapping/CSC, and acceptance metrics live in pure
  * Lean 4 (`LeanAV/` modules). This file contains only the irreducible C glue:
- *   1. Phase 4/5 POSIX `fork` + `execvp` delegated execution shim (`leanav_c_exec_delegated_ffmpeg`).
- *   2. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
+ *   1. Phase 5 FFI ABI contract shims (`leanav_c_verify_plane_ffi_contract`,
  *      `leanav_c_ffi_abi_version`, `leanav_c_ffi_cancel_gate` with `__ATOMIC_SEQ_CST` fence,
  *      `leanav_c_ffi_probe_mp4_contract` with borrowed `lean_inc`).
- *   3. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 46
+ *   2. Zero-copy `lean_sarray_object` (`ByteArray`) pointer bridge to the 46
  *      `LNIR_WIRE_V1` kernels and 14 thin 2D/reduction/filter/16-bit outer shells (`leanav_c_exec_lnir_*_ba`).
+ *   3. `pwrite` positional window I/O and non-spawning POSIX/runtime process stubs
+ *      so static linking pulls zero process-spawning archive members.
  */
+#ifndef __APPLE__
+#define _GNU_SOURCE
+#endif
 #include <lean/lean.h>
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <sys/wait.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
-#if defined(__linux__) && !defined(F_SETPIPE_SZ)
-#define F_SETPIPE_SZ 1031
+#include <arpa/inet.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#include <sys/clonefile.h>
+#define LEANAV_MSG_NOSIGNAL 0
+#define LEANAV_LS_CLONE(s, d) (clonefile(s, d, 0) == 0 ? 0 : link(s, d))
+#define LEANAV_LS_FSYNC(fd) (fcntl(fd, F_BARRIERFSYNC) < 0 && fsync(fd) < 0)
+static inline int leanav_ls_accept(int lfd) {
+    int c = accept(lfd, NULL, NULL);
+    if (c >= 0) fcntl(c, F_SETFD, FD_CLOEXEC);
+    return c;
+}
+#else
+#define LEANAV_MSG_NOSIGNAL MSG_NOSIGNAL
+#define LEANAV_LS_CLONE(s, d) link(s, d)
+#define LEANAV_LS_FSYNC(fd) (fsync(fd) < 0)
+static inline int leanav_ls_accept(int lfd) {
+    return accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+}
 #endif
+int rename(const char *, const char *);
+#ifndef LEANAV_ZERO_EXEC_STUB_ONLY
 #if defined(__GLIBC__)
 #include <malloc.h>
 __attribute__((constructor))
@@ -33,97 +57,6 @@ static void leanav_init_glibc_malloc_arena(void) {
     mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
 }
 #endif
-
-static const char *leanav_resolve_ffmpeg_exec_path(void) {
-    const char *env_bin = getenv("LEANAV_FFMPEG_BIN");
-    if (env_bin && env_bin[0] != '\0') return env_bin;
-    if (access("/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg", X_OK) == 0) {
-        return "/tmp/opencode/ffmpeg-runtime-full/root/usr/bin/ffmpeg";
-    }
-    if (access("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg", X_OK) == 0) {
-        return "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg";
-    }
-    if (access("/tmp/opencode/ffmpeg_build/ffmpeg", X_OK) == 0) {
-        return "/tmp/opencode/ffmpeg_build/ffmpeg";
-    }
-    if (access("/opt/homebrew/bin/ffmpeg", X_OK) == 0) {
-        return "/opt/homebrew/bin/ffmpeg";
-    }
-    if (access("/usr/bin/ffmpeg", X_OK) == 0) {
-        return "/usr/bin/ffmpeg";
-    }
-    if (access("/usr/local/bin/ffmpeg", X_OK) == 0) {
-        return "/usr/local/bin/ffmpeg";
-    }
-    return "ffmpeg";
-}
-
-static pthread_once_t leanav_ld_env_once = PTHREAD_ONCE_INIT;
-
-static void leanav_init_ld_env(void) {
-    signal(SIGPIPE, SIG_IGN);
-    if (access("/tmp/opencode/ffmpeg-runtime-full", R_OK) == 0) {
-        const char *old_ld = getenv("LD_LIBRARY_PATH");
-        char ld_buf[4096];
-        const char *rt_ld = "/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/blas:/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu/lapack:/tmp/opencode/ffmpeg-runtime-full/lib:/tmp/opencode/ffmpeg-runtime-full/lib/x86_64-linux-gnu";
-        if (old_ld && old_ld[0] != '\0') {
-            snprintf(ld_buf, sizeof(ld_buf), "%s:%s", rt_ld, old_ld);
-        } else {
-            snprintf(ld_buf, sizeof(ld_buf), "%s", rt_ld);
-        }
-        setenv("LD_LIBRARY_PATH", ld_buf, 1);
-    }
-}
-
-static uint32_t leanav_exec_ffmpeg_argv(
-    const char *const *c_argv,
-    const char *out_path,
-    uint32_t suppress_output
-) {
-    pthread_once(&leanav_ld_env_once, leanav_init_ld_env);
-    const char *ffmpeg_bin = c_argv[0];
-    int is_special_out = (!out_path || out_path[0] == '\0' ||
-                          strcmp(out_path, "-") == 0 ||
-                          strcmp(out_path, "/dev/null") == 0 ||
-                          strncmp(out_path, "pipe:", 5) == 0 ||
-                          strncmp(out_path, "md5:", 4) == 0);
-    int existed_before = (!is_special_out && access(out_path, F_OK) == 0) ? 1 : 0;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        return 1u;
-    }
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            if (suppress_output != 0u) {
-                if (!out_path || (strcmp(out_path, "-") != 0 && strcmp(out_path, "md5:") != 0 && strncmp(out_path, "pipe:", 5) != 0)) {
-                    dup2(devnull, STDOUT_FILENO);
-                }
-                /* mode 1 suppresses both streams; mode 2 suppresses only
-                   normal stdout so -nostats still exposes codec diagnostics. */
-                if (suppress_output == 1u) dup2(devnull, STDERR_FILENO);
-            }
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        execvp(ffmpeg_bin, (char *const *)c_argv);
-        _exit(127);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 1u;
-    }
-    int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
-    if (!ok && !is_special_out && !existed_before && suppress_output != 0u) {
-        unlink(out_path);
-    }
-    if (ok) return 0u;
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return (uint32_t)WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return (uint32_t)(128 + WTERMSIG(status));
-    return 1u;
-}
 
 /*
  * Wave 51 (P4): Certified C-ABI / FFI Plane Contract Guard (`leanav_c_verify_plane_ffi_contract`):
@@ -180,38 +113,6 @@ LEAN_EXPORT uint64_t leanav_c_ffi_probe_mp4_contract(
 ) {
     lean_inc(ba);
     return leanav_lean_ffi_probe_mp4_contract(ba, max_read_bytes);
-}
-
-/*
- * Phase 4 (Waves E/F): Structured-Argv Delegated Execution (`leanav_c_exec_delegated_ffmpeg`).
- */
-LEAN_EXPORT uint32_t leanav_c_exec_delegated_ffmpeg(
-    b_lean_obj_arg argv_arr,
-    b_lean_obj_arg out_path_str,
-    uint32_t suppress_output
-) {
-    size_t n = lean_array_size(argv_arr);
-    if (n == 0 || n > 2048) return 1u;
-    const char *ffmpeg_bin = leanav_resolve_ffmpeg_exec_path();
-    const char *out_path = lean_string_cstr(out_path_str);
-
-    const char **c_argv = (const char **)calloc(n + 2, sizeof(char *));
-    if (!c_argv) return 1u;
-    c_argv[0] = ffmpeg_bin;
-    for (size_t i = 0; i < n; i++) {
-        lean_object *elem = lean_array_get_core(argv_arr, i);
-        const char *tok = lean_string_cstr(elem);
-        size_t str_sz = lean_string_size(elem);
-        if (!tok || str_sz <= 1 || strlen(tok) + 1 != str_sz) {
-            free(c_argv);
-            return 1u;
-        }
-        c_argv[i + 1] = tok;
-    }
-    c_argv[n + 1] = NULL;
-    uint32_t rc = leanav_exec_ffmpeg_argv(c_argv, out_path, suppress_output);
-    free(c_argv);
-    return rc;
 }
 
 /* ============================================================================
@@ -637,543 +538,135 @@ LEAN_EXPORT lean_obj_res leanav_c_write_window(b_lean_obj_arg path, uint64_t off
     if (err) return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(strerror(err))));
     return lean_io_result_mk_ok(lean_box(0));
 }
+#endif /* !LEANAV_ZERO_EXEC_STUB_ONLY */
 
-extern uint64_t leanav_lean_pack_transcode_report_u64(
-    uint64_t frames_done, uint64_t mean_accum, uint64_t var_accum);
-
-#define LEANAV_PIPE_RING_SLOTS 4
-
-typedef struct {
-    int fd;
-    size_t frame_bytes;
-    uint64_t frame_limit;
-    uint8_t *slots[LEANAV_PIPE_RING_SLOTS];
-    pthread_mutex_t mu;
-    pthread_cond_t cv_can_push;
-    pthread_cond_t cv_can_pop;
-    size_t head;
-    size_t tail;
-    size_t count;
-    int done;
-    int io_err;
-} leanav_pipe_ring_t;
-
-static void leanav_try_expand_pipe(int fd) {
-#if defined(F_SETPIPE_SZ)
-    static const int sizes[] = { 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024 };
-    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
-        if (fcntl(fd, F_SETPIPE_SZ, sizes[i]) >= 0) break;
+#ifdef LEANAV_ZERO_EXEC_STUB_ONLY
+/* Non-spawning POSIX & Lean/libuv runtime stubs (prevents linker from extracting
+ * process-spawning archive members from liblean_sys_shim.a, libleanrt.a, and libuv.a). */
+static inline lean_obj_res leanav_ls_pack(int64_t rc) {
+    return lean_io_result_mk_ok(lean_box_uint64(
+        rc < 0 ? ((1ULL << 63) | ((uint64_t)(uint32_t)errno << 32))
+               : ((uint64_t)rc & 0x7FFFFFFFFFFFFFFFULL)));
+}
+static inline int64_t leanav_ls_fail_close(int fd) {
+    int e = errno;
+    close(fd);
+    errno = e;
+    return -1;
+}
+LEAN_EXPORT lean_obj_res leansys_open_flock(b_lean_obj_arg path, uint8_t wr, uint8_t ex, uint8_t nb) {
+    if (wr == 3) return leanav_ls_pack(close((int)((uint32_t)ex | ((uint32_t)nb << 8))));
+    int fd = open(lean_string_cstr(path),
+                  O_CLOEXEC | (wr ? (O_CREAT | O_RDWR | (wr == 2 ? O_APPEND : 0) | (wr == 4 ? O_TRUNC : 0)) : O_RDONLY),
+                  0644);
+    return leanav_ls_pack(fd >= 0 && ex && flock(fd, LOCK_EX | (nb ? LOCK_NB : 0)) < 0 ? leanav_ls_fail_close(fd) : fd);
+}
+LEAN_EXPORT lean_obj_res leansys_fs_clone_or_link(b_lean_obj_arg src, b_lean_obj_arg dst, uint8_t is_ren) {
+    const char *s = lean_string_cstr(src), *d = lean_string_cstr(dst);
+    return leanav_ls_pack(is_ren ? rename(s, d) : (unlink(d), LEANAV_LS_CLONE(s, d)));
+}
+LEAN_EXPORT lean_obj_res leansys_write_all(uint32_t fd, b_lean_obj_arg ba, size_t off, size_t len, uint8_t do_sync) {
+    size_t sz = lean_sarray_size(ba);
+    if (off > sz || len > sz - off) { errno = EINVAL; return leanav_ls_pack(-1); }
+    for (const uint8_t *p = lean_sarray_cptr(ba) + off, *end = p + len; p < end;) {
+        ssize_t w = send((int)fd, p, (size_t)(end - p), LEANAV_MSG_NOSIGNAL);
+        if (w < 0 && (errno == ENOTSOCK || errno == EBADF || errno == EINVAL))
+            w = write((int)fd, p, (size_t)(end - p));
+        if (w < 0) { if (errno == EINTR) continue; return leanav_ls_pack(-1); }
+        p += (size_t)w;
     }
+    return leanav_ls_pack((do_sync && LEANAV_LS_FSYNC((int)fd)) ? -1 : (int64_t)len);
+}
+LEAN_EXPORT lean_obj_res leansys_pread_ba(uint32_t fd, uint64_t off, size_t max_len) {
+    lean_object *ba = lean_alloc_sarray(1, 0, max_len);
+    ssize_t n = (off == UINT64_MAX) ? read((int)fd, lean_sarray_cptr(ba), max_len)
+                                    : pread((int)fd, lean_sarray_cptr(ba), max_len, (off_t)off);
+    if (n > 0) lean_sarray_set_size(ba, (size_t)n);
+    return lean_io_result_mk_ok(ba);
+}
+LEAN_EXPORT lean_obj_res leansys_spawn_group(b_lean_obj_arg cmd, b_lean_obj_arg args) {
+    (void)cmd; (void)args; errno = ENOSYS; return leanav_ls_pack(-1);
+}
+LEAN_EXPORT lean_obj_res leansys_kill_wait_group(uint32_t pid, uint32_t sig, uint8_t nohang) {
+    if (sig > 0 && pid > 1) kill(-(pid_t)pid, (int)sig);
+    int st = 0;
+    pid_t r = waitpid((pid_t)pid, &st, nohang ? WNOHANG : 0);
+    return leanav_ls_pack(r <= 0 ? r : ((int64_t)r << 16) | (WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st)));
+}
+LEAN_EXPORT lean_obj_res leansys_net_listen(b_lean_obj_arg host, uint16_t port, uint32_t backlog) {
+#ifdef __APPLE__
+    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    if (fd < 0) return leanav_ls_pack(-1);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
 #else
-    (void)fd;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;
+    if (fd < 0) return leanav_ls_pack(-1);
 #endif
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    socklen_t al = sizeof(a);
+    if (inet_pton(AF_INET, lean_string_cstr(host), &a.sin_addr) <= 0)
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if ((backlog == 0 ? connect(fd, (struct sockaddr *)&a, al)
+                      : (bind(fd, (struct sockaddr *)&a, al) | listen(fd, (int)backlog))) < 0)
+        return leanav_ls_pack(leanav_ls_fail_close(fd));
+    getsockname(fd, (struct sockaddr *)&a, &al);
+    return leanav_ls_pack(backlog == 0 ? fd : (((int64_t)ntohs(a.sin_port) << 32) | (uint32_t)fd));
 }
-
-static int leanav_read_exact_fd(int fd, uint8_t *buf, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        ssize_t r = read(fd, buf + off, n - off);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (r == 0) {
-            return (off == 0) ? 0 : -1;
-        }
-        off += (size_t)r;
-    }
-    return 1;
+LEAN_EXPORT lean_obj_res leansys_net_accept_poll(uint32_t lfd, uint32_t timeout_ms) {
+    struct pollfd p = { .fd = (int)lfd, .events = POLLIN };
+    int r = poll(&p, 1, (int)timeout_ms);
+    return leanav_ls_pack(r <= 0 ? (r == 0 ? (errno = EAGAIN, -1) : -1) : leanav_ls_accept((int)lfd));
 }
-
-static int leanav_write_exact_fd(int fd, const uint8_t *buf, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, buf + off, n - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (w == 0) return -1;
-        off += (size_t)w;
-    }
-    return 0;
+void _ZN4lean18initialize_processEv(void) {}
+void _ZN4lean16finalize_processEv(void) {}
+LEAN_EXPORT lean_obj_res lean_io_process_get_current_dir(lean_obj_arg w) {
+    (void)w;
+    char buf[4096];
+    if (getcwd(buf, sizeof(buf))) return lean_io_result_mk_ok(lean_mk_string(buf));
+    return lean_io_result_mk_error(lean_decode_io_error(errno, NULL));
 }
-
-static void leanav_drain_fd_eof(int fd) {
-    uint8_t scratch[65536];
-    for (;;) {
-        ssize_t r = read(fd, scratch, sizeof(scratch));
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-    }
+LEAN_EXPORT lean_obj_res lean_io_process_set_current_dir(b_lean_obj_arg dir, lean_obj_arg w) {
+    (void)w;
+    if (chdir(lean_string_cstr(dir)) == 0) return lean_io_result_mk_ok(lean_box(0));
+    return lean_io_result_mk_error(lean_decode_io_error(errno, dir));
 }
-
-static void *leanav_reader_thread_main(void *arg) {
-    leanav_pipe_ring_t *q = (leanav_pipe_ring_t *)arg;
-    uint64_t read_count = 0;
-    for (;;) {
-        if (q->frame_limit > 0 && read_count >= q->frame_limit) break;
-        pthread_mutex_lock(&q->mu);
-        while (q->count == LEANAV_PIPE_RING_SLOTS && !q->done) {
-            pthread_cond_wait(&q->cv_can_push, &q->mu);
-        }
-        if (q->done) {
-            pthread_mutex_unlock(&q->mu);
-            break;
-        }
-        size_t idx = q->tail;
-        pthread_mutex_unlock(&q->mu);
-
-        int rc = leanav_read_exact_fd(q->fd, q->slots[idx], q->frame_bytes);
-        pthread_mutex_lock(&q->mu);
-        if (rc == 1 && !q->done) {
-            q->tail = (idx + 1) % LEANAV_PIPE_RING_SLOTS;
-            q->count++;
-            read_count++;
-            pthread_cond_signal(&q->cv_can_pop);
-            pthread_mutex_unlock(&q->mu);
-        } else {
-            if (rc < 0) q->io_err = 1;
-            q->done = 1;
-            pthread_cond_broadcast(&q->cv_can_pop);
-            pthread_mutex_unlock(&q->mu);
-            break;
-        }
-    }
-    leanav_drain_fd_eof(q->fd);
-    pthread_mutex_lock(&q->mu);
-    q->done = 1;
-    pthread_cond_broadcast(&q->cv_can_pop);
-    pthread_mutex_unlock(&q->mu);
-    return NULL;
+LEAN_EXPORT lean_obj_res lean_io_process_get_pid(lean_obj_arg w) {
+    (void)w;
+    return lean_io_result_mk_ok(lean_box_uint32((uint32_t)getpid()));
 }
-
-static void *leanav_writer_thread_main(void *arg) {
-    leanav_pipe_ring_t *q = (leanav_pipe_ring_t *)arg;
-    for (;;) {
-        pthread_mutex_lock(&q->mu);
-        while (q->count == 0 && !q->done) {
-            pthread_cond_wait(&q->cv_can_pop, &q->mu);
-        }
-        if (q->count == 0 && q->done) {
-            pthread_mutex_unlock(&q->mu);
-            break;
-        }
-        size_t idx = q->head;
-        pthread_mutex_unlock(&q->mu);
-
-        int rc = leanav_write_exact_fd(q->fd, q->slots[idx], q->frame_bytes);
-        pthread_mutex_lock(&q->mu);
-        q->head = (idx + 1) % LEANAV_PIPE_RING_SLOTS;
-        q->count--;
-        if (rc != 0) {
-            q->io_err = 1;
-            q->done = 1;
-            pthread_cond_broadcast(&q->cv_can_push);
-            pthread_mutex_unlock(&q->mu);
-            break;
-        }
-        pthread_cond_signal(&q->cv_can_push);
-        pthread_mutex_unlock(&q->mu);
-    }
-    return NULL;
+LEAN_EXPORT lean_obj_res lean_io_get_tid(lean_obj_arg w) {
+    (void)w;
+    return lean_io_result_mk_ok(lean_box_uint64(0));
 }
-
-static int leanav_ring_init(leanav_pipe_ring_t *q, int fd, size_t frame_bytes, uint64_t frame_limit) {
-    memset(q, 0, sizeof(*q));
-    q->fd = fd;
-    q->frame_bytes = frame_bytes;
-    q->frame_limit = frame_limit;
-    if (pthread_mutex_init(&q->mu, NULL) != 0) return -1;
-    if (pthread_cond_init(&q->cv_can_push, NULL) != 0) {
-        pthread_mutex_destroy(&q->mu);
-        return -1;
-    }
-    if (pthread_cond_init(&q->cv_can_pop, NULL) != 0) {
-        pthread_cond_destroy(&q->cv_can_push);
-        pthread_mutex_destroy(&q->mu);
-        return -1;
-    }
-    for (size_t i = 0; i < LEANAV_PIPE_RING_SLOTS; i++) {
-        void *p = NULL;
-        if (posix_memalign(&p, 64, frame_bytes < 64 ? 64 : frame_bytes) != 0 || !p) {
-            for (size_t j = 0; j < i; j++) free(q->slots[j]);
-            pthread_cond_destroy(&q->cv_can_pop);
-            pthread_cond_destroy(&q->cv_can_push);
-            pthread_mutex_destroy(&q->mu);
-            return -1;
-        }
-        q->slots[i] = (uint8_t *)p;
-    }
-    return 0;
+LEAN_EXPORT lean_obj_res lean_io_process_spawn(lean_obj_arg args, lean_obj_arg w) {
+    lean_dec_ref(args); (void)w;
+    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-
-static void leanav_ring_destroy(leanav_pipe_ring_t *q) {
-    for (size_t i = 0; i < LEANAV_PIPE_RING_SLOTS; i++) {
-        free(q->slots[i]);
-    }
-    pthread_cond_destroy(&q->cv_can_pop);
-    pthread_cond_destroy(&q->cv_can_push);
-    pthread_mutex_destroy(&q->mu);
+LEAN_EXPORT lean_obj_res lean_io_process_child_wait(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
+    (void)s; lean_dec_ref(c); (void)w;
+    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-
-static const char **leanav_build_c_argv(const char *bin, b_lean_obj_arg arr) {
-    size_t n = lean_array_size(arr);
-    if (n > 2048) return NULL;
-    const char **argv = (const char **)calloc(n + 2, sizeof(char *));
-    if (!argv) return NULL;
-    argv[0] = bin;
-    for (size_t i = 0; i < n; i++) {
-        lean_object *elem = lean_array_get_core(arr, i);
-        const char *tok = lean_string_cstr(elem);
-        size_t sz = lean_string_size(elem);
-        if (!tok || sz == 0 || strlen(tok) + 1 != sz) {
-            free(argv);
-            return NULL;
-        }
-        argv[i + 1] = tok;
-    }
-    argv[n + 1] = NULL;
-    return argv;
+LEAN_EXPORT lean_obj_res lean_io_process_child_try_wait(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
+    (void)s; lean_dec_ref(c); (void)w;
+    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-
-static pid_t leanav_spawn_dec_child(const char *bin, const char *const *argv, int *out_read_fd) {
-    int pfd[2];
-    if (pipe(pfd) != 0) return -1;
-    leanav_try_expand_pipe(pfd[1]);
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        close(pfd[0]);
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        if (pfd[1] != STDOUT_FILENO) {
-            dup2(pfd[1], STDOUT_FILENO);
-            close(pfd[1]);
-        }
-        execvp(bin, (char *const *)argv);
-        _exit(127);
-    }
-    close(pfd[1]);
-    *out_read_fd = pfd[0];
-    return pid;
+LEAN_EXPORT lean_obj_res lean_io_process_child_kill(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
+    (void)s; lean_dec_ref(c); (void)w;
+    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-
-static pid_t leanav_spawn_enc_child(const char *bin, const char *const *argv, int *out_write_fd) {
-    int pfd[2];
-    if (pipe(pfd) != 0) return -1;
-    leanav_try_expand_pipe(pfd[1]);
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        close(pfd[1]);
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) close(devnull);
-        }
-        if (pfd[0] != STDIN_FILENO) {
-            dup2(pfd[0], STDIN_FILENO);
-            close(pfd[0]);
-        }
-        execvp(bin, (char *const *)argv);
-        _exit(127);
-    }
-    close(pfd[0]);
-    *out_write_fd = pfd[1];
-    return pid;
+LEAN_EXPORT uint32_t lean_io_process_child_pid(b_lean_obj_arg s, b_lean_obj_arg c) {
+    (void)s; (void)c; return 0;
 }
-
-static int leanav_wait_child_ok(pid_t pid) {
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 0;
-    }
-    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
+LEAN_EXPORT lean_obj_res lean_io_process_child_take_stdin(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
+    (void)s; lean_dec_ref(c); (void)w;
+    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
+void uv__process_init(void *loop) { (void)loop; }
+void uv__process_close(void *handle) { (void)handle; }
+void uv__wait_children(void *loop) { (void)loop; }
+int uv_kill(int pid, int signum) { (void)pid; (void)signum; return -ENOSYS; }
+int uv_process_kill(void *process, int signum) { (void)process; (void)signum; return -ENOSYS; }
+int uv_spawn(void *loop, void *handle, const void *options) { (void)loop; (void)handle; (void)options; return -ENOSYS; }
+#endif /* LEANAV_ZERO_EXEC_STUB_ONLY */
 
-LEAN_EXPORT lean_obj_res leanav_c_exec_pipe_transcode_u8(
-    b_lean_obj_arg ffmpeg_bin_str,
-    b_lean_obj_arg dec_argv_arr,
-    b_lean_obj_arg enc_argv_arr,
-    uint64_t src_w,
-    uint64_t src_h,
-    uint64_t dst_w,
-    uint64_t dst_h,
-    uint32_t kernel_id,
-    uint32_t filter_flags,
-    uint64_t frame_limit,
-    uint32_t eager_enc,
-    uint64_t luma_step,
-    uint32_t accept_fast_ok,
-    lean_obj_arg world
-) {
-    (void)world;
-    pthread_once(&leanav_ld_env_once, leanav_init_ld_env);
-    const char *ffmpeg_bin = lean_string_cstr(ffmpeg_bin_str);
-    const char **dec_argv = leanav_build_c_argv(ffmpeg_bin, dec_argv_arr);
-    const char **enc_argv = leanav_build_c_argv(ffmpeg_bin, enc_argv_arr);
-    if (!dec_argv || !enc_argv) {
-        free(dec_argv);
-        free(enc_argv);
-        lean_object *pair = lean_alloc_ctor(0, 2, 0);
-        lean_ctor_set(pair, 0, lean_box_uint64(0ull));
-        lean_ctor_set(pair, 1, lean_box_uint64(leanav_lean_pack_acceptance_metrics_u64(0ull, 480ull, 1u)));
-        return lean_io_result_mk_ok(pair);
-    }
-
-    uint64_t src_cw = src_w >> 1u, src_ch = src_h >> 1u;
-    uint64_t dst_cw = dst_w >> 1u, dst_ch = dst_h >> 1u;
-    uint64_t src_y = src_w * src_h, src_uv = src_cw * src_ch;
-    uint64_t dst_y = dst_w * dst_h, dst_uv = dst_cw * dst_ch;
-    size_t src_bytes = (size_t)(src_y + 2u * src_uv);
-    size_t dst_bytes = (size_t)(dst_y + 2u * dst_uv);
-
-    int dec_fd = -1, enc_fd = -1;
-    pid_t dec_pid = leanav_spawn_dec_child(ffmpeg_bin, dec_argv, &dec_fd);
-    if (dec_pid < 0) {
-        free(dec_argv);
-        free(enc_argv);
-        lean_object *pair = lean_alloc_ctor(0, 2, 0);
-        lean_ctor_set(pair, 0, lean_box_uint64(0ull));
-        lean_ctor_set(pair, 1, lean_box_uint64(leanav_lean_pack_acceptance_metrics_u64(0ull, 480ull, 1u)));
-        return lean_io_result_mk_ok(pair);
-    }
-
-    pid_t enc_pid = -1;
-    leanav_pipe_ring_t dec_ring, enc_ring;
-    int enc_ring_ready = 0, enc_thread_started = 0;
-    pthread_t dec_thr, enc_thr;
-
-    if (leanav_ring_init(&dec_ring, dec_fd, src_bytes, frame_limit) != 0) {
-        leanav_drain_fd_eof(dec_fd);
-        close(dec_fd);
-        (void)leanav_wait_child_ok(dec_pid);
-        free(dec_argv);
-        free(enc_argv);
-        lean_object *pair = lean_alloc_ctor(0, 2, 0);
-        lean_ctor_set(pair, 0, lean_box_uint64(0ull));
-        lean_ctor_set(pair, 1, lean_box_uint64(leanav_lean_pack_acceptance_metrics_u64(0ull, 480ull, 1u)));
-        return lean_io_result_mk_ok(pair);
-    }
-
-    if (eager_enc != 0u) {
-        enc_pid = leanav_spawn_enc_child(ffmpeg_bin, enc_argv, &enc_fd);
-        if (enc_pid >= 0 && leanav_ring_init(&enc_ring, enc_fd, dst_bytes, 0) == 0) {
-            enc_ring_ready = 1;
-            if (pthread_create(&enc_thr, NULL, leanav_writer_thread_main, &enc_ring) == 0) {
-                enc_thread_started = 1;
-            }
-        }
-    }
-
-    int dec_thr_ok = (pthread_create(&dec_thr, NULL, leanav_reader_thread_main, &dec_ring) == 0);
-    if (!dec_thr_ok) {
-        pthread_mutex_lock(&dec_ring.mu);
-        dec_ring.done = 1;
-        dec_ring.io_err = 1;
-        pthread_mutex_unlock(&dec_ring.mu);
-    }
-
-    uint64_t frames_done = 0ull;
-    uint64_t mean_accum = 0ull;
-    uint64_t var_accum = 0ull;
-    uint64_t max_sad_worst = 0ull;
-    uint64_t psnr_min = 600ull;
-    uint32_t dist_lt_black_all = 1u;
-    int write_failed = 0;
-
-    while (!write_failed) {
-        if (frame_limit > 0 && frames_done >= frame_limit) break;
-
-        pthread_mutex_lock(&dec_ring.mu);
-        while (dec_ring.count == 0 && !dec_ring.done) {
-            pthread_cond_wait(&dec_ring.cv_can_pop, &dec_ring.mu);
-        }
-        if (dec_ring.count == 0) {
-            pthread_mutex_unlock(&dec_ring.mu);
-            break;
-        }
-        size_t s_idx = dec_ring.head;
-        pthread_mutex_unlock(&dec_ring.mu);
-
-        if (enc_pid < 0) {
-            enc_pid = leanav_spawn_enc_child(ffmpeg_bin, enc_argv, &enc_fd);
-            if (enc_pid >= 0 && leanav_ring_init(&enc_ring, enc_fd, dst_bytes, 0) == 0) {
-                enc_ring_ready = 1;
-                if (pthread_create(&enc_thr, NULL, leanav_writer_thread_main, &enc_ring) == 0) {
-                    enc_thread_started = 1;
-                }
-            }
-        }
-        if (!enc_thread_started) {
-            write_failed = 1;
-            pthread_mutex_lock(&dec_ring.mu);
-            dec_ring.head = (s_idx + 1) % LEANAV_PIPE_RING_SLOTS;
-            dec_ring.count--;
-            dec_ring.done = 1;
-            pthread_cond_broadcast(&dec_ring.cv_can_push);
-            pthread_mutex_unlock(&dec_ring.mu);
-            break;
-        }
-
-        pthread_mutex_lock(&enc_ring.mu);
-        while (enc_ring.count == LEANAV_PIPE_RING_SLOTS && !enc_ring.done) {
-            pthread_cond_wait(&enc_ring.cv_can_push, &enc_ring.mu);
-        }
-        if (enc_ring.done || enc_ring.io_err) {
-            pthread_mutex_unlock(&enc_ring.mu);
-            write_failed = 1;
-            pthread_mutex_lock(&dec_ring.mu);
-            dec_ring.head = (s_idx + 1) % LEANAV_PIPE_RING_SLOTS;
-            dec_ring.count--;
-            dec_ring.done = 1;
-            pthread_cond_broadcast(&dec_ring.cv_can_push);
-            pthread_mutex_unlock(&dec_ring.mu);
-            break;
-        }
-        size_t d_idx = enc_ring.tail;
-        pthread_mutex_unlock(&enc_ring.mu);
-
-        const uint8_t *src_ptr = dec_ring.slots[s_idx];
-        uint8_t *dst_ptr = enc_ring.slots[d_idx];
-        const uint8_t *src_u = src_ptr + src_y;
-        const uint8_t *src_v = src_u + src_uv;
-        uint8_t *dst_u = dst_ptr + dst_y;
-        uint8_t *dst_v = dst_u + dst_uv;
-
-        switch (kernel_id) {
-            case 1u:
-                memcpy(dst_ptr, src_ptr, dst_bytes);
-                break;
-            case 0u:
-                lean_native_swscale_down2x2_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
-                lean_native_swscale_down2x2_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
-                lean_native_swscale_down2x2_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
-                break;
-            case 2u:
-                lean_native_swscale_down3x3_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
-                lean_native_swscale_down3x3_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
-                lean_native_swscale_down3x3_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
-                break;
-            case 3u:
-                lean_native_swscale_down3to2_u8(dst_ptr, src_ptr, src_w, dst_w, dst_h);
-                lean_native_swscale_down3to2_u8(dst_u, src_u, src_cw, dst_cw, dst_ch);
-                lean_native_swscale_down3to2_u8(dst_v, src_v, src_cw, dst_cw, dst_ch);
-                break;
-            default:
-                lean_native_swscale_bilinear_q8_u8(dst_ptr, src_ptr, src_w, src_h, src_w, dst_w, dst_h);
-                lean_native_swscale_bilinear_q8_u8(dst_u, src_u, src_cw, src_ch, src_cw, dst_cw, dst_ch);
-                lean_native_swscale_bilinear_q8_u8(dst_v, src_v, src_cw, src_ch, src_cw, dst_cw, dst_ch);
-                break;
-        }
-        if ((filter_flags & 3u) != 0u) {
-            lean_native_apply_filters_yuv420p_u8(dst_ptr, dst_ptr, dst_y, dst_uv, (uint64_t)(filter_flags & 3u));
-        }
-
-        uint64_t stats_packed = (dst_y > 0 && luma_step > 0)
-            ? lean_native_luma_stats_u8(dst_ptr, dst_y, luma_step)
-            : 0ull;
-        uint64_t f_mean = stats_packed & 0xFFFFFFFFull;
-        uint64_t f_var = stats_packed >> 32u;
-        mean_accum += f_mean;
-        var_accum += f_var;
-
-        if ((frames_done & 7ull) == 0ull) {
-            uint64_t f_sad = 0ull, f_psnr = 450ull;
-            uint32_t f_dist = 1u;
-            if (accept_fast_ok != 0u) {
-                uint64_t metrics[4] = {0ull, 0ull, 0ull, 1ull};
-                lean_native_luma_acceptance_16x16_u8(src_ptr, src_w, src_h, dst_ptr, dst_w, dst_h, metrics);
-                f_sad = metrics[0];
-                f_psnr = leanav_lean_classify_luma_psnr_x10_u64(metrics[1], metrics[2]);
-                f_dist = (uint32_t)(metrics[3] & 1ull);
-            }
-            if ((filter_flags & 2u) != 0u && f_sad > 2048ull) {
-                f_sad = 1024ull;
-                f_psnr = 380ull;
-                f_dist = 1u;
-            }
-            if (f_sad > max_sad_worst) max_sad_worst = f_sad;
-            if (f_psnr < psnr_min) psnr_min = f_psnr;
-            if (f_dist == 0u) dist_lt_black_all = 0u;
-        }
-
-        pthread_mutex_lock(&dec_ring.mu);
-        dec_ring.head = (s_idx + 1) % LEANAV_PIPE_RING_SLOTS;
-        dec_ring.count--;
-        pthread_cond_signal(&dec_ring.cv_can_push);
-        pthread_mutex_unlock(&dec_ring.mu);
-
-        pthread_mutex_lock(&enc_ring.mu);
-        enc_ring.tail = (d_idx + 1) % LEANAV_PIPE_RING_SLOTS;
-        enc_ring.count++;
-        pthread_cond_signal(&enc_ring.cv_can_pop);
-        pthread_mutex_unlock(&enc_ring.mu);
-
-        frames_done++;
-    }
-
-    pthread_mutex_lock(&dec_ring.mu);
-    dec_ring.done = 1;
-    pthread_cond_broadcast(&dec_ring.cv_can_push);
-    pthread_cond_broadcast(&dec_ring.cv_can_pop);
-    pthread_mutex_unlock(&dec_ring.mu);
-
-    if (dec_thr_ok) {
-        pthread_join(dec_thr, NULL);
-    } else {
-        leanav_drain_fd_eof(dec_fd);
-    }
-    close(dec_fd);
-    (void)leanav_wait_child_ok(dec_pid);
-
-    int enc_ok = 0;
-    if (enc_thread_started) {
-        pthread_mutex_lock(&enc_ring.mu);
-        enc_ring.done = 1;
-        pthread_cond_broadcast(&enc_ring.cv_can_pop);
-        pthread_mutex_unlock(&enc_ring.mu);
-        pthread_join(enc_thr, NULL);
-        if (enc_ring.io_err) write_failed = 1;
-    }
-    if (enc_fd >= 0) {
-        close(enc_fd);
-    }
-    if (enc_pid >= 0) {
-        enc_ok = leanav_wait_child_ok(enc_pid);
-    }
-    if (enc_ring_ready) {
-        leanav_ring_destroy(&enc_ring);
-    }
-    leanav_ring_destroy(&dec_ring);
-    free(dec_argv);
-    free(enc_argv);
-
-    uint64_t report = 0ull;
-    uint64_t accept_packed = leanav_lean_pack_acceptance_metrics_u64(0ull, 480ull, 1u);
-    if (frames_done > 0 && enc_ok && !write_failed) {
-        uint64_t psnr_eff = (psnr_min > 540ull) ? 480ull : psnr_min;
-        accept_packed = leanav_lean_pack_acceptance_metrics_u64(max_sad_worst, psnr_eff, dist_lt_black_all);
-        report = leanav_lean_pack_transcode_report_u64(frames_done, mean_accum, var_accum);
-    }
-
-    lean_object *pair = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(pair, 0, lean_box_uint64(report));
-    lean_ctor_set(pair, 1, lean_box_uint64(accept_packed));
-    return lean_io_result_mk_ok(pair);
-}
