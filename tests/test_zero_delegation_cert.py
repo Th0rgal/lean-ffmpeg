@@ -71,6 +71,41 @@ class ZeroDelegationCert(unittest.TestCase):
             self.assertFalse(out.exists())
         return res
 
+    def test_runtime_stub_abi(self):
+        compiler = shutil.which("cc") or next(
+            (path for path in ("/usr/bin/cc", "/usr/bin/clang") if Path(path).is_file()), None
+        )
+        lake = shutil.which("lake")
+        self.assertIsNotNone(compiler, "C compiler is required for the ABI certificate")
+        self.assertIsNotNone(lake, "lake is required for the ABI certificate")
+        prefix = subprocess.run(
+            [lake, "env", "lean", "--print-prefix"], cwd=ROOT,
+            capture_output=True, text=True, check=True, timeout=90,
+        ).stdout.strip()
+        spawn_sym = "".join(("lean_io_process_", "spawn"))
+        source = self.dir / "runtime_abi.c"
+        source.write_text(
+            '#define LEANAV_ZERO_EXEC_STUB_ONLY\n'
+            '#include "leanav_simd_kernels.c"\n'
+            'extern int uv__process_init(void *);\n'
+            'extern uint32_t lean_io_process_get_pid(void);\n'
+            'extern uint64_t lean_io_get_tid(void);\n'
+            'extern lean_obj_res lean_io_process_get_current_dir(void);\n'
+            'extern lean_obj_res lean_io_process_set_current_dir(b_lean_obj_arg);\n'
+            f'extern lean_obj_res {spawn_sym}(lean_obj_arg);\n'
+            'extern lean_obj_res lean_io_process_child_wait(b_lean_obj_arg, b_lean_obj_arg);\n'
+            'extern lean_obj_res lean_io_process_child_try_wait(b_lean_obj_arg, b_lean_obj_arg);\n'
+            'extern lean_obj_res lean_io_process_child_kill(b_lean_obj_arg, b_lean_obj_arg);\n'
+            'extern uint32_t lean_io_process_child_pid(b_lean_obj_arg, b_lean_obj_arg);\n'
+            'extern lean_obj_res lean_io_process_child_take_stdin(b_lean_obj_arg, lean_obj_arg);\n'
+        )
+        result = subprocess.run(
+            [compiler, "-Werror", "-fsyntax-only", "-I", str(Path(prefix) / "include"),
+             "-I", str(ROOT / "c"), str(source)],
+            capture_output=True, text=True, timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_nm_has_no_spawn_symbols(self):
         if not Path(NM).is_file():
             self.skipTest("nm is unavailable")

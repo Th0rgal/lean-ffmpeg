@@ -28,6 +28,10 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <pthread.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <sys/clonefile.h>
@@ -620,49 +624,45 @@ LEAN_EXPORT lean_obj_res leansys_net_accept_poll(uint32_t lfd, uint32_t timeout_
 }
 void _ZN4lean18initialize_processEv(void) {}
 void _ZN4lean16finalize_processEv(void) {}
-LEAN_EXPORT lean_obj_res lean_io_process_get_current_dir(lean_obj_arg w) {
-    (void)w;
+LEAN_EXPORT lean_obj_res lean_io_process_get_current_dir(void) {
     char buf[4096];
     if (getcwd(buf, sizeof(buf))) return lean_io_result_mk_ok(lean_mk_string(buf));
     return lean_io_result_mk_error(lean_decode_io_error(errno, NULL));
 }
-LEAN_EXPORT lean_obj_res lean_io_process_set_current_dir(b_lean_obj_arg dir, lean_obj_arg w) {
-    (void)w;
+LEAN_EXPORT lean_obj_res lean_io_process_set_current_dir(b_lean_obj_arg dir) {
     if (chdir(lean_string_cstr(dir)) == 0) return lean_io_result_mk_ok(lean_box(0));
     return lean_io_result_mk_error(lean_decode_io_error(errno, dir));
 }
-LEAN_EXPORT lean_obj_res lean_io_process_get_pid(lean_obj_arg w) {
-    (void)w;
-    return lean_io_result_mk_ok(lean_box_uint32((uint32_t)getpid()));
+LEAN_EXPORT uint32_t lean_io_process_get_pid(void) { return (uint32_t)getpid(); }
+LEAN_EXPORT uint64_t lean_io_get_tid(void) {
+#ifdef __APPLE__
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid); return tid;
+#elif defined(__linux__)
+    return (uint64_t)(pid_t)syscall(SYS_gettid);
+#else
+    return 0;
+#endif
 }
-LEAN_EXPORT lean_obj_res lean_io_get_tid(lean_obj_arg w) {
-    (void)w;
-    return lean_io_result_mk_ok(lean_box_uint64(0));
-}
-LEAN_EXPORT lean_obj_res lean_io_process_spawn(lean_obj_arg args, lean_obj_arg w) {
-    lean_dec_ref(args); (void)w;
+LEAN_EXPORT lean_obj_res lean_io_process_spawn(lean_obj_arg args) {
+    lean_dec_ref(args);
     return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-LEAN_EXPORT lean_obj_res lean_io_process_child_wait(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
-    (void)s; lean_dec_ref(c); (void)w;
-    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+LEAN_EXPORT lean_obj_res lean_io_process_child_wait(b_lean_obj_arg s, b_lean_obj_arg c) {
+    (void)s; (void)c; return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-LEAN_EXPORT lean_obj_res lean_io_process_child_try_wait(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
-    (void)s; lean_dec_ref(c); (void)w;
-    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+LEAN_EXPORT lean_obj_res lean_io_process_child_try_wait(b_lean_obj_arg s, b_lean_obj_arg c) {
+    (void)s; (void)c; return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-LEAN_EXPORT lean_obj_res lean_io_process_child_kill(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
-    (void)s; lean_dec_ref(c); (void)w;
-    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+LEAN_EXPORT lean_obj_res lean_io_process_child_kill(b_lean_obj_arg s, b_lean_obj_arg c) {
+    (void)s; (void)c; return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
 LEAN_EXPORT uint32_t lean_io_process_child_pid(b_lean_obj_arg s, b_lean_obj_arg c) {
     (void)s; (void)c; return 0;
 }
-LEAN_EXPORT lean_obj_res lean_io_process_child_take_stdin(b_lean_obj_arg s, lean_obj_arg c, lean_obj_arg w) {
-    (void)s; lean_dec_ref(c); (void)w;
-    return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
+LEAN_EXPORT lean_obj_res lean_io_process_child_take_stdin(b_lean_obj_arg s, lean_obj_arg c) {
+    (void)s; lean_dec_ref(c); return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-void uv__process_init(void *loop) { (void)loop; }
+int uv__process_init(void *loop) { (void)loop; return 0; }
 void uv__process_close(void *handle) { (void)handle; }
 void uv__wait_children(void *loop) { (void)loop; }
 int uv_kill(int pid, int signum) { (void)pid; (void)signum; return -ENOSYS; }
