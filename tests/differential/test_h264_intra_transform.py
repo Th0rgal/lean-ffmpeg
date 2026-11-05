@@ -8,7 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / ".lake" / "build" / "bin" / "lffmpeg"
-FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg")
+FFMPEG = os.environ.get("LEANAV_TEST_FFMPEG") or os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+ISOLATED = {"PATH": "/nonexistent"}
 
 
 class _BitWriter:
@@ -203,7 +204,7 @@ class H264IntraTransformTests(unittest.TestCase):
     def probe(self, *args):
         res = subprocess.run(
             [str(BINARY), "h264-intra-probe", *(str(a) for a in args)],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60, env=ISOLATED)
         self.assertEqual(res.returncode, 0, res.stderr)
         return [int(x) for x in res.stdout.strip().split(",") if x != ""]
 
@@ -287,12 +288,12 @@ class H264IntraTransformTests(unittest.TestCase):
                             ("1", ["0", "1", "2"]), ("2", ["3"]), ("3", [])):
             res = subprocess.run(
                 [str(BINARY), "h264-intra-probe", "lossless-mb-roundtrip", part, "2", *modes],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, env=ISOLATED)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertTrue(json.loads(res.stdout)["ok"])
         lossy = subprocess.run(
             [str(BINARY), "h264-intra-probe", "lossy-mb", "1", "12", "0"],
-            capture_output=True, text=True, timeout=180)
+            capture_output=True, text=True, timeout=180, env=ISOLATED)
         self.assertEqual(lossy.returncode, 0, lossy.stderr)
         body = json.loads(lossy.stdout)
         self.assertTrue(body["ok"])
@@ -306,7 +307,7 @@ class H264IntraTransformTests(unittest.TestCase):
         for pad in ("0", "3", "7"):
             ipcm = subprocess.run(
                 [str(BINARY), "h264-intra-probe", "ipcm-roundtrip", pad],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, env=ISOLATED)
             self.assertEqual(ipcm.returncode, 0, ipcm.stderr)
             ipcm_body = json.loads(ipcm.stdout)
             self.assertTrue(ipcm_body["ok"])
@@ -331,7 +332,7 @@ class H264IntraTransformTests(unittest.TestCase):
             raw_path.write_bytes(bytes(raw))
             enc = subprocess.run(
                 [str(BINARY), "h264-intra-probe", "ipcm-encode-annexb", str(raw_path), str(h264_path)],
-                capture_output=True, timeout=60)
+                capture_output=True, timeout=60, env=ISOLATED)
             self.assertEqual(enc.returncode, 0, enc.stderr)
             ffmpeg_dec = subprocess.run([
                 FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "h264",
@@ -341,7 +342,7 @@ class H264IntraTransformTests(unittest.TestCase):
             self.assertEqual(decoded_path.read_bytes(), bytes(raw))
             lean_dec = subprocess.run(
                 [str(BINARY), "h264-intra-probe", "ipcm-decode-annexb", str(h264_path), str(td / "lean.yuv")],
-                capture_output=True, timeout=60)
+                capture_output=True, timeout=60, env=ISOLATED)
             self.assertEqual(lean_dec.returncode, 0, lean_dec.stderr)
             self.assertEqual((td / "lean.yuv").read_bytes(), bytes(raw))
 

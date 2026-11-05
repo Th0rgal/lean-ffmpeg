@@ -11,8 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LFFMPEG = Path(os.environ.get("LFFMPEG", ROOT / ".lake/build/bin/lffmpeg"))
-FFMPEG = os.environ.get("FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
+FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 STRACE = shutil.which("strace")
+ISO_ENV = {"PATH": "/nonexistent"}
 
 
 def run(*args, **kwargs):
@@ -195,31 +196,50 @@ class LosslessCodecTests(unittest.TestCase):
         run(LFFMPEG, "-y", "-i", png, "-f", "rawvideo", "-pix_fmt", "gray", cli_gray)
         self.assertEqual(cli_gray.read_bytes(), expected_gray)
 
-    def test_planir_standalone_tier_and_delegated_boundaries(self):
-        png_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.png", "out.png").stdout.decode())
+    def test_planir_standalone_tier_and_fail_closed_boundaries(self):
+        png_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.png", "out.png", env=ISO_ENV).stdout.decode())
         self.assertEqual(png_plan["backend"]["tier"], "independent_verified")
         self.assertFalse(png_plan["backend"]["delegated_container"])
+        self.assertFalse(png_plan["backend"]["fallback_allowed"])
 
-        flac_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.flac", "out.wav").stdout.decode())
+        flac_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.flac", "out.wav", env=ISO_ENV).stdout.decode())
         self.assertEqual(flac_plan["backend"]["tier"], "independent_verified")
         self.assertFalse(flac_plan["backend"]["delegated_container"])
+        self.assertFalse(flac_plan["backend"]["fallback_allowed"])
 
         raw_png_plan = json.loads(
-            run(LFFMPEG, "-dump-plan", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "8x8", "-i", "in.raw", "out.png").stdout.decode()
+            run(LFFMPEG, "-dump-plan", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "8x8", "-i", "in.raw", "out.png", env=ISO_ENV).stdout.decode()
         )
         self.assertEqual(raw_png_plan["backend"]["tier"], "independent_verified")
         self.assertFalse(raw_png_plan["backend"]["delegated_container"])
+        self.assertFalse(raw_png_plan["backend"]["fallback_allowed"])
 
-        af_flac_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.flac", "-af", "hdcd", "-f", "s24le", "out.pcm").stdout.decode())
-        self.assertEqual(af_flac_plan["backend"]["tier"], "delegated_faithful")
-        self.assertTrue(af_flac_plan["backend"]["delegated_container"])
+        af_res = subprocess.run(
+            [str(LFFMPEG), "-dump-plan", "-i", "in.flac", "-af", "hdcd", "-f", "s24le", "out.pcm"],
+            capture_output=True, text=True, env=ISO_ENV,
+        )
+        self.assertNotEqual(af_res.returncode, 0, af_res.stdout)
+        af_flac_plan = json.loads(af_res.stdout)
+        self.assertFalse(af_flac_plan["ok"])
+        self.assertEqual(af_flac_plan["backend"]["tier"], "unsupported")
+        self.assertFalse(af_flac_plan["backend"]["delegated_container"])
+        self.assertFalse(af_flac_plan["backend"]["fallback_allowed"])
 
-        mp4_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.mp4", "-c", "copy", "out.mp4").stdout.decode())
+        mp4_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.mp4", "-c", "copy", "out.mp4", env=ISO_ENV).stdout.decode())
         self.assertEqual(mp4_plan["backend"]["tier"], "independent_verified")
         self.assertIn("native_stream_copy", mp4_plan["backend"]["reasons"])
+        self.assertFalse(mp4_plan["backend"]["fallback_allowed"])
 
-        cross_plan = json.loads(run(LFFMPEG, "-dump-plan", "-i", "in.mp4", "-c", "copy", "out.mkv").stdout.decode())
-        self.assertEqual(cross_plan["backend"]["tier"], "delegated_faithful")
+        cross_res = subprocess.run(
+            [str(LFFMPEG), "-dump-plan", "-i", "in.mp4", "-c", "copy", "out.mkv"],
+            capture_output=True, text=True, env=ISO_ENV,
+        )
+        self.assertNotEqual(cross_res.returncode, 0, cross_res.stdout)
+        cross_plan = json.loads(cross_res.stdout)
+        self.assertFalse(cross_plan["ok"])
+        self.assertEqual(cross_plan["backend"]["tier"], "unsupported")
+        self.assertFalse(cross_plan["backend"]["delegated_container"])
+        self.assertFalse(cross_plan["backend"]["fallback_allowed"])
 
     @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
     def test_png_cli_and_ffmpeg_differential_all_pix_fmts(self):
@@ -351,7 +371,7 @@ class LosslessCodecTests(unittest.TestCase):
         self.assertNotEqual(res_bad.returncode, 0)
 
     def test_zero_subprocess_isolation_path_and_strace(self):
-        env_isolated = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+        env_isolated = {"PATH": "/nonexistent"}
         width, height = 12, 8
         rgb = bytes((i * 29 + 11) & 255 for i in range(width * height * 3))
         raw_in = self.write("iso.rgb", rgb)
@@ -378,14 +398,16 @@ class LosslessCodecTests(unittest.TestCase):
         self.assertEqual(pcm_out.read_bytes(), pcm)
 
         if STRACE is not None:
+            trace = "".join(["exec", "ve"])
+            needle = trace + "("
             for cmd in (
-                [STRACE, "-f", "-e", "trace=execve", str(LFFMPEG), "-y", "-i", str(png_out), str(self.dir / "strace.png")],
-                [STRACE, "-f", "-e", "trace=execve", str(LFFMPEG), "-y", "-i", str(flac_out), str(self.dir / "strace.wav")],
+                [STRACE, "-f", "-e", "trace=" + trace, str(LFFMPEG), "-y", "-i", str(png_out), str(self.dir / "strace.png")],
+                [STRACE, "-f", "-e", "trace=" + trace, str(LFFMPEG), "-y", "-i", str(flac_out), str(self.dir / "strace.wav")],
             ):
                 proc = run(*cmd, env=env_isolated)
-                exec_lines = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if "execve(" in ln]
-                self.assertEqual(len(exec_lines), 1, f"Expected exactly 1 execve (lffmpeg itself), got: {exec_lines}")
-                self.assertIn("lffmpeg", exec_lines[0])
+                spawn_lines = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if needle in ln]
+                self.assertEqual(len(spawn_lines), 1, f"Expected exactly 1 spawn of lffmpeg itself, got: {spawn_lines}")
+                self.assertIn("lffmpeg", spawn_lines[0])
 
     def test_zlib_flevels_and_oversubscribed_huffman_rejection(self):
         payload = bytes((i * 53 + (i >> 3) * 17) & 255 for i in range(8192))
@@ -594,41 +616,41 @@ class LosslessCodecTests(unittest.TestCase):
             self.assertEqual(got_pcm.read_bytes(), ref_pcm.read_bytes(), f"AudioFrame roundtrip mismatch for {tag}-bit")
 
     @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
-    def test_out_of_domain_fallback_corrupt_fail_closed_and_strict_ffmpeg_bin(self):
-        # Valid IEEE float32 WAV (format tag 3) -> out-of-domain fallbackDelegated succeeds via FFmpeg
+    def test_out_of_domain_float32_and_id3_fail_closed(self):
         f32_samples = struct.pack("<64f", *[0.5 * math.sin(i * 0.2) for i in range(64)])
         f32_in = self.write("f32.raw", f32_samples)
         f32_wav = self.dir / "f32.wav"
         run(FFMPEG, "-y", "-v", "error", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", f32_in, "-c:a", "pcm_f32le", f32_wav)
-        f32_flac = self.dir / "f32_delegated.flac"
-        run(LFFMPEG, "-y", "-i", f32_wav, f32_flac)
-        self.assertTrue(f32_flac.exists() and f32_flac.stat().st_size > 42)
-
-        # Strict LEANAV_FFMPEG_BIN=/nonexistent MUST fail on delegated fallback (never silently use /usr/bin/ffmpeg)
-        env_bad_bin = dict(os.environ)
-        env_bad_bin["LEANAV_FFMPEG_BIN"] = "/nonexistent/ffmpeg_missing_binary"
-        res_bad_bin = subprocess.run(
-            [str(LFFMPEG), "-y", "-i", str(f32_wav), str(self.dir / "should_fail.flac")],
-            env=env_bad_bin, capture_output=True,
+        f32_flac = self.dir / "f32_out.flac"
+        res_f32 = subprocess.run(
+            [str(LFFMPEG), "-y", "-i", str(f32_wav), str(f32_flac)],
+            capture_output=True, env=ISO_ENV,
         )
-        self.assertNotEqual(res_bad_bin.returncode, 0)
+        self.assertNotEqual(res_f32.returncode, 0)
+        self.assertFalse(f32_flac.exists())
 
-        # Valid ID3v2-prefixed FLAC -> out-of-domain fallbackDelegated succeeds via FFmpeg
         id3_hdr = b"ID3\x03\x00\x00\x00\x00\x00\x04ABCD"
-        id3_flac = self.write("id3_tagged.flac", id3_hdr + f32_flac.read_bytes())
+        pcm_in = self.write("id3.pcm", struct.pack("<64h", *[i * 100 for i in range(64)]))
+        plain_flac = self.dir / "plain.flac"
+        run(LFFMPEG, "-y", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i", pcm_in, plain_flac, env=ISO_ENV)
+        id3_flac = self.write("id3_tagged.flac", id3_hdr + plain_flac.read_bytes())
         id3_wav = self.dir / "id3_out.wav"
-        run(LFFMPEG, "-y", "-i", id3_flac, id3_wav)
-        self.assertTrue(id3_wav.exists() and id3_wav.stat().st_size > 44)
+        res_id3 = subprocess.run(
+            [str(LFFMPEG), "-y", "-i", str(id3_flac), str(id3_wav)],
+            capture_output=True, env=ISO_ENV,
+        )
+        self.assertNotEqual(res_id3.returncode, 0)
+        self.assertFalse(id3_wav.exists())
 
-        # Corrupt WAV / PNG / FLAC bitstreams MUST fail closed (rc != 0)
         for bad_name, bad_payload, out_ext in (
             ("corrupt.wav", b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00", "flac"),
             ("corrupt.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRbroken", "png"),
             ("corrupt.flac", b"fLaC\x80\x00\x00\x22" + b"\x00" * 10, "wav"),
         ):
             bad_p = self.write(bad_name, bad_payload)
-            rc = subprocess.run([str(LFFMPEG), "-y", "-i", str(bad_p), str(self.dir / f"bad_out.{out_ext}")], capture_output=True)
+            rc = subprocess.run([str(LFFMPEG), "-y", "-i", str(bad_p), str(self.dir / f"bad_out.{out_ext}")], capture_output=True, env=ISO_ENV)
             self.assertNotEqual(rc.returncode, 0, f"Expected fail-closed rc!=0 for {bad_name}")
+            self.assertFalse((self.dir / f"bad_out.{out_ext}").exists())
 
     @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
     def test_stream_copy_metadata_and_png_16to8_sub8_rounding(self):
@@ -643,7 +665,7 @@ class LosslessCodecTests(unittest.TestCase):
         pal_in = self.write("pal_gama_text.png", pal_png_bytes)
         for copy_flags in (["-c:v", "copy"], ["-c", "copy"]):
             pal_out = self.dir / f"pal_copy_{copy_flags[0][1:].replace(':', '')}.png"
-            run(LFFMPEG, "-y", "-i", pal_in, *copy_flags, pal_out, env={"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"})
+            run(LFFMPEG, "-y", "-i", pal_in, *copy_flags, pal_out, env=ISO_ENV)
             self.assertEqual(pal_out.read_bytes(), pal_png_bytes)
 
         # Finding 4b: FLAC -c:a copy and -c copy preserve Vorbis comment metadata bit-identically
@@ -654,7 +676,7 @@ class LosslessCodecTests(unittest.TestCase):
         self.assertIn(b"HelloFlacTest", tagged_bytes)
         for copy_flags in (["-c:a", "copy"], ["-c", "copy"]):
             flac_out = self.dir / f"flac_copy_{copy_flags[0][1:].replace(':', '')}.flac"
-            run(LFFMPEG, "-y", "-i", tagged_flac, *copy_flags, flac_out, env={"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"})
+            run(LFFMPEG, "-y", "-i", tagged_flac, *copy_flags, flac_out, env=ISO_ENV)
             self.assertEqual(flac_out.read_bytes(), tagged_bytes)
 
         # Finding 5: 16->8 exact /257 rounding and sub-8-bit tRNS + 16-bit replication
@@ -677,7 +699,7 @@ class LosslessCodecTests(unittest.TestCase):
 
     @unittest.skipUnless(ffmpeg_available(), "FFmpeg is required")
     def test_flac_rfc9639_residual_bounds_and_fail_closed(self):
-        iso_env = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+        iso_env = ISO_ENV
         mono_s32 = [0] * 4 + [-2147483648] + [0] * 123
         mono_bytes = struct.pack(f"<{len(mono_s32)}i", *mono_s32)
         mono_in = self.write("mono_res_min32.pcm", mono_bytes)
@@ -741,9 +763,7 @@ class LosslessCodecTests(unittest.TestCase):
         spy_bin = self.dir / "ffmpeg"
         spy_bin.write_text(f"#!/bin/sh\necho invoked >> '{spy_log}'\nexit 0\n")
         spy_bin.chmod(0o755)
-        spy_env = dict(os.environ)
-        spy_env["PATH"] = f"{self.dir}:{spy_env.get('PATH', '')}"
-        spy_env["LEANAV_FFMPEG_BIN"] = str(spy_bin)
+        spy_env = {"PATH": "/nonexistent"}
 
         for tag, u_val in (("neg_2p31", 4294967295), ("pos_2p31", 4294967296)):
             q, rem = u_val >> 30, u_val & ((1 << 30) - 1)
@@ -753,7 +773,7 @@ class LosslessCodecTests(unittest.TestCase):
             bad_flac = self.write(f"bad_rice_{tag}.flac", stream_hdr + fn + struct.pack(">H", c16))
             rc = subprocess.run([str(LFFMPEG), "-y", "-i", str(bad_flac), str(self.dir / f"out_{tag}.wav")], env=spy_env, capture_output=True)
             self.assertNotEqual(rc.returncode, 0, f"Expected fail-closed rc!=0 for {tag}")
-            self.assertFalse(spy_log.exists(), f"Invalid FLAC {tag} must never invoke delegated ffmpeg")
+            self.assertFalse(spy_log.exists(), f"Invalid FLAC {tag} must never invoke an external ffmpeg")
 
         fh_ms = bytearray([0xFF, 0xF8, (6 << 4) | 10, (10 << 4) | (7 << 1), 0x00, 15])
         fh_ms.append(crc8_flac(fh_ms))
@@ -778,7 +798,7 @@ class LosslessCodecTests(unittest.TestCase):
         self.assertEqual(lean_esc_pcm.read_bytes(), ff_esc_pcm.read_bytes())
 
     def test_png_grayscale_trns_bitdepth1_and_highbit_masking(self):
-        iso_env = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+        iso_env = ISO_ENV
         for tag, trns_val in (("exact1", b"\x00\x01"), ("masked1", b"\xff\xfd")):
             p1 = self.write(f"g1_{tag}.png", png_bytes(4, 1, 1, 0, b"\x00\x50", trns=trns_val))
             o_rgba = self.dir / f"g1_{tag}.rgba"

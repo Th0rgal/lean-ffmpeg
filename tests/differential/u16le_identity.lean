@@ -69,12 +69,13 @@ unsafe def unitTests : IO Unit := do
 unsafe def main (args : List String) : IO Unit := do
   if args.isEmpty then unitTests
   else
+    -- General MP4 transcode is fail-closed: it must not scale, write, or spawn.
     encoderCliOptionsRef.set { pixFmt := args[2]!, showStats := false, showBanner := false }
     let n (i : Nat) := (args[i]!).toNat!.toUInt32
-    -- Exclude imported module initializers from the measured transcode.
     let _ ← takeCalls
     let report ← transcodeMp4GeneralVerifiedIO (args[0]!) (args[1]!)
       (n 3) (n 4) (n 5) (n 6) 0 0 1 0 (n 7) (some ByteArray.empty)
     let metrics ← lastAcceptanceMetricsRef.get
     let calls ← takeCalls
+    require (report == 0 && metrics == 0 && calls == 0) "general transcode must stay closed"
     IO.println s!"{report},{metrics},{calls}"

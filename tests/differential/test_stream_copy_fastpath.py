@@ -54,12 +54,26 @@ class StreamCopyFastpathTests(unittest.TestCase):
                 for mode, flags in [
                     ("copy", ["-c", "copy"]),
                     ("json-copy", ["-json", "-c", "copy"]),
-                    ("scale", ["-json", "-vf", "scale=16:16"]),
+                    ("scale", ["-json", "-vf", "scale=16:16", "-c:v", "h264"]),
                 ]:
                     out = root / (layout + "-" + mode + ".mp4")
                     result = self.run_cmd([BINARY, "-y", "-i", source, *flags, out])
                     self.assertEqual(result.returncode, 0, result.stderr)
                     if "-json" in flags:
-                        self.assertTrue(json.loads(result.stdout)["ok"])
+                        doc = json.loads(result.stdout)
+                        self.assertTrue(doc["ok"])
+                        if mode == "scale":
+                            self.assertEqual(doc["mode"], "ffmpeg-cli-inproc-h264-aac-mp4")
+                            self.assertEqual(doc["tier"], "independent_verified")
                     video = next(s for s in self.probe_json(out)["streams"] if s["codec_type"] == "video")
                     self.assertEqual(video["width"], 16 if mode == "scale" else 32)
+
+                implicit = root / (layout + "-implicit-scale.mp4")
+                result = self.run_cmd([
+                    BINARY, "-y", "-i", source, "-json", "-vf", "scale=16:16", implicit,
+                ])
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(implicit.exists())
+                implicit_doc = json.loads(result.stdout.strip())
+                self.assertFalse(implicit_doc["ok"])
+                self.assertEqual(implicit_doc["mode"], "ffmpeg-cli-mp4-transcode-failed")

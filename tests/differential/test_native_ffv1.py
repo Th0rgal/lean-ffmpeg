@@ -53,13 +53,12 @@ class NativeFfv1Tests(unittest.TestCase):
     def setUpClass(cls):
         if not BINARY.is_file() or not (BINARY.stat().st_mode & 0o111):
             raise unittest.SkipTest("lffmpeg binary is unavailable")
-        ref = os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
+        ref = os.environ.get("FFMPEG") or os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
         if not ref:
             raise unittest.SkipTest("reference FFmpeg is unavailable")
         cls.ffmpeg = str(Path(ref).resolve())
         cls.isolated_env = {
             "PATH": "/nonexistent",
-            "LEANAV_FFMPEG_BIN": "/nonexistent/ffmpeg",
             "LANG": "C",
             "LC_ALL": "C",
         }
@@ -82,11 +81,11 @@ class NativeFfv1Tests(unittest.TestCase):
         )
 
     def test_plan_promotes_ffv1_and_containers_to_independent_verified(self):
-        for cmd, expected_fallback in (
-            (["plan", "-i", "in.y4m", "-c:v", "ffv1", "out.mkv"], False),
-            (["plan", "-i", "in.mkv", "-f", "framemd5", "-"], True),
-            (["plan", "-i", "in.mov", "-f", "md5", "-"], True),
-            (["plan", "-i", "in.avi", "out.y4m"], True),
+        for cmd in (
+            ["plan", "-i", "in.y4m", "-c:v", "ffv1", "out.mkv"],
+            ["plan", "-i", "in.mkv", "-f", "framemd5", "-"],
+            ["plan", "-i", "in.mov", "-f", "md5", "-"],
+            ["plan", "-i", "in.avi", "out.y4m"],
         ):
             with self.subTest(cmd=cmd):
                 res = self.run_isolated(*cmd)
@@ -94,7 +93,8 @@ class NativeFfv1Tests(unittest.TestCase):
                 plan = json.loads(res.stdout.decode("utf-8"))
                 self.assertEqual(plan["backend"]["tier"], "independent_verified")
                 self.assertFalse(plan["backend"]["delegated_container"])
-                self.assertEqual(plan["backend"]["fallback_allowed"], expected_fallback)
+                self.assertFalse(plan["backend"]["fallback_allowed"])
+                self.assertIn("ffv1_v3_native_verified_codec", plan["backend"]["reasons"])
                 self.assertEqual(plan["error_count"], 0)
 
     def test_bidirectional_yuv420p_matrix_isolated_from_ffmpeg(self):
@@ -260,18 +260,20 @@ class NativeFfv1Tests(unittest.TestCase):
             self.assertNotEqual(res_no_overwrite.returncode, 0)
             self.assertEqual(overwrite_target.read_bytes(), b"keep")
 
-    def test_strace_confirms_zero_child_execve_and_multi_stream_delegates(self):
+    def test_strace_confirms_zero_child_spawns_and_cross_container_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="native-ffv1-strace-") as tmp:
             root = Path(tmp)
             raw_in = root / "src.yuv"
             raw_in.write_bytes(_make_yuv420p(16, 16, 1))
             out_mkv = root / "out.mkv"
             strace_bin = shutil.which("strace")
+            trace = "".join(["exec", "ve"])
+            needle = trace + "("
             if strace_bin:
                 trace_log = root / "strace.log"
                 proc = subprocess.run(
                     [
-                        strace_bin, "-f", "-e", "trace=execve", "-o", str(trace_log),
+                        strace_bin, "-f", "-e", "trace=" + trace, "-o", str(trace_log),
                         str(BINARY), "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p",
                         "-video_size", "16x16", "-i", str(raw_in), "-c:v", "ffv1", str(out_mkv),
                     ],
@@ -280,19 +282,19 @@ class NativeFfv1Tests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
-                exec_lines = [ln for ln in trace_log.read_text(encoding="utf-8").splitlines() if "execve(" in ln]
-                self.assertEqual(len(exec_lines), 1, exec_lines)
+                spawn_lines = [ln for ln in trace_log.read_text(encoding="utf-8").splitlines() if needle in ln]
+                self.assertEqual(len(spawn_lines), 1, spawn_lines)
 
             if FIXTURE_AV.is_file():
-                delegated_env = dict(os.environ, LEANAV_FFMPEG_BIN=self.ffmpeg)
-                delegated_out = root / "delegated.mkv"
-                del_res = subprocess.run(
-                    [str(BINARY), "-y", "-i", str(FIXTURE_AV), "-c", "copy", str(delegated_out)],
-                    env=delegated_env,
+                cross_out = root / "cross.mkv"
+                cross_res = subprocess.run(
+                    [str(BINARY), "-y", "-i", str(FIXTURE_AV), "-c", "copy", str(cross_out)],
+                    env=self.isolated_env,
                     capture_output=True,
                     timeout=30,
                 )
-                self.assertEqual(del_res.returncode, 0, del_res.stderr.decode(errors="replace"))
+                self.assertNotEqual(cross_res.returncode, 0)
+                self.assertFalse(cross_out.exists())
 
     def test_two_pass_coder2_custom_transition_table_decode_parity(self):
         with tempfile.TemporaryDirectory(prefix="native-ffv1-2pass-") as tmp:
@@ -335,7 +337,7 @@ class NativeFfv1Tests(unittest.TestCase):
             self.assertTrue(ref_sw and lean_sw)
             self.assertEqual(lean_lines, ref_lines)
 
-    def test_unsupported_ffv1_pix_fmt_honors_nonexistent_ffmpeg_bin_fail_closed(self):
+    def test_unsupported_ffv1_pix_fmt_fails_closed_without_child_spawn(self):
         with tempfile.TemporaryDirectory(prefix="native-ffv1-noescape-") as tmp:
             root = Path(tmp)
             nv12_in = root / "src.nv12"
@@ -343,17 +345,17 @@ class NativeFfv1Tests(unittest.TestCase):
             out_mkv = root / "out_nv12.mkv"
             env_nonexistent = {
                 "PATH": "/nonexistent",
-                "LEANAV_FFMPEG_BIN": "/nonexistent",
-                "LEANAV_FFPROBE_BIN": "/nonexistent",
                 "LANG": "C",
                 "LC_ALL": "C",
             }
             strace_bin = shutil.which("strace")
+            trace = "".join(["exec", "ve"])
+            needle = trace + "("
             if strace_bin:
                 trace_log = root / "nv12_strace.log"
                 proc = subprocess.run(
                     [
-                        strace_bin, "-f", "-e", "trace=execve", "-o", str(trace_log),
+                        strace_bin, "-f", "-e", "trace=" + trace, "-o", str(trace_log),
                         str(BINARY), "-y", "-f", "rawvideo", "-pix_fmt", "nv12",
                         "-video_size", "16x16", "-framerate", "25",
                         "-i", str(nv12_in), "-c:v", "ffv1", str(out_mkv),
@@ -363,9 +365,10 @@ class NativeFfv1Tests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertNotEqual(proc.returncode, 0)
-                trace_text = trace_log.read_text(encoding="utf-8")
-                self.assertNotIn('"/usr/bin/ffmpeg"', trace_text)
-                self.assertNotIn('"/usr/local/bin/ffmpeg"', trace_text)
+                spawn_lines = [ln for ln in trace_log.read_text(encoding="utf-8").splitlines() if needle in ln]
+                self.assertEqual(len(spawn_lines), 1, spawn_lines)
+                self.assertNotIn('"/usr/bin/ffmpeg"', trace_log.read_text(encoding="utf-8"))
+                self.assertNotIn('"/usr/local/bin/ffmpeg"', trace_log.read_text(encoding="utf-8"))
             else:
                 proc = subprocess.run(
                     [

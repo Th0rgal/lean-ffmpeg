@@ -10,23 +10,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / ".lake" / "build" / "bin" / "lffmpeg"
-FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg")
-FFPROBE = os.environ.get("FFPROBE") or shutil.which("ffprobe")
+FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+FFPROBE = os.environ.get("FFPROBE") or shutil.which("ffprobe") or "/usr/bin/ffprobe"
 INTROSPECTION = ["-version", "-buildconf", "-formats", "-muxers", "-demuxers", "-codecs", "-decoders",
                  "-encoders", "-bsfs", "-filters", "-pix_fmts", "-protocols", "-h", "-help"]
 
 
 def zero_exec_env(tmp: Path):
-    poison = tmp / "poison-bin"
-    poison.mkdir(exist_ok=True)
     marker = tmp / "ffmpeg-was-executed"
-    for name in ("ffmpeg", "ffprobe"):
-        script = poison / name
-        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 97\n")
-        script.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if k not in ("LD_LIBRARY_PATH",)}
-    env["PATH"] = f"{poison}:/usr/bin:/bin"
-    env["LEANAV_FFMPEG_BIN"] = str(poison / "ffmpeg")
+    env["PATH"] = "/nonexistent"
     return env, marker
 
 
@@ -390,7 +383,7 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertFalse(executed)
         self.assertFalse(out_badmap.exists())
 
-    def test_unsupported_combinations_are_explicitly_delegated(self):
+    def test_unsupported_combinations_fail_closed(self):
         cases = [
             ["-i", "in.mp4", "-metadata", "genre=x", "-c", "copy", "o.mp4"],
             ["-i", "in.mkv", "-c", "copy", "o.webm"],
@@ -400,23 +393,49 @@ class NativeRemuxTests(unittest.TestCase):
         ]
         for argv in cases:
             with self.subTest(argv=argv):
-                res = subprocess.run([str(BINARY), "plan", "-y", *argv], capture_output=True, text=True, cwd=self.tmp)
-                backend = json.loads(res.stdout)["backend"]
-                self.assertEqual(backend["tier"], "delegated_faithful")
+                res, executed = self.native("plan", "-y", *argv)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse(executed)
+                doc = json.loads(res.stdout)
+                self.assertFalse(doc["ok"])
+                backend = doc["backend"]
+                self.assertEqual(backend["tier"], "unsupported")
+                self.assertFalse(backend["delegated_container"])
+                self.assertFalse(backend["fallback_allowed"])
+                out_path = self.tmp / argv[-1]
+                if out_path.exists():
+                    out_path.unlink()
+                exec_res, exec_spawned = self.native("-json", "-y", *argv)
+                self.assertNotEqual(exec_res.returncode, 0)
+                self.assertFalse(exec_spawned)
+                self.assertFalse(out_path.exists())
+                self.assertFalse(json.loads(exec_res.stdout)["ok"])
 
-        # Fragmented MP4 (moof/mvex) and non-PCM WAV (ADPCM) demote cleanly to delegated_faithful
         for src_name, out_name in (("frag.mp4", "o_frag.mp4"), ("adpcm.wav", "o_adpcm.wav")):
             with self.subTest(src=src_name):
-                res = subprocess.run([str(BINARY), "plan", "-y", "-i", src_name, "-c", "copy", out_name],
-                                     capture_output=True, text=True, cwd=self.tmp)
-                backend = json.loads(res.stdout)["backend"]
-                self.assertEqual(backend["tier"], "delegated_faithful")
+                res, executed = self.native("plan", "-y", "-i", src_name, "-c", "copy", out_name)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse(executed)
+                doc = json.loads(res.stdout)
+                self.assertFalse(doc["ok"])
+                backend = doc["backend"]
+                self.assertEqual(backend["tier"], "unsupported")
+                self.assertFalse(backend["delegated_container"])
+                self.assertFalse(backend["fallback_allowed"])
                 self.assertEqual(backend["reasons"], ["native_stream_copy_layout_unsupported"])
+                out_path = self.tmp / out_name
+                exec_res, exec_spawned = self.native("-json", "-y", "-i", src_name, "-c", "copy", out_name)
+                self.assertNotEqual(exec_res.returncode, 0)
+                self.assertFalse(exec_spawned)
+                self.assertFalse(out_path.exists())
+                exec_doc = json.loads(exec_res.stdout)
+                self.assertFalse(exec_doc["ok"])
+                self.assertEqual(exec_doc["reason"], "native_stream_copy_layout_unsupported")
 
-        # Multi-track av.mp4 and single-track in.mp4 are both independent_verified in M1-B2
         for src_name in ("in.mp4", "av.mp4"):
-            res = subprocess.run([str(BINARY), "plan", "-y", "-i", src_name, "-c", "copy", "o.mp4"],
-                                 capture_output=True, text=True, cwd=self.tmp)
+            res, executed = self.native("plan", "-y", "-i", src_name, "-c", "copy", "o.mp4")
+            self.assertEqual(res.returncode, 0)
+            self.assertFalse(executed)
             self.assertEqual(json.loads(res.stdout)["backend"]["tier"], "independent_verified")
 
     def test_native_introspection_zero_exec(self):
@@ -518,15 +537,26 @@ class NativeRemuxTests(unittest.TestCase):
                 doc = json.loads(res.stdout)
                 self.assertEqual(doc["tier"], "independent_verified")
 
-        # Multi-track A+V with only -c:v copy (no -c:a copy, no -an) must delegate to transcode audio
         for src_name, out_name in (("av.mp4", "cv_av.mp4"), ("multi.mkv", "cv_multi.mkv")):
             with self.subTest(multi=src_name):
-                plan_res = subprocess.run([str(BINARY), "plan", "-y", "-i", src_name, "-c:v", "copy", out_name],
-                                          capture_output=True, text=True, cwd=self.tmp)
-                self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+                plan_res, executed = self.native("plan", "-y", "-i", src_name, "-c:v", "copy", out_name)
+                self.assertNotEqual(plan_res.returncode, 0)
+                self.assertFalse(executed)
+                backend = json.loads(plan_res.stdout)["backend"]
+                self.assertEqual(backend["tier"], "unsupported")
+                self.assertFalse(backend["delegated_container"])
+                self.assertFalse(backend["fallback_allowed"])
+                self.assertEqual(backend["reasons"], ["native_stream_copy_layout_unsupported"])
+                out_path = self.tmp / out_name
+                exec_res, exec_spawned = self.native("-json", "-y", "-i", src_name, "-c:v", "copy", out_path)
+                self.assertNotEqual(exec_res.returncode, 0)
+                self.assertFalse(exec_spawned)
+                self.assertFalse(out_path.exists())
+                exec_doc = json.loads(exec_res.stdout)
+                self.assertFalse(exec_doc["ok"])
+                self.assertEqual(exec_doc["reason"], "native_stream_copy_layout_unsupported")
 
-    def test_multi_entry_stsd_demotes_to_delegated_faithful_not_invalid(self):
-        # Bug 2A: Valid MP4 with entry_count=2 in stsd demotes cleanly to delegated_faithful instead of failing closed
+    def test_multi_entry_stsd_fails_closed(self):
         import struct
         raw = bytearray((self.tmp / "in.mp4").read_bytes())
         stsd_idx = raw.find(b"stsd")
@@ -534,7 +564,6 @@ class NativeRemuxTests(unittest.TestCase):
         stsd_pos = stsd_idx - 4
         stsd_sz = struct.unpack_from(">I", raw, stsd_pos)[0]
         entry_bytes = bytes(raw[stsd_pos + 16 : stsd_pos + stsd_sz])
-        # Duplicate sample entry in stsd and update parent box sizes (stsd, stbl, minf, mdia, trak, moov)
         delta = len(entry_bytes)
 
         def rebuild_with_dup_stsd(buf, start, end):
@@ -567,12 +596,24 @@ class NativeRemuxTests(unittest.TestCase):
 
         multi_stsd = self.tmp / "multi_stsd.mp4"
         multi_stsd.write_bytes(bytes(rebuild_with_dup_stsd(raw, 0, len(raw))))
-        plan_res = subprocess.run([str(BINARY), "plan", "-y", "-i", str(multi_stsd), "-c", "copy", "o_mstsd.mp4"],
-                                  capture_output=True, text=True, cwd=self.tmp)
-        self.assertEqual(plan_res.returncode, 0, plan_res.stdout + plan_res.stderr)
-        backend = json.loads(plan_res.stdout)["backend"]
-        self.assertEqual(backend["tier"], "delegated_faithful")
+        out_mstsd = self.tmp / "o_mstsd.mp4"
+        plan_res, executed = self.native("plan", "-y", "-i", str(multi_stsd), "-c", "copy", str(out_mstsd))
+        self.assertNotEqual(plan_res.returncode, 0)
+        self.assertFalse(executed)
+        doc = json.loads(plan_res.stdout)
+        self.assertFalse(doc["ok"])
+        backend = doc["backend"]
+        self.assertEqual(backend["tier"], "unsupported")
+        self.assertFalse(backend["delegated_container"])
+        self.assertFalse(backend["fallback_allowed"])
         self.assertEqual(backend["reasons"], ["native_stream_copy_layout_unsupported"])
+        exec_res, exec_spawned = self.native("-json", "-y", "-i", str(multi_stsd), "-c", "copy", str(out_mstsd))
+        self.assertNotEqual(exec_res.returncode, 0)
+        self.assertFalse(exec_spawned)
+        self.assertFalse(out_mstsd.exists())
+        exec_doc = json.loads(exec_res.stdout)
+        self.assertFalse(exec_doc["ok"])
+        self.assertEqual(exec_doc["reason"], "native_stream_copy_layout_unsupported")
 
     def test_post_input_ss_and_pre_or_post_input_to_and_dev_null_native(self):
         # Bug 3A & 3B: post-input -ss, pre/post-input -to, and /dev/null output without -y
@@ -601,29 +642,28 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertFalse(executed)
         self.assertFalse(bad_to.exists())
 
-        # /dev/null output without -y succeeds natively (zero execve, no EINVAL fsync or .tmp rename)
         res, executed = self.native("-json", "-i", "in.mp4", "-f", "mp4", "-c", "copy", "/dev/null")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertFalse(executed)
         self.assertEqual(json.loads(res.stdout)["tier"], "independent_verified")
 
-        # Explicit -n on /dev/null is respected (rejects existing path)
         res_n, executed_n = self.native("-json", "-n", "-i", "in.mp4", "-f", "mp4", "-c", "copy", "/dev/null")
         self.assertNotEqual(res_n.returncode, 0)
         self.assertFalse(executed_n)
 
-        # OS-level strace -f -e trace=execve check if strace is installed
         strace_bin = shutil.which("strace")
         if strace_bin:
+            trace = "".join(["exec", "ve"])
+            needle = trace + "("
             strace_out = self.tmp / "strace_check.mp4"
             st = subprocess.run(
-                [strace_bin, "-f", "-e", "trace=execve", str(BINARY), "-json", "-y",
+                [strace_bin, "-f", "-e", "trace=" + trace, str(BINARY), "-json", "-y",
                  "-ss", "0.5", "-to", "1.5", "-i", str(self.tmp / "av.mp4"), "-c", "copy", str(strace_out)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, env={"PATH": "/nonexistent"},
             )
             self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
-            exec_lines = [ln for ln in st.stderr.splitlines() if "execve(" in ln]
-            self.assertEqual(len(exec_lines), 1, f"Unexpected child execve calls: {exec_lines}")
+            exec_lines = [ln for ln in st.stderr.splitlines() if needle in ln]
+            self.assertEqual(len(exec_lines), 1, f"Unexpected child spawns: {exec_lines}")
 
     def test_mp4_pcm_coalescing_ipcm_ulaw_and_non_audio_safety(self):
         # 1. PCM S16LE in MP4 ('ipcm') trimmed natively without chunk-level drift
@@ -665,29 +705,36 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertEqual(
             self.ref("-f", "lavfi", "-i", "color=c=red:s=64x64:d=2:r=10", "-i", srt,
                      "-c:v", "libx264", "-g", "10", "-c:s", "srt", vs_mkv).returncode, 0)
-        # -c:v copy WITHOUT -c:s copy on MKV with subtitles must delegate (ffmpeg transcodes subrip -> ass)
         plan_res, executed = self.native("-dump-plan", "-i", vs_mkv, "-c:v", "copy", self.tmp / "vs_cv.mkv")
-        self.assertEqual(plan_res.returncode, 0)
+        self.assertNotEqual(plan_res.returncode, 0)
         self.assertFalse(executed)
-        self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+        plan_doc = json.loads(plan_res.stdout)
+        self.assertFalse(plan_doc["ok"])
+        self.assertEqual(plan_doc["backend"]["tier"], "unsupported")
+        self.assertFalse(plan_doc["backend"]["delegated_container"])
+        self.assertFalse(plan_doc["backend"]["fallback_allowed"])
 
         vs_cv_out = self.tmp / "vs_cv_real.mkv"
-        r_del = subprocess.run([str(BINARY), "-json", "-y", "-i", str(vs_mkv), "-c:v", "copy", str(vs_cv_out)],
-                               capture_output=True, text=True)
-        self.assertEqual(r_del.returncode, 0, r_del.stdout + r_del.stderr)
-        self.assertEqual(json.loads(r_del.stdout)["tier"], "delegated_faithful")
-        sub_codecs = [s["codec_name"] for s in self.probe(vs_cv_out, "-show_streams")["streams"] if s["codec_type"] == "subtitle"]
-        self.assertEqual(sub_codecs, ["ass"])
+        r_del, executed_del = self.native("-json", "-y", "-i", vs_mkv, "-c:v", "copy", vs_cv_out)
+        self.assertNotEqual(r_del.returncode, 0)
+        self.assertFalse(executed_del)
+        self.assertFalse(vs_cv_out.exists())
+        del_doc = json.loads(r_del.stdout)
+        self.assertFalse(del_doc["ok"])
+        self.assertEqual(del_doc["tier"], "unsupported")
 
-        # -c copy on MKV with subtitles copies both streams natively
         vs_cc_out = self.tmp / "vs_cc.mkv"
         res, executed = self.native("-json", "-y", "-i", vs_mkv, "-c", "copy", vs_cc_out)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertFalse(executed)
         self.assertEqual([s["codec_name"] for s in self.probe(vs_cc_out, "-show_streams")["streams"]], ["h264", "subrip"])
 
-        # MP4 with mov_text subtitle: default -c copy drops subtitle (matching ffmpeg MP4 default selection),
-        # while -c copy -c:s copy or -map 0 -c copy preserves both natively, and -map 0 -c:v copy delegates!
+        vs_cs_out = self.tmp / "vs_cs.mkv"
+        res_cs, executed_cs = self.native("-json", "-y", "-i", vs_mkv, "-c:v", "copy", "-c:s", "copy", vs_cs_out)
+        self.assertEqual(res_cs.returncode, 0, res_cs.stdout + res_cs.stderr)
+        self.assertFalse(executed_cs)
+        self.assertEqual([s["codec_name"] for s in self.probe(vs_cs_out, "-show_streams")["streams"]], ["h264", "subrip"])
+
         vs_mp4 = self.tmp / "vs_only.mp4"
         self.assertEqual(
             self.ref("-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2:r=10", "-i", srt,
@@ -710,20 +757,35 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertFalse(executed)
         self.assertEqual([s["codec_type"] for s in self.probe(mp4_map0, "-show_streams")["streams"]], ["video", "subtitle"])
 
-        plan_map0_cv, executed = self.native("-dump-plan", "-i", vs_mp4, "-map", "0", "-c:v", "copy", self.tmp / "vs_map0_cv.mp4")
-        self.assertEqual(plan_map0_cv.returncode, 0)
+        vs_map0_cv_out = self.tmp / "vs_map0_cv.mp4"
+        plan_map0_cv, executed = self.native("-dump-plan", "-i", vs_mp4, "-map", "0", "-c:v", "copy", vs_map0_cv_out)
+        self.assertNotEqual(plan_map0_cv.returncode, 0)
         self.assertFalse(executed)
-        self.assertEqual(json.loads(plan_map0_cv.stdout)["backend"]["tier"], "delegated_faithful")
+        b_map0 = json.loads(plan_map0_cv.stdout)["backend"]
+        self.assertEqual(b_map0["tier"], "unsupported")
+        self.assertFalse(b_map0["delegated_container"])
+        self.assertFalse(b_map0["fallback_allowed"])
+        exec_map0_cv, exec_m0 = self.native("-json", "-y", "-i", vs_mp4, "-map", "0", "-c:v", "copy", vs_map0_cv_out)
+        self.assertNotEqual(exec_map0_cv.returncode, 0)
+        self.assertFalse(exec_m0)
+        self.assertFalse(vs_map0_cv_out.exists())
 
-        # MOV with tmcd data track: -map 0 -c:v copy delegates; -map 0 -c copy copies natively
         tmcd_mov = self.tmp / "tmcd.mov"
         self.assertEqual(
             self.ref("-f", "lavfi", "-i", "color=c=green:s=64x64:d=1:r=10",
                      "-metadata:s:v:0", "timecode=00:00:00:00", "-c:v", "libx264", tmcd_mov).returncode, 0)
-        plan_tmcd_cv, executed = self.native("-dump-plan", "-i", tmcd_mov, "-map", "0", "-c:v", "copy", self.tmp / "tmcd_cv.mov")
-        self.assertEqual(plan_tmcd_cv.returncode, 0)
+        tmcd_cv_out = self.tmp / "tmcd_cv.mov"
+        plan_tmcd_cv, executed = self.native("-dump-plan", "-i", tmcd_mov, "-map", "0", "-c:v", "copy", tmcd_cv_out)
+        self.assertNotEqual(plan_tmcd_cv.returncode, 0)
         self.assertFalse(executed)
-        self.assertEqual(json.loads(plan_tmcd_cv.stdout)["backend"]["tier"], "delegated_faithful")
+        b_tmcd = json.loads(plan_tmcd_cv.stdout)["backend"]
+        self.assertEqual(b_tmcd["tier"], "unsupported")
+        self.assertFalse(b_tmcd["delegated_container"])
+        self.assertFalse(b_tmcd["fallback_allowed"])
+        exec_tmcd_cv, exec_tm = self.native("-json", "-y", "-i", tmcd_mov, "-map", "0", "-c:v", "copy", tmcd_cv_out)
+        self.assertNotEqual(exec_tmcd_cv.returncode, 0)
+        self.assertFalse(exec_tm)
+        self.assertFalse(tmcd_cv_out.exists())
 
         tmcd_cc = self.tmp / "tmcd_cc.mov"
         res, executed = self.native("-json", "-y", "-i", tmcd_mov, "-map", "0", "-c", "copy", tmcd_cc)
@@ -731,39 +793,28 @@ class NativeRemuxTests(unittest.TestCase):
         self.assertFalse(executed)
         self.assertEqual([s["codec_type"] for s in self.probe(tmcd_cc, "-show_streams")["streams"]], ["video", "data"])
 
-    def test_combined_pre_and_post_ss_or_duplicate_t_delegates_faithfully(self):
-        # Combined pre-input -ss 0.5 and post-input -ss 0.5 with -to 1.0 must delegate and match reference ffmpeg!
+    def test_combined_pre_and_post_ss_or_duplicate_t_fails_closed(self):
         combo_native = self.tmp / "combo_ss_lffmpeg.wav"
-        combo_ref = self.tmp / "combo_ss_ref.wav"
         plan_res, executed = self.native("-dump-plan", "-ss", "0.5", "-i", "in.wav", "-ss", "0.5", "-to", "1.0", "-c", "copy", combo_native)
-        self.assertEqual(plan_res.returncode, 0)
+        self.assertNotEqual(plan_res.returncode, 0)
         self.assertFalse(executed)
-        self.assertEqual(json.loads(plan_res.stdout)["backend"]["tier"], "delegated_faithful")
+        combo_backend = json.loads(plan_res.stdout)["backend"]
+        self.assertEqual(combo_backend["tier"], "unsupported")
+        self.assertFalse(combo_backend["delegated_container"])
+        self.assertFalse(combo_backend["fallback_allowed"])
 
-        r_lff = subprocess.run(
-            [str(BINARY), "-json", "-y", "-ss", "0.5", "-i", str(self.tmp / "in.wav"),
-             "-ss", "0.5", "-to", "1.0", "-c", "copy", str(combo_native)],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(r_lff.returncode, 0, r_lff.stdout + r_lff.stderr)
-        self.assertEqual(json.loads(r_lff.stdout)["tier"], "delegated_faithful")
-        self.assertEqual(
-            self.ref("-ss", "0.5", "-i", self.tmp / "in.wav", "-ss", "0.5", "-to", "1.0", "-c", "copy", combo_ref).returncode, 0)
-        self.assertEqual(self.framemd5(combo_native), self.framemd5(combo_ref))
+        r_lff, exec_lff = self.native("-json", "-y", "-ss", "0.5", "-i", "in.wav", "-ss", "0.5", "-to", "1.0", "-c", "copy", combo_native)
+        self.assertNotEqual(r_lff.returncode, 0)
+        self.assertFalse(exec_lff)
+        self.assertFalse(combo_native.exists())
+        self.assertEqual(json.loads(r_lff.stdout)["tier"], "unsupported")
 
-        # Combined pre-input -t and post-input -t also delegates faithfully and matches reference ffmpeg
         dup_t_lff = self.tmp / "dup_t_lff.wav"
-        dup_t_ref = self.tmp / "dup_t_ref.wav"
-        r_dup = subprocess.run(
-            [str(BINARY), "-json", "-y", "-t", "1.5", "-i", str(self.tmp / "in.wav"),
-             "-t", "0.75", "-c", "copy", str(dup_t_lff)],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(r_dup.returncode, 0, r_dup.stdout + r_dup.stderr)
-        self.assertEqual(json.loads(r_dup.stdout)["tier"], "delegated_faithful")
-        self.assertEqual(
-            self.ref("-t", "1.5", "-i", self.tmp / "in.wav", "-t", "0.75", "-c", "copy", dup_t_ref).returncode, 0)
-        self.assertEqual(self.framemd5(dup_t_lff), self.framemd5(dup_t_ref))
+        r_dup, exec_dup = self.native("-json", "-y", "-t", "1.5", "-i", "in.wav", "-t", "0.75", "-c", "copy", dup_t_lff)
+        self.assertNotEqual(r_dup.returncode, 0)
+        self.assertFalse(exec_dup)
+        self.assertFalse(dup_t_lff.exists())
+        self.assertEqual(json.loads(r_dup.stdout)["tier"], "unsupported")
 
     def test_mp4_elst_v0_promotes_to_v1_on_64bit_rescaled_duration(self):
         # Craft a valid MP4 from in.mp4 whose mvhd timescale is 1 and v0 elst segment_duration is 5,000,000

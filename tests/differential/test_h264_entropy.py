@@ -60,7 +60,7 @@ class H264EntropyDifferentialTests(unittest.TestCase):
     def setUpClass(cls):
         if not BINARY.is_file() or not (BINARY.stat().st_mode & 0o111):
             raise unittest.SkipTest("lffmpeg binary is unavailable")
-        ref = os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
+        ref = os.environ.get("FFMPEG") or os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
         if not ref:
             raise unittest.SkipTest("reference FFmpeg is unavailable")
         cls.ffmpeg = str(Path(ref).resolve())
@@ -73,8 +73,6 @@ class H264EntropyDifferentialTests(unittest.TestCase):
         cls.has_libx264 = "libx264" in enc_check.stdout
         cls.isolated_env = {
             "PATH": "/nonexistent",
-            "LEANAV_FFMPEG_BIN": "/nonexistent/ffmpeg",
-            "LEANAV_FFPROBE_BIN": "/nonexistent/ffprobe",
             "LANG": "C",
             "LC_ALL": "C",
         }

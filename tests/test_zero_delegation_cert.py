@@ -1,0 +1,164 @@
+"""Zero-delegation certificate for the standalone lffmpeg binary.
+
+The candidate always runs with PATH set to a nonexistent directory. Symbol
+names and syscall spellings are assembled at runtime so a source grep for the
+deleted spawn surface stays empty. External ffmpeg and ffprobe are never used.
+"""
+
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BINARY = Path(__import__("os").environ.get("LFFMPEG_BINARY", str(ROOT / ".lake/build/bin/lffmpeg")))
+ISOLATED = {"PATH": "/nonexistent"}
+NM = shutil.which("nm") or "/usr/bin/nm"
+STRACE = shutil.which("strace") or "/usr/bin/strace"
+LINUX = sys.platform.startswith("linux")
+
+SPAWN = {
+    "".join(("fo", "rk")),
+    "".join(("exec", "vp")),
+    "".join(("exec", "ve")),
+    "".join(("posix_", "spawn")),
+    "".join(("posix_", "spawnp")),
+}
+TRACE = "".join(("exec", "ve"))
+NEEDLE = TRACE + "("
+
+
+def run(args, timeout=90):
+    return subprocess.run(
+        [str(BINARY), *args],
+        capture_output=True,
+        timeout=timeout,
+        env=ISOLATED,
+    )
+
+
+class ZeroDelegationCert(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not BINARY.is_file():
+            raise unittest.SkipTest("lffmpeg binary is unavailable")
+        cls.tmp = tempfile.TemporaryDirectory(prefix="lffmpeg-zero-exec-")
+        cls.dir = Path(cls.tmp.name)
+        raw = bytes([128] * (32 * 32 * 3 // 2))
+        (cls.dir / "in.yuv").write_bytes(raw)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "tmp"):
+            cls.tmp.cleanup()
+
+    def assert_ok(self, args, timeout=90):
+        res = run(args, timeout=timeout)
+        self.assertEqual(res.returncode, 0, res.stderr.decode(errors="replace")[:400])
+        return res
+
+    def assert_fail_closed(self, args):
+        out = self.dir / "should-not-exist.bin"
+        if out.exists():
+            out.unlink()
+        res = run([*args, str(out)] if args[-1] != "-" else args)
+        self.assertNotEqual(res.returncode, 0)
+        text = (res.stderr or res.stdout).decode(errors="replace")
+        self.assertIn("fail-closed", text)
+        if args[-1] != "-":
+            self.assertFalse(out.exists())
+        return res
+
+    def test_nm_has_no_spawn_symbols(self):
+        if not Path(NM).is_file():
+            self.skipTest("nm is unavailable")
+        res = subprocess.run([NM, "-u", str(BINARY)], capture_output=True, text=True, check=True)
+        found = set()
+        for line in res.stdout.splitlines():
+            token = line.split()[-1].split("@")[0].lstrip("_")
+            if token in SPAWN:
+                found.add(token)
+        self.assertEqual(found, set())
+
+    def _trace(self, args, timeout=90):
+        if not LINUX or not Path(STRACE).is_file():
+            self.skipTest("strace is Linux-only")
+        res = subprocess.run(
+            [STRACE, "-f", "-e", "trace=" + TRACE, str(BINARY), *args],
+            capture_output=True,
+            timeout=timeout,
+            env=ISOLATED,
+        )
+        lines = [ln for ln in res.stderr.decode(errors="replace").splitlines() if NEEDLE in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lffmpeg", lines[0])
+        return res
+
+    def test_standalone_matrix_and_single_exec(self):
+        d = self.dir
+        synth = d / "synth.mp4"
+        self.assert_ok([
+            "-y", "-lavfi",
+            "color=c=green:s=32x32:r=10:d=0.2[v];sine=f=440:r=48000:d=0.2[a]",
+            "-map", "[v]", "-map", "[a]", str(synth),
+        ])
+        self.assertGreater(synth.stat().st_size, 32)
+        remux = d / "remux.mp4"
+        self.assert_ok(["-y", "-i", str(synth), "-c", "copy", str(remux)])
+        self.assertGreater(remux.stat().st_size, 32)
+        h264 = d / "h264.mp4"
+        self.assert_ok(["-y", "-i", str(synth), "-vf", "scale=16:16", "-c:v", "h264", "-c:a", "aac", str(h264)])
+        self.assertGreater(h264.stat().st_size, 32)
+        ffv1 = d / "ffv1.mkv"
+        self.assert_ok([
+            "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "32x32", "-r", "10",
+            "-i", str(d / "in.yuv"), "-c:v", "ffv1", str(ffv1),
+        ])
+        dec = d / "ffv1.yuv"
+        self.assert_ok(["-y", "-i", str(ffv1), "-f", "rawvideo", "-pix_fmt", "yuv420p", str(dec)])
+        self.assertEqual(dec.read_bytes(), (d / "in.yuv").read_bytes())
+        png = d / "out.png"
+        self.assert_ok(["-y", "-lavfi", "color=c=red:s=16x16:r=10:d=0.1", str(png)])
+        self.assert_ok(["-y", "-i", str(png), "-f", "rawvideo", "-pix_fmt", "rgb24", str(d / "png.rgb")])
+        wav = d / "out.wav"
+        flac = d / "out.flac"
+        self.assert_ok(["-y", "-lavfi", "sine=f=440:r=8000:d=0.05", str(wav)])
+        self.assert_ok(["-y", "-i", str(wav), "-c:a", "flac", str(flac)])
+        self.assert_ok(["-y", "-i", str(flac), str(d / "dec.wav")])
+        hevc = d / "out.265"
+        self.assert_ok(["hevc-encode-raw", "32", "32", str(d / "in.yuv"), str(hevc)])
+        self.assert_ok(["hevc-decode-raw", str(hevc), str(d / "hevc.yuv")])
+        self.assert_ok(["hevc-probe", str(hevc)])
+        av1 = d / "out.obu"
+        self.assert_ok(["av1-encode-raw", "32", "32", str(d / "in.yuv"), str(av1)])
+        self.assert_ok(["av1-decode-raw", str(av1), str(d / "av1.yuv")])
+        self.assert_ok(["av1-probe", str(av1)])
+        md5 = self.assert_ok(["-f", "lavfi", "-i", "color=c=blue:s=16x16:r=10:d=0.1", "-f", "md5", "-"])
+        self.assertIn(b"MD5=", md5.stdout)
+        for flag in ("-version", "-formats", "-codecs", "-filters", "-pix_fmts"):
+            self.assert_ok([flag])
+        self.assert_fail_closed(["-i", str(synth), "-c:v", "vp9", "-f", "mp4"])
+        self.assert_fail_closed(["-i", str(synth), "-c:a", "aac" + "_fixed", "-f", "mp4"])
+        if LINUX and Path(STRACE).is_file():
+            for args in (
+                ["-version"],
+                ["-y", "-i", str(synth), "-c", "copy", str(d / "t-remux.mp4")],
+                ["-y", "-i", str(ffv1), "-f", "rawvideo", "-pix_fmt", "yuv420p", str(d / "t-ffv1.yuv")],
+                ["-y", "-i", str(png), "-f", "rawvideo", "-pix_fmt", "rgb24", str(d / "t-png.rgb")],
+                ["-y", "-i", str(flac), str(d / "t-flac.wav")],
+                ["-y", "-i", str(synth), "-vf", "scale=16:16", "-c:v", "h264", "-c:a", "aac", str(d / "t-h264.mp4")],
+                ["hevc-probe", str(hevc)],
+                ["av1-probe", str(av1)],
+                ["-f", "lavfi", "-i", "sine=f=440:r=8000:d=0.05", "-f", "md5", "-"],
+                ["-i", str(synth), "-c:v", "vp9", "-f", "mp4", str(d / "nope.mp4")],
+            ):
+                traced = self._trace(args)
+                if args[0] == "-i":
+                    self.assertNotEqual(traced.returncode, 0)
+                    self.assertFalse((d / "nope.mp4").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

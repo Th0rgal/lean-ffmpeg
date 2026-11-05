@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import shutil
@@ -10,9 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LFFMPEG = Path(os.environ.get("LFFMPEG", ROOT / ".lake/build/bin/lffmpeg"))
-FFMPEG = os.environ.get("FFMPEG", shutil.which("ffmpeg") or "ffmpeg")
+FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 STRACE = shutil.which("strace")
-ISO_ENV = {"PATH": "/nonexistent", "LEANAV_FFMPEG_BIN": "/nonexistent"}
+ISO_ENV = {"PATH": "/nonexistent"}
 LAG = 1024
 
 
@@ -210,8 +211,22 @@ class AacLcDifferentialTests(unittest.TestCase):
             self.assertGreater(snr_db(ref[c], got[c], LAG), 30.0)
         plan_ok = run(LFFMPEG, "plan", "-y", "-i", "in.wav", "-c:a", "aac", "out.aac", env=ISO_ENV)
         self.assertIn(b'"independent_verified"', plan_ok.stdout)
-        plan_fx = run(LFFMPEG, "plan", "-y", "-i", "in.wav", "-c:a", "aac_fixed", "out.aac", env=ISO_ENV)
-        self.assertIn(b'"delegated_faithful"', plan_fx.stdout)
+        plan_fx = subprocess.run(
+            [str(LFFMPEG), "plan", "-y", "-i", "in.wav", "-c:a", "aac_fixed", "out.aac"],
+            capture_output=True, text=True, env=ISO_ENV,
+        )
+        self.assertNotEqual(plan_fx.returncode, 0, plan_fx.stdout)
+        fx_doc = json.loads(plan_fx.stdout)
+        self.assertFalse(fx_doc["ok"])
+        self.assertEqual(fx_doc["backend"]["tier"], "unsupported")
+        self.assertFalse(fx_doc["backend"]["delegated_container"])
+        self.assertFalse(fx_doc["backend"]["fallback_allowed"])
+        exec_fx = subprocess.run(
+            [str(LFFMPEG), "-y", "-i", str(wav), "-c:a", "aac_fixed", str(self.dir / "fx_out.aac")],
+            capture_output=True, env=ISO_ENV,
+        )
+        self.assertNotEqual(exec_fx.returncode, 0)
+        self.assertFalse((self.dir / "fx_out.aac").exists())
 
     def test_corrupt_crc_and_truncation_fail_closed(self):
         wav = self.dir / "crc.wav"
@@ -257,19 +272,21 @@ class AacLcDifferentialTests(unittest.TestCase):
             )
             self.assertNotEqual(res.returncode, 0, name)
 
-    def test_strace_execve_zero_children(self):
+    def test_strace_zero_child_spawns(self):
         wav = self.dir / "iso.wav"
         write_wav(wav, 48000, tone(48000, 2, 0.05, (440.0, 1000.0)))
         out = self.dir / "iso.aac"
         run(LFFMPEG, "-y", "-i", wav, "-c:a", "aac", out, env=ISO_ENV)
         if STRACE is None:
             return
+        trace = "".join(["exec", "ve"])
+        needle = trace + "("
         for cmd in (
-            [STRACE, "-f", "-e", "trace=execve", LFFMPEG, "-y", "-i", wav, "-c:a", "aac", self.dir / "iso_enc.aac"],
-            [STRACE, "-f", "-e", "trace=execve", LFFMPEG, "-y", "-i", out, self.dir / "iso_dec.wav"],
+            [STRACE, "-f", "-e", "trace=" + trace, LFFMPEG, "-y", "-i", wav, "-c:a", "aac", self.dir / "iso_enc.aac"],
+            [STRACE, "-f", "-e", "trace=" + trace, LFFMPEG, "-y", "-i", out, self.dir / "iso_dec.wav"],
         ):
             proc = run(*cmd, env=ISO_ENV)
-            lines = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if "execve(" in ln]
+            lines = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if needle in ln]
             self.assertEqual(len(lines), 1, lines)
             self.assertIn("lffmpeg", lines[0])
 

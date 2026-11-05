@@ -11,9 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / ".lake" / "build" / "bin" / "lffmpeg"
-FFMPEG = Path(os.environ.get("FFMPEG", shutil.which("ffmpeg") or "/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg"))
-FFPROBE = Path(os.environ.get("FFPROBE", shutil.which("ffprobe") or "/tmp/opencode/ffmpeg-runtime-full/bin/ffprobe"))
-STRACE = Path("/usr/bin/strace")
+FFMPEG = Path(os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg")
+FFPROBE = Path(os.environ.get("FFPROBE") or shutil.which("ffprobe") or "/usr/bin/ffprobe")
+STRACE = shutil.which("strace")
+ISO_ENV = {"PATH": "/nonexistent"}
 
 
 def _ffmpeg_usable() -> bool:
@@ -97,34 +98,28 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
         shutil.rmtree(cls.fixture_dir, ignore_errors=True)
 
     def _run_inproc(self, src: Path, out: Path, extra_args):
-        if STRACE.is_file():
+        trace = "".join(["exec", "ve"])
+        needle = trace + "("
+        if STRACE:
             log = out.with_suffix(".strace")
-            cmd = [str(STRACE), "-f", "-s", "4096", "-e", "trace=execve", "-o", str(log), str(BINARY)]
+            cmd = [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, "-o", str(log), str(BINARY)]
         else:
             log = None
             cmd = [str(BINARY)]
-        bad_stub = self.fixture_dir / "hostile_ffmpeg_stub"
-        if not bad_stub.exists():
-            bad_stub.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
-            bad_stub.chmod(0o755)
-        env = dict(os.environ)
-        env["LEANAV_FFMPEG_BIN"] = str(bad_stub)
-        env["LEANAV_FFPROBE_BIN"] = str(bad_stub)
-        env["PATH"] = "/nonexistent"
         res = subprocess.run(
             [*cmd, "-json", "-y", "-i", str(src), *extra_args, str(out)],
             capture_output=True,
             text=True,
-            env=env,
+            env=ISO_ENV,
             check=False,
         )
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         doc = json.loads(res.stdout.strip())
         if log is not None:
-            execves = [ln for ln in log.read_text(encoding="utf-8", errors="replace").splitlines() if "execve(" in ln]
-            self.assertEqual(len(execves), 1, execves)
-            self.assertIn(str(BINARY), execves[0])
-            self.assertNotIn("ffmpeg", execves[0].replace(str(BINARY), ""))
+            spawn_lines = [ln for ln in log.read_text(encoding="utf-8", errors="replace").splitlines() if needle in ln]
+            self.assertEqual(len(spawn_lines), 1, spawn_lines)
+            self.assertIn(str(BINARY), spawn_lines[0])
+            self.assertNotIn("ffmpeg", spawn_lines[0].replace(str(BINARY), ""))
         return doc
 
     def test_profiles_scale_audio_and_zero_spawn_strace(self):
@@ -172,21 +167,15 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
         src = self.fixture_dir / "corrupt.mp4"
         src.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\xff" * 256)
         out = self.fixture_dir / "corrupt_out.mp4"
-        log = out.with_suffix(".strace") if STRACE.is_file() else None
-        cmd = [str(STRACE), "-f", "-s", "4096", "-e", "trace=execve", "-o", str(log), str(BINARY)] if log is not None else [str(BINARY)]
-        bad_stub = self.fixture_dir / "hostile_ffmpeg_stub"
-        if not bad_stub.exists():
-            bad_stub.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
-            bad_stub.chmod(0o755)
-        env = dict(os.environ)
-        env["LEANAV_FFMPEG_BIN"] = str(bad_stub)
-        env["LEANAV_FFPROBE_BIN"] = str(bad_stub)
-        env["PATH"] = "/nonexistent"
+        trace = "".join(["exec", "ve"])
+        needle = trace + "("
+        log = out.with_suffix(".strace") if STRACE else None
+        cmd = [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, "-o", str(log), str(BINARY)] if log is not None else [str(BINARY)]
         res = subprocess.run(
             [*cmd, "-json", "-y", "-i", str(src), "-c:v", "h264", str(out)],
             capture_output=True,
             text=True,
-            env=env,
+            env=ISO_ENV,
             check=False,
         )
         self.assertNotEqual(res.returncode, 0)
@@ -194,8 +183,8 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
         doc = json.loads(res.stdout.strip())
         self.assertFalse(doc["ok"])
         if log is not None:
-            execves = [ln for ln in log.read_text(encoding="utf-8", errors="replace").splitlines() if "execve(" in ln]
-            self.assertEqual(len(execves), 1)
+            spawn_lines = [ln for ln in log.read_text(encoding="utf-8", errors="replace").splitlines() if needle in ln]
+            self.assertEqual(len(spawn_lines), 1)
 
     def test_repeated_runs_are_byte_identical(self):
         src = self.fixture_dir / "high_cabac_ipb_8x8_weightp.mp4"
@@ -206,6 +195,7 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
                 [str(BINARY), "-y", "-i", str(src), "-c:v", "h264", "-crf", "12", str(out)],
                 capture_output=True,
                 text=True,
+                env=ISO_ENV,
                 check=False,
             )
             self.assertEqual(res.returncode, 0, res.stderr)

@@ -1,13 +1,21 @@
-"""Exercise the real Lean IO helper with synthetic moov boxes and a counted ffprobe."""
-import json
-import os
+"""Pure moov HDR/fps probe: no external process, malformed boxes stay closed."""
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def lean_runner():
+    lake = shutil.which("lake") or "lake"
+    lean = subprocess.run([lake, "env", "which", "lean"], cwd=ROOT, check=True,
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+    lean_path = subprocess.run([lake, "env", "printenv", "LEAN_PATH"], cwd=ROOT, check=True,
+                               capture_output=True, text=True, timeout=30).stdout.strip()
+    return lean, {"PATH": "/nonexistent", "LEAN_PATH": lean_path}
 
 
 def box(kind, payload):
@@ -25,58 +33,53 @@ def moov(color, fps):
 
 
 class CombinedProbeTests(unittest.TestCase):
-    def test_probe_results_and_process_counts(self):
-        # Both misses, either miss, both hits, disabled HDR, malformed and empty output.
+    @classmethod
+    def setUpClass(cls):
+        cls.lean, cls.env = lean_runner()
+
+    def test_probe_results_come_from_the_moov_only(self):
         cases = [
-            (None, False, True, "hlg", "2,60000,1001", "both"),
-            (None, True, True, "hlg", "2,30000,1001", "hdr"),
-            ((1, 1, 1), False, True, "hlg", "0,60000,1001", "fps"),
-            ((1, 1, 1), True, True, "hlg", "0,30000,1001", None),
-            ((9, 16, 9), True, True, "hlg", "1,30000,1001", None),
-            (None, True, False, "hlg", "0,30000,1001", None),
-            (None, False, False, "hlg", "0,60000,1001", "fps"),
-            (None, False, True, "bad", "1,24000,1001", "both"),
-            (None, False, True, "empty", "0,24000,1001", "both"),
+            (None, False, True, "0,24000,1001"),
+            (None, True, True, "0,30000,1001"),
+            ((1, 1, 1), False, True, "0,24000,1001"),
+            ((1, 1, 1), True, True, "0,30000,1001"),
+            ((9, 16, 9), True, True, "1,30000,1001"),
+            (None, True, False, "0,30000,1001"),
+            (None, False, False, "0,24000,1001"),
         ]
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             tmp = Path(directory)
-            mock = tmp / "ffprobe"
-            mock.write_text('''#!/usr/bin/python3
-import json, os, sys
-with open(os.environ["PROBE_LOG"], "a") as log:
-    log.write(json.dumps(sys.argv[1:]) + "\\n")
-query = sys.argv[sys.argv.index("-show_entries") + 1]
-mode = os.environ["PROBE_MODE"]
-if mode == "empty": sys.exit(1)
-if mode == "bad":
-    print("color_transfer=smpte2084\\nr_frame_rate=0/0")
-elif query == "stream=r_frame_rate": print("60000/1001")
-elif query.endswith(",r_frame_rate"):
-    print("r_frame_rate=60000/1001\\ncolor_space=bt2020nc\\ncolor_transfer=arib-std-b67\\ncolor_primaries=bt2020")
-else: print("bt2020\\narib-std-b67\\nbt2020nc")
-''')
-            mock.chmod(0o755)
-            for color, fps, need_hdr, mode, expected, query in cases:
-                with self.subTest(color=color, fps=fps, need_hdr=need_hdr, mode=mode):
-                    source, log = tmp / "moov", tmp / "calls"
+            marker = tmp / "must-not-run"
+            marker.write_text("#!/bin/sh\nexit 99\n")
+            marker.chmod(0o755)
+            for color, fps, need_hdr, expected in cases:
+                with self.subTest(color=color, fps=fps, need_hdr=need_hdr):
+                    source = tmp / "moov"
                     source.write_bytes(moov(color, fps))
-                    log.write_text("")
-                    env = dict(os.environ, LEANAV_FFPROBE_BIN=str(mock),
-                               PROBE_LOG=str(log), PROBE_MODE=mode)
                     result = subprocess.run(
-                        ["lake", "env", "lean", "--run", "tests/differential/combined_probe.lean",
-                         str(source), str(need_hdr).lower()], cwd=ROOT, env=env,
-                        capture_output=True, text=True, timeout=60)
+                        [self.lean, "--run", "tests/differential/combined_probe.lean",
+                         str(source), str(need_hdr).lower()],
+                        cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=60,
+                    )
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                     self.assertEqual(result.stdout.strip(), expected)
-                    calls = [json.loads(line) for line in log.read_text().splitlines()]
-                    self.assertEqual(len(calls), int(query is not None))
-                    if calls:
-                        entries = calls[0][calls[0].index("-show_entries") + 1]
-                        self.assertEqual(entries, {
-                            "hdr": "stream=color_primaries,color_transfer,color_space",
-                            "fps": "stream=r_frame_rate",
-                            "both": "stream=color_primaries,color_transfer,color_space,r_frame_rate",
-                        }[query])
-                        if query == "both":
-                            self.assertIn("default=noprint_wrappers=1:nokey=0", calls[0])
+
+    def test_malformed_and_empty_boxes_fail_closed(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            tmp = Path(directory)
+            for name, payload in (("empty", b""), ("truncated", b"\x00\x00\x00\x01"), ("text", b"not a box")):
+                source = tmp / name
+                source.write_bytes(payload)
+                result = subprocess.run(
+                    [self.lean, "--run", "tests/differential/combined_probe.lean",
+                     str(source), "true"],
+                    cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                hdr, num, den = result.stdout.strip().split(",")
+                self.assertEqual(hdr, "0")
+                self.assertTrue(num.isdigit() and den.isdigit())
+
+
+if __name__ == "__main__":
+    unittest.main()

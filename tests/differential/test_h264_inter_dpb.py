@@ -137,19 +137,19 @@ class H264InterDeblockDpbTests(unittest.TestCase):
     def setUpClass(cls):
         if not BINARY.is_file() or not (BINARY.stat().st_mode & 0o111):
             raise unittest.SkipTest("lffmpeg binary is unavailable")
-        ref = os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
+        ref = os.environ.get("FFMPEG") or os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
         if not ref:
             raise unittest.SkipTest("reference FFmpeg is unavailable")
         cls.ffmpeg = str(Path(ref).resolve())
         ffprobe_cand = Path(cls.ffmpeg).with_name("ffprobe")
         cls.ffprobe = (
-            str(ffprobe_cand)
-            if ffprobe_cand.is_file()
-            else (shutil.which("ffprobe") or "")
+            os.environ.get("FFPROBE")
+            or (str(ffprobe_cand) if ffprobe_cand.is_file() else "")
+            or shutil.which("ffprobe")
+            or ""
         )
         cls.isolated_env = {
             "PATH": "/nonexistent",
-            "LEANAV_FFMPEG_BIN": "/nonexistent/ffmpeg",
             "LANG": "C",
             "LC_ALL": "C",
         }

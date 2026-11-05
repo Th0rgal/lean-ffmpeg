@@ -15,15 +15,14 @@ class H264SyntaxDifferentialTests(unittest.TestCase):
     def setUpClass(cls):
         if not BINARY.is_file() or not (BINARY.stat().st_mode & 0o111):
             raise unittest.SkipTest("lffmpeg binary is unavailable")
-        ffmpeg_bin = os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
-        ffprobe_bin = os.environ.get("LEANAV_TEST_FFPROBE") or shutil.which("ffprobe")
+        ffmpeg_bin = os.environ.get("FFMPEG") or os.environ.get("LEANAV_TEST_FFMPEG") or shutil.which("ffmpeg")
+        ffprobe_bin = os.environ.get("FFPROBE") or os.environ.get("LEANAV_TEST_FFPROBE") or shutil.which("ffprobe")
         if not ffmpeg_bin or not ffprobe_bin:
             raise unittest.SkipTest("reference ffmpeg/ffprobe is unavailable")
         cls.ffmpeg = str(Path(ffmpeg_bin).resolve())
         cls.ffprobe = str(Path(ffprobe_bin).resolve())
         cls.isolated_env = {
             "PATH": "/nonexistent",
-            "LEANAV_FFMPEG_BIN": "/nonexistent/ffmpeg",
             "LANG": "C",
             "LC_ALL": "C",
         }

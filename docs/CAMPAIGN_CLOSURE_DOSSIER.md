@@ -371,3 +371,5 @@ preserves delegated argv. Current project qualification passed 136/136 unit,
 8,899 declarations and 264 tight specs. The initial incorrect test assertion is
 retained in the audit. No fresh selected FATE media result or performance claim
 follows from this correction.
+
+M3-D (`campaign/m3-d-zero-exec-20261104`, integrating M3-A `7beef63e`, M3-B `c944e1dc`, and M3-C `644b0056` onto `741fb1d`) deletes every `ffmpeg`/`ffprobe` subprocess. HEVC Main 8-bit 4:2:0, AV1 Main 8-bit 4:2:0, and the lavfi DAG run in-process; every other route fails closed (`BackendTier.unsupported`, `delegatedContainer := false`). The post-deletion kernel check is **22,820 declarations, 0 sorryAx, 0 custom axioms**, and `turbo-lean audit-spec` is **807/807 `non_vacuous_and_tight`** across 37 modules (84,963 LOC). `c/leanav_simd_kernels.c` is 672 lines of FFI/OS glue with no process spawn. `tests/test_zero_delegation_cert.py` checks the undefined-symbol table and, on Linux, a single `execve` of `lffmpeg` itself across introspection, remux, FFV1, PNG, FLAC, H.264+AAC MP4, HEVC, AV1, lavfi, and fail-closed cases. No new benchmark numbers are claimed.
