@@ -1496,7 +1496,7 @@ def applyPixelFiltersYuv420pFrameFast (src : ByteArray) (w h : Nat)
     y ++ u ++ v
 
 /-- Exhaustive byte-pair differential check plus vector tails and malformed-buffer cases. -/
-def verifyPixelFiltersNative : Bool := Id.run do
+def verifyPixelFiltersNative (_ : Unit) : Bool := Id.run do
   let y : ByteArray := ⟨(Array.range 256).map Nat.toUInt8⟩
   let u : ByteArray := ⟨(Array.range 65536).map (fun i => (i / 256).toUInt8)⟩
   let v : ByteArray := ⟨(Array.range 65536).map Nat.toUInt8⟩

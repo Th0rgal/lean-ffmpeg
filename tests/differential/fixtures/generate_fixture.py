@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_FFMPEG = Path("/tmp/opencode/ffmpeg-runtime-full/bin/ffmpeg")
+DEFAULT_FFMPEG = Path(os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg")
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "input-av.mp4"
 
 
@@ -33,21 +34,6 @@ def main():
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
-    if str(args.ffmpeg).endswith("ffmpeg-runtime-full/bin/ffmpeg"):
-        library_paths = [
-            Path("/tmp/opencode/ffmpeg-runtime-full/lib"),
-            Path("/tmp/opencode/ffmpeg-runtime-full/root/usr/lib/x86_64-linux-gnu"),
-            Path("/tmp/opencode/ffmpeg-runtime-full/root/usr/lib"),
-        ]
-    else:
-        library_paths = [
-            ROOT / ".tools" / "ffmpeg-pkg" / "usr" / "lib" / "x86_64-linux-gnu",
-            ROOT / ".tools" / "ffmpeg-pkg" / "lib" / "x86_64-linux-gnu",
-            Path("/usr/lib/x86_64-linux-gnu"),
-        ]
-    environment["LD_LIBRARY_PATH"] = os.pathsep.join(
-        [str(path) for path in library_paths] + [environment.get("LD_LIBRARY_PATH", "")]
-    ).rstrip(os.pathsep)
     command = [
         str(args.ffmpeg),
         "-hide_banner",

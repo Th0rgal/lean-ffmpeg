@@ -284,7 +284,13 @@ class RunnerTests(unittest.TestCase):
             reference = self.make_executable(
                 directory,
                 "reference",
-                "import os, pathlib, sys, time; child = os.fork(); pathlib.Path(sys.argv[1]).write_text(str(child)); time.sleep(0.4); pathlib.Path(sys.argv[2]).write_text('alive')",
+                (
+                    "import pathlib, subprocess, sys, time; "
+                    "child_code = \"import pathlib, sys, time; time.sleep(0.4); pathlib.Path(sys.argv[1]).write_text('alive')\"; "
+                    "proc = subprocess.Popen([sys.executable, '-c', child_code, sys.argv[2]]); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(proc.pid)); "
+                    "time.sleep(0.4)"
+                ),
             )
             candidate = self.make_executable(directory, "candidate", "print('ok')")
             fixture = self.make_fixture(directory, args=[str(marker), str(after)])

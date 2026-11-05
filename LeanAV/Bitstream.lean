@@ -71,21 +71,21 @@ def readBitsMSB (r : BitReader) (n : Nat) : Option (UInt64 × BitReader) :=
         loop k' (cur + 1) ((acc <<< 1) ||| bit)
     some (loop n r.bitOffset 0)
 
+def readBitsLSBLoop (s : ByteSlice) : Nat → Nat → Nat → UInt64 → UInt64 × Nat
+  | 0, _, cur, acc => (acc, cur)
+  | rem + 1, i, cur, acc =>
+    let b := s.getByteD (cur / 8) 0
+    let bit := ((b >>> (cur % 8).toUInt8) &&& 1).toUInt64
+    readBitsLSBLoop s rem (i + 1) (cur + 1) (acc ||| (bit <<< i.toUInt64))
+
 /-- Read `n` bits (`0 ≤ n ≤ 64`) LSB-first as a `UInt64` (used by Vorbis, Opus raw bits, Deflate). -/
-def readBitsLSB (r : BitReader) (n : Nat) : Option (UInt64 × BitReader) := Id.run do
+def readBitsLSB (r : BitReader) (n : Nat) : Option (UInt64 × BitReader) :=
   let tot := r.totalBits
   if verifyBitstreamCursor r.bitOffset.toUInt64 n.toUInt64 tot.toUInt64 != 1 then
-    return none
-  let mut acc : UInt64 := 0
-  let mut cur := r.bitOffset
-  for i in [0:n] do
-    let byteIdx := cur / 8
-    let bitIdx  := cur % 8
-    let b := r.slice.getByteD byteIdx 0
-    let bit := ((b >>> bitIdx.toUInt8) &&& 1).toUInt64
-    acc := acc ||| (bit <<< i.toUInt64)
-    cur := cur + 1
-  return some (acc, { r with bitOffset := cur })
+    none
+  else
+    let (acc, cur) := readBitsLSBLoop r.slice n 0 r.bitOffset 0
+    some (acc, { r with bitOffset := cur })
 
 /-- Align cursor upward to the next byte boundary. -/
 @[inline]
@@ -128,11 +128,7 @@ def readSE (r : BitReader) (maxLz : Nat := 31) : Option (Int32 × BitReader) := 
   let signedVal : Int32 := if (codeNum &&& 1) == 1 then mag else -mag
   some (signedVal, r')
 
-/--
-  Read a Unary-coded non-negative integer (count of `0` bits before a terminating `1` bit)
-  bounded by `maxZeros` (used in FLAC Rice coding).
--/
-def readUnary0 (r : BitReader) (maxZeros : Nat := 65536) : Option (Nat × BitReader) :=
+def readUnary0 (r : BitReader) (maxZeros : Nat := 16777216) : Option (Nat × BitReader) :=
   let rec loop (fuel : Nat) (cur : BitReader) (q : Nat) : Option (Nat × BitReader) :=
     match fuel with
     | 0 => none
@@ -142,22 +138,19 @@ def readUnary0 (r : BitReader) (maxZeros : Nat := 65536) : Option (Nat × BitRea
       | some (b, nextR) =>
         if b == 1 then some (q, nextR)
         else loop fuel' nextR (q + 1)
-  loop (maxZeros + 1) r 0
+  loop (Nat.min maxZeros r.bitsLeft + 1) r 0
 
-/--
-  Read a signed Rice-Golomb residual with parameter `k` (`0 ≤ k ≤ 30`) as used in FLAC LPC subframes:
-  Reads unary quotient `q`, `k`-bit remainder `rem`, combines `u = (q <<< k) ||| rem`,
-  and unfolds zig-zag sign `if (u & 1) == 1 then -(u >> 1) - 1 else (u >> 1)`.
--/
-def readRiceSigned (r : BitReader) (k : Nat) : Option (Int32 × BitReader) := do
-  if k > 30 then none
+def readRiceSigned (r : BitReader) (k : Nat) : Option (Int64 × BitReader) := do
+  if k > 31 then none
   else
-    let (q, r1) ← r.readUnary0 65536
+    let (q, r1) ← r.readUnary0 r.bitsLeft
     let (remBits, r2) ← r1.readBitsMSB k
-    let u : UInt64 := (q.toUInt64 <<< k.toUInt64) ||| remBits
-    let half : Int32 := (u >>> 1).toUInt32.toInt32
-    let signedVal : Int32 := if (u &&& 1) == 1 then -half - 1 else half
-    some (signedVal, r2)
+    if q ≥ (1 <<< (63 - k)) then none
+    else
+      let u : UInt64 := (q.toUInt64 <<< k.toUInt64) ||| remBits
+      let half : Int64 := (u >>> 1).toInt64
+      let signedVal : Int64 := if (u &&& 1) == 1 then -half - 1 else half
+      some (signedVal, r2)
 
 /--
   Read an AV1 LEB128 unsigned integer (up to 8 bytes) from a byte-aligned `ByteSlice` at `byteOff`.
@@ -269,12 +262,12 @@ namespace BitWriter
 /-- Create an empty `BitWriter` with optional byte capacity hint. -/
 @[inline]
 def empty (_capBytes : Nat := 64) : BitWriter :=
-  { bytes := ByteArray.empty, curByte := 0, bitsUsed := 0 }
+  { bytes := { data := #[] }, curByte := 0, bitsUsed := 0 }
 
 /-- Total number of bits written so far. -/
 @[inline]
 def totalBitsWritten (w : BitWriter) : Nat :=
-  w.bytes.size * 8 + w.bitsUsed
+  w.bytes.data.size * 8 + w.bitsUsed
 
 /-- Write a single bit (`bit & 1`) MSB-first. -/
 @[inline]
@@ -346,19 +339,13 @@ def writeSE (w : BitWriter) (v : Int32) : BitWriter :=
     else 2 * mag
   w.writeUE codeNum
 
-/--
-  Write a signed Rice-Golomb residual with parameter `k` (`0 ≤ k ≤ 30`, inverse of `BitReader.readRiceSigned`):
-  Folds `v` into unsigned zig-zag `u = if v < 0 then 2 * (-v - 1) + 1 else 2 * v`,
-  writes unary quotient `q = u >>> k`, and writes `k`-bit remainder `u &&& ((1 <<< k) - 1)`.
--/
-def writeRiceSigned (w : BitWriter) (k : Nat) (v : Int32) : BitWriter :=
+def writeRiceSigned (w : BitWriter) (k : Nat) (v : Int64) : BitWriter :=
   let u : UInt64 :=
     if v < 0 then
-      let m : UInt64 := (-1 - v.toInt).natAbs.toUInt64
+      let m : UInt64 := (-1 - v).toUInt64
       (m <<< 1) ||| 1
     else
-      let m : UInt64 := v.toInt.natAbs.toUInt64
-      m <<< 1
+      v.toUInt64 <<< 1
   let q : Nat := (u >>> k.toUInt64).toNat
   let mask : UInt64 := ((1 : UInt64) <<< k.toUInt64) - 1
   let remBits : UInt64 := u &&& mask
@@ -397,8 +384,7 @@ def roundtripSE (v : Int32) : Option Int32 :=
   | some (out, _) => some out
   | none => none
 
-/-- Round-trip helper for Signed Rice-Golomb (`writeRiceSigned` followed by `readRiceSigned`). -/
-def roundtripRiceSigned (k : Nat) (v : Int32) : Option Int32 :=
+def roundtripRiceSigned (k : Nat) (v : Int64) : Option Int64 :=
   let bytes := (BitWriter.empty.writeRiceSigned k v).toByteArray
   match (BitReader.ofSlice { ba := bytes, off := 0, len := bytes.data.size }).readRiceSigned k with
   | some (out, _) => some out
@@ -422,21 +408,22 @@ theorem writeSE_readSE_roundtrip :
     roundtripSE (-12) = some (-12) := by
   decide
 
-/-- Theorem: `writeRiceSigned` / `readRiceSigned` round-trip holds across Rice parameters `k ∈ {0, 2, 4, 8}` and signed residuals. -/
+set_option maxRecDepth 20000 in
 theorem writeRiceSigned_readRiceSigned_roundtrip :
     roundtripRiceSigned 0 0 = some 0 ∧
     roundtripRiceSigned 2 (-5) = some (-5) ∧
     roundtripRiceSigned 4 19 = some 19 ∧
     roundtripRiceSigned 8 (-137) = some (-137) ∧
-    roundtripRiceSigned 8 235 = some 235 := by
+    roundtripRiceSigned 8 235 = some 235 ∧
+    roundtripRiceSigned 30 34359738368 = some 34359738368 ∧
+    roundtripRiceSigned 30 (-34359738368) = some (-34359738368) := by
   decide
 
 set_option maxRecDepth 20000 in
-/-- Theorem: Universal bounded Rice-Golomb round-trip for all `k ∈ [0, 4]` and all signed residuals `v ∈ [-8, 8]`. -/
 theorem writeRiceSigned_readRiceSigned_bounded_all :
     ((List.range 5).all (fun k =>
       (List.range 17).all (fun i =>
-        let v : Int32 := Int32.ofInt ((i : Int) - 8)
+        let v : Int64 := Int64.ofInt ((i : Int) - 8)
         roundtripRiceSigned k v == some v))) = true := by
   decide
 
@@ -1245,5 +1232,1119 @@ theorem withSliceBits_confined {α : Type} (sliceBits : Nat) (m : BitM α)
   · contradiction
 
 end BitM
+
+structure LsbWriter where
+  bytes : ByteArray := { data := #[] }
+  curByte : UInt8 := 0
+  bitsUsed : Nat := 0
+  deriving Inhabited
+
+namespace LsbWriter
+
+def empty : LsbWriter := {}
+
+def writeBit (w : LsbWriter) (bit : UInt8) : LsbWriter :=
+  let b := w.curByte ||| ((bit &&& 1) <<< w.bitsUsed.toUInt8)
+  if w.bitsUsed == 7 then
+    { bytes := { data := w.bytes.data.push b }, curByte := 0, bitsUsed := 0 }
+  else
+    { w with curByte := b, bitsUsed := w.bitsUsed + 1 }
+
+def writeBits (w : LsbWriter) (v : UInt32) : Nat → LsbWriter
+  | 0 => w
+  | n + 1 => writeBits (w.writeBit ((v &&& 1).toUInt8)) (v >>> 1) n
+
+def alignToByte (w : LsbWriter) : LsbWriter :=
+  if w.bitsUsed == 0 then w else { bytes := { data := w.bytes.data.push w.curByte }, curByte := 0, bitsUsed := 0 }
+
+def toByteArray (w : LsbWriter) : ByteArray := w.alignToByte.bytes
+
+end LsbWriter
+
+structure DeflateHuffman where
+  lengths : Array Nat
+  codes : Array UInt32
+  counts : Array Nat
+  symbols : Array Nat
+  deriving Inhabited
+
+def deflateReverseCode (code : UInt32) : Nat → Nat → UInt32
+  | 0, acc => acc.toUInt32
+  | n + 1, acc => deflateReverseCode (code >>> 1) n (acc * 2 + (code &&& 1).toNat)
+
+def deflateCountLengths : List Nat → Array Nat → Nat → Option (Array Nat × Nat)
+  | [], counts, used => if used == 0 then none else some (counts, used)
+  | len :: rest, counts, used =>
+    if len > 15 then none
+    else if len == 0 then deflateCountLengths rest counts used
+    else deflateCountLengths rest (counts.set! len (counts.getD len 0 + 1)) (used + 1)
+
+def deflateCheckKraft (counts : Array Nat) : Nat → Int → Bool
+  | 0, _ => true
+  | k + 1, left =>
+    let len := 16 - (k + 1)
+    let left' := left * 2 - (counts.getD len 0 : Int)
+    if left' < 0 then false else deflateCheckKraft counts k left'
+
+def deflateInitTables (counts : Array Nat) : Nat → UInt32 → Nat → Array UInt32 → Array Nat → Array UInt32 × Array Nat
+  | 0, _, _, next, offsets => (next, offsets)
+  | k + 1, code, offAcc, next, offsets =>
+    let len := 16 - (k + 1)
+    let code' := (code + (counts.getD (len - 1) 0).toUInt32) <<< 1
+    let cnt := counts.getD len 0
+    deflateInitTables counts k code' (offAcc + cnt) (next.set! len code') (offsets.set! len offAcc)
+
+def deflateAssignSymbols (lengths : Array Nat) :
+    Nat → Nat → Array UInt32 → Array Nat → Array UInt32 → Array Nat → Array UInt32 × Array Nat
+  | 0, _, _, _, codes, symbols => (codes, symbols)
+  | fuel + 1, sym, next, offsets, codes, symbols =>
+    if sym ≥ lengths.size then (codes, symbols)
+    else
+      let len := lengths.getD sym 0
+      if len == 0 then
+        deflateAssignSymbols lengths fuel (sym + 1) next offsets codes symbols
+      else
+        let c := next.getD len 0
+        let pos := offsets.getD len 0
+        deflateAssignSymbols lengths fuel (sym + 1)
+          (next.set! len (c + 1)) (offsets.set! len (pos + 1))
+          (codes.set! sym (deflateReverseCode c len 0)) (symbols.set! pos sym)
+
+def deflateBuildHuffman (lengths : Array Nat) : Option DeflateHuffman := do
+  let n := lengths.size
+  let (counts, used) ← deflateCountLengths lengths.toList (List.replicate 16 0).toArray 0
+  if !deflateCheckKraft counts 15 1 then none
+  let (next, offsets) := deflateInitTables counts 15 0 0 (List.replicate 16 0).toArray (List.replicate 16 0).toArray
+  let (codes, symbols) := deflateAssignSymbols lengths n 0 next offsets
+    (List.replicate n 0).toArray (List.replicate used 0).toArray
+  some { lengths, codes, counts, symbols }
+
+def deflateDecodeSymbol (r : BitReader) (h : DeflateHuffman) : Option (Nat × BitReader) :=
+  let nSym := h.symbols.size
+  let rec loop (cur : BitReader) (len : Nat) (code first index : Nat) : Nat → Option (Nat × BitReader)
+    | 0 => none
+    | fuel + 1 => do
+      let (b, next) ← cur.readBitsLSB 1
+      let code' := code + b.toNat
+      let count := h.counts.getD len 0
+      if code' ≥ first && code' - first < count then
+        let idx := index + (code' - first)
+        if idx < nSym then some (h.symbols.getD idx 0, next) else none
+      else if len == 15 then none
+      else loop next (len + 1) (code' * 2) ((first + count) * 2) (index + count) fuel
+  loop r 1 0 0 0 15
+
+def deflateFixedLiteralHuffman : DeflateHuffman :=
+  let lengths := ((List.range 288).map fun sym =>
+    if sym ≤ 143 then 8 else if sym ≤ 255 then 9 else if sym ≤ 279 then 7 else 8).toArray
+  (deflateBuildHuffman lengths).getD { lengths, codes := #[], counts := #[], symbols := #[] }
+
+def deflateFixedDistanceHuffman : DeflateHuffman :=
+  let lengths := (List.replicate 32 5).toArray
+  (deflateBuildHuffman lengths).getD { lengths, codes := #[], counts := #[], symbols := #[] }
+
+def deflateLengthBase : Array Nat :=
+  #[3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+    67, 83, 99, 115, 131, 163, 195, 227, 258]
+
+def deflateLengthExtra : Array Nat :=
+  #[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5, 0]
+
+def deflateDistanceBase : Array Nat :=
+  #[1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+
+def deflateDistanceExtra : Array Nat :=
+  #[0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+    11, 11, 12, 12, 13, 13]
+
+def deflateCopyMatch (out : ByteArray) (distance : Nat) : Nat → Option ByteArray
+  | 0 => some out
+  | n + 1 =>
+    let curLen := out.data.size
+    if distance == 0 || distance > curLen then none
+    else
+      let b := out.data.getD (curLen - distance) 0
+      deflateCopyMatch { data := out.data.push b } distance n
+
+def deflateCodeLengthOrder : Array Nat :=
+  #[16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+def deflateReadCodeLengths (r : BitReader) (h : DeflateHuffman) (remaining : Nat)
+    (out : Array Nat) : Nat → Option (Array Nat × BitReader)
+  | 0 => none
+  | fuel + 1 =>
+    if remaining == 0 then some (out, r)
+    else do
+      let (sym, r1) ← deflateDecodeSymbol r h
+      if sym ≤ 15 then
+        deflateReadCodeLengths r1 h (remaining - 1) (out.push sym) fuel
+      else if sym == 16 then do
+        if out.size == 0 then none
+        let (extra, r2) ← r1.readBitsLSB 2
+        let reps := extra.toNat + 3
+        if reps > remaining then none
+        let v := out.getD (out.size - 1) 0
+        deflateReadCodeLengths r2 h (remaining - reps) (out ++ (List.replicate reps v).toArray) fuel
+      else if sym == 17 then do
+        let (extra, r2) ← r1.readBitsLSB 3
+        let reps := extra.toNat + 3
+        if reps > remaining then none
+        deflateReadCodeLengths r2 h (remaining - reps) (out ++ (List.replicate reps 0).toArray) fuel
+      else if sym == 18 then do
+        let (extra, r2) ← r1.readBitsLSB 7
+        let reps := extra.toNat + 11
+        if reps > remaining then none
+        deflateReadCodeLengths r2 h (remaining - reps) (out ++ (List.replicate reps 0).toArray) fuel
+      else none
+
+def deflateReadDynamicHuffman (r : BitReader) : Option (DeflateHuffman × DeflateHuffman × BitReader) := do
+  let (a, r1) ← r.readBitsLSB 5
+  let (b, r2) ← r1.readBitsLSB 5
+  let (c, r3) ← r2.readBitsLSB 4
+  let hlit := a.toNat + 257
+  let hdist := b.toNat + 1
+  let hclen := c.toNat + 4
+  if hlit > 286 || hdist > 32 then none
+  let rec readCl (cur : BitReader) (i : Nat) (lens : Array Nat) : Nat → Option (Array Nat × BitReader)
+    | 0 => none
+    | fuel + 1 => do
+      if i == hclen then some (lens, cur)
+      else
+        let (v, next) ← cur.readBitsLSB 3
+        readCl next (i + 1) (lens.set! (deflateCodeLengthOrder.getD i 0) v.toNat) fuel
+  let (clLens, r4) ← readCl r3 0 (List.replicate 19 0).toArray (hclen + 1)
+  let clHuff ← deflateBuildHuffman clLens
+  let (allLens, r5) ← deflateReadCodeLengths r4 clHuff (hlit + hdist) #[] (hlit + hdist + 1)
+  let litLens := (allLens.toList.take hlit).toArray
+  let distLens := (allLens.toList.drop hlit).toArray
+  if litLens.getD 256 0 == 0 then none
+  let lit ← deflateBuildHuffman litLens
+  let dist ← if distLens.toList.all (· == 0) then
+      some { lengths := distLens, codes := #[], counts := #[], symbols := #[] }
+    else deflateBuildHuffman distLens
+  some (lit, dist, r5)
+
+def deflateDecodeTokens (r : BitReader) (lit dist : DeflateHuffman) (maxOutput : Nat)
+    (out : ByteArray) : Nat → Option (ByteArray × BitReader)
+  | 0 => none
+  | fuel + 1 => do
+    let (sym, r1) ← deflateDecodeSymbol r lit
+    if sym < 256 then
+      if out.data.size ≥ maxOutput then none
+      deflateDecodeTokens r1 lit dist maxOutput { data := out.data.push sym.toUInt8 } fuel
+    else if sym == 256 then some (out, r1)
+    else if sym ≤ 285 then do
+      let li := sym - 257
+      let eb := deflateLengthExtra.getD li 0
+      let (extra, r2) ← r1.readBitsLSB eb
+      let len := deflateLengthBase.getD li 0 + extra.toNat
+      if dist.symbols.size == 0 then none
+      let (dsym, r3) ← deflateDecodeSymbol r2 dist
+      if dsym ≥ 30 then none
+      let de := deflateDistanceExtra.getD dsym 0
+      let (dextra, r4) ← r3.readBitsLSB de
+      let distance := deflateDistanceBase.getD dsym 0 + dextra.toNat
+      if len > maxOutput - out.data.size then none
+      let out' ← deflateCopyMatch out distance len
+      deflateDecodeTokens r4 lit dist maxOutput out' fuel
+    else none
+
+def deflateCopyStored (r : BitReader) (out : ByteArray) (maxOutput : Nat) : Nat → Option (ByteArray × BitReader)
+  | 0 => some (out, r)
+  | n + 1 => do
+    if out.data.size ≥ maxOutput then none
+    let (v, next) ← r.readBitsLSB 8
+    deflateCopyStored next { data := out.data.push v.toUInt8 } maxOutput n
+
+def deflateDecode (s : ByteSlice) (maxOutput : Nat := 268435456) : Option (ByteArray × BitReader) :=
+  let rec blocks (r : BitReader) (out : ByteArray) : Nat → Option (ByteArray × BitReader)
+    | 0 => none
+    | fuel + 1 =>
+      match r.readBitsLSB 1 with
+      | none => none
+      | some (final, r1) =>
+        match r1.readBitsLSB 2 with
+        | none => none
+        | some (kind, r2) =>
+          if kind == 0 then
+            let r3 := r2.alignToByte
+            match r3.readBitsLSB 16 with
+            | none => none
+            | some (lv, r4) =>
+              match r4.readBitsLSB 16 with
+              | none => none
+              | some (nv, r5) =>
+                if (lv.toUInt16 ^^^ 0xFFFF) != nv.toUInt16 then none
+                else
+                  match deflateCopyStored r5 out maxOutput lv.toNat with
+                  | none => none
+                  | some (out', r6) =>
+                    if final == 1 then some (out', r6) else blocks r6 out' fuel
+          else if kind == 1 || kind == 2 then
+            let treesOpt :=
+              if kind == 1 then some (deflateFixedLiteralHuffman, deflateFixedDistanceHuffman, r2)
+              else deflateReadDynamicHuffman r2
+            match treesOpt with
+            | none => none
+            | some (lit, dist, r3) =>
+              match deflateDecodeTokens r3 lit dist maxOutput out (s.len * 8 + 1) with
+              | none => none
+              | some (out', r4) =>
+                if final == 1 then some (out', r4) else blocks r4 out' fuel
+          else none
+  blocks (BitReader.ofSlice s) { data := #[] } (s.len * 8 + 1)
+
+inductive DeflateMode where
+  | stored
+  | fixed
+  | dynamic
+  deriving DecidableEq, Repr, Inhabited
+
+inductive DeflateToken where
+  | lit (b : UInt8)
+  | matchRef (len dist : Nat)
+  deriving DecidableEq, Repr, Inhabited
+
+def pushByteArrayLoop (dst src : ByteArray) (i : Nat) : Nat → ByteArray
+  | 0 => dst
+  | k + 1 =>
+    if i ≥ src.data.size then dst
+    else pushByteArrayLoop { data := dst.data.push (src.data.getD i 0) } src (i + 1) k
+
+def appendByteArraySpec (a b : ByteArray) : ByteArray :=
+  { data := a.data ++ b.data }
+
+def deflateEncodeStoredSingle (data : ByteArray) : ByteArray :=
+  let len : UInt16 := data.data.size.toUInt16
+  let nlen : UInt16 := len ^^^ 0xFFFF
+  let hdr : ByteArray := { data := #[
+    0x01,
+    (len &&& 0xFF).toUInt8,
+    ((len >>> 8) &&& 0xFF).toUInt8,
+    (nlen &&& 0xFF).toUInt8,
+    ((nlen >>> 8) &&& 0xFF).toUInt8
+  ] }
+  appendByteArraySpec hdr data
+
+def deflateSliceArrayLoop (src : Array UInt8) (pos : Nat) (acc : Array UInt8) : Nat → Array UInt8
+  | 0 => acc
+  | k + 1 => deflateSliceArrayLoop src (pos + 1) (acc.push (src.getD pos 0)) k
+
+def deflateEncodeStoredBlocks (data : ByteArray) (off : Nat) (acc : ByteArray) : Nat → ByteArray
+  | 0 => acc
+  | fuel + 1 =>
+    let total := data.data.size
+    if off ≥ total && off > 0 then acc
+    else
+      let rem := total - off
+      let chunk := if rem > 65535 then 65535 else rem
+      let isFinal : UInt8 := if off + chunk ≥ total then 1 else 0
+      let len : UInt16 := chunk.toUInt16
+      let nlen : UInt16 := len ^^^ 0xFFFF
+      let hdr : Array UInt8 := #[
+        isFinal,
+        (len &&& 0xFF).toUInt8,
+        ((len >>> 8) &&& 0xFF).toUInt8,
+        (nlen &&& 0xFF).toUInt8,
+        ((nlen >>> 8) &&& 0xFF).toUInt8
+      ]
+      let nextData := deflateSliceArrayLoop data.data off (acc.data ++ hdr) chunk
+      let nextAcc : ByteArray := { data := nextData }
+      if isFinal == 1 then nextAcc
+      else deflateEncodeStoredBlocks data (off + chunk) nextAcc fuel
+
+def deflateEncodeStored (data : ByteArray) : ByteArray :=
+  deflateEncodeStoredBlocks data 0 { data := #[] } (data.data.size / 65535 + 2)
+
+def deflateLengthCodeLoop (len : Nat) : Nat → Nat × Nat × UInt32
+  | 0 => (257, 0, 0)
+  | rem + 1 =>
+    let idx := 28 - (rem + 1)
+    let base := deflateLengthBase.getD idx 3
+    let eb := deflateLengthExtra.getD idx 0
+    let span := 1 <<< eb
+    if len ≥ base && len < base + span then (257 + idx, eb, (len - base).toUInt32)
+    else deflateLengthCodeLoop len rem
+
+def deflateLengthCode (len : Nat) : Nat × Nat × UInt32 :=
+  if len == 258 then (285, 0, 0) else deflateLengthCodeLoop len 28
+
+def deflateDistanceCodeLoop (dist : Nat) : Nat → Nat × Nat × UInt32
+  | 0 => (0, 0, 0)
+  | rem + 1 =>
+    let idx := 30 - (rem + 1)
+    let base := deflateDistanceBase.getD idx 1
+    let eb := deflateDistanceExtra.getD idx 0
+    let span := 1 <<< eb
+    if dist ≥ base && dist < base + span then (idx, eb, (dist - base).toUInt32)
+    else deflateDistanceCodeLoop dist rem
+
+def deflateDistanceCode (dist : Nat) : Nat × Nat × UInt32 :=
+  deflateDistanceCodeLoop dist 30
+
+def deflateMatchLen (data : ByteArray) (p pos cur maxLen : Nat) : Nat → Nat
+  | 0 => cur
+  | fuel + 1 =>
+    if cur ≥ maxLen then cur
+    else if data.data.getD (p + cur) 0 == data.data.getD (pos + cur) 0 then
+      deflateMatchLen data p pos (cur + 1) maxLen fuel
+    else cur
+
+def deflateSearchChain (data : ByteArray) (prev : Array Int) (pos maxLen : Nat)
+    (cur : Int) (bestLen bestDist : Nat) : Nat → Nat × Nat
+  | 0 => (bestLen, bestDist)
+  | steps + 1 =>
+    if cur < 0 then (bestLen, bestDist)
+    else
+      let p := cur.toNat
+      let dist := pos - p
+      if dist == 0 || dist > 32768 then (bestLen, bestDist)
+      else
+        let (bl, bd) :=
+          if data.data.getD (p + bestLen) 0 == data.data.getD (pos + bestLen) 0 then
+            let ml := deflateMatchLen data p pos 0 maxLen maxLen
+            if ml > bestLen then (ml, dist) else (bestLen, bestDist)
+          else (bestLen, bestDist)
+        deflateSearchChain data prev pos maxLen (prev.getD p (-1)) bl bd steps
+
+def deflateInsertRange (data : ByteArray) (pos : Nat) : Nat → Nat → Array Int → Array Int → Array Int × Array Int
+  | 0, _, head, prev => (head, prev)
+  | fuel + 1, adv, head, prev =>
+    let q := pos + adv
+    let hmod := head.size
+    let (head', prev') :=
+      if q + 3 ≤ data.data.size && hmod > 0 then
+        let c0 := (data.data.getD q 0).toNat
+        let c1 := (data.data.getD (q + 1) 0).toNat
+        let c2 := (data.data.getD (q + 2) 0).toNat
+        let hq := ((c0 * 257 + c1) * 257 + c2) % hmod
+        (head.set! hq (Int.ofNat q), prev.set! q (head.getD hq (-1)))
+      else (head, prev)
+    deflateInsertRange data pos fuel (adv + 1) head' prev'
+
+def deflateLz77Loop (data : ByteArray) (pos : Nat) (head prev : Array Int)
+    (out : Array DeflateToken) : Nat → Array DeflateToken
+  | 0 => out
+  | fuel + 1 =>
+    let n := data.data.size
+    let hmod := if head.size > 0 then head.size else 1
+    if pos ≥ n then out
+    else if pos + 3 ≤ n then
+      let b0 := (data.data.getD pos 0).toNat
+      let b1 := (data.data.getD (pos + 1) 0).toNat
+      let b2 := (data.data.getD (pos + 2) 0).toNat
+      let h := ((b0 * 257 + b1) * 257 + b2) % hmod
+      let cand0 := head.getD h (-1)
+      let prev1 := prev.set! pos cand0
+      let head1 := head.set! h (Int.ofNat pos)
+      let maxLen := if n - pos < 258 then n - pos else 258
+      let (bestLen, bestDist) := deflateSearchChain data prev1 pos maxLen cand0 2 0 16
+      if bestLen ≥ 3 && bestDist ≥ 1 then
+        let (head2, prev2) := deflateInsertRange data pos (bestLen - 1) 1 head1 prev1
+        deflateLz77Loop data (pos + bestLen) head2 prev2 (out.push (.matchRef bestLen bestDist)) fuel
+      else
+        deflateLz77Loop data (pos + 1) head1 prev1 (out.push (.lit (data.data.getD pos 0))) fuel
+    else
+      deflateLz77Loop data (pos + 1) head prev (out.push (.lit (data.data.getD pos 0))) fuel
+
+def deflateMapLitLoop (arr : Array UInt8) (i : Nat) (acc : Array DeflateToken) : Nat → Array DeflateToken
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ arr.size then acc
+    else deflateMapLitLoop arr (i + 1) (acc.push (.lit (arr.getD i 0))) k
+
+def deflateLz77HashSize (n : Nat) : Nat :=
+  if n < 32 then 16
+  else if n < 512 then 128
+  else 4096
+
+def deflateRepArray {α : Type} (n : Nat) (v : α) : Array α :=
+  (List.replicate n v).toArray
+
+def deflateTokenizeLz77 (data : ByteArray) : Array DeflateToken :=
+  let n := data.data.size
+  if n < 3 then
+    deflateMapLitLoop data.data 0 #[] n
+  else
+    let hSize := deflateLz77HashSize n
+    deflateLz77Loop data 0 (deflateRepArray hSize (-1)) (deflateRepArray n (-1)) #[] (n + 1)
+
+def deflateEncodeSymbol (w : LsbWriter) (h : DeflateHuffman) (sym : Nat) : LsbWriter :=
+  w.writeBits (h.codes.getD sym 0) (h.lengths.getD sym 0)
+
+def deflateEncodeTokenList (w : LsbWriter) (lit dist : DeflateHuffman) : List DeflateToken → LsbWriter
+  | [] => deflateEncodeSymbol w lit 256
+  | .lit b :: rest =>
+    deflateEncodeTokenList (deflateEncodeSymbol w lit b.toNat) lit dist rest
+  | .matchRef len d :: rest =>
+    let (lsym, leb, lextra) := deflateLengthCode len
+    let w1 := deflateEncodeSymbol w lit lsym
+    let w2 := if leb > 0 then w1.writeBits lextra leb else w1
+    let (dsym, deb, dextra) := deflateDistanceCode d
+    let w3 := deflateEncodeSymbol w2 dist dsym
+    let w4 := if deb > 0 then w3.writeBits dextra deb else w3
+    deflateEncodeTokenList w4 lit dist rest
+
+def deflateEncodeTokenStream (w0 : LsbWriter) (lit dist : DeflateHuffman)
+    (tokens : Array DeflateToken) : LsbWriter :=
+  deflateEncodeTokenList w0 lit dist tokens.toList
+
+def deflateCollectActive (freqs : Array Nat) (i : Nat) (acc : Array (Nat × Nat)) : Nat → Array (Nat × Nat)
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ freqs.size then acc
+    else
+      let f := freqs.getD i 0
+      deflateCollectActive freqs (i + 1) (if f > 0 then acc.push (f, i) else acc) k
+
+def deflateInitPool (active : Array (Nat × Nat)) (i : Nat) (acc : Array (Nat × Nat)) : Nat → Array (Nat × Nat)
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ active.size then acc
+    else deflateInitPool active (i + 1) (acc.push ((active.getD i (1, 0)).1, i)) k
+
+def deflateFindMinIdx (pool : Array (Nat × Nat)) (i best : Nat) : Nat → Nat
+  | 0 => best
+  | k + 1 =>
+    if i ≥ pool.size then best
+    else
+      let best' := if (pool.getD i (0, 0)).1 < (pool.getD best (0, 0)).1 then i else best
+      deflateFindMinIdx pool (i + 1) best' k
+
+def deflateRemoveIdx (pool : Array (Nat × Nat)) (skip i : Nat) (acc : Array (Nat × Nat)) : Nat → Array (Nat × Nat)
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ pool.size then acc
+    else deflateRemoveIdx pool skip (i + 1) (if i == skip then acc else acc.push (pool.getD i (0, 0))) k
+
+def deflateMergePool (pool : Array (Nat × Nat)) (parent : Array Nat) (nextId : Nat) : Nat → Array Nat
+  | 0 => parent
+  | k + 1 =>
+    if pool.size ≤ 1 then parent
+    else
+      let i1 := deflateFindMinIdx pool 1 0 (pool.size - 1)
+      let n1 := pool.getD i1 (0, 0)
+      let pool1 := deflateRemoveIdx pool i1 0 #[] pool.size
+      let i2 := deflateFindMinIdx pool1 1 0 (pool1.size - 1)
+      let n2 := pool1.getD i2 (0, 0)
+      let pool2 := deflateRemoveIdx pool1 i2 0 #[] pool1.size
+      let parent' := (parent.set! n1.2 nextId).set! n2.2 nextId
+      deflateMergePool (pool2.push (n1.1 + n2.1, nextId)) parent' (nextId + 1) k
+
+def deflateNodeDepth (parent : Array Nat) (totalNodes cur d : Nat) : Nat → Nat
+  | 0 => d
+  | k + 1 =>
+    let p := parent.getD cur totalNodes
+    if p ≥ totalNodes then d else deflateNodeDepth parent totalNodes p (d + 1) k
+
+def deflateInsertDepthSorted (entry : Nat × Nat) : List (Nat × Nat) → List (Nat × Nat)
+  | [] => [entry]
+  | cur :: rest =>
+    let before := if entry.1 == cur.1 then entry.2 < cur.2 else entry.1 > cur.1
+    if before then entry :: cur :: rest else cur :: deflateInsertDepthSorted entry rest
+
+def deflateCollectDepths (active : Array (Nat × Nat)) (parent : Array Nat) (totalNodes maxLen i : Nat)
+    (blCount : Array Nat) (overflow : Nat) (sorted : List (Nat × Nat)) :
+    Nat → Array Nat × Nat × List (Nat × Nat)
+  | 0 => (blCount, overflow, sorted)
+  | k + 1 =>
+    if i ≥ active.size then (blCount, overflow, sorted)
+    else
+      let (_, sym) := active.getD i (1, 0)
+      let d := deflateNodeDepth parent totalNodes i 0 totalNodes
+      let sorted' := deflateInsertDepthSorted (d, sym) sorted
+      let (blCount', overflow') :=
+        if d > maxLen then (blCount.set! maxLen (blCount.getD maxLen 0 + 1), overflow + 1)
+        else (blCount.set! d (blCount.getD d 0 + 1), overflow)
+      deflateCollectDepths active parent totalNodes maxLen (i + 1) blCount' overflow' sorted' k
+
+def deflateFindSplitBit (blCount : Array Nat) : Nat → Nat
+  | 0 => 0
+  | b + 1 => if blCount.getD (b + 1) 0 > 0 then b + 1 else deflateFindSplitBit blCount b
+
+def deflateFixOverflow (blCount : Array Nat) (maxLen overflow : Nat) : Nat → Option (Array Nat)
+  | 0 => if overflow == 0 then some blCount else none
+  | k + 1 =>
+    if overflow == 0 then some blCount
+    else
+      let bits := deflateFindSplitBit blCount (maxLen - 1)
+      if bits == 0 then none
+      else
+        let bl1 := blCount.set! bits (blCount.getD bits 0 - 1)
+        let bl2 := bl1.set! (bits + 1) (bl1.getD (bits + 1) 0 + 2)
+        let bl3 := bl2.set! maxLen (bl2.getD maxLen 0 - 1)
+        deflateFixOverflow bl3 maxLen (overflow - 2) k
+
+def deflateAssignBitGroup : Nat → List (Nat × Nat) → Nat → Array Nat → List (Nat × Nat) × Array Nat
+  | 0, rem, _, lens => (rem, lens)
+  | _ + 1, [], _, lens => ([], lens)
+  | c + 1, (_, sym) :: rem, bits, lens =>
+    deflateAssignBitGroup c rem bits (lens.set! sym bits)
+
+def deflateAssignAllLengths (blCount : Array Nat) : Nat → List (Nat × Nat) → Array Nat → Array Nat
+  | 0, _, lens => lens
+  | bits + 1, rem, lens =>
+    let (rem', lens') := deflateAssignBitGroup (blCount.getD (bits + 1) 0) rem (bits + 1) lens
+    deflateAssignAllLengths blCount bits rem' lens'
+
+def deflateBuildLimitedLengths (freqs : Array Nat) (maxLen : Nat) : Option (Array Nat) := do
+  let n := freqs.size
+  let active := deflateCollectActive freqs 0 #[] n
+  if active.size < 2 || maxLen == 0 then none
+  else
+    let totalNodes := 2 * active.size - 1
+    let pool0 := deflateInitPool active 0 #[] active.size
+    let parent := deflateMergePool pool0 (deflateRepArray totalNodes totalNodes) active.size (active.size - 1)
+    let (bl0, overflow, sorted) :=
+      deflateCollectDepths active parent totalNodes maxLen 0 (deflateRepArray (maxLen + 1) 0) 0 [] active.size
+    let blCount ← deflateFixOverflow bl0 maxLen overflow active.size
+    some (deflateAssignAllLengths blCount maxLen sorted (deflateRepArray n 0))
+
+def deflateDefaultDynLitLengths : Array Nat :=
+  ((List.range 286).map fun sym => if sym < 226 then 8 else 9).toArray
+
+def deflateDefaultDynDistLengths : Array Nat :=
+  ((List.range 30).map fun sym => if sym < 2 then 4 else 5).toArray
+
+def deflateWriteClHeader (w : LsbWriter) (clLens : Array Nat) : Nat → LsbWriter
+  | 0 => w
+  | k + 1 =>
+    let idx := 19 - (k + 1)
+    let v := clLens.getD (deflateCodeLengthOrder.getD idx 0) 0
+    deflateWriteClHeader (w.writeBits v.toUInt32 3) clLens k
+
+def deflateWriteTreeLengths (w : LsbWriter) (cl : DeflateHuffman) : List Nat → LsbWriter
+  | [] => w
+  | l :: rest => deflateWriteTreeLengths (deflateEncodeSymbol w cl l) cl rest
+
+def deflateEncodeDynamicCanonical (tokens : Array DeflateToken) : ByteArray :=
+  let lit := (deflateBuildHuffman deflateDefaultDynLitLengths).getD deflateFixedLiteralHuffman
+  let dist := (deflateBuildHuffman deflateDefaultDynDistLengths).getD deflateFixedDistanceHuffman
+  let clLens := ((List.replicate 19 0).toArray).set! 0 1 |>.set! 4 2 |>.set! 5 3 |>.set! 8 4 |>.set! 9 4
+  let cl := (deflateBuildHuffman clLens).getD deflateFixedLiteralHuffman
+  let w0 := (LsbWriter.empty.writeBit 1).writeBits 2 2
+  let wa := (w0.writeBits 29 5).writeBits 29 5 |>.writeBits 15 4
+  let wb := deflateWriteClHeader wa clLens 19
+  let wc := deflateWriteTreeLengths wb cl lit.lengths.toList
+  let wd := deflateWriteTreeLengths wc cl dist.lengths.toList
+  (deflateEncodeTokenStream wd lit dist tokens).toByteArray
+
+def deflateAccumTokenFreqs (tokens : Array DeflateToken) (i : Nat) (litFreq distFreq : Array Nat) :
+    Nat → Array Nat × Array Nat
+  | 0 => (litFreq, distFreq)
+  | k + 1 =>
+    if i ≥ tokens.size then (litFreq, distFreq)
+    else
+      match tokens.getD i (.lit 0) with
+      | .lit b =>
+        let s := b.toNat
+        deflateAccumTokenFreqs tokens (i + 1) (litFreq.set! s (litFreq.getD s 0 + 1)) distFreq k
+      | .matchRef len d =>
+        let (lsym, _, _) := deflateLengthCode len
+        let (dsym, _, _) := deflateDistanceCode d
+        deflateAccumTokenFreqs tokens (i + 1)
+          (litFreq.set! lsym (litFreq.getD lsym 0 + 1))
+          (distFreq.set! dsym (distFreq.getD dsym 0 + 1)) k
+
+def deflateCountNonZero (arr : Array Nat) (i acc : Nat) : Nat → Nat
+  | 0 => acc
+  | k + 1 =>
+    if i ≥ arr.size then acc
+    else deflateCountNonZero arr (i + 1) (if arr.getD i 0 > 0 then acc + 1 else acc) k
+
+def deflateAccumClFreqs (allLens : Array Nat) (i : Nat) (clFreq : Array Nat) : Nat → Array Nat
+  | 0 => clFreq
+  | k + 1 =>
+    if i ≥ allLens.size then clFreq
+    else
+      let l := allLens.getD i 0
+      deflateAccumClFreqs allLens (i + 1) (clFreq.set! l (clFreq.getD l 0 + 1)) k
+
+def deflateAllLensCovered (allLens ls : Array Nat) (i : Nat) : Nat → Bool
+  | 0 => true
+  | k + 1 =>
+    if i ≥ allLens.size then true
+    else if ls.getD (allLens.getD i 0) 0 == 0 then false
+    else deflateAllLensCovered allLens ls (i + 1) k
+
+def deflateFindLastNonZero (arr : Array Nat) (minLen : Nat) : Nat → Nat
+  | 0 => minLen
+  | i + 1 =>
+    if i + 1 ≤ minLen then minLen
+    else if arr.getD i 0 != 0 then i + 1
+    else deflateFindLastNonZero arr minLen i
+
+def deflateTrimTrailingZerosLoop (arr : Array Nat) (minLen : Nat) (_ : Nat) : Array Nat :=
+  let keep := deflateFindLastNonZero arr minLen arr.size
+  if keep ≥ arr.size then arr else (arr.toList.take keep).toArray
+
+def deflateMaxLitSymTokens : List DeflateToken → Nat → Nat
+  | [], m => m
+  | .lit b :: rest, m => deflateMaxLitSymTokens rest (if b.toNat > m then b.toNat else m)
+  | .matchRef len _ :: rest, m =>
+    let (lsym, _, _) := deflateLengthCode len
+    deflateMaxLitSymTokens rest (if lsym > m then lsym else m)
+
+def deflateMaxDistSymTokens : List DeflateToken → Nat → Nat
+  | [], m => m
+  | .lit _ :: rest, m => deflateMaxDistSymTokens rest m
+  | .matchRef _ d :: rest, m =>
+    let (dsym, _, _) := deflateDistanceCode d
+    deflateMaxDistSymTokens rest (if dsym > m then dsym else m)
+
+def deflateEncodeWithTrees (data : ByteArray) (dynamic : Bool) : ByteArray :=
+  let tokens := deflateTokenizeLz77 data
+  if !dynamic then
+    let w0 := (LsbWriter.empty.writeBit 1).writeBits 1 2
+    let w1 := deflateEncodeTokenStream w0 deflateFixedLiteralHuffman deflateFixedDistanceHuffman tokens
+    w1.toByteArray
+  else
+    let tokList := tokens.toList
+    let litCount := deflateMaxLitSymTokens tokList 256 + 1
+    let distCount := deflateMaxDistSymTokens tokList 1 + 1
+    let litFreq0 := (deflateRepArray litCount 0).set! 256 1
+    let distFreq0 := deflateRepArray distCount 0
+    let (litFreq1, distFreq1) := deflateAccumTokenFreqs tokens 0 litFreq0 distFreq0 tokens.size
+    let litActive := deflateCountNonZero litFreq1 0 0 litFreq1.size
+    let litFreq := if litActive < 2 then litFreq1.set! 0 (litFreq1.getD 0 0 + 1) else litFreq1
+    let distActive := deflateCountNonZero distFreq1 0 0 distFreq1.size
+    let distFreq :=
+      if distActive == 0 then distFreq1.set! 0 1 |>.set! 1 1
+      else if distActive == 1 then
+        let alt := if distFreq1.getD 0 0 == 0 then 0 else 1
+        distFreq1.set! alt 1
+      else distFreq1
+    let litLens := (deflateBuildLimitedLengths litFreq 15).getD deflateDefaultDynLitLengths
+    let distLens := (deflateBuildLimitedLengths distFreq 15).getD deflateDefaultDynDistLengths
+    let lit := (deflateBuildHuffman litLens).getD
+      ((deflateBuildHuffman deflateDefaultDynLitLengths).getD deflateFixedLiteralHuffman)
+    let dist := (deflateBuildHuffman distLens).getD
+      ((deflateBuildHuffman deflateDefaultDynDistLengths).getD deflateFixedDistanceHuffman)
+    let litHdrLens := deflateTrimTrailingZerosLoop lit.lengths 257 lit.lengths.size
+    let distHdrLens := deflateTrimTrailingZerosLoop dist.lengths 1 dist.lengths.size
+    let allLens := litHdrLens ++ distHdrLens
+    let clFreq0 := deflateAccumClFreqs allLens 0 (deflateRepArray 19 0) allLens.size
+    let clActive := deflateCountNonZero clFreq0 0 0 clFreq0.size
+    let clFreq :=
+      if clActive < 2 then
+        let alt := if clFreq0.getD 0 0 == 0 then 0 else 1
+        clFreq0.set! alt 1
+      else clFreq0
+    let fallbackCl := (deflateRepArray 19 0).set! 0 1 |>.set! 4 2 |>.set! 5 3 |>.set! 8 4 |>.set! 9 4
+    let clLensOpt := match deflateBuildLimitedLengths clFreq 7 with
+      | some ls => if deflateAllLensCovered allLens ls 0 allLens.size then some ls else none
+      | none => none
+    let (useLit, useDist, useLitHdr, useDistHdr, clLens) := match clLensOpt with
+      | some ls =>
+        match deflateBuildHuffman ls with
+        | some _ => (lit, dist, litHdrLens, distHdrLens, ls)
+        | none =>
+          let dl := (deflateBuildHuffman deflateDefaultDynLitLengths).getD deflateFixedLiteralHuffman
+          let dd := (deflateBuildHuffman deflateDefaultDynDistLengths).getD deflateFixedDistanceHuffman
+          (dl, dd, dl.lengths, dd.lengths, fallbackCl)
+      | none =>
+        let dl := (deflateBuildHuffman deflateDefaultDynLitLengths).getD deflateFixedLiteralHuffman
+        let dd := (deflateBuildHuffman deflateDefaultDynDistLengths).getD deflateFixedDistanceHuffman
+        (dl, dd, dl.lengths, dd.lengths, fallbackCl)
+    let cl := (deflateBuildHuffman clLens).getD deflateFixedLiteralHuffman
+    let w0 := (LsbWriter.empty.writeBit 1).writeBits 2 2
+    let wa := (w0.writeBits (useLitHdr.size - 257).toUInt32 5).writeBits
+      (useDistHdr.size - 1).toUInt32 5 |>.writeBits 15 4
+    let wb := deflateWriteClHeader wa clLens 19
+    let wc := deflateWriteTreeLengths wb cl useLitHdr.toList
+    let wd := deflateWriteTreeLengths wc cl useDistHdr.toList
+    (deflateEncodeTokenStream wd useLit useDist tokens).toByteArray
+
+def deflateEncodeFixed (data : ByteArray) : ByteArray := deflateEncodeWithTrees data false
+
+def deflateEncodeDynamic (data : ByteArray) : ByteArray := deflateEncodeWithTrees data true
+
+def deflateEncodeMode (data : ByteArray) : DeflateMode → ByteArray
+  | .stored => deflateEncodeStored data
+  | .fixed => deflateEncodeFixed data
+  | .dynamic => deflateEncodeDynamic data
+
+def adler32Step (s1 s2 : UInt32) (b : UInt8) : UInt32 × UInt32 :=
+  let a := (s1 + b.toUInt32) % 65521
+  (a, (s2 + a) % 65521)
+
+def adler32Loop (arr : Array UInt8) (i : Nat) (s1 s2 : UInt32) : Nat → UInt32 × UInt32
+  | 0 => (s1, s2)
+  | k + 1 =>
+    if i ≥ arr.size then (s1, s2)
+    else
+      let (a, b) := adler32Step s1 s2 (arr.getD i 0)
+      adler32Loop arr (i + 1) a b k
+
+def adler32 (data : ByteArray) : UInt32 :=
+  let sums := adler32Loop data.data 0 1 0 data.data.size
+  (sums.2 <<< 16) ||| sums.1
+
+theorem adler32Step_bounds (s1 s2 : UInt32) (b : UInt8) :
+    (adler32Step s1 s2 b).1 < 65521 ∧ (adler32Step s1 s2 b).2 < 65521 ∧
+    adler32 ByteArray.empty = 1 ∧
+    adler32 (ByteArray.mk #[0x57, 0x69, 0x6B, 0x69, 0x70, 0x65, 0x64, 0x69, 0x61]) = 0x11E60398 := by
+  refine ⟨UInt32.mod_lt _ (by decide), UInt32.mod_lt _ (by decide), ?_, ?_⟩
+  · decide
+  · decide
+
+def pushU32BEDeflate (ba : ByteArray) (v : UInt32) : ByteArray :=
+  { data := ((((ba.data.push ((v >>> 24) &&& 0xFF).toUInt8).push
+      ((v >>> 16) &&& 0xFF).toUInt8).push
+      ((v >>> 8) &&& 0xFF).toUInt8).push (v &&& 0xFF).toUInt8) }
+
+def zlibEncodeMode (data : ByteArray) (mode : DeflateMode) : ByteArray :=
+  let body := deflateEncodeMode data mode
+  pushU32BEDeflate (appendByteArraySpec { data := #[0x78, 0x9C] } body) (adler32 data)
+
+def zlibEncode (data : ByteArray) (dynamic : Bool := true) : ByteArray :=
+  zlibEncodeMode data (if dynamic then .dynamic else .fixed)
+
+def isZlibHeaderBytesValid (cmf flg : UInt8) : Bool :=
+  (cmf &&& 0x0F == 8) &&
+  decide (cmf >>> 4 ≤ 7) &&
+  (flg &&& 0x20 == 0) &&
+  ((cmf.toNat * 256 + flg.toNat) % 31 == 0)
+
+def zlibDecodePrefix (s : ByteSlice) (maxOutput : Nat := 268435456) : Option (ByteArray × Nat) := do
+  if s.len < 6 then none
+  let cmf := s.getByteD 0 0
+  let flg := s.getByteD 1 0
+  if !isZlibHeaderBytesValid cmf flg then none
+  let body : ByteSlice := { ba := s.ba, off := s.off + 2, len := s.len - 2 }
+  let (out, r) ← deflateDecode body maxOutput
+  let endByte := (r.bitOffset + 7) / 8
+  if endByte + 6 > s.len then none
+  let p := 2 + endByte
+  let expected := ((s.getByteD p 0).toUInt32 <<< 24) ||| ((s.getByteD (p + 1) 0).toUInt32 <<< 16) |||
+    ((s.getByteD (p + 2) 0).toUInt32 <<< 8) ||| (s.getByteD (p + 3) 0).toUInt32
+  if expected != adler32 out then none
+  some (out, p + 4)
+
+def zlibDecode (s : ByteSlice) (maxOutput : Nat := 268435456) : Option ByteArray := do
+  let (out, used) ← zlibDecodePrefix s maxOutput
+  if used == s.len then some out else none
+
+def deflateKraftWeight : List Nat → Nat
+  | [] => 0
+  | len :: rest =>
+    (if len == 0 then 0 else 2 ^ (15 - len)) + deflateKraftWeight rest
+
+def isDeflateTreeLengthsValid (lengths : Array Nat) : Bool :=
+  lengths.toList.any (· != 0) &&
+  lengths.toList.all (· ≤ 15) &&
+  decide (deflateKraftWeight lengths.toList ≤ 32768)
+
+def DeflateTreeSafe (lengths : Array Nat) : Prop :=
+  (∃ l ∈ lengths.toList, l ≠ 0) ∧
+  (∀ l ∈ lengths.toList, l ≤ 15) ∧
+  deflateKraftWeight lengths.toList ≤ 32768
+
+def deflateTreeGateSpec : AVGateSpec (Array Nat) DeflateTreeSafe where
+  gate := isDeflateTreeLengthsValid
+  sound lengths h := by
+    unfold isDeflateTreeLengthsValid DeflateTreeSafe at *
+    simp only [Bool.and_eq_true, List.any_eq_true, bne_iff_ne, ne_eq,
+      List.all_eq_true, decide_eq_true_eq] at h
+    exact ⟨h.1.1, h.1.2, h.2⟩
+  complete lengths h := by
+    unfold isDeflateTreeLengthsValid DeflateTreeSafe at *
+    rcases h with ⟨hAny, hAll, hKraft⟩
+    simp only [Bool.and_eq_true, List.any_eq_true, bne_iff_ne, ne_eq,
+      List.all_eq_true, decide_eq_true_eq]
+    exact ⟨⟨hAny, hAll⟩, hKraft⟩
+  posWitness := #[8, 8]
+  negWitness := #[0, 0]
+  nonVacuous := by decide
+  tight := by decide
+
+theorem deflateTreeGateSpec_iff (lengths : Array Nat) :
+    deflateTreeGateSpec.gate lengths = true ↔ DeflateTreeSafe lengths :=
+  deflateTreeGateSpec.iff_safe lengths
+
+def ZlibHeaderSafe (cmf flg : UInt8) : Prop :=
+  cmf &&& 0x0F = 8 ∧ cmf >>> 4 ≤ 7 ∧ flg &&& 0x20 = 0 ∧ (cmf.toNat * 256 + flg.toNat) % 31 = 0
+
+def zlibHeaderGateSpec : AVGateSpec (UInt8 × UInt8) (fun a => ZlibHeaderSafe a.1 a.2) where
+  gate a := isZlibHeaderBytesValid a.1 a.2
+  sound a h := by
+    unfold isZlibHeaderBytesValid ZlibHeaderSafe at *
+    simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at h
+    exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+  complete a h := by
+    unfold isZlibHeaderBytesValid ZlibHeaderSafe at *
+    rcases h with ⟨h1, h2, h3, h4⟩
+    simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq]
+    exact ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩
+  posWitness := (0x78, 0x9C)
+  negWitness := (0, 0)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem zlibHeaderGateSpec_iff (a : UInt8 × UInt8) :
+    zlibHeaderGateSpec.gate a = true ↔ ZlibHeaderSafe a.1 a.2 :=
+  zlibHeaderGateSpec.iff_safe a
+
+private def lsbReconstructU8 (b : UInt8) : UInt64 :=
+  (((((0 : UInt64) ||| (((b >>> (0 : UInt8)) &&& 1).toUInt64 <<< (0 : UInt64))) |||
+      (((b >>> (1 : UInt8)) &&& 1).toUInt64 <<< (1 : UInt64))) |||
+      (((b >>> (2 : UInt8)) &&& 1).toUInt64 <<< (2 : UInt64))) |||
+      (((b >>> (3 : UInt8)) &&& 1).toUInt64 <<< (3 : UInt64))) |||
+      (((b >>> (4 : UInt8)) &&& 1).toUInt64 <<< (4 : UInt64)) |||
+      (((b >>> (5 : UInt8)) &&& 1).toUInt64 <<< (5 : UInt64)) |||
+      (((b >>> (6 : UInt8)) &&& 1).toUInt64 <<< (6 : UInt64)) |||
+      (((b >>> (7 : UInt8)) &&& 1).toUInt64 <<< (7 : UInt64))
+
+set_option maxRecDepth 20000 in
+private theorem lsbReconstructU8_range :
+    ((List.range 256).all (fun n => lsbReconstructU8 (UInt8.ofNat n) == (UInt8.ofNat n).toUInt64)) = true := by
+  decide
+
+theorem byte_reconstruct_lsb (b : UInt8) : lsbReconstructU8 b = b.toUInt64 := by
+  have hm : b.toNat ∈ List.range 256 := List.mem_range.mpr b.toBitVec.isLt
+  have hall := List.all_eq_true.mp lsbReconstructU8_range b.toNat hm
+  rw [UInt8.ofNat_toNat] at hall
+  exact eq_of_beq hall
+
+private theorem uint64_cursor_ok (off req tot : Nat)
+    (h1 : off + req ≤ tot) (h2 : req ≤ 64) (h3 : tot < UInt64.size) :
+    verifyBitstreamCursor off.toUInt64 req.toUInt64 tot.toUInt64 = 1 := by
+  unfold verifyBitstreamCursor
+  have ho : off.toUInt64.toNat = off := UInt64.toNat_ofNat_of_lt (Nat.lt_of_le_of_lt (by omega) h3)
+  have hr : req.toUInt64.toNat = req := UInt64.toNat_ofNat_of_lt (Nat.lt_of_le_of_lt (by omega) h3)
+  have ht : tot.toUInt64.toNat = tot := UInt64.toNat_ofNat_of_lt h3
+  have c1 : off.toUInt64 ≤ tot.toUInt64 := by
+    rw [UInt64.le_iff_toNat_le, ho, ht]; omega
+  have c2 : req.toUInt64 ≤ tot.toUInt64 - off.toUInt64 := by
+    rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le _ _ c1, hr, ht, ho]; omega
+  have c3 : req.toUInt64 ≤ 64 := by
+    rw [UInt64.le_iff_toNat_le, hr]; change req ≤ 64; omega
+  simp [c1, c2, c3]
+
+theorem readBitsLSB_byte_exact (s : ByteSlice) (k : Nat)
+    (hk : k + 1 ≤ s.len) (hsmall : s.len * 8 < UInt64.size) :
+    BitReader.readBitsLSB { slice := s, bitOffset := k * 8 } 8 =
+      some ((s.getByteD k 0).toUInt64, { slice := s, bitOffset := (k + 1) * 8 }) := by
+  unfold BitReader.readBitsLSB BitReader.totalBits
+  have hok : verifyBitstreamCursor (k * 8).toUInt64 (8 : Nat).toUInt64 (s.len * 8).toUInt64 = 1 :=
+    uint64_cursor_ok (k * 8) 8 (s.len * 8) (by omega) (by omega) hsmall
+  simp only [hok, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, BitReader.readBitsLSBLoop]
+  have hd0 : (k * 8) / 8 = k := by omega
+  have hm0 : (k * 8) % 8 = 0 := by omega
+  have hd1 : (k * 8 + 1) / 8 = k := by omega
+  have hm1 : (k * 8 + 1) % 8 = 1 := by omega
+  have hd2 : (k * 8 + 1 + 1) / 8 = k := by omega
+  have hm2 : (k * 8 + 1 + 1) % 8 = 2 := by omega
+  have hd3 : (k * 8 + 1 + 1 + 1) / 8 = k := by omega
+  have hm3 : (k * 8 + 1 + 1 + 1) % 8 = 3 := by omega
+  have hd4 : (k * 8 + 1 + 1 + 1 + 1) / 8 = k := by omega
+  have hm4 : (k * 8 + 1 + 1 + 1 + 1) % 8 = 4 := by omega
+  have hd5 : (k * 8 + 1 + 1 + 1 + 1 + 1) / 8 = k := by omega
+  have hm5 : (k * 8 + 1 + 1 + 1 + 1 + 1) % 8 = 5 := by omega
+  have hd6 : (k * 8 + 1 + 1 + 1 + 1 + 1 + 1) / 8 = k := by omega
+  have hm6 : (k * 8 + 1 + 1 + 1 + 1 + 1 + 1) % 8 = 6 := by omega
+  have hd7 : (k * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1) / 8 = k := by omega
+  have hm7 : (k * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1) % 8 = 7 := by omega
+  have hcur : k * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 = (k + 1) * 8 := by omega
+  simp only [hd0, hm0, hd1, hm1, hd2, hm2, hd3, hm3, hd4, hm4, hd5, hm5, hd6, hm6, hd7, hm7, hcur]
+  exact congrArg (fun x => some (x, _)) (byte_reconstruct_lsb (s.getByteD k 0))
+
+set_option maxRecDepth 20000 in
+private theorem u8_u64_u8_range :
+    ((List.range 256).all (fun n => (UInt8.ofNat n).toUInt64.toUInt8 == UInt8.ofNat n)) = true := by
+  decide
+
+private theorem u8_u64_u8 (b : UInt8) : b.toUInt64.toUInt8 = b := by
+  have hm : b.toNat ∈ List.range 256 := List.mem_range.mpr b.toBitVec.isLt
+  have hall := List.all_eq_true.mp u8_u64_u8_range b.toNat hm
+  rw [UInt8.ofNat_toNat] at hall
+  exact eq_of_beq hall
+
+theorem deflateCopyStored_spec (n : Nat) :
+    ∀ (s : ByteSlice) (k : Nat) (out : ByteArray) (maxOutput : Nat),
+      k + n ≤ s.len →
+      s.len * 8 < UInt64.size →
+      out.size + n ≤ maxOutput →
+      deflateCopyStored { slice := s, bitOffset := k * 8 } out maxOutput n =
+        some ({ data := out.data ++ ((List.range n).map (fun i => s.getByteD (k + i) 0)).toArray },
+              { slice := s, bitOffset := (k + n) * 8 }) := by
+  induction n with
+  | zero =>
+    intro s k out maxOutput _ _ _
+    simp [deflateCopyStored]
+  | succ m ih =>
+    intro s k out maxOutput hlen hsmall hmax
+    have hge : ¬ (out.data.size ≥ maxOutput) := by
+      have hs : out.data.size = out.size := rfl
+      omega
+    have hbyte := readBitsLSB_byte_exact s k (by omega) hsmall
+    unfold deflateCopyStored
+    simp only [hge, ↓reduceIte, bind, Option.bind, hbyte, u8_u64_u8]
+    have hout : ({ data := out.data.push (s.getByteD k 0) } : ByteArray).size + m ≤ maxOutput := by
+      have hp : ({ data := out.data.push (s.getByteD k 0) } : ByteArray) = out.push (s.getByteD k 0) := rfl
+      rw [hp, ByteArray.size_push]; omega
+    rw [ih s (k + 1) { data := out.data.push (s.getByteD k 0) } maxOutput (by omega) hsmall hout]
+    congr 2
+    · apply congrArg ByteArray.mk
+      apply Array.ext'
+      simp [List.range_succ_eq_map]
+      intro a _
+      exact congrArg (fun idx => s.getByteD idx 0) (by omega)
+    · congr 1; omega
+
+theorem deflateCopyStored_output_bounded (n : Nat) :
+    ∀ (r r' : BitReader) (out out' : ByteArray) (maxOutput : Nat),
+      out.size ≤ maxOutput →
+      deflateCopyStored r out maxOutput n = some (out', r') →
+      out'.size = out.size + n ∧ out'.size ≤ maxOutput ∧ r'.bitOffset = r.bitOffset + n * 8 := by
+  induction n with
+  | zero =>
+    intro r r' out out' maxOutput hle hok
+    simp [deflateCopyStored] at hok
+    rcases hok with ⟨rfl, rfl⟩
+    exact ⟨by omega, hle, by omega⟩
+  | succ m ih =>
+    intro r r' out out' maxOutput hle hok
+    unfold deflateCopyStored at hok
+    split at hok
+    · contradiction
+    · rename_i hlt
+      have hlt' : ¬ (out.size ≥ maxOutput) := hlt
+      cases hrb : r.readBitsLSB 8 with
+      | none => simp [hrb, bind, Option.bind] at hok
+      | some vr =>
+        rcases vr with ⟨v, next⟩
+        simp only [hrb, bind, Option.bind] at hok
+        have hnext : next.bitOffset = r.bitOffset + 8 := by
+          unfold BitReader.readBitsLSB at hrb
+          dsimp at hrb
+          split at hrb
+          · contradiction
+          · simp only [BitReader.readBitsLSBLoop] at hrb
+            injection hrb with hp
+            have h2 := congrArg Prod.snd hp
+            dsimp at h2
+            have hbo' := congrArg BitReader.bitOffset h2
+            dsimp at hbo'
+            omega
+        have hpush : ({ data := out.data.push v.toUInt8 } : ByteArray).size ≤ maxOutput := by
+          have hp : ({ data := out.data.push v.toUInt8 } : ByteArray) = out.push v.toUInt8 := rfl
+          rw [hp, ByteArray.size_push]; omega
+        have ⟨hs1, hs2, hbo⟩ := ih next r' { data := out.data.push v.toUInt8 } out' maxOutput hpush hok
+        have hp : ({ data := out.data.push v.toUInt8 } : ByteArray) = out.push v.toUInt8 := rfl
+        rw [hp, ByteArray.size_push] at hs1
+        exact ⟨by omega, hs2, by omega⟩
+
+def zlibRoundtripData (data : ByteArray) (mode : DeflateMode) : Option (List UInt8) :=
+  let enc := zlibEncodeMode data mode
+  match zlibDecode { ba := enc, off := 0, len := enc.data.size } with
+  | some dec => some dec.data.toList
+  | none => none
+
+set_option maxHeartbeats 800000 in
+set_option maxRecDepth 200000 in
+private theorem zlibEncodeMode_stored_fixed_roundtrip :
+    let p0 : ByteArray := { data := #[] }
+    let p1 : ByteArray := { data := #[0x42] }
+    let p2 : ByteArray := { data := #[0, 1, 2, 0, 1, 2, 255] }
+    zlibRoundtripData p0 .stored = some p0.data.toList ∧
+    zlibRoundtripData p0 .fixed = some p0.data.toList ∧
+    zlibRoundtripData p1 .stored = some p1.data.toList ∧
+    zlibRoundtripData p1 .fixed = some p1.data.toList ∧
+    zlibRoundtripData p2 .stored = some p2.data.toList ∧
+    zlibRoundtripData p2 .fixed = some p2.data.toList := by
+  refine ⟨by decide, by decide, by decide, by decide, by decide, ?_⟩
+  decide
+
+set_option maxHeartbeats 1600000 in
+set_option maxRecDepth 200000 in
+private theorem zlibEncodeMode_dynamic_roundtrip :
+    let p2 : ByteArray := { data := #[0, 1, 2, 0, 1, 2, 255] }
+    zlibRoundtripData p2 .dynamic = some p2.data.toList := by
+  decide
+
+theorem zlibEncodeMode_decode_all_modes_roundtrip :
+    let p0 : ByteArray := { data := #[] }
+    let p1 : ByteArray := { data := #[0x42] }
+    let p2 : ByteArray := { data := #[0, 1, 2, 0, 1, 2, 255] }
+    zlibRoundtripData p0 .stored = some p0.data.toList ∧
+    zlibRoundtripData p0 .fixed = some p0.data.toList ∧
+    zlibRoundtripData p1 .stored = some p1.data.toList ∧
+    zlibRoundtripData p1 .fixed = some p1.data.toList ∧
+    zlibRoundtripData p2 .stored = some p2.data.toList ∧
+    zlibRoundtripData p2 .fixed = some p2.data.toList ∧
+    zlibRoundtripData p2 .dynamic = some p2.data.toList := by
+  rcases zlibEncodeMode_stored_fixed_roundtrip with ⟨h1, h2, h3, h4, h5, h6⟩
+  exact ⟨h1, h2, h3, h4, h5, h6, zlibEncodeMode_dynamic_roundtrip⟩
+
+def md5K : Array UInt32 := #[
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391]
+
+def md5S : Array UInt32 := #[
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+
+def md5Rotl (x s : UInt32) : UInt32 := (x <<< s) ||| (x >>> (32 - s))
+
+def md5BlockRounds (msg : ByteArray) (off : Nat) (i : Nat)
+    (a b c d : UInt32) : Nat → UInt32 × UInt32 × UInt32 × UInt32
+  | 0 => (a, b, c, d)
+  | rem + 1 =>
+    let (f, g) :=
+      if i < 16 then ((b &&& c) ||| ((~~~b) &&& d), i)
+      else if i < 32 then ((d &&& b) ||| ((~~~d) &&& c), (5 * i + 1) % 16)
+      else if i < 48 then (b ^^^ c ^^^ d, (3 * i + 5) % 16)
+      else (c ^^^ (b ||| (~~~d)), (7 * i) % 16)
+    let p := off + 4 * g
+    let w :=
+      (msg.data.getD p 0).toUInt32 ||| ((msg.data.getD (p + 1) 0).toUInt32 <<< 8) |||
+        ((msg.data.getD (p + 2) 0).toUInt32 <<< 16) ||| ((msg.data.getD (p + 3) 0).toUInt32 <<< 24)
+    let f' := f + a + md5K.getD i 0 + w
+    let b' := b + md5Rotl f' (md5S.getD i 0)
+    md5BlockRounds msg off (i + 1) d b' b c rem
+
+def md5Block (st : UInt32 × UInt32 × UInt32 × UInt32) (msg : ByteArray) (off : Nat) :
+    UInt32 × UInt32 × UInt32 × UInt32 :=
+  let (a0, b0, c0, d0) := st
+  let (a, b, c, d) := md5BlockRounds msg off 0 a0 b0 c0 d0 64
+  (a0 + a, b0 + b, c0 + c, d0 + d)
+
+def md5PadZeros (arr : Array UInt8) : Nat → Array UInt8
+  | 0 => arr
+  | k + 1 =>
+    if arr.size % 64 == 56 then arr
+    else md5PadZeros (arr.push 0) k
+
+def md5PushU64LE (arr : Array UInt8) (v : UInt64) (i : Nat) : Nat → Array UInt8
+  | 0 => arr
+  | k + 1 => md5PushU64LE (arr.push ((v >>> (8 * i).toUInt64) &&& 0xFF).toUInt8) v (i + 1) k
+
+def md5BlocksLoop (st : UInt32 × UInt32 × UInt32 × UInt32) (msg : ByteArray) (blk : Nat) :
+    Nat → UInt32 × UInt32 × UInt32 × UInt32
+  | 0 => st
+  | k + 1 => md5BlocksLoop (md5Block st msg (64 * blk)) msg (blk + 1) k
+
+def md5PushU32LE (arr : Array UInt8) (w : UInt32) : Array UInt8 :=
+  (((arr.push (w &&& 0xFF).toUInt8).push ((w >>> 8) &&& 0xFF).toUInt8).push
+    ((w >>> 16) &&& 0xFF).toUInt8).push ((w >>> 24) &&& 0xFF).toUInt8
+
+def md5 (data : ByteArray) : ByteArray :=
+  let bitLen := (data.data.size * 8).toUInt64
+  let msgArr := md5PushU64LE (md5PadZeros (data.data.push 0x80) 64) bitLen 0 8
+  let msg : ByteArray := { data := msgArr }
+  let st0 : UInt32 × UInt32 × UInt32 × UInt32 := (0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476)
+  let (a, b, c, d) := md5BlocksLoop st0 msg 0 (msgArr.size / 64)
+  { data := md5PushU32LE (md5PushU32LE (md5PushU32LE (md5PushU32LE #[] a) b) c) d }
 
 end LeanAV.Bitstream

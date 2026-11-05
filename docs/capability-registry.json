@@ -20097,8 +20097,36 @@
   },
   "schema_version": "1.1",
   "tested_lean_ffmpeg_capabilities": {
-    "entries": [],
-    "evidence": [],
-    "status": "untested"
+    "entries": [
+      {
+        "codec": "ffv1",
+        "containers": [
+          "matroska",
+          "mov",
+          "avi",
+          "rawvideo",
+          "yuv4mpegpipe",
+          "md5",
+          "framemd5"
+        ],
+        "pix_fmts": [
+          "yuv420p",
+          "gray",
+          "rgb24",
+          "bgr0"
+        ],
+        "tier": "independent_verified",
+        "version": 3
+      }
+    ],
+    "evidence": [
+      "LeanAV/Ffv1.lean",
+      "LeanAV/Ffv1Container.lean",
+      "LeanAV/Md5.lean",
+      "LeanAV/Ffv1Pipeline.lean",
+      "LeanAV/Ffv1Proofs.lean",
+      "tests/differential/test_native_ffv1.py"
+    ],
+    "status": "independent_verified_subset"
   }
 }

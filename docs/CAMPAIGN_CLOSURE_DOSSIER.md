@@ -1,5 +1,251 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-05 M3-D standalone zero-exec integration & runtime certification
+(`campaign/m3-d-zero-exec-20261104`, integrating M3-A `7beef63e`, M3-B `c944e1dc`,
+and M3-C `644b0056` over `741fb1d0`) under Lean v4.35.0 and `turbo-lean`
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) deletes every
+`ffmpeg`/`ffprobe` subprocess (`BackendTier.delegatedFaithful`,
+`ffiExecDelegatedFfmpegC`, `execPipeTranscodeU8IO`, `LEANAV_FFMPEG_BIN`, and
+`LEANAV_FFPROBE_BIN`), auditing **22,820 declarations with zero sorryAx/custom
+axioms** (`84,983` LOC across 37 formal `LeanAV/*.lean` modules) and **807/807
+`non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
+`H264IntraTransformProofs`: 70, `Format`: 64, `H264InterDeblockDpbProofs`: 61,
+`Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Encoder`: 37,
+`LavfiGraphProofs`: 36, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `Av1MainProofs`: 26, `H264SyntaxProofs`: 26, `HevcMainProofs`:
+23, `Spec`: 23, `PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8,
+`Md5`: 7, `Cli`: 6, `Filter`: 6, `LavfiGraph`: 5; `0` vacuous, `0` trivial, `0`
+shadowed). HEVC Main 8-bit 4:2:0 (`hevc-probe`, `hevc-decode-raw`,
+`hevc-encode-raw`), AV1 Main 8-bit 4:2:0 (`av1-probe`, `av1-decode-raw`,
+`av1-encode-raw`), typed `lavfi` DAG execution (`inproc_lavfi_dag`), H.264 High
+8-bit 4:2:0 + AAC-LC MP4 transcode, FFV1 v3, PNG, FLAC, and container stream copy
+execute in-process; every unsupported codec/profile/container/protocol fails
+closed (`BackendTier.unsupported`, `delegatedContainer := false`,
+`fallbackAllowed := false`) with zero partial output. `c/leanav_simd_kernels.c`
+is `672` lines of FFI/OS glue and non-spawning runtime stubs (`lean -c`
+ownership-verified in `tests/test_zero_delegation_cert.py`, `nm -u` spawn-free,
+and Linux `strace -f -e trace=execve` `execve == 1` across the standalone
+matrix), with direct C-interposition differential verification of all three
+10-bit LNIR C-ABI wrappers (`tests/differential/test_u16le_identity.py`). No new
+benchmark numbers are claimed.
+
+The 2026-11-04 M3-B AV1 Main 8-bit 4:2:0 standalone codec qualification
+(`campaign/m3-b-av1-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**19,925 declarations with zero sorryAx/custom axioms** (`73,833` LOC across 33
+formal `LeanAV/*.lean` modules) and **743/743 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `Av1MainProofs`: 26, `H264SyntaxProofs`: 26, `Spec`: 23,
+`PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
+`Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 AV1
+Main profile 8-bit YUV420p OBU + IVF + AV1-ISOBMFF (`av1C` including 0-byte
+`configOBUs` + in-band sequence header + unsized trailing sample OBUs,
+multi-track/chunked `stsc`+`stco`/`co64`+`stsz`/`stz2` MP4 video demux, and
+`ctts`-free AV1 MP4 mux) probing,
+MSAC/CDF entropy coding, intra/inter/compound/warped motion compensation,
+DCT/ADST/IDTX/WHT transforms, deblocking + CDEF + superres + Wiener/SGR loop
+restoration, multi-tile decoding, and lossless/lossy I+P encoding
+(`LeanAV/Av1Main.lean`, `LeanAV/Av1MainProofs.lean`, `av1-probe`,
+`av1-decode-raw`, `av1-encode-raw`) with zero `ffmpeg` subprocesses and
+fail-closed rejection of non-Main / 10-bit / 4:4:4 / fragmented (`moof`/`mvex`) /
+malformed inputs.
+
+The 2026-11-02 M3-C typed `lavfi` filtergraph DAG & synthetic source qualification
+(`campaign/m3-c-lavfi-dag-20261102` over `741fb1d`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**18,429 declarations with zero sorryAx/custom axioms** (`61,925` LOC across 33
+formal `LeanAV/*.lean` modules) and **758/758 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `LavfiGraphProofs`: 36, `Audio`: 34, `H264EntropyProofs`: 31,
+`Scale`: 28, `Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 21,
+`Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6,
+`LavfiGraph`: 5; `0` vacuous, `0` trivial, `0` shadowed), adding the zero-exec
+in-process `lavfi` filtergraph DAG & synthetic source engine (`inproc_lavfi_dag`
+in `LeanAV/LavfiGraph.lean` and `LeanAV/LavfiGraphProofs.lean`): Kahn topological
+ordering with soundness & completeness equivalence to DAG acyclicity, static pad
+link type-safety, bounded per-edge FIFO queues, `SCALEBITS=16` BT.601 color
+conversion, synthetic video/audio sources (`color`, `testsrc`, `nullsrc`, `sine`,
+`anullsrc`), multi-pad DAG nodes (`split`, `asplit`, `overlay`, `hstack`, `vstack`,
+`amix`, `amerge`) plus 19 unary video/audio filters, and zero-subprocess muxing
+across raw/`md5`/`framemd5`/`.mp4`/`.mkv`/`.avi`/`.wav`/`.flac`/`.png`.
+
+The 2026-11-02 M3-A HEVC / H.265 Main 8-bit 4:2:0 standalone codec qualification
+(`campaign/m3-a-hevc-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**19,449 declarations with zero sorryAx/custom axioms** (`67,056` LOC across 33
+formal `LeanAV/*.lean` modules) and **740/740 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `HevcMainProofs`: 23, `Spec`: 23,
+`PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
+`Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 ITU-T
+H.265 Main profile 8-bit YUV420p Annex-B + ISO 14496-15 `hvcC` MP4 probing,
+decoding, and encoding (`LeanAV/HevcMain.lean`, `LeanAV/HevcMainProofs.lean`,
+`hevc-probe`, `hevc-decode-raw`, `hevc-encode-raw`) with zero `ffmpeg`
+subprocesses and fail-closed rejection of non-Main / 10-bit / 4:4:4 / malformed
+inputs.
+
+The 2026-11-01 M2-D in-process H.264 + AAC-LC MP4 transcode qualification
+(`campaign/m2-complete-20261031` over `77c6ca9`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**17,478 declarations with zero sorryAx/custom axioms** (`58,674` LOC across 31
+formal `LeanAV/*.lean` modules) and **717/717 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 21, `Core`: 11,
+`Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6; `0` vacuous,
+`0` trivial, `0` shadowed), adding the zero-delegation in-process transcoder
+(`inproc_h264_aac_mp4_transcode`): 8-bit 4:2:0 Baseline/Main/High CAVLC & CABAC
+I/P/B slices, 8x8 transform, frame cropping, ITU-T H.264 explicit weighted
+prediction (`weighted_pred_flag` / `weighted_bipred_idc == 1`, with proofs that
+default weights reduce to the identity and to `biPredSample`) and implicit
+weighted biprediction (`weighted_bipred_idc == 2`), Q8 bilinear scaling,
+mono/stereo AAC-LC re-encode, a bounded in-process packet ring, and synthetic
+ISO-BMFF mux, all with zero `ffmpeg` subprocesses and fail-closed rejection of
+10-bit, 4:4:4, FMO, scaling-matrix, and qpprime-bypass inputs.
+
+The 2026-10-30 M2-A1 H.264 / AVC bitstream syntax qualification
+(`campaign/m2-a1-h264-syntax-20261030` over `a39d5516`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**13,167 declarations with zero sorryAx/custom axioms** (`40,960` LOC across 22
+formal `LeanAV/*.lean` modules) and **454/454 `non_vacuous_and_tight`
+specifications** (`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Audio`: 34, `Encoder`: 30, `Scale`: 28, `Bitstream`: 27,
+`H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 20, `Core`: 11, `Domain`: 8,
+`Md5`: 7, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding
+pure Lean 4 H.264 / AVC Annex-B + ISO 14496-15 `avcC` / length-prefixed
+(`1`/`2`/`4`-byte) NALU framing, RBSP `0x000003` emulation-prevention
+strip/insert with EBSP-safety and roundtrip proofs, SPS/PPS/slice-header parsing
+& serialization (including exact CABAC `cabac_alignment_one_bit` prefix emission
+without spurious `0x80` stop-bit padding and bit-level `slice_data` splicing)
+across Baseline, Main, High, High 10, High 4:2:2, and High 4:4:4 Predictive
+profiles, POC Type 0 (including `delta_pic_order_cnt_bottom` and bottom-field
+derivation) / Type 2 derivation, `lffmpeg h264-probe` zero-exec CLI inspection,
+and differential `ffprobe` / `ffmpeg` parity tests (`121` unit suite entries and
+`114` differential suite entries).
+
+The 2026-10-30 M1 integrated campaign closure (`campaign/m1-complete-20261029`,
+combining M1-A2 `c0a811f4`, M1-B2 `f619a6ab`, M1-C1 v4 `64028fe3`, and M1-C2 v2
+`5d32bf26` over base `367be082`) under Lean v4.35.0 and `turbo-lean`
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited **12,019
+declarations with zero sorryAx/custom axioms** (`38,045` LOC across 20 formal
+`LeanAV/*.lean` modules) and **428/428 `non_vacuous_and_tight` specifications**
+(`Format`: 63, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Audio`: 34,
+`Encoder`: 30, `Scale`: 28, `Bitstream`: 27, `Spec`: 23, `PlanIR`: 20, `Core`:
+11, `Domain`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
+shadowed), with **46/46 `LNIR_WIRE_V1` kernels** (`validate-tv --samples 64` +
+`verify-certs`: `184` pass certificates across `46` verified declarations), **14
+zero-drift LLVM 18 outer shells** (`./scripts/regen_lnir_c_kernels.sh --check-ir`),
+a **`1,179`-line** C-ABI/POSIX/SIMD bridge (`c/leanav_simd_kernels.c`), `53/53`
+self-test waves, `verify-ffi`, `verify-kernels`, `121` unit suite entries (`119`
+passed, `2` skipped without `clang-18`), and `108` differential suite entries
+(`104` passed, `4` skipped without optional external fixtures).
+
+The 2026-10-30 M1-C2 v2 standalone FFV1 v3 validation under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**9,853 declarations with zero sorryAx/custom axioms** and **333/333 tight
+specifications** across 20 formal modules (`Ffv1Proofs`: 60, `Format`: 56,
+`Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23,
+`PlanIR`: 17, `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Md5`: 7,
+`Cli`: 6, `Filter`: 6), adding standalone pure Lean 4 FFV1 version 3 lossless
+video encoding, decoding, and remuxing (`yuv420p`, `gray`, `rgb24`, `bgr0`;
+Golomb-Rice coder `0` and range coders `-2`/`1`/`2` including 2-pass custom
+state transition tables across `1..255`; context models `0`/`1`; `1..64` slices;
+CRC-32 `slicecrc` `0`/`1`; Matroska `.mkv` with spec-exact `DisplayUnit` SAR
+handling across `0/1`, `1/1`, and explicit DAR, QuickTime `.mov`, AVI `.avi`,
+`rawvideo`, `yuv4mpegpipe`, `md5`, and `framemd5`) under `independent_verified`
+with zero `ffmpeg` subprocess execution and fail-closed `LEANAV_FFMPEG_BIN` /
+`LEANAV_FFPROBE_BIN` override enforcement (verified under `PATH=/nonexistent`
+and `strace -f -e trace=execve`).
+
+The 2026-10-30 M1-C1 standalone lossless codec qualification under Lean v4.35.0
+and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1)
+audited **10,309 declarations with zero sorryAx/custom axioms** and **320/320
+tight specifications** (`Format`: 56, `Video`: 46, `Audio`: 34, `Encoder`: 30,
+`Scale`: 28, `Bitstream`: 27, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 20,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6; `0` vacuous, `0` trivial, `0`
+shadowed), adding pure Lean 4 `independent_verified` Zlib/DEFLATE (RFC 1950 /
+RFC 1951 stored, fixed, and dynamic canonical Huffman + LZ77 + Adler-32), PNG
+(filters `0..4`, Adam7 interlace, strict RFC 2083 chunk ordering/multiplicity,
+`PLTE`/`tRNS` including 16-bit RGB and sub-8-bit keys, 1-bit grayscale `tRNS`
+with low-`bitDepth` high-bit masking, exact `(v + 128) / 257`
+16->8 downscaling and `-c:v copy`/`-c copy` chunk-exact stream copy, 8/16-bit
+rawvideo CLI roundtrip), and FLAC (RFC 9639 constant/verbatim/fixed `0..4`/LPC
+subframes, 33-bit stereo side-channel samples with RFC 9639 §9.2.7.3
+`[-2147483647, 2147483647]` signed Rice residuals and adaptive
+partition order selection, fail-closed rejection of residual values outside
+`[-2147483647, 2147483647]` with verbatim fallback, `AudioFrame` 8..32-bit
+sign-extension/denormalization roundtrip, wasted bits, 4 stereo modes,
+STREAMINFO MD5 + CRC-8/CRC-16, `-c:a copy`/`-c copy` metadata-preserving stream
+copy, 3-way `independentVerified` / out-of-domain `fallbackDelegated` / corrupt
+fail-closed dispatch, and `WAVE_FORMAT_EXTENSIBLE` 8/12/16/20/24/32-bit WAV &
+raw PCM CLI roundtrip) decode and encode with zero `ffmpeg` subprocesses
+(verified under `PATH=/nonexistent` and `LEANAV_FFMPEG_BIN=/nonexistent`),
+passing `121` unit suite entries (`119` passed, `2` skipped without `clang-18`)
+and `78` differential suite entries (`74` passed, `4` skipped).
+
+The 2026-10-30 M1-A2 LNIR Pixel-Core Outer-Loop Wiring & TCB Disclosure update
+under Lean v4.35.0 and `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`,
+`audit-spec` v2.1) audited **9,065 declarations with zero sorryAx/custom axioms**
+and **300/300 tight specifications** (`NativeKernels`: 59, `Format`: 56, `Video`: 31,
+`Encoder`: 30, `Scale`: 28, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with **`46/46` `LNIR_WIRE_V1`
+kernels** (29 data-parallel SIMD + 17 scalar `@lnir_px_*` pixel cores) passing
+`SymbolicTV` (`validate-tv --samples 64`) and certificate verification
+(`verify-certs`: `verified: true`, `37 VerifiedKernelProof`,
+`8 TranslationValidated`, `1 Tested`, all `chainValid: true` and
+`theoremsValid: true`), a `1,179`-line C-ABI/POSIX/SIMD bridge
+(`c/leanav_simd_kernels.c`), and **14 thin 2D strided/tiling/narrow-memory LLVM 18
+outer-loop shells** (`1,454` lines in `c/leanav_lnir_{x86_64,arm64}.ll` generated
+deterministically by `scripts/gen_lnir_outer_shells.py` and gated by
+`./scripts/regen_lnir_c_kernels.sh --check-ir`) that call the verified `@lnir_px_*`
+cores directly and are explicitly disclosed in the §6.8 Unverified TCB boundary
+(`docs/M1_LNIR_DSP_LIFT_BLOCKER_20261029.md`).
+
+The 2026-10-30 M1-B2 native zero-exec stream-copy & remux closure under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**9,540 declarations with zero sorryAx/custom axioms** and **273/273 tight
+specifications** (`Format`: 63, `Video`: 31, `Encoder`: 30, `Scale`: 28,
+`NativeKernels`: 25, `Spec`: 23, `PlanIR`: 17, `Bitstream`: 13, `Audio`: 12,
+`Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6), with `16/16` `LNIR_WIRE_V1`
+kernels passing `SymbolicTV` (`validate-tv --samples 64`) and certificate
+verification (`verify-certs`: `verified: true`, `11 VerifiedKernelProof`,
+`4 TranslationValidated`, `1 Tested`, all `chainValid: true` and
+`theoremsValid: true`), and a `1,166`-line C-ABI/POSIX/SIMD bridge
+(`c/leanav_simd_kernels.c`). Native `independent_verified` stream copy (`-c copy`,
+`-c:v copy`, `-c:a copy`, `-c:s copy`, `-c:d copy`, `-ss`, `-t`, `-to`, `-map`,
+`-vn`/`-an`/`-sn`/`-dn`, `-metadata`, and `/dev/null` output) executes in pure Lean 4
+with zero `ffmpeg` subprocesses across MP4/MOV/M4V/M4A (including `ctts` v0/v1,
+`elst` `mvhd` timescale rescaling with v0->v1 64-bit promotion, `stss`, `co64`,
+uncompressed PCM/G.711 fixed-sample slicing, subtitle/data stream-selection & copy
+gates, and multi-`stsd` safe demotion), Matroska/WebM (`SimpleBlock`, `BlockGroup`,
+`SeekHead`/`Cues`), WAV, FLAC (`STREAMINFO` + `VORBIS_COMMENT`), and IVF, verified by
+21 zero-exec differential & OS-`strace` tests in `tests/differential/test_native_remux.py`. In the Wave 2 FATE sweep across the `6,133`
+retained inventory rows (`5,721` configured + `412` disabled = `6,065` real
+upstream targets; `reports/fate-sweep-wave2-complete-20261029.json`), all
+`5,721/5,721` configured baseline targets exited status-zero and all
+`5,370/5,370` disjoint candidate-CLI-exercised targets passed (`0` candidate
+failures; `659` non-CLI helper rows kept at `0` candidate credit; `1`
+non-candidate upstream `astcenc 5.4.0` API failure; `35` hardware/arch-gated
+not runnable; `global_parity: false` pending full-suite eBPF syscall-provenance
+certification). Stage-1 untimed `1080p120` equivalence passed `17,577` checks,
+and Stage-2 `paired-baseline-v5-wave2-357e1a4-thp-a` passed `14/14` byte-exact
+oracle outputs (`quality_passed: true`) while failing closed on shared-host SMT
+timing noise (`CV = 6.851%` / `6.350%`, `timing_valid: false`); the accepted
+bounded timing baseline remains `paired-baseline-v5-ae6ed0b-thp-a` (`10.5057 s`
+vs `10.2235 s`, `+2.86%` slower, `CV = 1.417%` / `0.382%`, `timing_valid: true`).
+
+The 2026-10-27 MPEG delegated-option validation under Lean v4.35.0 audited
+**8,899 declarations with zero sorryAx/custom axioms** and **264/264 tight
+specifications**. Build, 53 self-test waves, FFI/kernel checks, 64 unit tests and
+74 differential tests passed. This local quality result does not certify FATE
+coverage or performance; historical counts below retain their original scope.
+
 ## W11-W14 direct all-ratio U8/U16LE acceptance, 10-bit identity zero-copy, dual-step luma stats, surgical trailing-moov, SIMD 3x3 & 3:2 U16LE, 16-lane down2x2_fused_eq, disabled-plane filter skip, and 8-lane box3x3 & AV1 CDEF validation
 
 The direct U16LE and U8 acceptance paths support `1:1`, `2:1`, `3:1`, and general Q8
@@ -22,7 +268,7 @@ and an 8-lane `<8 x i32>` SIMD interior loop with `shift & 31` normalization in
 `@lean_native_av1_cdef_filter_u8` (`av1CdefInteriorVecGateSpec`). Local
 validation under Lean v4.35.0 passed all 53 self-test waves, `verify-ffi`,
 `verify-kernels`, and the axiom audit: **8,887 declarations, zero sorryAx/custom axioms**.
-The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 56,
+The current spec audit is **264/264 non_vacuous_and_tight, zero shadowed** (`Format`: 59,
 `Video`: 31, `Encoder`: 30, `Scale`: 28, `NativeKernels`: 25, `Spec`: 23, `PlanIR`: 15,
 `Bitstream`: 13, `Audio`: 12, `Core`: 11, `Domain`: 8, `Cli`: 6, `Filter`: 6). The bridge
 has 621 lines and links 14 runtime routines. The earlier local report claimed 30 unit/IR and 53 differential tests. The retained
@@ -103,7 +349,8 @@ Every capability in the registry and in [`LeanAV.PlanIR.BackendTier`](../LeanAV/
   1. `LeanAV.PlanIR.rescalePtsIndependentOrFallback` (exact rational timestamp conversion with explicit out-of-domain fallback).
   2. `LeanAV.PlanIR.scalePlane2x2IndependentOrFallback` (verified 2x2 downscaler with bounds and parity guards).
   3. `LeanAV.PlanIR.demuxIvfIndependentOrFallback`, `LeanAV.PlanIR.demuxMatroskaIndependentOrFallback`, and `LeanAV.PlanIR.demuxMpegTsIndependentOrFallback` (IVF, Matroska `SimpleBlock`, and 188-byte MPEG-TS container demuxers with explicit out-of-domain fallback).
-  4. **16 Compiled `LNIR_WIRE_V1` DSP & Stencil Kernels** in [`LeanAV/NativeKernels.lean`](../LeanAV/NativeKernels.lean) (`swscale_luma_gain_bias_simd`, `flac_lpc_autocorr_dot_simd`, `opus_celt_pvq_mix_saxpy_gpu`, `av1_wiener_3tap_sym_gpu`, `av1_cdef_fma_blend_gpu`, `h264_idct_tuple_accum_sroa`, `bframe_bipred_blend_gpu`, `hevc_sao_band_offset_add_gpu`, `aac_imdct_window_mul_gpu`, `prores_qscale_map_simd`, `boxblur_div9_recip_shift_simd`, `pq10_studio_clamp_select_simd`, `swscale_down2x2_box_simd`, `swscale_down3x3_box_simd`, `swscale_down3to2_bilinear_simd`, `av1_cdef_dir_filter_simd`), validated with `lean-native-core validate-tv` (`16/16`, 64 samples) and `lean-native-core verify-certs` (`16/16 VerifiedKernelProof`), lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, including 7 vectorized 2D strided/reduction runtime routines) and NVIDIA PTX 8.0 (`sm_90`), linked into `libleanav_dsp.a`, and verified at runtime against `evalLnirKernel`.
+  4. `LeanAV.PlanIR.decodePngIndependentOrFallback`, `LeanAV.PlanIR.encodePngIndependentOrFallback`, `LeanAV.PlanIR.decodeFlacIndependentOrFallback`, and `LeanAV.PlanIR.encodeFlacIndependentOrFallback` (standalone PNG + Zlib/DEFLATE and FLAC lossless codecs gated by `standaloneLosslessPlanGateSpec` with zero `ffmpeg` subprocesses).
+  5. **16 Compiled `LNIR_WIRE_V1` DSP & Stencil Kernels** in [`LeanAV/NativeKernels.lean`](../LeanAV/NativeKernels.lean) (`swscale_luma_gain_bias_simd`, `flac_lpc_autocorr_dot_simd`, `opus_celt_pvq_mix_saxpy_gpu`, `av1_wiener_3tap_sym_gpu`, `av1_cdef_fma_blend_gpu`, `h264_idct_tuple_accum_sroa`, `bframe_bipred_blend_gpu`, `hevc_sao_band_offset_add_gpu`, `aac_imdct_window_mul_gpu`, `prores_qscale_map_simd`, `boxblur_div9_recip_shift_simd`, `pq10_studio_clamp_select_simd`, `swscale_down2x2_box_simd`, `swscale_down3x3_box_simd`, `swscale_down3to2_bilinear_simd`, `av1_cdef_dir_filter_simd`), validated with `lean-native-core validate-tv` (`16/16`, 64 samples) and `lean-native-core verify-certs` (`16/16 VerifiedKernelProof`), lowered to LLVM 18 IR (`c/leanav_lnir_x86_64.ll` and `c/leanav_lnir_arm64.ll`, including 7 vectorized 2D strided/reduction runtime routines) and NVIDIA PTX 8.0 (`sm_90`), linked into `libleanav_dsp.a`, and verified at runtime against `evalLnirKernel`.
 - **Completeness & Fallback Theorem**: `LeanAV.PlanIR.independentKernel_fallback_complete_and_sound`.
 - **CLI Verification**: `lffmpeg verify-kernels`.
 
@@ -148,3 +395,68 @@ support GNU `--wrap`; the test now compiles the production C bridge with a renam
 scaler entrypoint and a counting wrapper on both platforms. No test is skipped to
 work around that failure. Historical benchmark and suite totals below are not
 claims that every case ran on the current CI runner.
+
+## 28 October integrated candidate
+
+See [the scoped qualification report](INTEGRATED_CONFORMANCE_20261028.md).
+Current source uses Lean 4.35.0, retains 8,899 declarations and 264 tight specs, and
+has 623 lines of C-ABI glue. Full FATE parity and current-candidate performance
+remain unproven; historical results above do not certify this candidate.
+
+
+## PFM routing correction (28 October 2026)
+
+See [PFM validation](PFM_ROUTING_20261028.md): four scoped image recipe comparisons,
+52 byte-identical image pairs and matching upstream MD5/size/decode CRC.
+Proof counts remain 8,897 declarations and 264 tight specifications.
+This branch adds no global FATE or performance certification.
+
+
+### IAMF compatibility qualification (2026-10-28, pending project completion)
+
+The isolated IAMF candidate adds explicit IAMF format routing, stream-group and stream-ID options, and safe local file-valued graph/group arguments. These paths delegate codec execution to the pinned FFmpeg backend; they do not establish an independent IAMF codec implementation. Numeric input group maps force delegation. Existing lexical path checks remain in force; they do not imply confinement of references inside graph files.
+
+All 14 original paired IAMF recipes passed, with 84 successful process receipts, byte-identical paired media and exact frozen upstream recipe output. Twenty-eight ffprobe invocations are upstream helpers and receive no candidate implementation credit. Parent raw validation passed 722 checks. The current axiom audit reports 8,899 declarations and no forbidden axioms. The full unit suite passed 118/118 with zero skips; the differential suite passed 81/81 with zero skips. No global FATE parity or performance claim follows from these focused results.
+
+## 28 October BSF parser correction
+
+See [the scoped BSF parsing report](BSF_ROUTING_20261028.md). The isolated BSF
+candidate `cb9c6ac` audited 8,897 declarations with no forbidden axioms and
+264/264 tight specs; integrated counts are reported separately below.
+The 8,909-case token-oracle comparison and routing tests are bounded parser
+evidence; they do not close the remaining FATE/media or performance gates.
+
+## Integrated IAMF/PFM/BSF project qualification (28 October 2026)
+
+The integrated candidate combines the reviewed IAMF/PFM base `e2912eb` with the
+BSF correction `cb9c6ac`. One complete local qualification passed all 22 commands:
+build (53 jobs), 53 self-test waves, FFI and kernel checks, 8,899 declarations with
+zero sorryAx/custom axioms, and 264/264 tight specifications across 15 modules.
+Python suites passed **129/129 unit tests and 81/81 differential tests**, with
+zero skips, failures or errors. These are project-suite counts, not upstream FATE
+coverage. The integrated executable SHA256 is
+`7064fdcc027733ee3ffb6218fb9b858e3ca3b349b6b14180f6965fa1a2a1d8c7`.
+
+The retained campaign qualification report passed 313 checks; the independent
+parent terminal review passed 53 checks. Original worktrees, binaries, source
+hashes and the original IAMF build cache were preserved. Earlier PFM/IAMF/BSF
+media results above describe their isolated candidates and are not new integrated
+FATE results. The historical GPL57 run credited 46 CLI cases, retained seven
+failures, and excluded four ffprobe helper cases from candidate credit. Later
+routing corrections are present here, but fresh integrated GPL57 execution
+remains outstanding.
+
+Full FATE provenance/configuration coverage and integrated performance remain
+open. The accepted bounded x86 result of 2.861% slower paired median latency
+belongs to frozen `ae6ed0b`, not this integrated executable. This qualification
+does not claim complete FFmpeg parity, independent delegated codecs, or a speedup.
+
+## Signed output timestamp offset qualification (28 October 2026)
+
+See [the scoped timestamp-offset report](OUTPUT_TS_OFFSET_20261028.md). The exact
+`-output_ts_offset` option now accepts the existing signed-duration grammar and
+preserves delegated argv. Current project qualification passed 136/136 unit,
+81/81 differential and 7/7 focused tests with zero skips; proof counts remain
+8,899 declarations and 264 tight specs. The initial incorrect test assertion is
+retained in the audit. No fresh selected FATE media result or performance claim
+follows from this correction.

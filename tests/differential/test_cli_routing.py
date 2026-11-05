@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / ".lake" / "build" / "bin" / "lffmpeg"
+FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 FIXTURE = ROOT / "tests" / "differential" / "fixtures" / "input-av.mp4"
 
 
@@ -15,10 +18,24 @@ class CliRoutingTests(unittest.TestCase):
     def setUpClass(cls):
         if not BINARY.is_file() or not BINARY.stat().st_mode & 0o111:
             raise unittest.SkipTest("lffmpeg binary is unavailable")
-        if not FIXTURE.is_file():
-            raise unittest.SkipTest("media fixture is unavailable")
+        cls.fixture = FIXTURE
+        if not cls.fixture.is_file():
+            tmp = tempfile.TemporaryDirectory(prefix="lffmpeg-cli-fixture-")
+            cls.addClassCleanup(tmp.cleanup)
+            cls.fixture = Path(tmp.name) / "input-av.mp4"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "testsrc=size=32x32:rate=25:duration=0.4",
+                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.4",
+                 "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-threads", "1",
+                 "-map_metadata", "-1", "-movflags", "+faststart", str(cls.fixture)],
+                check=True, capture_output=True,
+            )
         try:
-            subprocess.run([str(BINARY), "-version"], check=True, capture_output=True, text=True)
+            subprocess.run([str(BINARY), "-version"], check=True, capture_output=True, text=True,
+                           env={"PATH": "/nonexistent"})
         except (OSError, subprocess.SubprocessError):
             raise unittest.SkipTest("lffmpeg runtime is unavailable")
 
@@ -30,6 +47,7 @@ class CliRoutingTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env={"PATH": "/nonexistent"},
             )
             return result
 
@@ -41,21 +59,21 @@ class CliRoutingTests(unittest.TestCase):
         return document
 
     def test_json_success_is_one_object_on_stdout_without_human_diagnostics(self):
-        result = self.run_cli("-json", "-y", "-i", str(FIXTURE), "-c", "copy")
+        result = self.run_cli("-json", "-y", "-i", str(self.fixture), "-c", "copy")
         self.assertEqual(result.returncode, 0, result.stderr)
         document = self.assert_one_json_object(result)
         self.assertTrue(document["ok"])
         self.assertEqual(result.stderr, "")
 
     def test_json_malformed_option_is_one_object_without_stderr(self):
-        result = self.run_cli("-json", "-y", "-i", str(FIXTURE), "-unsupported-option")
+        result = self.run_cli("-json", "-y", "-i", str(self.fixture), "-unsupported-option")
         self.assertNotEqual(result.returncode, 0)
         document = self.assert_one_json_object(result)
         self.assertFalse(document["ok"])
         self.assertEqual(result.stderr, "")
 
     def test_non_json_failure_routes_diagnostic_to_stderr(self):
-        result = self.run_cli("-y", "-i", str(FIXTURE), "-unsupported-option")
+        result = self.run_cli("-y", "-i", str(self.fixture), "-unsupported-option")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertNotEqual(result.stderr, "")
@@ -63,7 +81,7 @@ class CliRoutingTests(unittest.TestCase):
     def test_quiet_levels_suppress_ordinary_stderr(self):
         for level in ("quiet", "-8"):
             with self.subTest(level=level):
-                result = self.run_cli("-y", "-v", level, "-i", str(FIXTURE), "-unsupported-option")
+                result = self.run_cli("-y", "-v", level, "-i", str(self.fixture), "-unsupported-option")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, "")
@@ -77,7 +95,7 @@ class CliRoutingTests(unittest.TestCase):
                     option,
                     "4294968",
                     "-i",
-                    str(FIXTURE),
+                    str(self.fixture),
                     "-c",
                     "copy",
                 )
@@ -95,7 +113,7 @@ class CliRoutingTests(unittest.TestCase):
                     option,
                     "-0.001",
                     "-i",
-                    str(FIXTURE),
+                    str(self.fixture),
                     "-c",
                     "copy",
                 )
@@ -105,7 +123,7 @@ class CliRoutingTests(unittest.TestCase):
                 self.assertEqual(result.stderr, "")
 
     def test_json_and_quiet_transcode_suppress_banner_and_stats_on_stderr(self):
-        result_json = self.run_cli("-json", "-y", "-i", str(FIXTURE), "-t", "0.1", "-c:v", "h264")
+        result_json = self.run_cli("-json", "-y", "-i", str(self.fixture), "-c:v", "h264")
         self.assertEqual(result_json.returncode, 0, result_json.stderr)
         document = self.assert_one_json_object(result_json)
         self.assertTrue(document["ok"])
@@ -113,13 +131,13 @@ class CliRoutingTests(unittest.TestCase):
 
         for level in ("quiet", "panic", "fatal", "error", "warning", "-8", "0", "8", "16", "24"):
             with self.subTest(level=level):
-                result_quiet = self.run_cli("-y", "-v", level, "-i", str(FIXTURE), "-t", "0.1", "-c:v", "h264")
+                result_quiet = self.run_cli("-y", "-v", level, "-i", str(self.fixture), "-c:v", "h264")
                 self.assertEqual(result_quiet.returncode, 0, result_quiet.stderr)
                 self.assertEqual(result_quiet.stdout, "")
                 self.assertEqual(result_quiet.stderr, "")
 
     def test_adversarial_corrupt_and_truncated_media_fail_closed_without_artifact(self):
-        raw = FIXTURE.read_bytes()
+        raw = self.fixture.read_bytes()
         corrupt_cases = {
             "empty": b"",
             "garbage": b"NOT_AN_MP4_CONTAINER_0123456789",
@@ -141,6 +159,7 @@ class CliRoutingTests(unittest.TestCase):
                             capture_output=True,
                             text=True,
                             check=False,
+                            env={"PATH": "/nonexistent"},
                         )
                         self.assertNotEqual(result.returncode, 0)
                         document = self.assert_one_json_object(result)
@@ -158,12 +177,69 @@ class CliRoutingTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env={"PATH": "/nonexistent"},
             )
             self.assertNotEqual(result_mdat.returncode, 0)
             document_mdat = self.assert_one_json_object(result_mdat)
             self.assertFalse(document_mdat["ok"])
             self.assertEqual(result_mdat.stderr, "")
             self.assertFalse(trunc_out.exists())
+
+    def test_existing_output_preserved_across_all_rejected_routes(self):
+        sentinel = b"CLI-ROUTING-SENTINEL-DO-NOT-MODIFY\x00\xff"
+        with tempfile.TemporaryDirectory(prefix="lffmpeg-overwrite-adm-") as directory:
+            root = Path(directory)
+            hevc_mp4 = root / "hevc_in.mp4"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "color=c=blue:s=32x32:r=10:d=0.2",
+                 "-c:v", "libx265", "-pix_fmt", "yuv420p", str(hevc_mp4)],
+                check=True, capture_output=True,
+            )
+            h264_mkv = root / "h264_in.mkv"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "color=c=red:s=32x32:r=10:d=0.2",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(h264_mkv)],
+                check=True, capture_output=True,
+            )
+            f32_wav = root / "f32_in.wav"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "sine=f=440:r=48000:d=0.1",
+                 "-c:a", "pcm_f32le", str(f32_wav)],
+                check=True, capture_output=True,
+            )
+            reject_cmds = [
+                (["-i", str(self.fixture), "-c:v", "vp9"], "mp4"),
+                (["-i", str(hevc_mp4), "-c:v", "h264"], "mp4"),
+                (["-i", str(h264_mkv), "-f", "rawvideo", "-pix_fmt", "yuv420p"], "yuv"),
+                (["-i", str(f32_wav), "-c:a", "flac"], "flac"),
+                (["-i", str(f32_wav), "-c:a", "aac"], "aac"),
+            ]
+            for idx, (cmd_prefix, ext) in enumerate(reject_cmds):
+                target = root / f"existing_{idx}.{ext}"
+                for flags in ([], ["-n"], ["-y"], ["-json"]):
+                    with self.subTest(idx=idx, flags=flags):
+                        target.write_bytes(sentinel)
+                        res = subprocess.run(
+                            [str(BINARY), *flags, *cmd_prefix, str(target)],
+                            capture_output=True, text=True, check=False,
+                            env={"PATH": "/nonexistent"},
+                        )
+                        self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
+                        self.assertNotIn("Not overwriting", res.stderr)
+                        self.assertEqual(target.read_bytes(), sentinel)
+
+            valid_target = root / "existing_valid.mp4"
+            valid_target.write_bytes(sentinel)
+            plain_res = subprocess.run(
+                [str(BINARY), "-i", str(self.fixture), "-c", "copy", str(valid_target)],
+                capture_output=True, text=True, check=False, env={"PATH": "/nonexistent"},
+            )
+            self.assertEqual(plain_res.returncode, 0, plain_res.stderr)
+            self.assertIn("Not overwriting - exiting", plain_res.stderr)
+            self.assertEqual(valid_target.read_bytes(), sentinel)
 
 
 if __name__ == "__main__":
