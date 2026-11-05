@@ -1,8 +1,10 @@
 import LeanAV.Encoder
 
-open LeanAV.Scale LeanAV.Encoder LeanAV.NativeKernels
+open LeanAV.Scale LeanAV.Encoder LeanAV.Format LeanAV.NativeKernels
 
 @[extern "identity_test_take_calls"] opaque takeCalls : IO UInt64
+@[extern "identity_test_take_luma_stats_calls"] opaque takeLumaStatsCalls : IO UInt64
+@[extern "identity_test_take_extract_msb8_calls"] opaque takeExtractMsb8Calls : IO UInt64
 
 def require (ok : Bool) (message : String) : IO Unit :=
   unless ok do throw (IO.userError message)
@@ -17,7 +19,27 @@ def pureScale (src : ByteArray) (sw sh dw dh : Nat) : ByteArray :=
     scalePlaneBilinearU16LeBytes src ((sw * sh + (sw / 2) * (sh / 2)) * 2)
       (sw / 2) (sh / 2) (dw / 2) (dh / 2) uxt uyt
 
+def pureLumaStatsPacked (src : ByteArray) (nPixels step : Nat) : UInt64 := Id.run do
+  let n := Nat.min nPixels (src.size / 2)
+  if n == 0 || step == 0 then return 0
+  let mut sum : UInt64 := 0
+  let mut sumSq : UInt64 := 0
+  let mut cnt : UInt64 := 0
+  let mut i : Nat := 0
+  while i < n do
+    let bOff := i * 2
+    let u16 : UInt64 := (src.get! bOff).toUInt64 ||| ((src.get! (bOff + 1)).toUInt64 <<< 8)
+    let v := u16 >>> 2
+    sum := sum + v
+    sumSq := sumSq + v * v
+    cnt := cnt + 1
+    i := i + step
+  return computeLumaMeanVarPackedU64 sum sumSq cnt
+
 unsafe def unitTests : IO Unit := do
+  let _ ← takeCalls
+  let _ ← takeLumaStatsCalls
+  let _ ← takeExtractMsb8Calls
   -- Admission boundaries are checked without allocating the claimed footprint.
   for (a, expected) in [
       ((2, 2, 2, 2, 12), true), ((2, 2, 2, 2, 13), true),
@@ -64,18 +86,73 @@ unsafe def unitTests : IO Unit := do
     let out := scaleFrameYuv420p10LeAuto src sw sh dw dh #[] #[] #[] #[]
     require (out.data == (pureScale src sw sh dw dh).data) "resize differential mismatch"
     require ((← takeCalls) == 1) "resize bypassed native scaler"
+  -- Direct C-ABI interposition & differential checks for luma_stats_u16le and extract_u16le_msb8
+  -- across empty, short/odd-byte, normal, SIMD-tail, and strided (>65536) inputs.
+  for n in [0, 1, 2, 15, 16, 17, 31, 32, 33, 65536, 65537] do
+    let mut base := ByteArray.emptyWithCapacity (n * 2)
+    for i in [:n] do
+      let v := (i * 7919 + 65535) % 65536
+      base := (base.push v.toUInt8).push (v / 256).toUInt8
+    for tail in [#[], #[0xFD], #[0x34, 0x12, 0xFE]] do
+      let src := base ++ ByteArray.mk tail
+      let capPx := src.size / 2
+      for req in [0, 1, capPx / 2, capPx, capPx + 9] do
+        let _ ← takeExtractMsb8Calls
+        let extDirect := execLnirExtractU16LeMsb8BaC src req.toUInt64
+        require ((← takeExtractMsb8Calls) == 1) "direct extract C-ABI counter"
+        let extPure := extractU16LeMsb8Pure src req
+        require (extDirect.data == extPure.data) s!"direct extract mismatch n={n} req={req}"
+        let extFast := extractU16LeMsb8Fast src req
+        require ((← takeExtractMsb8Calls) == 1) "fast extract C-ABI counter"
+        require (extFast.data == extPure.data) s!"fast extract mismatch n={n} req={req}"
+        for step in [0, 1, 3, 16, 17] do
+          let _ ← takeLumaStatsCalls
+          let stDirect := execLnirLumaStatsU16LeBaC src req.toUInt64 step.toUInt64
+          require ((← takeLumaStatsCalls) == 1) "direct stats C-ABI counter"
+          let stRef := pureLumaStatsPacked src req step
+          require (stDirect == stRef) s!"direct stats mismatch n={n} req={req} step={step}"
+        let _ ← takeLumaStatsCalls
+        let stFast := computeLumaStatsU16LeFast src req
+        require ((← takeLumaStatsCalls) == 1) "fast stats C-ABI counter"
+        require (stFast == computeLumaStatsU16LePure src req) s!"fast stats mismatch n={n} req={req}"
+  require ((← takeCalls) == 0) "unexpected scale calls during stats/extract checks"
   IO.println "unit identity, pointer reuse, native/pure differential and fallback checks passed"
 
 unsafe def main (args : List String) : IO Unit := do
-  if args.isEmpty then unitTests
-  else
-    -- General MP4 transcode is fail-closed: it must not scale, write, or spawn.
+  match args with
+  | [] => unitTests
+  | ["wrappers", inPath, outScalePath, outMsbPath, swStr, shStr, dwStr, dhStr, nPxStr, stepStr] =>
+    let src ← IO.FS.readBinFile inPath
+    let sw := swStr.toNat!
+    let sh := shStr.toNat!
+    let dw := dwStr.toNat!
+    let dh := dhStr.toNat!
+    let nPx := nPxStr.toNat!
+    let step := stepStr.toNat!
+    let _ ← takeCalls
+    let _ ← takeLumaStatsCalls
+    let _ ← takeExtractMsb8Calls
+    let scaled := execLnirScale2dYuv420p10LeBaC src sw.toUInt64 sh.toUInt64 dw.toUInt64 dh.toUInt64
+    let stats := execLnirLumaStatsU16LeBaC src nPx.toUInt64 step.toUInt64
+    let msb := execLnirExtractU16LeMsb8BaC src nPx.toUInt64
+    let sc ← takeCalls
+    let lc ← takeLumaStatsCalls
+    let ec ← takeExtractMsb8Calls
+    IO.FS.writeBinFile outScalePath scaled
+    IO.FS.writeBinFile outMsbPath msb
+    IO.println s!"{stats &&& 0xFFFFFFFF},{stats >>> 32},{sc},{lc},{ec}"
+  | _ =>
+    -- General MP4 transcode is fail-closed: it must not scale, compute stats, extract, write, or spawn.
     encoderCliOptionsRef.set { pixFmt := args[2]!, showStats := false, showBanner := false }
     let n (i : Nat) := (args[i]!).toNat!.toUInt32
     let _ ← takeCalls
+    let _ ← takeLumaStatsCalls
+    let _ ← takeExtractMsb8Calls
     let report ← transcodeMp4GeneralVerifiedIO (args[0]!) (args[1]!)
       (n 3) (n 4) (n 5) (n 6) 0 0 1 0 (n 7) (some ByteArray.empty)
     let metrics ← lastAcceptanceMetricsRef.get
-    let calls ← takeCalls
-    require (report == 0 && metrics == 0 && calls == 0) "general transcode must stay closed"
-    IO.println s!"{report},{metrics},{calls}"
+    let sc ← takeCalls
+    let lc ← takeLumaStatsCalls
+    let ec ← takeExtractMsb8Calls
+    require (report == 0 && metrics == 0 && sc == 0 && lc == 0 && ec == 0) "general transcode must stay closed"
+    IO.println s!"{report},{metrics},{sc},{lc},{ec}"

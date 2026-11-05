@@ -2082,10 +2082,9 @@ def transcodeMp4GeneralVerifiedIO
   return 0
 
 /--
-  Pure Lean 4 verified MP4 transcode & remux entry point (`transcodeMp4GeneralVerifiedC`):
-  Supports `-c copy` keyframe-aligned remux (`codecId = 0`), arbitrary `(dstW, dstH)` scaling (`2x2`, `3x3`, `3:2`,
-  or Q8 bilinear), `-ss`/`-t` millisecond seek/trim (`startMs, durMs`), BT.2020->BT.709 color & tonemap filters
-  (`filterFlags`), 6ch->2ch AAC downmix (`filterFlags &&& 8`), and ISO BMFF `colr`/`clli`/`mdcv`/`pasp`/`edts` patching.
+  Legacy general C entry point (`transcodeMp4GeneralVerifiedC`).
+  Standalone zero-exec builds fail closed, returning `0` without writing output.
+  Native stream copy and in-process H.264 + AAC-LC use separate CLI routes.
 -/
 def transcodeMp4GeneralVerifiedC
     (inPath : @& String) (outPath : @& String)

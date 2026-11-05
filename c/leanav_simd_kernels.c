@@ -656,8 +656,8 @@ LEAN_EXPORT lean_obj_res lean_io_process_child_try_wait(b_lean_obj_arg s, b_lean
 LEAN_EXPORT lean_obj_res lean_io_process_child_kill(b_lean_obj_arg s, b_lean_obj_arg c) {
     (void)s; (void)c; return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));
 }
-LEAN_EXPORT uint32_t lean_io_process_child_pid(b_lean_obj_arg s, b_lean_obj_arg c) {
-    (void)s; (void)c; return 0;
+LEAN_EXPORT uint32_t lean_io_process_child_pid(b_lean_obj_arg s, lean_obj_arg c) {
+    (void)s; lean_dec_ref(c); return 0;
 }
 LEAN_EXPORT lean_obj_res lean_io_process_child_take_stdin(b_lean_obj_arg s, lean_obj_arg c) {
     (void)s; lean_dec_ref(c); return lean_io_result_mk_error(lean_decode_io_error(ENOSYS, NULL));

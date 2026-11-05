@@ -1461,14 +1461,23 @@ def nativeIntrospectionLines (flag : String) : Option (List String) :=
     some (["File formats:", " D. = Demuxing supported", " --"] ++ nativeFormats.map (fun l => " D." ++ String.ofList (l.toList.drop 3)))
   else if flag == "-codecs" then
     some ["Codecs:", " D..... = Decoding supported", " .E.... = Encoding supported", " -------",
-          " DEV.L. av1                  Alliance for Open Media AV1", " DEV.LS h264                 H.264 / AVC",
-          " DEV.L. hevc                 H.265 / HEVC", " DEA.L. aac                  AAC",
-          " DEA..S flac                 FLAC", " DEA..S pcm_s16le            PCM signed 16-bit little-endian",
+          " DEV.LS h264                 H.264 / AVC (in-process 8-bit 4:2:0 MP4 -i; raw subcommands)",
+          " DEV.L. hevc                 H.265 / HEVC (via hevc-probe, hevc-decode-raw, hevc-encode-raw)",
+          " DEV.L. av1                  Alliance for Open Media AV1 (via av1-probe, av1-decode-raw, av1-encode-raw)",
+          " DEV..S ffv1                 FFV1 version 3 lossless video",
+          " DEV..S png                  PNG lossless image",
+          " DEA.L. aac                  AAC-LC (in-process MP4 & standalone ADTS)",
+          " DEA..S flac                 FLAC lossless audio",
+          " DEA..S pcm_s16le            PCM signed 16-bit little-endian",
           " ..V... copy                 native stream copy"]
   else if flag == "-decoders" then
-    some ["Decoders:", " ------", " V..... av1", " V..... h264", " V..... hevc", " A..... aac", " A..... flac", " A..... pcm_s16le"]
+    some ["Decoders:", " ------", " V..... h264", " V..... ffv1", " V..... png",
+          " V..... hevc (hevc-decode-raw)", " V..... av1 (av1-decode-raw)",
+          " A..... aac", " A..... flac", " A..... pcm_s16le"]
   else if flag == "-encoders" then
-    some ["Encoders:", " ------", " V..... h264", " V..... hevc", " V..... av1", " A..... aac", " A..... flac", " A..... pcm_s16le"]
+    some ["Encoders:", " ------", " V..... h264", " V..... ffv1", " V..... png",
+          " V..... hevc (hevc-encode-raw)", " V..... av1 (av1-encode-raw)",
+          " A..... aac", " A..... flac", " A..... pcm_s16le"]
   else if flag == "-bsfs" then
     some ["Bitstream filters:", "null"]
   else if flag == "-filters" then
@@ -2653,25 +2662,6 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     let plainStreamCopy := streamCopyFastRouteGateSpec.gate
       (validCfg.videoCodec == some .copy, validCfg.videoFilter.isSome, validCfg.jsonOutput)
     if plan.backend.tier == .unsupported || plainStreamCopy then
-      for o in plan.outputs do
-        let oSpecial :=
-          o.path == "-" || o.path == "/dev/null" || o.path == "md5:" ||
-          strStartsWithFast o.path "md5:" || strStartsWithFast o.path "pipe:" ||
-          isNoFileOutputFormat o.format o.path || o.path.toList.contains '%'
-        if !validCfg.overwrite && !oSpecial then
-          if (← System.FilePath.pathExists o.path) then
-            if validCfg.jsonOutput then
-              return ← reportCliError validCfg
-                "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-                "File exists"
-            else if !(args.contains "-n") then
-              if !cliQuiet validCfg.logLevel then
-                IO.eprintln s!"File '{o.path}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-              return 0
-            else
-              return ← reportCliError validCfg
-                "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-                "File exists"
       let fmtStr := (plan.outputs.head?).map (fun o => o.format) |>.getD "unknown"
       let rawOptions := scanRawLavfiCli args
       let vCodecStr := rawOptions.vCodec.getD "none"
@@ -2752,29 +2742,37 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
 
 def printLffmpegVersion : IO UInt32 := do
   IO.println "lffmpeg version 0.4.0-LeanAV (lean-ffmpeg, Lean 4.35.0, Standalone Zero-Exec)"
-  IO.println "  CLI video: h264, hevc, av1, ffv1, png, copy (standalone in-process, zero bundled ffmpeg)"
-  IO.println "  CLI audio: aac, flac, pcm_s16le, copy (standalone in-process, zero bundled ffmpeg)"
-  IO.println "  LeanAV library codecs: FLAC, AAC-LC, H.264, HEVC, AV1, FFV1, PNG, Opus, ProRes"
-  IO.println "  LeanAV library formats: IVF, MP4, MKV/WebM, WAV, FLAC, PNG, Ogg, MPEG-TS"
+  IO.println "  FFmpeg-style -i video: h264 (8-bit 4:2:0 MP4), ffv1 (v3), png, copy (pure Lean 4 in-process)"
+  IO.println "  FFmpeg-style -i audio: aac (AAC-LC), flac, pcm_s16le, copy (pure Lean 4 in-process)"
+  IO.println "  Dedicated raw subcommands: hevc-{probe,decode-raw,encode-raw}, av1-{probe,decode-raw,encode-raw}, lavfi-{probe,run}"
+  IO.println "  LeanAV library-only modules: Opus, ProRes, Ogg, MPEG-TS"
   IO.println "  LeanAV filters: formally checked lavfi DAG, scale, colorspace=bt709, and tonemap"
   return 0
 
 def printLffmpegFormats : IO UInt32 := do
-  IO.println "Formats (lffmpeg CLI):"
-  IO.println " DE mp4                 ISO Base Media File Format"
-  IO.println "  E null                Null muxer"
-  IO.println "Library-only demuxers (not wired to the CLI): matroska, mpegts, ivf, wav, ogg"
+  IO.println "Formats (lffmpeg standalone pure Lean 4 in-process CLI):"
+  IO.println " DE mov,mp4             QuickTime / MOV / ISO BMFF (H.264+AAC-LC transcode, FFV1, stream copy)"
+  IO.println " DE matroska,webm       Matroska / WebM (FFV1 v3, lavfi mux, multi-track stream copy)"
+  IO.println " DE ivf                 On2 IVF (native stream copy & av1-encode-raw / av1-decode-raw)"
+  IO.println " DE wav                 WAV / WAVE (PCM, FLAC/AAC-LC routes, sample-exact stream copy)"
+  IO.println " DE flac                raw FLAC (lossless encode/decode & frame-exact stream copy)"
+  IO.println " DE adts                ADTS AAC-LC (standalone audio encode/decode)"
+  IO.println " DE png                 PNG image (lossless encode/decode & chunk-exact stream copy)"
+  IO.println "  E md5,framemd5        Hash muxers (FFV1 & lavfi)"
+  IO.println "Library-only demuxers (not wired to -i): ogg, mpegts"
   return 0
 
 def printLffmpegCodecs : IO UInt32 := do
-  IO.println "Codecs (lffmpeg CLI; linked libav/x264 implementations):"
-  IO.println " DEV h264                   H.264 / AVC"
-  IO.println " DEV hevc                   HEVC / H.265"
-  IO.println " DEV av1                    AV1"
-  IO.println " DEV copy                   stream copy"
-  IO.println " DEA aac                    AAC"
-  IO.println " DEA copy                   audio stream copy in stream-copy mode"
-  IO.println "Library-only LeanAV codecs: flac, opus, prores, ffv1, pcm_s16le"
+  IO.println "Codecs (lffmpeg standalone pure Lean 4 in-process; zero bundled ffmpeg/libav/x264):"
+  IO.println " DEV h264                   H.264 / AVC 8-bit 4:2:0 (-i MP4 transcode; h264-probe / h264-entropy)"
+  IO.println " DEV ffv1                   FFV1 version 3 lossless video (-i & lavfi)"
+  IO.println " DEV png                    PNG lossless image (-i & lavfi)"
+  IO.println " DEV copy                   native container stream copy (-c copy)"
+  IO.println " DEA aac                    AAC-LC (-i MP4 & standalone ADTS)"
+  IO.println " DEA flac                   FLAC lossless audio (-i & lossless-codec)"
+  IO.println " DEA pcm_s16le              PCM signed 16-bit little-endian (-i WAV/raw & lavfi)"
+  IO.println "Dedicated raw subcommand codecs (not wired to -i -c:v): hevc (hevc-{probe,decode-raw,encode-raw}), av1 (av1-{probe,decode-raw,encode-raw})"
+  IO.println "Library-only LeanAV codecs: opus, prores"
   return 0
 
 /-- Phase 5 (Wave G) C-ABI FFI Verification Gate (`lffmpeg verify-ffi`). -/

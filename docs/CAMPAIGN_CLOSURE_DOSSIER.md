@@ -1,5 +1,94 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-05 M3-D standalone zero-exec integration & runtime certification
+(`campaign/m3-d-zero-exec-20261104`, integrating M3-A `7beef63e`, M3-B `c944e1dc`,
+and M3-C `644b0056` over `741fb1d0`) under Lean v4.35.0 and `turbo-lean`
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) deletes every
+`ffmpeg`/`ffprobe` subprocess (`BackendTier.delegatedFaithful`,
+`ffiExecDelegatedFfmpegC`, `execPipeTranscodeU8IO`, `LEANAV_FFMPEG_BIN`, and
+`LEANAV_FFPROBE_BIN`), auditing **22,820 declarations with zero sorryAx/custom
+axioms** (`84,960` LOC across 37 formal `LeanAV/*.lean` modules) and **807/807
+`non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
+`H264IntraTransformProofs`: 70, `Format`: 64, `H264InterDeblockDpbProofs`: 61,
+`Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Encoder`: 37,
+`LavfiGraphProofs`: 36, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `Av1MainProofs`: 26, `H264SyntaxProofs`: 26, `HevcMainProofs`:
+23, `Spec`: 23, `PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8,
+`Md5`: 7, `Cli`: 6, `Filter`: 6, `LavfiGraph`: 5; `0` vacuous, `0` trivial, `0`
+shadowed). HEVC Main 8-bit 4:2:0 (`hevc-probe`, `hevc-decode-raw`,
+`hevc-encode-raw`), AV1 Main 8-bit 4:2:0 (`av1-probe`, `av1-decode-raw`,
+`av1-encode-raw`), typed `lavfi` DAG execution (`inproc_lavfi_dag`), H.264 High
+8-bit 4:2:0 + AAC-LC MP4 transcode, FFV1 v3, PNG, FLAC, and container stream copy
+execute in-process; every unsupported codec/profile/container/protocol fails
+closed (`BackendTier.unsupported`, `delegatedContainer := false`,
+`fallbackAllowed := false`) with zero partial output. `c/leanav_simd_kernels.c`
+is `672` lines of FFI/OS glue and non-spawning runtime stubs (`lean -c`
+ownership-verified in `tests/test_zero_delegation_cert.py`, `nm -u` spawn-free,
+and Linux `strace -f -e trace=execve` `execve == 1` across the standalone
+matrix), with direct C-interposition differential verification of all three
+10-bit LNIR C-ABI wrappers (`tests/differential/test_u16le_identity.py`). No new
+benchmark numbers are claimed.
+
+The 2026-11-04 M3-B AV1 Main 8-bit 4:2:0 standalone codec qualification
+(`campaign/m3-b-av1-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**19,925 declarations with zero sorryAx/custom axioms** (`73,833` LOC across 33
+formal `LeanAV/*.lean` modules) and **743/743 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `Av1MainProofs`: 26, `H264SyntaxProofs`: 26, `Spec`: 23,
+`PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
+`Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 AV1
+Main profile 8-bit YUV420p OBU + IVF + AV1-ISOBMFF (`av1C` including 0-byte
+`configOBUs` + in-band sequence header + unsized trailing sample OBUs,
+multi-track/chunked `stsc`+`stco`/`co64`+`stsz`/`stz2` MP4 video demux, and
+`ctts`-free AV1 MP4 mux) probing,
+MSAC/CDF entropy coding, intra/inter/compound/warped motion compensation,
+DCT/ADST/IDTX/WHT transforms, deblocking + CDEF + superres + Wiener/SGR loop
+restoration, multi-tile decoding, and lossless/lossy I+P encoding
+(`LeanAV/Av1Main.lean`, `LeanAV/Av1MainProofs.lean`, `av1-probe`,
+`av1-decode-raw`, `av1-encode-raw`) with zero `ffmpeg` subprocesses and
+fail-closed rejection of non-Main / 10-bit / 4:4:4 / fragmented (`moof`/`mvex`) /
+malformed inputs.
+
+The 2026-11-02 M3-C typed `lavfi` filtergraph DAG & synthetic source qualification
+(`campaign/m3-c-lavfi-dag-20261102` over `741fb1d`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**18,429 declarations with zero sorryAx/custom axioms** (`61,925` LOC across 33
+formal `LeanAV/*.lean` modules) and **758/758 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `LavfiGraphProofs`: 36, `Audio`: 34, `H264EntropyProofs`: 31,
+`Scale`: 28, `Bitstream`: 27, `H264SyntaxProofs`: 26, `Spec`: 23, `PlanIR`: 21,
+`Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6, `Filter`: 6,
+`LavfiGraph`: 5; `0` vacuous, `0` trivial, `0` shadowed), adding the zero-exec
+in-process `lavfi` filtergraph DAG & synthetic source engine (`inproc_lavfi_dag`
+in `LeanAV/LavfiGraph.lean` and `LeanAV/LavfiGraphProofs.lean`): Kahn topological
+ordering with soundness & completeness equivalence to DAG acyclicity, static pad
+link type-safety, bounded per-edge FIFO queues, `SCALEBITS=16` BT.601 color
+conversion, synthetic video/audio sources (`color`, `testsrc`, `nullsrc`, `sine`,
+`anullsrc`), multi-pad DAG nodes (`split`, `asplit`, `overlay`, `hstack`, `vstack`,
+`amix`, `amerge`) plus 19 unary video/audio filters, and zero-subprocess muxing
+across raw/`md5`/`framemd5`/`.mp4`/`.mkv`/`.avi`/`.wav`/`.flac`/`.png`.
+
+The 2026-11-02 M3-A HEVC / H.265 Main 8-bit 4:2:0 standalone codec qualification
+(`campaign/m3-a-hevc-main-20261102` over `741fb1d0`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
+**19,449 declarations with zero sorryAx/custom axioms** (`67,056` LOC across 33
+formal `LeanAV/*.lean` modules) and **740/740 `non_vacuous_and_tight`
+specifications** (`AacLcProofs`: 84, `H264IntraTransformProofs`: 70, `Format`: 64,
+`H264InterDeblockDpbProofs`: 61, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`:
+46, `Encoder`: 37, `Audio`: 34, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `H264SyntaxProofs`: 26, `HevcMainProofs`: 23, `Spec`: 23,
+`PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8, `Md5`: 7, `Cli`: 6,
+`Filter`: 6; `0` vacuous, `0` trivial, `0` shadowed), adding pure Lean 4 ITU-T
+H.265 Main profile 8-bit YUV420p Annex-B + ISO 14496-15 `hvcC` MP4 probing,
+decoding, and encoding (`LeanAV/HevcMain.lean`, `LeanAV/HevcMainProofs.lean`,
+`hevc-probe`, `hevc-decode-raw`, `hevc-encode-raw`) with zero `ffmpeg`
+subprocesses and fail-closed rejection of non-Main / 10-bit / 4:4:4 / malformed
+inputs.
+
 The 2026-11-01 M2-D in-process H.264 + AAC-LC MP4 transcode qualification
 (`campaign/m2-complete-20261031` over `77c6ca9`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) audited
@@ -371,5 +460,3 @@ preserves delegated argv. Current project qualification passed 136/136 unit,
 8,899 declarations and 264 tight specs. The initial incorrect test assertion is
 retained in the audit. No fresh selected FATE media result or performance claim
 follows from this correction.
-
-M3-D (`campaign/m3-d-zero-exec-20261104`, integrating M3-A `7beef63e`, M3-B `c944e1dc`, and M3-C `644b0056` onto `741fb1d`) deletes every `ffmpeg`/`ffprobe` subprocess. HEVC Main 8-bit 4:2:0, AV1 Main 8-bit 4:2:0, and the lavfi DAG run in-process; every other route fails closed (`BackendTier.unsupported`, `delegatedContainer := false`). The post-deletion kernel check is **22,820 declarations, 0 sorryAx, 0 custom axioms**, and `turbo-lean audit-spec` is **807/807 `non_vacuous_and_tight`** across 37 modules (84,963 LOC). `c/leanav_simd_kernels.c` is 672 lines of FFI/OS glue with no process spawn. `tests/test_zero_delegation_cert.py` checks the undefined-symbol table and, on Linux, a single `execve` of `lffmpeg` itself across introspection, remux, FFV1, PNG, FLAC, H.264+AAC MP4, HEVC, AV1, lavfi, and fail-closed cases. No new benchmark numbers are claimed.
