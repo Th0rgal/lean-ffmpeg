@@ -2187,8 +2187,6 @@ def runCertifiedGeneralTranscodeMp4 (inPath outPath : String) (demux : IsoMp4Tra
   let acceptOk := cOk &&
     LeanAV.Domain.verifyFFmpegAcceptance 0 1 0 0 realMaxSad maxAllowedSad realDistLtBlack realPsnrX10 lVar == 1
   let allOk := vfOk && syncOk && acceptOk
-  if !allOk && outPath != "" && outPath != "-" && outPath != "/dev/null" then
-    try IO.FS.removeFile outPath catch _ => pure ()
   return {
     ok := allOk
     framesDecoded := frames

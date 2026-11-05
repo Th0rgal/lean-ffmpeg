@@ -10,7 +10,7 @@ Measured on `campaign/m3-d-zero-exec-20261104` after the zero-delegation deletio
 Verified 22820 LeanAV declarations (0 sorryAx, 0 custom axioms).
 ```
 
-37 `LeanAV/*.lean` modules, 84,960 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
+37 `LeanAV/*.lean` modules, 84,983 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
 
 ## Tight specifications
 

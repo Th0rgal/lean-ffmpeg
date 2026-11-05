@@ -287,25 +287,37 @@ private def ffv1JsonEsc (s : String) : String :=
     else if c == '\n' then '\\' :: 'n' :: acc
     else c :: acc) []
 
-private def isSpecialFfv1Out (outPath outFmt : String) : Bool :=
-  outPath == "-" || outPath == "/dev/null" || outPath == "md5:" ||
-  strStartsWithFast outPath "md5:" || strStartsWithFast outPath "pipe:" ||
-  isNoFileOutputFormat outFmt outPath
+private def ffv1EffectiveFileTarget (outPath outFmt : String) : Option String :=
+  if outFmt == "md5" && strStartsWithFast outPath "md5:" then
+    let stripped := String.ofList (outPath.toList.drop 4)
+    if stripped.isEmpty || stripped == "-" || stripped == "pipe:1" then none else some stripped
+  else if outPath == "-" || strStartsWithFast outPath "pipe:" || isNoFileOutputFormat outFmt outPath then
+    none
+  else
+    some outPath
 
 private def checkFfv1Overwrite (job : Ffv1CliJob) : IO (Option UInt32) := do
-  if job.overwrite || isSpecialFfv1Out job.outPath job.outFmt then
+  if job.overwrite then
     return none
-  if !(← System.FilePath.pathExists job.outPath) then
+  let target? :=
+    if job.outFmt == "null" || job.outPath == "/dev/null" then
+      if job.noOverwrite && job.outPath != "-" && !strStartsWithFast job.outPath "pipe:" then
+        some job.outPath
+      else none
+    else
+      ffv1EffectiveFileTarget job.outPath job.outFmt
+  let some target := target? | return none
+  if !(← System.FilePath.pathExists target) then
     return none
   if job.jsonOutput then
     IO.println "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
     return some 1
   if !job.noOverwrite then
     if !ffv1CliQuiet job.logLevel then
-      IO.eprintln s!"File '{job.outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+      IO.eprintln s!"File '{target}' already exists. Overwrite? [y/N] Not overwriting - exiting"
     return some 0
   if !ffv1CliQuiet job.logLevel then
-    IO.eprintln s!"File '{job.outPath}' already exists. Exiting."
+    IO.eprintln s!"File '{target}' already exists. Exiting."
   return some 1
 
 private def writeFfv1OutputTarget (outPath outFmt : String) (payload : ByteArray) : IO (Except String Nat) := do
@@ -497,8 +509,6 @@ def tryExecuteNativeFfv1Cli (args : List String) : IO (Option UInt32) := do
     else if !ffv1CliQuiet job.logLevel then
       IO.eprintln s!"{job.inPath}: No such file or directory"
     return some 1
-  if let some owRc ← checkFfv1Overwrite job then
-    return some owRc
   let inBytes ←
     try
       IO.FS.readBinFile job.inPath
@@ -518,6 +528,8 @@ def tryExecuteNativeFfv1Cli (args : List String) : IO (Option UInt32) := do
       IO.eprintln s!"FFV1 error: {err}"
     return some 1
   | .ok (outPayload, frameCount) =>
+    if let some owRc ← checkFfv1Overwrite job then
+      return some owRc
     match ← writeFfv1OutputTarget job.outPath job.outFmt outPayload with
     | .error wErr =>
       if job.jsonOutput then

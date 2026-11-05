@@ -314,6 +314,156 @@ class ZeroDelegationCert(unittest.TestCase):
                     self.assertFalse((d / "nope.mp4").exists())
                     self.assertEqual(existing_mp4.read_bytes(), sentinel)
 
+    def test_lavfi_joint_admission_preserves_targets(self):
+        video = "color=c=red:s=16x16:r=10:d=0.1"
+        odd_video = "color=c=red:s=15x16:r=10:d=0.1"
+        audio = "sine=f=440:r=8000:d=0.01"
+        both = video + "[v];" + audio + "[a]"
+        cases = [
+            (video, ["-c:v", "ffv1"], "mp4"),
+            (video, ["-c:v", "h264"], "mkv"),
+            (video, ["-c:v", "libx264"], "avi"),
+            (audio, ["-c:a", "flac"], "mp4"),
+            (audio, ["-c:a", "pcm_s16le"], "mp4"),
+            (video, ["-pix_fmt", "rgb24"], "mp4"),
+            (video, ["-pix_fmt", "gray"], "mkv"),
+            (video, ["-pix_fmt", "yuv420p"], "png"),
+            (odd_video, [], "mp4"),
+            (video, ["-map", "[missing]"], "mp4"),
+            (video, ["-vn"], "mp4"),
+            (audio, ["-an"], "wav"),
+            (audio, ["-f", "s24le", "-c:a", "pcm_s16le"], "pcm"),
+            ("sine=d=0.01[a];[a]scale=16:16", [], "mp4"),
+            (video + "[a];[a][b]overlay[c];[c]split[b][out]", ["-map", "[out]"], "mp4"),
+        ]
+        for fmt in ("matroska", "avi", "image2", "rawvideo", "framemd5", "wav", "flac", "adts", "s16le", "md5"):
+            cases.append((both, ["-map", "[v]", "-map", "[a]", "-f", fmt], "mp4"))
+        sentinel = b"admission-sentinel\x00\xff"
+        for index, (spec, options, suffix) in enumerate(cases):
+            target = self.dir / f"reject-{index}.{suffix}"
+            for flags in ([], ["-n"], ["-y"], ["-json"]):
+                for exists in (False, True):
+                    with self.subTest(index=index, flags=flags, exists=exists):
+                        target.unlink(missing_ok=True)
+                        if exists:
+                            target.write_bytes(sentinel)
+                        result = run([*flags, "-lavfi", spec, *options, str(target)])
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertNotIn(b"Not overwriting", result.stderr)
+                        self.assertEqual(target.read_bytes() if exists else target.exists(), sentinel if exists else False)
+        for index, (spec, options, suffix) in enumerate(cases[:6]):
+            plan_res = run(["plan", "-lavfi", spec, *options, str(self.dir / f"plan-{index}.{suffix}")])
+            self.assertNotIn(b'"inproc_lavfi_dag"', plan_res.stdout)
+
+    def test_lavfi_valid_overwrite_and_effective_format(self):
+        spec = "color=c=red:s=16x16:r=10:d=0.1"
+        target = self.dir / "effective.mp4"
+        sentinel = b"keep-existing-output"
+        for flags, code in (([], 0), (["-n"], 1), (["-json"], 1), (["-y"], 0)):
+            with self.subTest(flags=flags):
+                target.write_bytes(sentinel)
+                result = run([*flags, "-lavfi", spec, "-f", "rawvideo", str(target)])
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                if flags == ["-y"]:
+                    self.assertEqual(target.stat().st_size, 384)
+                else:
+                    self.assertEqual(target.read_bytes(), sentinel)
+                if not flags:
+                    self.assertIn(b"Not overwriting - exiting", result.stderr)
+        result = run(["-n", "-lavfi", spec, "-f", "null", "/dev/null"])
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_file_routes_admission_before_overwrite(self):
+        import struct
+        d = self.dir
+        synth = d / "adm_synth.mp4"
+        self.assert_ok([
+            "-y", "-lavfi",
+            "color=c=green:s=32x32:r=10:d=0.2[v];sine=f=440:r=48000:d=0.2[a]",
+            "-map", "[v]", "-map", "[a]", str(synth),
+        ])
+        raw_mp4 = synth.read_bytes()
+        avcc_idx = raw_mp4.find(b"avcC")
+        mp4_10bit = bytearray(raw_mp4)
+        mp4_10bit[avcc_idx + 5] = 135
+        mp4_10bit[avcc_idx + 13] = 135
+        in_10bit = d / "adm_10bit.mp4"
+        in_10bit.write_bytes(bytes(mp4_10bit))
+
+        bad_mp4 = d / "adm_bad.mp4"
+        bad_mp4.write_bytes(b"NOT_AN_MP4_CONTAINER")
+        bad_mkv = d / "adm_not_ffv1.mkv"
+        bad_mkv.write_bytes(b"\x1a\x45\xdf\xa3\x00\x00\x00\x00")
+        bad_png = d / "adm_bad.png"
+        bad_png.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 16)
+        float_wav = d / "adm_float32.wav"
+        fmt_chunk = struct.pack("<4sIHHIIHH", b"fmt ", 16, 3, 1, 48000, 192000, 4, 32)
+        data_chunk = struct.pack("<4sI", b"data", 16) + b"\x00" * 16
+        float_wav.write_bytes(b"RIFF" + struct.pack("<I", 4 + len(fmt_chunk) + len(data_chunk)) + b"WAVE" + fmt_chunk + data_chunk)
+        bad_aac = d / "adm_bad.aac"
+        bad_aac.write_bytes(b"\xff\xf1\x50\x80\x00\x1f\xfc\xde\xad\xbe\xef")
+
+        valid_png = d / "adm_valid.png"
+        self.assert_ok(["-y", "-lavfi", "color=c=red:s=16x16:r=10:d=0.1", str(valid_png)])
+        valid_wav = d / "adm_valid.wav"
+        self.assert_ok(["-y", "-lavfi", "sine=f=440:r=48000:d=0.05", str(valid_wav)])
+        valid_aac = d / "adm_valid.aac"
+        self.assert_ok(["-y", "-i", str(valid_wav), "-c:a", "aac", str(valid_aac)])
+        valid_ffv1 = d / "adm_valid.mkv"
+        self.assert_ok([
+            "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "32x32", "-r", "10",
+            "-i", str(d / "in.yuv"), "-c:v", "ffv1", str(valid_ffv1),
+        ])
+
+        sentinel = b"sentinel-route-preserve\x00\xfe"
+        reject_cases = [
+            (["-i", str(synth), "-c:v", "vp9"], "mp4"),
+            (["-i", str(in_10bit), "-c:v", "h264"], "mp4"),
+            (["-i", str(bad_mp4), "-c:v", "h264"], "mp4"),
+            (["-i", str(bad_mp4), "-c", "copy"], "mp4"),
+            (["-i", str(bad_mkv), "-f", "rawvideo", "-pix_fmt", "yuv420p"], "yuv"),
+            (["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "32x32", "-i", str(bad_png), "-c:v", "ffv1"], "mkv"),
+            (["-i", str(bad_png)], "png"),
+            (["-i", str(float_wav), "-c:a", "flac"], "flac"),
+            (["-i", str(bad_aac)], "wav"),
+            (["-i", str(float_wav), "-c:a", "aac"], "aac"),
+        ]
+        for idx, (cmd_prefix, ext) in enumerate(reject_cases):
+            target = d / f"route_reject_{idx}.{ext}"
+            for flags in ([], ["-n"], ["-y"], ["-json"]):
+                for exists in (False, True):
+                    with self.subTest(route=idx, flags=flags, exists=exists):
+                        target.unlink(missing_ok=True)
+                        if exists:
+                            target.write_bytes(sentinel)
+                        res = run([*flags, *cmd_prefix, str(target)])
+                        self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
+                        self.assertNotIn(b"Not overwriting", res.stderr)
+                        self.assertEqual(target.read_bytes() if exists else target.exists(), sentinel if exists else False)
+
+        valid_routes = [
+            (["-i", str(synth), "-c:v", "h264", "-c:a", "aac"], "mp4"),
+            (["-i", str(synth), "-c", "copy"], "mp4"),
+            (["-i", str(valid_ffv1), "-f", "rawvideo", "-pix_fmt", "yuv420p"], "yuv"),
+            (["-i", str(valid_png)], "png"),
+            (["-i", str(valid_wav), "-c:a", "flac"], "flac"),
+            (["-i", str(valid_aac)], "wav"),
+        ]
+        for idx, (cmd_prefix, ext) in enumerate(valid_routes):
+            target = d / f"route_valid_{idx}.{ext}"
+            for flags, expected_rc in (([], 0), (["-n"], 1), (["-json"], 1), (["-y"], 0)):
+                with self.subTest(valid_route=idx, flags=flags):
+                    target.write_bytes(sentinel)
+                    res = run([*flags, *cmd_prefix, str(target)])
+                    self.assertEqual(res.returncode, expected_rc, res.stdout + res.stderr)
+                    if flags == ["-y"]:
+                        self.assertNotEqual(target.read_bytes(), sentinel)
+                        self.assertGreater(target.stat().st_size, 16)
+                    else:
+                        self.assertEqual(target.read_bytes(), sentinel)
+                    if not flags:
+                        self.assertIn(b"Not overwriting - exiting", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

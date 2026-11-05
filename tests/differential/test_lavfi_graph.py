@@ -191,6 +191,39 @@ class LavfiGraphDifferentialTests(unittest.TestCase):
         self._run(["-y", "-lavfi", "color=c=red:s=8x8:r=10:d=0.1,crop=16:16:0:0", "-f", "null", "-"], expect_ok=False)
         self._run(["-y", "-lavfi", "color=c=red:s=8x8:r=10:d=0.1;[missing]null", "-f", "null", "-"], expect_ok=False)
 
+    def test_lavfi_admission_overwrite_and_stream_contracts(self):
+        video = "color=c=red:s=16x16:r=10:d=0.1"
+        audio = "sine=f=440:r=8000:d=0.05"
+        both = video + "[v];" + audio + "[a]"
+        sentinel = b"lavfi-differential-sentinel"
+        for idx, (spec, opts, ext) in enumerate([
+            (video + "[a];[a][b]overlay[c];[c]split[b][out]", ["-map", "[out]"], "mp4"),
+            (video, ["-c:v", "ffv1"], "mp4"),
+            (video, ["-c:v", "h264"], "mkv"),
+            (audio, ["-c:a", "flac"], "mp4"),
+            (both, ["-map", "[v]", "-map", "[a]"], "mkv"),
+            (both, ["-map", "[v]", "-map", "[a]"], "wav"),
+        ]):
+            out = self.work / f"adm_{idx}.{ext}"
+            out.write_bytes(sentinel)
+            self._run(["-lavfi", spec, *opts, str(out)], expect_ok=False)
+            self.assertEqual(out.read_bytes(), sentinel)
+        wav = self.work / "s24.wav"
+        self._run(["-y", "-lavfi", audio, "-c:a", "pcm_s24le", str(wav)])
+        probe = json.loads(subprocess.run(
+            [str(FFPROBE), "-v", "error", "-show_streams", "-of", "json", str(wav)],
+            capture_output=True, text=True, check=True,
+        ).stdout)
+        self.assertEqual(len(probe["streams"]), 1)
+        self.assertEqual(probe["streams"][0]["codec_name"], "pcm_s24le")
+        keep = self.work / "keep.mp4"
+        keep.write_bytes(sentinel)
+        res = self._run(["-lavfi", video, str(keep)])
+        self.assertIn(b"Not overwriting - exiting", res.stderr)
+        self.assertEqual(keep.read_bytes(), sentinel)
+        self._run(["-n", "-lavfi", video, str(keep)], expect_ok=False)
+        self.assertEqual(keep.read_bytes(), sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()

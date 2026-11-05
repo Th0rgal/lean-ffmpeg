@@ -1324,6 +1324,19 @@ def reportCliError (cfg : CliConfig) (jsonMsg textMsg : String) : IO UInt32 := d
     IO.eprintln textMsg
   return 1
 
+private def checkCliOverwrite (cfg : CliConfig) (args : List String) (outPath : String) :
+    IO (Option UInt32) := do
+  let explicitNoOverwrite := args.contains "-n"
+  if cfg.overwrite || outPath == "-" || (outPath == "/dev/null" && !explicitNoOverwrite) then
+    return none
+  if !(← System.FilePath.pathExists outPath) then return none
+  if cfg.jsonOutput || explicitNoOverwrite then
+    return some (← reportCliError cfg
+      "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists")
+  if !cliQuiet cfg.logLevel then
+    IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
+  return some 0
+
 def runtimeVideoFilterStageSupported (stage : String) : Bool :=
   stage.startsWith "scale=" ||
   stage == "colorspace=bt709" ||
@@ -1804,31 +1817,95 @@ def assembleRawLavfiGraphSpec (raw : RawLavfiCliSpec) : Option String :=
     else
       some (String.intercalate ";" raw.lavfiInputs)
 
+private def lavfiOutputFormat (raw : RawLavfiCliSpec) : String :=
+  let fmt := (inferContainerFormat raw.outFmt (raw.outPath.getD "")).toLower
+  if fmt == "aac" then "adts" else if fmt == "mkv" then "matroska" else fmt
+
 private def isSupportedLavfiOutputTarget (raw : RawLavfiCliSpec) : Bool :=
-  let outP := (raw.outPath.getD "").toLower
-  let fmt := (raw.outFmt.getD "").toLower
-  let pf := (raw.pixFmt.getD "yuv420p").toLower
+  ["null", "rawvideo", "s16le", "u8", "s24le", "s32le", "wav", "flac",
+   "adts", "mp4", "image2", "png_pipe", "matroska", "avi", "md5", "framemd5"].contains
+    (lavfiOutputFormat raw)
+
+private def lavfiOutputStreamsSupported (raw : RawLavfiCliSpec) (video audio : Bool) : Bool :=
+  let fmt := lavfiOutputFormat raw
   let vc := (raw.vCodec.getD "").toLower
   let ac := (raw.aCodec.getD "").toLower
-  let pixOk := pf == "" || pf == "yuv420p" || pf == "rgb24" || pf == "gray" || pf == "gray8"
-  let vcOk := vc == "" || vc == "rawvideo" || vc == "png" || vc == "h264" || vc == "libx264" || vc == "ffv1" || vc == "wrapped_avframe"
-  let acOk := ac == "" || ac == "pcm_s16le" || ac == "pcm_u8" || ac == "pcm_s24le" || ac == "pcm_s32le" ||
-              ac == "flac" || ac == "aac"
-  let fmtOk :=
-    fmt == "null" || outP == "/dev/null" ||
-    fmt == "rawvideo" || fmt == "s16le" || fmt == "u8" || fmt == "s24le" || fmt == "s32le" ||
-    fmt == "wav" || fmt == "flac" || fmt == "adts" || fmt == "mp4" || fmt == "image2" || fmt == "png_pipe" ||
-    fmt == "matroska" || fmt == "mkv" || fmt == "avi" || fmt == "md5" || fmt == "framemd5" ||
-    (fmt == "" && (outP.endsWith ".yuv" || outP.endsWith ".rgb" || outP.endsWith ".raw" ||
-                   outP.endsWith ".pcm" || outP.endsWith ".wav" || outP.endsWith ".flac" ||
-                   outP.endsWith ".aac" || outP.endsWith ".adts" || outP.endsWith ".png" ||
-                   outP.endsWith ".mp4" || outP.endsWith ".m4v" || outP.endsWith ".mkv" || outP.endsWith ".avi"))
-  pixOk && vcOk && acOk && fmtOk
+  let pf := raw.pixFmt.map String.toLower
+  let videoCodec (names : List String) := !video || vc == "" || names.contains vc
+  let audioCodec (names : List String) := !audio || ac == "" || names.contains ac
+  let pixel (names : List String) := !video || pf.isNone || names.contains (pf.getD "")
+  let pcm := ["pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le"]
+  (video || audio) &&
+    if fmt == "mp4" then
+      videoCodec ["h264", "libx264"] && audioCodec ["aac"] && pixel ["yuv420p"]
+    else if fmt == "matroska" || fmt == "avi" then
+      video && !audio && videoCodec ["ffv1"] && pixel ["yuv420p"]
+    else if fmt == "image2" || fmt == "png_pipe" then
+      video && !audio && videoCodec ["png"] && pixel ["rgb24"]
+    else if fmt == "rawvideo" || fmt == "framemd5" then
+      video && !audio && videoCodec ["rawvideo"] &&
+        pixel (if fmt == "framemd5" then ["yuv420p"] else ["yuv420p", "rgb24", "gray", "gray8"])
+    else if fmt == "wav" then !video && audio && audioCodec pcm
+    else if fmt == "flac" then !video && audio && audioCodec ["flac"]
+    else if fmt == "adts" then !video && audio && audioCodec ["aac"]
+    else if ["u8", "s16le", "s24le", "s32le"].contains fmt then
+      !video && audio && audioCodec ["pcm_" ++ fmt]
+    else if fmt == "md5" then
+      !(video && audio) && videoCodec ["rawvideo"] && audioCodec ["pcm_s16le"] &&
+        pixel ["yuv420p", "rgb24", "gray", "gray8"]
+    else if fmt == "null" then
+      videoCodec ["rawvideo", "wrapped_avframe"] && audioCodec ["pcm_s16le"] &&
+        pixel ["yuv420p", "rgb24", "gray", "gray8"]
+    else false
 
-/-- True when `args` asks for a supported lavfi DAG (`-f lavfi -i`, `-lavfi`, or
-source-only `-filter_complex`) with a natively supported output container/codec.
-Notice: if all filter names are supported, cyclic or ill-typed graphs STILL match
-here so they fail closed in-process! -/
+private def lavfiMapPad (m : String) : String :=
+  let p := if m.startsWith "[" then String.ofList (m.toList.drop 1) else m
+  if p.endsWith "]" then String.ofList (p.toList.dropLast) else p
+
+private def lavfiPrepareGraph (raw : RawLavfiCliSpec) (spec : String) :
+    Except String (FilterGraph × TypedFilterGraph) := do
+  let g0 ← parseFilterGraph spec
+  let g : FilterGraph :=
+    match raw.durStr with
+    | none => g0
+    | some dStr =>
+      { g0 with
+        nodes := g0.nodes.map fun nd =>
+          let nm := nd.name.toLower
+          let isSrc := nm == "color" || nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc"
+          let hasDur :=
+            (FilterArg.lookup nd.args "d" 99).isSome ||
+            (FilterArg.lookup nd.args "duration" 99).isSome ||
+            (nm == "color" && nd.args.length ≥ 4) ||
+            ((nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc") && nd.args.length ≥ 3)
+          if isSrc && !hasDur then { nd with args := nd.args ++ [.keyed "d" dStr] } else nd }
+  let tg ← typecheckFilterGraph g []
+  pure (g, tg)
+
+private def lavfiSelectOutputs {α : Type} (raw : RawLavfiCliSpec)
+    (outs : List (String × PadFormat × α)) : Option (List (String × PadFormat × α)) :=
+  if raw.maps.isEmpty then some outs
+  else
+    let mapped := raw.maps.map fun m =>
+      let pad := lavfiMapPad m
+      outs.find? fun (p, _, _) => p == pad
+    if mapped.all Option.isSome then some (mapped.filterMap id) else none
+
+private def lavfiPlanContractOk (raw : RawLavfiCliSpec) (spec : String) : Bool :=
+  match lavfiPrepareGraph raw spec with
+  | .error _ => false
+  | .ok (_, tg) =>
+    match lavfiSelectOutputs raw (tg.openOutputs.map fun (p, f) => (p, f, ())) with
+    | none => false
+    | some sel =>
+      let video := !raw.noVideo && sel.any (fun (_, f, _) => f.kind == .video)
+      let audio := !raw.noAudio && sel.any (fun (_, f, _) => f.kind == .audio)
+      lavfiOutputStreamsSupported raw video audio &&
+        (!video || lavfiOutputFormat raw != "mp4" ||
+          (match sel.find? (fun (_, f, _) => f.kind == .video) with
+           | some (_, vf, _) => vf.width > 0 && vf.height > 0 && vf.width % 2 == 0 && vf.height % 2 == 0
+           | none => false))
+
 def inprocLavfiDagCandidateArgs (plan : MediaPlanIR) (args : List String) : Bool :=
   if !plan.errors.isEmpty then false
   else if plan.backend.reasons.contains "inproc_h264_aac_mp4_transcode" then false
@@ -1839,7 +1916,7 @@ def inprocLavfiDagCandidateArgs (plan : MediaPlanIR) (args : List String) : Bool
     else
       match assembleRawLavfiGraphSpec raw with
       | none => false
-      | some spec => lavfiSpecUsesOnlySupportedFilters spec
+      | some spec => lavfiSpecUsesOnlySupportedFilters spec && lavfiPlanContractOk raw spec
 
 /-- Promote a supported lavfi CLI plan to the zero-exec `independent_verified` tier. -/
 def promoteLavfiDagPlanArgs (plan : MediaPlanIR) (args : List String) : MediaPlanIR :=
@@ -1974,61 +2051,32 @@ def runInprocLavfiDagCli
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"missing lavfi graph\"}"
         "Missing lavfi graph specification"
   let outPath := raw.outPath.getD (cfg.output.getD "")
-  let explicitNoOverwrite := args.contains "-n"
-  let isNullOut := (raw.outFmt.getD "").toLower == "null" || outPath == "/dev/null" || outPath == "-"
-  if !cfg.overwrite && !isNullOut && (← System.FilePath.pathExists outPath) then
-    if cfg.jsonOutput || explicitNoOverwrite then
-      return ← reportCliError cfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists"
-    if !cliQuiet cfg.logLevel then
-      IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-    return 0
   let t0 ← IO.monoNanosNow
-  let g0 ← match parseFilterGraph spec with
-    | .ok g => pure g
-    | .error e =>
-      return ← reportCliError cfg
-        (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
-        (s!"Lavfi parse error: {e}")
   let cliDurMs? := raw.durStr.bind parseDurationMillis
-  let g : FilterGraph :=
-    match raw.durStr with
-    | none => g0
-    | some dStr =>
-      { g0 with
-        nodes := g0.nodes.map fun nd =>
-          let nm := nd.name.toLower
-          let isSrc := nm == "color" || nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc"
-          let hasDur :=
-            (FilterArg.lookup nd.args "d" 99).isSome ||
-            (FilterArg.lookup nd.args "duration" 99).isSome ||
-            (nm == "color" && nd.args.length ≥ 4) ||
-            ((nm == "testsrc" || nm == "nullsrc" || nm == "sine" || nm == "anullsrc") && nd.args.length ≥ 3)
-          if isSrc && !hasDur then { nd with args := nd.args ++ [.keyed "d" dStr] } else nd }
-  let tg ← match typecheckFilterGraph g [] with
-    | .ok tg => pure tg
+  let (_, tg) ← match lavfiPrepareGraph raw spec with
+    | .ok pair => pure pair
     | .error e =>
       return ← reportCliError cfg
         (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
-        (s!"Lavfi typecheck error: {e}")
+        (s!"Lavfi graph error: {e}")
   let outs ← match executeTypedFilterGraph tg [] with
     | .ok outs => pure outs
     | .error e =>
       return ← reportCliError cfg
         (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape e}\"}")
         (s!"Lavfi execution error: {e}")
-  let selected :=
-    if raw.maps.isEmpty then outs
-    else
-      outs.filter fun (p, _, _) =>
-        raw.maps.any fun m =>
-          let mm := if m.startsWith "[" then String.ofList (m.toList.drop 1) else m
-          let mm2 := if mm.endsWith "]" then String.ofList (mm.toList.dropLast) else mm
-          mm2 == p
+  let some selected := lavfiSelectOutputs raw outs
+    | return ← reportCliError cfg
+        "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"invalid lavfi -map pad\"}"
+        "Invalid lavfi -map pad"
   let pick (k : MediaKind) : Option (String × PadFormat × EdgeBufferQueue) :=
     selected.find? fun (_, fmt, _) => fmt.kind == k
   let vSel := if raw.noVideo then none else pick .video
   let aSel := if raw.noAudio then none else pick .audio
+  if !lavfiOutputStreamsSupported raw vSel.isSome aSel.isSome then
+    return ← reportCliError cfg
+      "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"unsupported lavfi codec, pixel format, or stream selection\"}"
+      "Unsupported lavfi codec, pixel format, or stream selection"
   let limN? := raw.maxFrames
   let vFrames? : Option (Array VideoFrame × Nat) :=
     match vSel with
@@ -2050,25 +2098,26 @@ def runInprocLavfiDagCli
         let capS := lavfiAudioSampleCount af.sampleRate.toNat dMs
         some (if capS < af.numSamples then execAudioTrim af 0 dMs else af)
       | none => some af
-  let fmt := (raw.outFmt.getD "").toLower
-  let lowerOut := outPath.toLower
+  let fmt := lavfiOutputFormat raw
+  let rawFmt := (raw.outFmt.getD "").toLower
   let pixFmt := (raw.pixFmt.getD "yuv420p").toLower
-  let isNull := fmt == "null" || lowerOut == "/dev/null"
-  let isPng := fmt == "png_pipe" || fmt == "image2" || lowerOut.endsWith ".png"
-  let isMp4 := fmt == "mp4" || lowerOut.endsWith ".mp4" || lowerOut.endsWith ".m4v"
-  let isMkv := fmt == "matroska" || fmt == "mkv" || lowerOut.endsWith ".mkv"
-  let isAvi := fmt == "avi" || lowerOut.endsWith ".avi"
+  let isNull := fmt == "null"
+  let isPng := fmt == "png_pipe" || fmt == "image2"
+  let isMp4 := fmt == "mp4"
+  let isMkv := fmt == "matroska"
+  let isAvi := fmt == "avi"
   let isMd5 := fmt == "md5"
   let isFrameMd5 := fmt == "framemd5"
-  let isFlac := fmt == "flac" || lowerOut.endsWith ".flac"
-  let isWav := fmt == "wav" || lowerOut.endsWith ".wav"
-  let isAdts := fmt == "adts" || lowerOut.endsWith ".aac" || lowerOut.endsWith ".adts"
+  let isFlac := fmt == "flac"
+  let isWav := fmt == "wav"
+  let isAdts := fmt == "adts"
   let isGray := pixFmt == "gray" || pixFmt == "gray8"
   let isRgb := pixFmt == "rgb24"
+  let ac := (raw.aCodec.getD "").toLower
   let bps :=
-    if fmt == "u8" then 8
-    else if fmt == "s24le" then 24
-    else if fmt == "s32le" then 32
+    if fmt == "u8" || ac == "pcm_u8" then 8
+    else if fmt == "s24le" || ac == "pcm_s24le" then 24
+    else if fmt == "s32le" || ac == "pcm_s32le" then 32
     else 16
   let bytesOpt : Option ByteArray :=
     if isNull then some ByteArray.empty
@@ -2076,7 +2125,7 @@ def runInprocLavfiDagCli
       muxLavfiMp4Bytes vFrames? aFrame?
     else
       match vFrames?, aFrame? with
-      | some (vfs, fps), _ =>
+      | some (vfs, fps), none =>
         if isMkv then muxLavfiFfv1Bytes "matroska" vfs fps
         else if isAvi then muxLavfiFfv1Bytes "avi" vfs fps
         else if isFrameMd5 then muxLavfiFrameMd5Bytes vfs fps
@@ -2117,17 +2166,36 @@ def runInprocLavfiDagCli
         else
           let rawAud := channelsToPcmRawLE (scaleChannelsBps chans 16 bps) bps
           if isMd5 then some (muxLavfiMd5Bytes rawAud) else some rawAud
-      | none, none => none
+      | _, _ => none
   let some outBytes := bytesOpt
     | return ← reportCliError cfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"lavfi output muxing failed\"}"
         "Lavfi output muxing failed"
+  let isMd5Spec := isMd5 && strStartsWithFast outPath.toLower "md5:"
+  let checkNullOverwrite := isNull && args.contains "-n" && outPath != "-"
+  if (!isNull && !isMd5Spec) || checkNullOverwrite then
+    if let some rc ← checkCliOverwrite cfg args outPath then return rc
   if !isNull then
     if outPath == "-" then
       if !cfg.jsonOutput then
         let stdout ← IO.getStdout
         stdout.write outBytes
         stdout.flush
+    else if isMd5Spec then
+      let md5Target := String.ofList (outPath.toList.drop 4)
+      if md5Target == "" || md5Target == "-" then
+        if !cfg.jsonOutput then
+          let stdout ← IO.getStdout
+          stdout.write outBytes
+          stdout.flush
+      else
+        if let some rc ← checkCliOverwrite cfg args md5Target then return rc
+        match ← writeMediaFileAtomic md5Target outBytes with
+        | .ok _ => pure ()
+        | .error e =>
+          return ← reportCliError cfg
+            (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"{jsonEscape (reprStr e)}\"}")
+            (s!"Failed to write lavfi output: {md5Target}")
     else
       match ← writeMediaFileAtomic outPath outBytes with
       | .ok _ => pure ()
@@ -2139,7 +2207,7 @@ def runInprocLavfiDagCli
   if cfg.jsonOutput then
     let nFrames := (vFrames?.map (·.1.size)).getD 0
     let nSamples := (aFrame?.map (·.numSamples)).getD 0
-    IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"tier\":\"independent_verified\",\"format\":\"{jsonEscape (if fmt == "" then "lavfi" else fmt)}\",\"frames\":{nFrames},\"samples\":{nSamples},\"output\":\"{jsonEscape outPath}\",\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
+    IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"tier\":\"independent_verified\",\"format\":\"{jsonEscape (if rawFmt == "" then "lavfi" else rawFmt)}\",\"frames\":{nFrames},\"samples\":{nSamples},\"output\":\"{jsonEscape outPath}\",\"out_bytes\":{outBytes.size},\"total_us\":{(t1 - t0) / 1000}}"
   return 0
 
 def runInprocH264TranscodeCli
@@ -2157,14 +2225,6 @@ def runInprocH264TranscodeCli
     | return ← reportCliError cfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"invalid in-process H.264 plan state\"}"
         "Invalid in-process H.264 plan state"
-  let explicitNoOverwrite := args.contains "-n"
-  if !cfg.overwrite && (← System.FilePath.pathExists outPath) then
-    if cfg.jsonOutput || explicitNoOverwrite then
-      return ← reportCliError cfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists"
-    if !cliQuiet cfg.logLevel then
-      IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-    return 0
   let t0 ← IO.monoNanosNow
   let raw ← try
       IO.FS.readBinFile inPath
@@ -2183,6 +2243,7 @@ def runInprocH264TranscodeCli
       return ← reportCliError cfg
         (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-h264\",\"error\":\"{jsonEscape err}\"}")
         (s!"In-process H.264/AAC MP4 transcode failed: {err}")
+  if let some rc ← checkCliOverwrite cfg args outPath then return rc
   match (← writeMediaFileAtomic outPath mp4Out) with
   | .ok _ => pure ()
   | .error e =>
@@ -2210,14 +2271,6 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
   let some outFmt := containerFormatOfName out.format | return none
   let some inFmt := nativeInputContainerFormat inPath | return none
   let isDevNull := out.path == "/dev/null"
-  let explicitNoOverwrite := args.contains "-n"
-  if !cfg.overwrite && (!isDevNull || explicitNoOverwrite) && (← System.FilePath.pathExists out.path) then
-    if cfg.jsonOutput || explicitNoOverwrite then
-      return some (← reportCliError cfg
-        "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}" "File exists")
-    if !cliQuiet cfg.logLevel then
-      IO.eprintln s!"File '{out.path}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-    return some 0
   let t0 ← IO.monoNanosNow
   let bytes ← IO.FS.readBinFile inPath
   let startMs := (plan.timeline.startMs.getD 0).toNat
@@ -2238,6 +2291,7 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
       s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-native-copy\",\"error\":\"{jsonEscape reason}\",\"input\":\"{jsonEscape inPath}\"}"
       s!"Native stream copy rejected {inPath}: {reason}")
   | .remuxed outBytes =>
+    if let some rc ← checkCliOverwrite cfg args out.path then return some rc
     let writeRes ←
       if isDevNull then
         writeMediaFileStreaming out.path outBytes
@@ -2256,20 +2310,6 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
 
 def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
     (plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
-  if !validCfg.overwrite then
-    if (← System.FilePath.pathExists outPath) then
-      if validCfg.jsonOutput then
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-          "File exists"
-      else if !(args.contains "-n") then
-        if !cliQuiet validCfg.logLevel then
-          IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-        return 0
-      else
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-          "File exists"
   let t0 ← IO.monoNanosNow
   let rawIn ← IO.FS.readBinFile inPath
   let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawIn
@@ -2332,6 +2372,7 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"PNG encode or pixel conversion failed\"}"
         (s!"PNG encode or pixel conversion failed: {outPath}")
+    if let some rc ← checkCliOverwrite validCfg args outPath then return rc
     match ← writeMediaFileAtomic outPath outBytes with
     | .ok _ => pure ()
     | .error _ =>
@@ -2426,6 +2467,7 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"FLAC or PCM output encoding failed\"}"
         (s!"FLAC or PCM output encoding failed: {outPath}")
+    if let some rc ← checkCliOverwrite validCfg args outPath then return rc
     match ← writeMediaFileAtomic outPath outBytes with
     | .ok _ => pure ()
     | .error _ =>
@@ -2445,20 +2487,6 @@ def runStandaloneLosslessCli (args : List String) (validCfg : CliConfig) (ext : 
 
 def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : ExtendedPlanFlags)
     (_plan : MediaPlanIR) (inPath outPath : String) : IO UInt32 := do
-  if !validCfg.overwrite then
-    if (← System.FilePath.pathExists outPath) then
-      if validCfg.jsonOutput then
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-          "File exists"
-      else if !(args.contains "-n") then
-        if !cliQuiet validCfg.logLevel then
-          IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-        return 0
-      else
-        return ← reportCliError validCfg
-          "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-          "File exists"
   let t0 ← IO.monoNanosNow
   let rawIn ← IO.FS.readBinFile inPath
   let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawIn
@@ -2496,6 +2524,7 @@ def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : E
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"AAC-LC decoded output muxing failed\"}"
         (s!"AAC-LC decoded output muxing failed: {outPath}")
+    if let some rc ← checkCliOverwrite validCfg args outPath then return rc
     match ← writeMediaFileAtomic outPath outBytes with
     | .ok _ => pure ()
     | .error _ =>
@@ -2555,6 +2584,7 @@ def runStandaloneAacAdtsCli (args : List String) (validCfg : CliConfig) (ext : E
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli-independent-failed\",\"error\":\"AAC-LC ADTS encoding failed\"}"
         (s!"AAC-LC ADTS encoding failed: {outPath}")
+    if let some rc ← checkCliOverwrite validCfg args outPath then return rc
     match ← writeMediaFileAtomic outPath outBytes with
     | .ok _ => pure ()
     | .error _ =>
@@ -2678,20 +2708,6 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
       return ← reportCliError validCfg
         "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"output must use .mp4 or .m4v\"}"
         "Output must use .mp4 or .m4v"
-    if !validCfg.overwrite then
-      if (← System.FilePath.pathExists outPath) then
-        if validCfg.jsonOutput then
-          return ← reportCliError validCfg
-            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-            "File exists"
-        else if !(args.contains "-n") then
-          if !cliQuiet validCfg.logLevel then
-            IO.eprintln s!"File '{outPath}' already exists. Overwrite? [y/N] Not overwriting - exiting"
-          return 0
-        else
-          return ← reportCliError validCfg
-            "{\"ok\":false,\"mode\":\"ffmpeg-cli\",\"error\":\"File exists\"}"
-            "File exists"
     let filterOps ← match validCfg.videoFilter with
       | some vfStr =>
         if !runtimeVideoFilterSupported vfStr then
@@ -2708,8 +2724,6 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
           return 1
       | none => pure []
     let t0 ← IO.monoNanosNow
-    -- Locate once, then share the exact bytes with the encoder's metadata probes.
-    -- The box walker skips mdat payloads and reads only a 64 KiB initial window.
     let moov ← readMp4MoovWindowIO inPath
     let fastDemuxOpt := probeIsoMp4HeaderSlice (LeanSys.Posix.ByteSlice.ofByteArray moov)
     let startMs : UInt32 := plan.timeline.startMs.getD 0
@@ -2727,7 +2741,6 @@ def runFFmpegCli (args : List String) : IO UInt32 := do
     else
       let rawBytes ← IO.FS.readBinFile inPath
       let inSlice := LeanSys.Posix.ByteSlice.ofByteArray rawBytes
-      -- If input is an ISO MP4 container (`ftyp`/`moov`/`mdat`):
       if let some demux := demuxIsoMp4Track inSlice then
         let handledFull ← tryFastHeaderProbeTranscode validCfg inPath outPath filterOps t0 rawBytes demux startMs durMs withAudio
         if handledFull then

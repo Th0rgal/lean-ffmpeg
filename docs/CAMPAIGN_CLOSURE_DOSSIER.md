@@ -7,7 +7,7 @@ and M3-C `644b0056` over `741fb1d0`) under Lean v4.35.0 and `turbo-lean`
 `ffmpeg`/`ffprobe` subprocess (`BackendTier.delegatedFaithful`,
 `ffiExecDelegatedFfmpegC`, `execPipeTranscodeU8IO`, `LEANAV_FFMPEG_BIN`, and
 `LEANAV_FFPROBE_BIN`), auditing **22,820 declarations with zero sorryAx/custom
-axioms** (`84,960` LOC across 37 formal `LeanAV/*.lean` modules) and **807/807
+axioms** (`84,983` LOC across 37 formal `LeanAV/*.lean` modules) and **807/807
 `non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
 `H264IntraTransformProofs`: 70, `Format`: 64, `H264InterDeblockDpbProofs`: 61,
 `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 46, `Encoder`: 37,

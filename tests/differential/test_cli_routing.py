@@ -185,6 +185,62 @@ class CliRoutingTests(unittest.TestCase):
             self.assertEqual(result_mdat.stderr, "")
             self.assertFalse(trunc_out.exists())
 
+    def test_existing_output_preserved_across_all_rejected_routes(self):
+        sentinel = b"CLI-ROUTING-SENTINEL-DO-NOT-MODIFY\x00\xff"
+        with tempfile.TemporaryDirectory(prefix="lffmpeg-overwrite-adm-") as directory:
+            root = Path(directory)
+            hevc_mp4 = root / "hevc_in.mp4"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "color=c=blue:s=32x32:r=10:d=0.2",
+                 "-c:v", "libx265", "-pix_fmt", "yuv420p", str(hevc_mp4)],
+                check=True, capture_output=True,
+            )
+            h264_mkv = root / "h264_in.mkv"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "color=c=red:s=32x32:r=10:d=0.2",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(h264_mkv)],
+                check=True, capture_output=True,
+            )
+            f32_wav = root / "f32_in.wav"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", "sine=f=440:r=48000:d=0.1",
+                 "-c:a", "pcm_f32le", str(f32_wav)],
+                check=True, capture_output=True,
+            )
+            reject_cmds = [
+                (["-i", str(self.fixture), "-c:v", "vp9"], "mp4"),
+                (["-i", str(hevc_mp4), "-c:v", "h264"], "mp4"),
+                (["-i", str(h264_mkv), "-f", "rawvideo", "-pix_fmt", "yuv420p"], "yuv"),
+                (["-i", str(f32_wav), "-c:a", "flac"], "flac"),
+                (["-i", str(f32_wav), "-c:a", "aac"], "aac"),
+            ]
+            for idx, (cmd_prefix, ext) in enumerate(reject_cmds):
+                target = root / f"existing_{idx}.{ext}"
+                for flags in ([], ["-n"], ["-y"], ["-json"]):
+                    with self.subTest(idx=idx, flags=flags):
+                        target.write_bytes(sentinel)
+                        res = subprocess.run(
+                            [str(BINARY), *flags, *cmd_prefix, str(target)],
+                            capture_output=True, text=True, check=False,
+                            env={"PATH": "/nonexistent"},
+                        )
+                        self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
+                        self.assertNotIn("Not overwriting", res.stderr)
+                        self.assertEqual(target.read_bytes(), sentinel)
+
+            valid_target = root / "existing_valid.mp4"
+            valid_target.write_bytes(sentinel)
+            plain_res = subprocess.run(
+                [str(BINARY), "-i", str(self.fixture), "-c", "copy", str(valid_target)],
+                capture_output=True, text=True, check=False, env={"PATH": "/nonexistent"},
+            )
+            self.assertEqual(plain_res.returncode, 0, plain_res.stderr)
+            self.assertIn("Not overwriting - exiting", plain_res.stderr)
+            self.assertEqual(valid_target.read_bytes(), sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()
