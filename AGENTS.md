@@ -5,9 +5,9 @@
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). The binary is standalone: every accepted route runs in-process, and anything outside that set fails closed. There is no child process and no external `ffmpeg` / `ffprobe` override environment variable.
 
 1. **38 Formal Lean 4 Modules (`LeanAV/*.lean`, `87,081` LOC)**:
-   - **`23,197` declarations** (verified under `v4.35.0`) with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+   - **`23,201` declarations** (verified under `v4.35.0`) with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
    - **`812 / 812` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, v2.1; `0 vacuous`, `0 trivial`, `0 shadowed`): `AacLcProofs` (84), `H264IntraTransformProofs` (70), `Format` (66), `H264InterDeblockDpbProofs` (61), `Ffv1Proofs` (60), `NativeKernels` (59), `Video` (47), `Encoder` (37), `LavfiGraphProofs` (36), `Audio` (35), `H264EntropyProofs` (31), `Scale` (28), `Bitstream` (27), `Av1MainProofs` (26), `H264SyntaxProofs` (26), `HevcMainProofs` (23), `Spec` (23), `PlanIR` (21), `Core` (11), `Domain` (8), `InprocTranscode` (8), `Md5` (7), `Cli` (6), `Filter` (6), `LavfiGraph` (5), `UnifiedPipeline` (1) (plus the 12 implementation/orchestration modules `AacLc`, `Av1Main`, `Ffv1`, `Ffv1Container`, `Ffv1Pipeline`, `H264Entropy`, `H264InterDeblockDpb`, `H264IntraTransform`, `H264Syntax`, `HevcMain`, `IO`, and `Main`).
-   - Native routes, all with zero subprocesses: unified multi-stream `-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline (`unified_media_pipeline` in `LeanAV/UnifiedPipeline.lean`), FFV1 v3, PNG + Zlib/DEFLATE, FLAC, H.264/AVC syntax + CAVLC/CABAC + intra/inter/deblock/DPB, AAC-LC, Opus (`Ogg/Opus` and `MP4/MOV`), Apple ProRes 422 (`apcn` in `MP4/MOV`), MPEG-TS (`PAT/PMT/PES`), HEVC Main 8-bit 4:2:0 (`-i` / `-c:v hevc` and `hevc-probe`), AV1 Main 8-bit 4:2:0 (`-i` / `-c:v av1` and `av1-probe`), lavfi DAG (`color`, `testsrc`, `nullsrc`, `overlay`, `split`, `hstack`, `vstack`, `sine`, `anullsrc`, `amix`, `amerge`, `asplit`, `md5`, `framemd5`), and stream copy for MP4/MOV/MKV/WebM/WAV/FLAC/IVF. Scale and `colorspace=bt709` / tonemap stay in-process. Out-of-scope codecs, profiles, GPU, network protocols, and rejected filter graphs are `BackendTier.unsupported` (`delegatedContainer := false`, `fallbackAllowed := false`) and exit non-zero with no output file. CLI classification lives in `LeanAV/PlanIR.lean`, `LeanAV/UnifiedPipeline.lean`, and `LeanAV/Main.lean`.
+   - Native routes, all with zero subprocesses: unified multi-stream `-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline (`unified_media_pipeline` in `LeanAV/UnifiedPipeline.lean`), FFV1 v3, PNG + Zlib/DEFLATE, FLAC, H.264/AVC syntax + CAVLC/CABAC + intra/inter/deblock/DPB, AAC-LC, Opus (`Ogg/Opus` and `MP4/MOV`, RFC 6716 CELT FB silence `0xFF 0xFE` with fail-closed rejection of compressed non-silent packets pending P1.2), Apple ProRes 422 (`apcn` in `MP4/MOV`), MPEG-TS (`PAT/PMT/PES`), HEVC Main 8-bit 4:2:0 (`-i` / `-c:v hevc` and `hevc-probe`), AV1 Main 8-bit 4:2:0 (`-i` / `-c:v av1` and `av1-probe`), lavfi DAG (`color`, `testsrc`, `nullsrc`, `overlay`, `split`, `hstack`, `vstack`, `sine`, `anullsrc`, `amix`, `amerge`, `asplit`, `md5`, `framemd5`), and stream copy for MP4/MOV/MKV/WebM/WAV/FLAC/IVF. Scale and `colorspace=bt709` / tonemap stay in-process. Out-of-scope codecs, profiles, GPU, network protocols, and rejected filter graphs are `BackendTier.unsupported` (`delegatedContainer := false`, `fallbackAllowed := false`) and exit non-zero with no output file. CLI classification lives in `LeanAV/PlanIR.lean`, `LeanAV/UnifiedPipeline.lean`, and `LeanAV/Main.lean`.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
    - Decision gates, ISO BMFF header/handler/colorimetry classifiers, edit-list (`elst`) timestamp rescaling, bitrate and muxing-overhead estimators, luma mean/variance and PSNR acceptance packers, plane FFI contract checks, and PQ10/BT.2020 color-space helpers live in pure Lean 4 (`LeanAV/Format.lean`, `LeanAV/Scale.lean`, `LeanAV/PlanIR.lean`, `LeanAV/Encoder.lean`) and are exported to C without shadow re-implementations.
 3. **46 Compiled `LNIR_WIRE_V1` Kernels, 14 Thin Outer Shells & `672`-Line C-ABI Bridge (`c/libleanav_dsp.a`)**:
@@ -40,7 +40,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 23,197 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 23,201 LeanAV.* declarations
 lake env lean scripts/check_axioms.lean
 
 # 4. Audit all 38 formal modules with turbo-lean (812/812 non_vacuous_and_tight)
@@ -63,5 +63,5 @@ claims that every case ran on the current CI runner.
 The MPEG options audit on 2026-10-27 under Lean v4.35.0 counted 8,897 declarations
 with zero sorryAx/custom axioms; all 264 specifications remained tight.
 The M3-D post-deletion measurement counted 22,820 declarations and 807/807 tight specs;
-the current P1.0 unified-pipeline measurement is 23,197 declarations and 812/812 tight specs
+the current P1.0 unified-pipeline measurement is 23,201 declarations and 812/812 tight specs
 (see `docs/VERIFICATION_APPENDIX.md`).

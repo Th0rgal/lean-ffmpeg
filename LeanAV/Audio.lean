@@ -2996,117 +2996,57 @@ def verifyOpusTagsPacket (s : ByteSlice) : Bool :=
   sliceByteD s 0 == 0x4F && sliceByteD s 1 == 0x70 && sliceByteD s 2 == 0x75 && sliceByteD s 3 == 0x73 &&
   sliceByteD s 4 == 0x54 && sliceByteD s 5 == 0x61 && sliceByteD s 6 == 0x67 && sliceByteD s 7 == 0x73
 
-/-- Encode a 20ms (960-sample @ 48 kHz) mono or stereo `AudioFrame` chunk into an RFC 6716 Opus CELT FB Code-0 packet.
-    Uses `config = 31` (`0xF8` mono / `0xFC` stereo, CELT Fullband 20ms) with valid CELT silence/band payload
-    decoded cleanly by both `lffmpeg` and external `libopus`/`ffmpeg`. -/
-def encodeOpusFrame20ms (af48k : AudioFrame) (sampleOffset : Nat) : ByteArray := Id.run do
-  let stereo := af48k.channels >= 2
-  let toc : UInt8 := if stereo then 0xFC else 0xF8
-  -- Compute band envelope excitation bytes from the 20ms window (960 samples @ 48kHz = 60 x 16-sample subbands)
-  let mut allZero := true
-  let mut payload := ByteArray.emptyWithCapacity (if stereo then 64 else 36)
-  let subbands := if stereo then 30 else 32
-  for sb in [:subbands] do
-    let mut accL : Int := 0
-    let mut accR : Int := 0
-    for k in [:16] do
-      let idx := sampleOffset + sb * 16 + k
-      let sL := if idx < af48k.numSamples then (af48k.getSample 0 idx).toInt else 0
-      let sR := if stereo && idx < af48k.numSamples then (af48k.getSample 1 idx).toInt else sL
-      if sL != 0 || sR != 0 then allZero := false
-      accL := accL + sL
-      accR := accR + sR
-    let avgL := accL / 16
-    let shiftedL := (avgL / 256) + 128
-    let qLNat : Nat := Nat.min 255 (if shiftedL < 0 then 0 else Int.toNat shiftedL)
-    payload := payload.push qLNat.toUInt8
-    if stereo then
-      let avgR := accR / 16
-      let shiftedR := (avgR / 256) + 128
-      let qRNat : Nat := Nat.min 255 (if shiftedR < 0 then 0 else Int.toNat shiftedR)
-      payload := payload.push qRNat.toUInt8
-  if allZero then
-    -- Canonical RFC 6716 CELT FB 20ms DTX/silence packet (`[toc, 0xFF, 0xFE]`)
-    return ByteArray.mk #[toc, 0xFF, 0xFE]
-  return (ByteArray.empty.push toc) ++ payload
+def encodeOpusFrame20ms (af48k : AudioFrame) (sampleOffset : Nat) : Option ByteArray := do
+  if af48k.sampleRate != 48000 || (af48k.channels != 1 && af48k.channels != 2) then none
+  for ch in [:af48k.channels.toNat] do
+    for i in [:960] do
+      let idx := sampleOffset + i
+      if idx < af48k.numSamples && af48k.getSample ch idx != 0 then none
+  let toc : UInt8 := if af48k.channels == 2 then 0xFC else 0xF8
+  some (ByteArray.mk #[toc, 0xFF, 0xFE])
 
-/-- Encode an arbitrary `AudioFrame` into 48 kHz RFC 6716 20ms Opus packets with `(packetBytes, cumulativeGranule48k)` pairs. -/
-def encodeAudioFrameToOpusPackets (af : AudioFrame) (preSkip : Nat := 312) : Option (UInt8 × Array (ByteArray × UInt64)) := Id.run do
-  if af.channels == 0 || af.numSamples == 0 || af.sampleRate == 0 then return none
-  let chOut : UInt8 := if af.channels >= 2 then 2 else 1
+def encodeAudioFrameToOpusPackets (af : AudioFrame) (preSkip : Nat := 312) : Option (UInt8 × Array (ByteArray × UInt64)) := do
+  if af.channels == 0 || af.channels > 2 || af.numSamples == 0 || af.sampleRate == 0 then none
+  let chOut : UInt8 := af.channels.toUInt8
   let af48 := if af.sampleRate == 48000 then af else resampleAudioFrame af 48000
-  if af48.numSamples == 0 then return none
+  if af48.numSamples == 0 then none
   let totalWithPreSkip := preSkip + af48.numSamples
-  let padded := AudioFrame.alloc .s16p 48000 chOut.toUInt32 totalWithPreSkip af.pts
-  let paddedFilled := Id.run do
-    let mut dst := padded
-    for ch in [:chOut.toNat] do
-      let srcCh := Nat.min ch (af48.channels.toNat - 1)
-      for i in [:af48.numSamples] do
-        dst := dst.setSample ch (preSkip + i) (af48.getSample srcCh i)
-    return dst
+  let mut padded := AudioFrame.alloc .s16p 48000 chOut.toUInt32 totalWithPreSkip af.pts
+  for ch in [:chOut.toNat] do
+    for i in [:af48.numSamples] do
+      padded := padded.setSample ch (preSkip + i) (af48.getSample ch i)
   let nFrames := (totalWithPreSkip + 959) / 960
   let mut out : Array (ByteArray × UInt64) := Array.mkEmpty nFrames
   for fIdx in [:nFrames] do
-    let pkt := encodeOpusFrame20ms paddedFilled (fIdx * 960)
+    let pkt ← encodeOpusFrame20ms padded (fIdx * 960)
     let granEnd := Nat.min totalWithPreSkip ((fIdx + 1) * 960)
     out := out.push (pkt, granEnd.toUInt64)
-  return some (chOut, out)
+  some (chOut, out)
 
-/-- Decode a sequence of RFC 6716 Opus packets into a 48 kHz `AudioFrame` (applying `preSkip` and end-granule trimming). -/
 def decodeOpusPacketsToAudioFrame (packets : Array ByteSlice) (outChannels : UInt8 := 2)
-    (preSkip : Nat := 312) (maxGranule? : Option UInt64 := none) : Option AudioFrame := Id.run do
-  if packets.isEmpty || (outChannels != 1 && outChannels != 2) then return none
-  let mut chL : Array Int32 := #[]
-  let mut chR : Array Int32 := #[]
+    (preSkip : Nat := 312) (maxGranule? : Option UInt64 := none) : Option AudioFrame := do
+  if packets.isEmpty || (outChannels != 1 && outChannels != 2) then none
+  let mut rawTotal : Nat := 0
   for pktSlice in packets do
-    let some view := parseOpusPacketFrames pktSlice | return none
-    let nSub := view.frames.size
-    for subIdx in [:nSub] do
-      let subSlice := view.frames[subIdx]!
-      let subView : OpusPacketView := { view with frames := #[subSlice] }
-      if subSlice.len == 2 && subSlice.getByteD 0 0 == 0xFF && subSlice.getByteD 1 0 == 0xFE then
-        let nSmp := Nat.min 960 (Nat.max 120 view.toc.samples48k)
-        for _ in [:nSmp] do
-          chL := chL.push 0
-          if outChannels == 2 then chR := chR.push 0
-      else if view.toc.config == 31 && (subSlice.len == 32 || subSlice.len == 60) then
-        let stereoSub := subSlice.len == 60
-        let sbCnt := if stereoSub then 30 else 32
-        let step := if stereoSub then 2 else 1
-        for i in [:960] do
-          let sb := Nat.min (sbCnt - 1) (i / 16)
-          let bL := (subSlice.getByteD (sb * step) 128).toNat
-          let vL := clipInt16 ((Int32.ofNat bL - 128) * 256)
-          chL := chL.push vL
-          if outChannels == 2 then
-            let bR := if stereoSub then (subSlice.getByteD (sb * step + 1) 128).toNat else bL
-            let vR := clipInt16 ((Int32.ofNat bR - 128) * 256)
-            chR := chR.push vR
+    let view ← parseOpusPacketFrames pktSlice
+    if view.toc.config < 16 then none
+    let nSmp := view.toc.samples48k
+    if nSmp == 0 then none
+    for subSlice in view.frames do
+      if subSlice.len == 0 then
+        rawTotal := rawTotal + nSmp
+      else if subSlice.len == 2 && subSlice.getByteD 0 0 == 0xFF && subSlice.getByteD 1 0 == 0xFE then
+        rawTotal := rawTotal + nSmp
       else
-        let mono := opusDecodeHybridFrameQ15 subView
-        for s in mono do
-          chL := chL.push s
-          if outChannels == 2 then chR := chR.push s
-  let rawTotal := chL.size
-  let trimmedEnd :=
-    match maxGranule? with
-    | some g => if g.toNat > 0 && g.toNat < rawTotal then g.toNat else rawTotal
-    | none => rawTotal
-  if trimmedEnd <= preSkip then
-    -- Preserve at least 1 sample if non-empty packet stream had short granule
-    if rawTotal == 0 then return none
-    let keep := rawTotal
-    let mut af := AudioFrame.alloc .s16p 48000 outChannels.toUInt32 keep 0
-    for i in [:keep] do
-      af := af.setSample 0 i (chL.getD i 0)
-      if outChannels == 2 then af := af.setSample 1 i (chR.getD i 0)
-    return some af
+        none
+  let trimmedEnd ← match maxGranule? with
+    | some g =>
+      if g.toNat <= preSkip || g.toNat > rawTotal then none
+      else some g.toNat
+    | none =>
+      if rawTotal <= preSkip then none
+      else some rawTotal
   let keep := trimmedEnd - preSkip
-  let mut af := AudioFrame.alloc .s16p 48000 outChannels.toUInt32 keep 0
-  for i in [:keep] do
-    af := af.setSample 0 i (chL.getD (preSkip + i) 0)
-    if outChannels == 2 then af := af.setSample 1 i (chR.getD (preSkip + i) 0)
-  return some af
+  some (AudioFrame.alloc .s16p 48000 outChannels.toUInt32 keep 0)
 
 end LeanAV.Audio

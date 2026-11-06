@@ -3984,7 +3984,7 @@ def proresReadCodeword (r : BitReader) (codebook : UInt8) : Option (Nat × BitRe
     let (rem, r2) ← r1.readBitsMSB riceOrder
     some ((q <<< riceOrder) ||| rem.toNat, r2)
   else
-    let bits := expOrder + q * 2 - (switchBits + 1)
+    let bits := expOrder + q - (switchBits + 1)
     if bits > 30 then none
     else
       let (val, r2) ← r1.readBitsMSB bits
@@ -4009,9 +4009,8 @@ def proresWriteCodeword (w : BitWriter) (codebook : UInt8) (val : Nat) : BitWrit
       match fuel with
       | 0 => acc
       | f + 1 => if tmp <= 1 then acc else bitLen f (tmp >>> 1) (acc + 1)
-    let bits := bitLen 32 adj 0
-    let q := (bits + switchBits + 1 - expOrder) / 2
-    let effBits := expOrder + q * 2 - (switchBits + 1)
+    let effBits := bitLen 32 adj 0
+    let q := switchBits + 1 + (effBits - expOrder)
     let suffix := adj - (1 <<< effBits)
     let w1 := w.writeUnary0 q
     w1.writeBitsMSB suffix.toUInt64 effBits

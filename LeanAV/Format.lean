@@ -10285,8 +10285,8 @@ private def flushPesUnit (pesBuf : ByteArray) : Option (ByteArray × UInt64) :=
     else
       let pts : UInt64 :=
         if (flags2 &&& 0x80) != 0 && hdrDataLen >= 5 then
-          (parsePesPts5 pesBuf 9).getD 0
-        else 0
+          (parsePesPts5 pesBuf 9).getD 0xFFFFFFFFFFFFFFFF
+        else 0xFFFFFFFFFFFFFFFF
       let payload := pesBuf.extract payloadOff pesBuf.size
       if payload.isEmpty then none else some (payload, pts)
 

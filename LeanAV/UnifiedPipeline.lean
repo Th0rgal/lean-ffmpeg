@@ -1,3 +1,4 @@
+import LeanAV.Cli
 import LeanAV.InprocTranscode
 import LeanAV.HevcMain
 import LeanAV.Av1Main
@@ -10,6 +11,7 @@ open LeanSys.Posix LeanAV.Spec LeanAV.Core LeanAV.Format LeanAV.LavfiGraph
 structure Media where
   video : Array VideoFrame := #[]
   audio : Option AudioFrame := none
+  audioBits : Nat := 16
   fps : Nat := 25
   audioCopy : Option SynthMp4Track := none
   deriving Inhabited
@@ -156,10 +158,24 @@ def decodeMpegTs (raw : ByteArray) : Option Media := do
         else do
           let decoded ← decodedVideo (LeanAV.HevcMain.decodeHevcToYuv420p payload)
           some decoded.video
-      media := { media with video := frames }
+      if frames.size < 2 || stream.packets.size != frames.size then none
+      let firstPts := stream.packets[0]!.2.toNat
+      let nextPts := stream.packets[1]!.2.toNat
+      if nextPts <= firstPts || nextPts >= 8589934592 then none
+      let step := nextPts - firstPts
+      if 90000 % step != 0 then none
+      for i in [:stream.packets.size] do
+        let pts := stream.packets[i]!.2.toNat
+        if pts >= 8589934592 || pts != firstPts + i * step then none
+      let frames := frames.mapIdx fun i vf =>
+        { vf with
+          pts := (i * step).toUInt64
+          duration := step.toUInt64
+          timeBase := AVRational.mkSafe 1 90000 }
+      media := { media with video := frames, fps := 90000 / step }
     else if stream.streamType == 0x0F then
       if media.audio.isSome then none
-      let (pcm, sr, bps) ← LeanAV.AacLc.aacDecodeAdtsStream (ByteSlice.ofByteArray payload) false
+      let (pcm, sr, bps) ← LeanAV.AacLc.aacDecodeAdtsStream (ByteSlice.ofByteArray payload) true
       media := { media with audio := some (channelArraysToAudioFrame (scaleChannelsBps pcm bps 16) sr) }
     else none
   some media
@@ -170,10 +186,11 @@ def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
   else if format == "rawvideo" then
     let frames ← unpackYuv420p width height raw
     some { video := frames }
-  else if format == "s16le" then
-    let pcm ← pcmRawLEToChannels (ByteSlice.ofByteArray raw) channels 16
+  else if format == "s16le" || format == "s24le" || format == "s32le" then
+    let bps := if format == "s32le" then 32 else if format == "s24le" then 24 else 16
+    let pcm ← pcmRawLEToChannels (ByteSlice.ofByteArray raw) channels bps
     if sampleRate == 0 then none
-    some { audio := some (channelArraysToAudioFrame pcm sampleRate) }
+    some { audio := some (channelArraysToAudioFrame pcm sampleRate bps), audioBits := bps }
   else if format == "mp4" || format == "mov" then decodeMp4 raw noAudio
   else if format == "hevc" then decodedVideo (LeanAV.HevcMain.decodeHevcToYuv420p raw)
   else if format == "av1" || format == "obu" || format == "ivf" then
@@ -184,11 +201,16 @@ def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
   else if format == "wav" || format == "adts" then
     let (pcm, sr, bps) ←
       if format == "wav" then demuxWavPcmLE (ByteSlice.ofByteArray raw)
-      else LeanAV.AacLc.aacDecodeAdtsStream (ByteSlice.ofByteArray raw) false
-    some { audio := some (channelArraysToAudioFrame (scaleChannelsBps pcm bps 16) sr) }
+      else LeanAV.AacLc.aacDecodeAdtsStream (ByteSlice.ofByteArray raw) true
+    let outBits := if format == "wav" then bps else 16
+    some {
+      audio := some (channelArraysToAudioFrame (scaleChannelsBps pcm bps outBits) sr outBits)
+      audioBits := outBits }
   else if format == "flac" then
     let decoded ← LeanAV.Audio.flacDecodeStream (ByteSlice.ofByteArray raw)
-    some { audio := some (LeanAV.Audio.flacDecodedToAudioFrame decoded) }
+    some {
+      audio := some (LeanAV.Audio.flacDecodedToAudioFrame decoded)
+      audioBits := decoded.info.bitsPerSample.toNat }
   else if format == "ogg" || format == "opus" then decodeOggOpus raw
   else if format == "mpegts" then decodeMpegTs raw
   else none
@@ -196,7 +218,7 @@ def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
 def filter (media : Media) (options : Options) : Except String Media := do
   if media.video.isEmpty && options.videoFilter != "" then throw "video filter without video stream"
   if media.audio.isNone && options.audioFilter != "" then throw "audio filter without audio stream"
-  let frames ← runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
+  let (frames, outFps) ← runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
   let frames := match options.maxFrames with
     | some n => frames.extract 0 n
     | none => frames
@@ -205,9 +227,12 @@ def filter (media : Media) (options : Options) : Except String Media := do
       let filtered ← runSingleStreamAudioFilterGraph options.audioFilter af
       pure (some filtered)
     | none => pure none
+  let audioBits := if options.audioFilter != "" then 16 else media.audioBits
   return { media with
     video := if options.noVideo then #[] else frames
+    fps := outFps
     audio := if options.noAudio then none else audio
+    audioBits := audioBits
     audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
 
 def encodeVideoTrack (media : Media) (options : Options) : Option SynthMp4Track := do
@@ -244,13 +269,19 @@ def encodeVideoTrack (media : Media) (options : Options) : Option SynthMp4Track 
     samples := packets.map fun p => { data := p.1, dur := 1000, cttsOff := 0, isSync := p.2 }
   }
 
+def audioChannels16 (media : Media) (af : AudioFrame) : Array (Array Int32) :=
+  let raw := LeanAV.Audio.flacAudioFrameToChannels af media.audioBits
+  scaleChannelsBps raw media.audioBits 16
+
 def encodeAudioTrack (media : Media) (options : Options) : Option SynthMp4Track := do
   let af ← media.audio
   if options.audioCodec == "copy" then media.audioCopy
   else if options.audioCodec == "aac" then
-    LeanAV.InprocTranscode.encodeChannelsToMp4AacTrack (audioFrameToChannelArrays af) af.sampleRate
+    LeanAV.InprocTranscode.encodeChannelsToMp4AacTrack (audioChannels16 media af) af.sampleRate
   else if options.audioCodec == "opus" then
-    let (channels, packets) ← LeanAV.Audio.encodeAudioFrameToOpusPackets af
+    let af16 := if media.audioBits == 16 && af.sampleFmt == .s16p then af
+      else channelArraysToAudioFrame (audioChannels16 media af) af.sampleRate 16
+    let (channels, packets) ← LeanAV.Audio.encodeAudioFrameToOpusPackets af16
     some {
       kind := .audio
       timescale := 48000
@@ -281,9 +312,16 @@ def muxMpegTs (media : Media) (options : Options) : Option ByteArray := do
     }
   if let some af := media.audio then
     if options.audioCodec != "aac" then none
-    let adts ← LeanAV.AacLc.aacEncodeAdtsStream (audioFrameToChannelArrays af) af.sampleRate 16 128000 true
+    let adts ← LeanAV.AacLc.aacEncodeAdtsStream (audioChannels16 media af) af.sampleRate 16 128000 true
     streams := streams.push { pid := 0x101, streamType := 0x0F, packets := #[(adts, 0)] }
   muxMpegTsProgram streams
+
+def pcmCodecDepth? : String → Option Nat
+  | "pcm_u8" => some 8
+  | "pcm_s16le" => some 16
+  | "pcm_s24le" => some 24
+  | "pcm_s32le" => some 32
+  | _ => none
 
 def mux (media : Media) (options : Options) : Option ByteArray := do
   if media.video.isEmpty && media.audio.isNone then none
@@ -305,32 +343,44 @@ def mux (media : Media) (options : Options) : Option ByteArray := do
     if !media.video.isEmpty && media.audio.isNone then some (muxLavfiMd5Bytes (packVideoFramesYuv420pRaw media.video))
     else if media.video.isEmpty then do
       let af ← media.audio
-      some (muxLavfiMd5Bytes (channelsToPcmRawLE (audioFrameToChannelArrays af) 16))
+      some (muxLavfiMd5Bytes (channelsToPcmRawLE (audioChannels16 media af) 16))
     else none
   else if options.format == "ogg" || options.format == "opus" then
     if !media.video.isEmpty || options.audioCodec != "opus" then none
     let af ← media.audio
-    let (channels, packets) ← LeanAV.Audio.encodeAudioFrameToOpusPackets af
+    let af16 := if media.audioBits == 16 && af.sampleFmt == .s16p then af
+      else channelArraysToAudioFrame (audioChannels16 media af) af.sampleRate 16
+    let (channels, packets) ← LeanAV.Audio.encodeAudioFrameToOpusPackets af16
     let header := LeanAV.Audio.buildOpusHeadPacket channels
     let tags := LeanAV.Audio.buildOpusTagsPacket
     muxOggLogicalStream (#[(header, 0), (tags, 0)] ++ packets)
   else if options.format == "mpegts" then muxMpegTs media options
   else if options.format == "wav" then
-    if !media.video.isEmpty || (options.audioCodec != "pcm_s16le" && options.audioCodec != "") then none
+    if !media.video.isEmpty then none
     let af ← media.audio
-    some (muxWavPcmLE (audioFrameToChannelArrays af) af.sampleRate 16)
-  else if options.format == "s16le" then
-    if !media.video.isEmpty || (options.audioCodec != "pcm_s16le" && options.audioCodec != "") then none
+    let srcChans := LeanAV.Audio.flacAudioFrameToChannels af media.audioBits
+    let outBps ←
+      if options.audioCodec == "" then some media.audioBits
+      else pcmCodecDepth? options.audioCodec
+    let outChans := scaleChannelsBps srcChans media.audioBits outBps
+    some (muxWavPcmLE outChans af.sampleRate outBps)
+  else if options.format == "s16le" || options.format == "s24le" || options.format == "s32le" then
+    let targetBps := if options.format == "s32le" then 32 else if options.format == "s24le" then 24 else 16
+    let expectedCodec := if targetBps == 32 then "pcm_s32le" else if targetBps == 24 then "pcm_s24le" else "pcm_s16le"
+    if !media.video.isEmpty || (options.audioCodec != expectedCodec && options.audioCodec != "") then none
     let af ← media.audio
-    some (channelsToPcmRawLE (audioFrameToChannelArrays af) 16)
+    let srcChans := LeanAV.Audio.flacAudioFrameToChannels af media.audioBits
+    let outChans := scaleChannelsBps srcChans media.audioBits targetBps
+    some (channelsToPcmRawLE outChans targetBps)
   else if options.format == "flac" then
     if !media.video.isEmpty || (options.audioCodec != "flac" && options.audioCodec != "") then none
     let af ← media.audio
-    LeanAV.Audio.flacEncodeAudioFrame af 16
+    let bps := if 4 ≤ media.audioBits && media.audioBits ≤ 32 then media.audioBits else 16
+    LeanAV.Audio.flacEncodeAudioFrame af bps
   else if options.format == "adts" then
     if !media.video.isEmpty || (options.audioCodec != "aac" && options.audioCodec != "") then none
     let af ← media.audio
-    LeanAV.AacLc.aacEncodeAdtsStream (audioFrameToChannelArrays af) af.sampleRate 16 128000 true
+    LeanAV.AacLc.aacEncodeAdtsStream (audioChannels16 media af) af.sampleRate 16 128000 true
   else if options.format == "mkv" || options.format == "avi" then
     if media.video.isEmpty || media.audio.isSome || options.videoCodec != "ffv1" then none
     muxLavfiFfv1Bytes options.format media.video media.fps
@@ -487,7 +537,7 @@ def scan (args : List String) : Option Invocation := do
       job := { job with options := { job.options with videoCodec := value } }
       rest := xs
     | "-c:a" :: value :: xs =>
-      if !["aac", "opus", "flac", "pcm_s16le", "copy"].contains value then none
+      if !["aac", "opus", "flac", "pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "copy"].contains value then none
       explicitAudio := true
       job := { job with options := { job.options with audioCodec := value } }
       rest := xs
@@ -568,7 +618,7 @@ def scan (args : List String) : Option Invocation := do
       rest := xs
     | flag :: value :: xs =>
       if flag == "-loglevel" || flag == "-v" then
-        if !["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace"].contains value then none
+        if !LeanAV.Cli.supportedLogLevel value then none
         rest := xs
       else if ["-y", "-n", "-json", "-hide_banner", "-nostdin"].contains flag then
         rest := value :: xs
@@ -592,7 +642,7 @@ def scan (args : List String) : Option Invocation := do
   if !explicitVideo && (job.options.videoFilter != "" || job.options.filterComplex != "") &&
      outputFormat != "null" && outputFormat != "rawvideo" && outputFormat != "md5" && outputFormat != "framemd5" &&
      outputFormat != "ogg" && outputFormat != "opus" && outputFormat != "wav" && outputFormat != "s16le" &&
-     outputFormat != "flac" && outputFormat != "adts" then none
+     outputFormat != "s24le" && outputFormat != "s32le" && outputFormat != "flac" && outputFormat != "adts" then none
   let options := { job.options with
     format := outputFormat
     videoCodec := if explicitVideo then job.options.videoCodec
@@ -600,7 +650,10 @@ def scan (args : List String) : Option Invocation := do
       else job.options.videoCodec
     audioCodec := if explicitAudio then job.options.audioCodec
       else if outputFormat == "ogg" || outputFormat == "opus" then "opus"
-      else if outputFormat == "wav" || outputFormat == "s16le" || outputFormat == "null" then "pcm_s16le"
+      else if outputFormat == "wav" then ""
+      else if outputFormat == "s16le" || outputFormat == "null" then "pcm_s16le"
+      else if outputFormat == "s24le" then "pcm_s24le"
+      else if outputFormat == "s32le" then "pcm_s32le"
       else if outputFormat == "flac" then "flac" else job.options.audioCodec }
   some { job with options := options }
 

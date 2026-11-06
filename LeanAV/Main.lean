@@ -1910,15 +1910,21 @@ def prepareUnifiedMediaPipeline (args : List String) : IO (Option (LeanAV.Unifie
   catch _ => return none
 
 def refinePlanWithInputWithArgs (plan : MediaPlanIR) (args : List String) : IO MediaPlanIR := do
-  if let some (job, media) ← prepareUnifiedMediaPipeline args then
-    if (LeanAV.UnifiedPipeline.filterStreams media job.options).isOk then
-      return { plan with backend := {
-        tier := .independentVerified
-        delegatedContainer := false
-        fallbackAllowed := false
-        reasons := ["unified_media_pipeline"]
-      } }
   let refined ← refinePlanWithInput plan
+  if standaloneLosslessPlanGateSpec.gate refined || standaloneAacAdtsPlanGateSpec.gate refined ||
+     (refined.backend.tier == .independentVerified &&
+       (refined.backend.reasons.contains "native_stream_copy" ||
+        refined.backend.reasons.contains "ffv1_v3_native_verified_codec")) then
+    return refined
+  if let some (job, media) ← prepareUnifiedMediaPipeline args then
+    if let .ok filtered := LeanAV.UnifiedPipeline.filterStreams media job.options then
+      if (LeanAV.UnifiedPipeline.mux filtered job.options).isSome then
+        return { plan with backend := {
+          tier := .independentVerified
+          delegatedContainer := false
+          fallbackAllowed := false
+          reasons := ["unified_media_pipeline"]
+        } }
   return promoteLavfiDagPlanArgs refined args
 
 /-- Run the typed lavfi DAG. `maxFrames?` limits video sources (`-frames:v`). -/

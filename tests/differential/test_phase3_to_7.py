@@ -179,14 +179,26 @@ class Phase3To7Tests(unittest.TestCase):
             for ext, codec in (("wav", "pcm_s16le"), ("flac", "flac")):
                 with self.subTest(cross_container=ext):
                     cand_aud = root / f"cand.{ext}"
+                    ref_aud = root / f"ref.{ext}"
+                    self.assertEqual(
+                        self.run_cmd([
+                            REFERENCE, "-v", "error", "-y", "-i", str(FIXTURE_AV), "-vn", "-c:a", codec, str(ref_aud),
+                        ]).returncode,
+                        0,
+                    )
                     r_ca = self.run_cmd([
                         BINARY, "-json", "-y", "-i", str(FIXTURE_AV), "-vn", "-c:a", codec, str(cand_aud),
                     ])
-                    self.assertNotEqual(r_ca.returncode, 0)
-                    self.assertFalse(cand_aud.exists())
+                    self.assertEqual(r_ca.returncode, 0, r_ca.stderr)
+                    self.assertTrue(cand_aud.is_file() and cand_aud.stat().st_size > 64)
                     ca_doc = json.loads(r_ca.stdout.strip())
-                    self.assertFalse(ca_doc["ok"])
-                    self.assertEqual(ca_doc["tier"], "unsupported")
+                    self.assertTrue(ca_doc["ok"])
+                    self.assertEqual(ca_doc["tier"], "independent_verified")
+                    p_ref_a = self.probe_json(ref_aud)
+                    p_cand_a = self.probe_json(cand_aud)
+                    self.assertEqual(p_ref_a["streams"][0]["codec_name"], p_cand_a["streams"][0]["codec_name"])
+                    self.assertEqual(p_ref_a["streams"][0]["sample_rate"], p_cand_a["streams"][0]["sample_rate"])
+                    self.assertEqual(p_ref_a["streams"][0]["channels"], p_cand_a["streams"][0]["channels"])
 
             pcm_src = root / "src_pcm.wav"
             self.assertEqual(
@@ -213,10 +225,11 @@ class Phase3To7Tests(unittest.TestCase):
             self.assertEqual(p_ref["streams"][0]["channels"], p_cand["streams"][0]["channels"])
 
             r_null = self.run_cmd([BINARY, "-json", "-y", "-i", str(FIXTURE_AV), "-f", "null", "-"])
-            self.assertNotEqual(r_null.returncode, 0)
+            self.assertEqual(r_null.returncode, 0, r_null.stderr)
             null_doc = json.loads(r_null.stdout.strip())
-            self.assertFalse(null_doc["ok"])
-            self.assertEqual(null_doc["tier"], "unsupported")
+            self.assertTrue(null_doc["ok"])
+            self.assertEqual(null_doc["tier"], "independent_verified")
+            self.assertEqual(null_doc["out_bytes"], 0)
 
             r_devnull = self.run_cmd([BINARY, "-json", "-i", str(FIXTURE_AV), "-f", "mp4", "-c", "copy", "/dev/null"])
             self.assertEqual(r_devnull.returncode, 0, r_devnull.stderr)

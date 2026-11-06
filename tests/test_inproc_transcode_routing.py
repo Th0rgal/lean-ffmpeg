@@ -232,7 +232,7 @@ class InprocTranscodeRoutingTests(unittest.TestCase):
         prores = self.root / "video_prores.mov"
         ts = self.root / "program.ts"
         for target, extra in (
-            (ogg, ["-vn", "-c:a", "opus"]),
+            (ogg, ["-vn", "-af", "volume=volume=0", "-c:a", "opus"]),
             (prores, ["-an", "-c:v", "prores"]),
             (ts, ["-c:v", "h264", "-c:a", "aac"]),
         ):
@@ -245,6 +245,14 @@ class InprocTranscodeRoutingTests(unittest.TestCase):
                                 env=ISO_ENV, capture_output=True, text=True, check=False)
             self.assertEqual(r2.returncode, 0, r2.stderr or r2.stdout)
             self.assertTrue(rt.is_file() and rt.stat().st_size > 64)
+
+        nonsilent_ogg = self.root / "nonsilent.ogg"
+        r_ns = subprocess.run(
+            [str(BINARY), "-json", "-y", "-i", str(self.valid_mp4), "-vn", "-c:a", "opus", str(nonsilent_ogg)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(r_ns.returncode, 0, r_ns.stdout)
+        self.assertFalse(nonsilent_ogg.exists())
 
         sentinel = self.root / "existing.mp4"
         sentinel.write_bytes(b"SENTINEL")
@@ -261,6 +269,65 @@ class InprocTranscodeRoutingTests(unittest.TestCase):
         res_s, plan_s = self.plan(["-i", str(self.valid_mp4), "-s", "32x32", "-c:v", "h264", str(out)])
         self.assertEqual(res_s.returncode, 0)
         self.assertNotEqual(plan_s["backend"]["reasons"], ["unified_media_pipeline"])
+
+    def test_vf_fps_ts_timestamps_and_32bit_wav_preservation(self):
+        fps50_mp4 = self.root / "fps50.mp4"
+        r_fps = subprocess.run(
+            [str(BINARY), "-json", "-y", "-i", str(self.valid_mp4), "-an", "-vf", "fps=50", "-c:v", "h264", str(fps50_mp4)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_fps.returncode, 0, r_fps.stderr or r_fps.stdout)
+        fps_doc = json.loads(r_fps.stdout.strip())
+        self.assertEqual(fps_doc["frames"], 10)
+        mp4_bytes = fps50_mp4.read_bytes()
+        mdhd_idx = mp4_bytes.find(b"mdhd")
+        self.assertGreater(mdhd_idx, 0)
+        timescale = int.from_bytes(mp4_bytes[mdhd_idx + 16:mdhd_idx + 20], "big")
+        duration = int.from_bytes(mp4_bytes[mdhd_idx + 20:mdhd_idx + 24], "big")
+        self.assertEqual(timescale, 50000)
+        self.assertEqual(duration, 10000)
+
+        mp4_30 = self.root / "src30.mp4"
+        r_30 = subprocess.run(
+            [str(BINARY), "-y", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=30:duration=0.2", str(mp4_30)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_30.returncode, 0, r_30.stderr or r_30.stdout)
+        ts_30 = self.root / "src30.ts"
+        r_ts = subprocess.run(
+            [str(BINARY), "-json", "-y", "-i", str(mp4_30), "-an", "-c:v", "h264", str(ts_30)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_ts.returncode, 0, r_ts.stderr or r_ts.stdout)
+        rt_30 = self.root / "rt30.mp4"
+        r_rt30 = subprocess.run(
+            [str(BINARY), "-json", "-y", "-i", str(ts_30), "-c:v", "h264", str(rt_30)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_rt30.returncode, 0, r_rt30.stderr or r_rt30.stdout)
+        rt30_bytes = rt_30.read_bytes()
+        rt_mdhd = rt30_bytes.find(b"mdhd")
+        self.assertGreater(rt_mdhd, 0)
+        self.assertEqual(int.from_bytes(rt30_bytes[rt_mdhd + 16:rt_mdhd + 20], "big"), 30000)
+        self.assertEqual(int.from_bytes(rt30_bytes[rt_mdhd + 20:rt_mdhd + 24], "big"), 6000)
+
+        s32_raw = self.root / "in.s32"
+        samples = [0x12345678, -0x12345678, 0x7FFFFFFF, -0x80000000] * 16
+        s32_bytes = b"".join(int(x).to_bytes(4, "little", signed=True) for x in samples)
+        s32_raw.write_bytes(s32_bytes)
+        wav32 = self.root / "out32.wav"
+        r_w32 = subprocess.run(
+            [str(BINARY), "-json", "-y", "-f", "s32le", "-ar", "48000", "-ac", "1", "-i", str(s32_raw), str(wav32)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_w32.returncode, 0, r_w32.stderr or r_w32.stdout)
+        s32_rt = self.root / "rt.s32"
+        r_s32 = subprocess.run(
+            [str(BINARY), "-json", "-y", "-i", str(wav32), "-f", "s32le", str(s32_rt)],
+            env=ISO_ENV, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(r_s32.returncode, 0, r_s32.stderr or r_s32.stdout)
+        self.assertEqual(s32_rt.read_bytes(), s32_bytes)
 
 
 if __name__ == "__main__":

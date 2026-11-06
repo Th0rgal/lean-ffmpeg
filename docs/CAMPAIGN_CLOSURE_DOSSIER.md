@@ -6,9 +6,10 @@ The 2026-11-06 P1.0 unified multi-stream pipeline qualification
 siloed raw subcommands (`hevc-encode-raw`, `hevc-decode-raw`, `av1-encode-raw`,
 `av1-decode-raw`) and `inproc_h264_aac_mp4_transcode` with a unified multi-stream
 `-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline
-(`LeanAV/UnifiedPipeline.lean`), wiring Opus (`Ogg/Opus` and `MP4/MOV`), Apple
+(`LeanAV/UnifiedPipeline.lean`), wiring Opus (`Ogg/Opus` and `MP4/MOV`, RFC 6716 CELT FB silence `0xFF 0xFE` with
+fail-closed rejection of compressed non-silent packets pending P1.2), Apple
 ProRes 422 (`apcn` in `MP4/MOV`), Ogg, and MPEG-TS (`PAT/PMT/PES`) into standard
-`-i` CLI routing, auditing **23,197 declarations with zero sorryAx/custom axioms**
+`-i` CLI routing, auditing **23,201 declarations with zero sorryAx/custom axioms**
 (`87,081` LOC across 38 formal `LeanAV/*.lean` modules) and **812/812
 `non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
 `H264IntraTransformProofs`: 70, `Format`: 66, `H264InterDeblockDpbProofs`: 61,

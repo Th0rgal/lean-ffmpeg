@@ -1718,14 +1718,15 @@ def audioFrameToChannelArrays (af : AudioFrame) : Array (Array Int32) := Id.run 
   return chans
 
 /-- Convert per-channel `Array (Array Int32)` into a planar `AudioFrame`. -/
-def channelArraysToAudioFrame (chans : Array (Array Int32)) (sampleRate : UInt32) : AudioFrame := Id.run do
+def channelArraysToAudioFrame (chans : Array (Array Int32)) (sampleRate : UInt32)
+    (bitsPerSample : Nat := 16) : AudioFrame := Id.run do
   let nCh := Nat.max 1 chans.size
   let nS := (chans.getD 0 #[]).size
-  let mut af := AudioFrame.alloc .s16p sampleRate nCh.toUInt32 nS 0
+  let mut af := AudioFrame.alloc (if bitsPerSample > 16 then .s32p else .s16p) sampleRate nCh.toUInt32 nS 0
   for ch in [:chans.size] do
     let arr := chans[ch]!
     for i in [:Nat.min nS arr.size] do
-      af := af.setSample ch i (clipInt16 arr[i]!)
+      af := af.setSample ch i (if bitsPerSample > 16 then arr[i]! else clipInt16 arr[i]!)
   return af
 
 /-! ## 10. Lossless All-Intra `I_PCM` H.264 + AAC-LC Synthetic MP4 Muxer -/
@@ -1936,23 +1937,24 @@ def muxLavfiFrameMd5Bytes (vfs : Array VideoFrame) (fps : Nat) : Option ByteArra
 /-- Run a single-stream `-vf` chain through `parseFilterGraph` -> `typecheckFilterGraph` ->
 `executeTypedFilterGraph`, bridging decoded `VideoFrame` streams directly into `LavfiGraph`. -/
 def runSingleStreamVideoFilterGraph (vfChain : String) (frames : Array VideoFrame) (fps : Nat := 25) :
-    Except String (Array VideoFrame) := do
+    Except String (Array VideoFrame × Nat) := do
+  let effFps := Nat.max 1 fps
   if vfChain.trimAscii.toString == "" then
-    return frames
+    return (frames, effFps)
   if frames.isEmpty then
-    return frames
+    return (frames, effFps)
   let vf0 := frames[0]!
   let spec := "[0:v]" ++ vfChain ++ "[vout]"
   let g ← parseFilterGraph spec
-  let extFmt : PadFormat := { kind := .video, width := vf0.width, height := vf0.height, fpsNum := Nat.max 1 fps }
+  let extFmt : PadFormat := { kind := .video, width := vf0.width, height := vf0.height, fpsNum := effFps }
   let tg ← typecheckFilterGraph g [("0:v", extFmt)]
   let inQ := buildVideoQueue (Nat.max maxLavfiVideoFrames frames.size) frames
   let outs ← executeTypedFilterGraph tg [("0:v", inQ)]
   match outs.find? (fun (lbl, fmt, _) => lbl == "vout" && fmt.kind == .video) with
-  | some (_, _, outQ) => return drainVideoQueue outQ
+  | some (_, fmt, outQ) => return (drainVideoQueue outQ, Nat.max 1 fmt.fpsNum)
   | none =>
     match outs.find? (fun (_, fmt, _) => fmt.kind == .video) with
-    | some (_, _, outQ) => return drainVideoQueue outQ
+    | some (_, fmt, outQ) => return (drainVideoQueue outQ, Nat.max 1 fmt.fpsNum)
     | none => throw "video filter graph produced no video output pad"
 
 /-- Run a single-stream `-af` chain through `parseFilterGraph` -> `typecheckFilterGraph` ->

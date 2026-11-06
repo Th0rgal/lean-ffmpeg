@@ -59,7 +59,7 @@ jobs:
         run: |
           out="$(lake env lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23197 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           ! command -v ffmpeg
@@ -68,7 +68,13 @@ jobs:
       - name: Install reference ffmpeg oracle
         run: sudo apt-get install -y ffmpeg
       - name: Differential oracle suite
-        run: python3 -m unittest discover -s tests/differential -p "test_*.py"
+        run: |
+          python3 - <<'PY'
+          import sys, unittest
+          suite = unittest.defaultTestLoader.discover("tests/differential", pattern="test_*.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
       - name: CLI smoke tests
         run: |
           set +e
@@ -139,7 +145,7 @@ jobs:
         run: |
           out="$(lake env lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23197 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           python3 - <<'PY'
@@ -153,4 +159,10 @@ jobs:
       - name: Install reference ffmpeg oracle
         run: brew install ffmpeg
       - name: Differential oracle suite
-        run: python3 -m unittest discover -s tests/differential -p "test_*.py"
+        run: |
+          python3 - <<'PY'
+          import sys, unittest
+          suite = unittest.defaultTestLoader.discover("tests/differential", pattern="test_*.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
