@@ -4,7 +4,7 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). The binary is standalone: every accepted route runs in-process, and anything outside that set fails closed. There is no child process and no external `ffmpeg` / `ffprobe` override environment variable.
 
-1. **38 Formal Lean 4 Modules (`LeanAV/*.lean`, `87,081` LOC)**:
+1. **38 Formal Lean 4 Modules (`LeanAV/*.lean`, `87,100` LOC)**:
    - **`23,201` declarations** (verified under `v4.35.0`) with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
    - **`812 / 812` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, v2.1; `0 vacuous`, `0 trivial`, `0 shadowed`): `AacLcProofs` (84), `H264IntraTransformProofs` (70), `Format` (66), `H264InterDeblockDpbProofs` (61), `Ffv1Proofs` (60), `NativeKernels` (59), `Video` (47), `Encoder` (37), `LavfiGraphProofs` (36), `Audio` (35), `H264EntropyProofs` (31), `Scale` (28), `Bitstream` (27), `Av1MainProofs` (26), `H264SyntaxProofs` (26), `HevcMainProofs` (23), `Spec` (23), `PlanIR` (21), `Core` (11), `Domain` (8), `InprocTranscode` (8), `Md5` (7), `Cli` (6), `Filter` (6), `LavfiGraph` (5), `UnifiedPipeline` (1) (plus the 12 implementation/orchestration modules `AacLc`, `Av1Main`, `Ffv1`, `Ffv1Container`, `Ffv1Pipeline`, `H264Entropy`, `H264InterDeblockDpb`, `H264IntraTransform`, `H264Syntax`, `HevcMain`, `IO`, and `Main`).
    - Native routes, all with zero subprocesses: unified multi-stream `-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline (`unified_media_pipeline` in `LeanAV/UnifiedPipeline.lean`), FFV1 v3, PNG + Zlib/DEFLATE, FLAC, H.264/AVC syntax + CAVLC/CABAC + intra/inter/deblock/DPB, AAC-LC, Opus (`Ogg/Opus` and `MP4/MOV`, RFC 6716 CELT FB silence `0xFF 0xFE` with fail-closed rejection of compressed non-silent packets pending P1.2), Apple ProRes 422 (`apcn` in `MP4/MOV`), MPEG-TS (`PAT/PMT/PES`), HEVC Main 8-bit 4:2:0 (`-i` / `-c:v hevc` and `hevc-probe`), AV1 Main 8-bit 4:2:0 (`-i` / `-c:v av1` and `av1-probe`), lavfi DAG (`color`, `testsrc`, `nullsrc`, `overlay`, `split`, `hstack`, `vstack`, `sine`, `anullsrc`, `amix`, `amerge`, `asplit`, `md5`, `framemd5`), and stream copy for MP4/MOV/MKV/WebM/WAV/FLAC/IVF. Scale and `colorspace=bt709` / tonemap stay in-process. Out-of-scope codecs, profiles, GPU, network protocols, and rejected filter graphs are `BackendTier.unsupported` (`delegatedContainer := false`, `fallbackAllowed := false`) and exit non-zero with no output file. CLI classification lives in `LeanAV/PlanIR.lean`, `LeanAV/UnifiedPipeline.lean`, and `LeanAV/Main.lean`.
@@ -18,7 +18,7 @@
 ## 2. Engineering & Verification Rules
 
 1. **Zero `sorryAx` & Zero Custom Axioms**:
-   Every declaration in `LeanAV.*` must depend only on standard Lean axioms (`{propext, Quot.sound, Classical.choice}`). Run `lake env lean scripts/check_axioms.lean` after any Lean edit.
+   Every declaration in `LeanAV.*` must depend only on standard Lean axioms (`{propext, Quot.sound, Classical.choice}`). Run `LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean` after any Lean edit.
 2. **Simple, Non-Vacuous Specifications (`AVGateSpec`)**:
    Keep Layer-II theorems short ($\le 3$ lines where possible) and verify all 38 modules pass `turbo-lean --json audit-spec` with `0` vacuous, `0` trivial, and `0` shadowed specs (`812/812` `non_vacuous_and_tight`).
 3. **Zero Model-Code Gap Across the FFI Boundary**:
@@ -32,7 +32,8 @@
 
 ```bash
 # 1. Build LeanAV, the 46 LLVM-compiled LNIR kernels + 14 wired outer shells, and the 672-line C-ABI bridge
-lake build
+export LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean'
+python3 scripts/build_turbo.py
 ./scripts/regen_lnir_c_kernels.sh --check-ir
 
 # 2. Run self-test waves, FFI ABI checks, and compiled LNIR kernel checks
@@ -41,7 +42,7 @@ lake build
 ./.lake/build/bin/lffmpeg verify-kernels
 
 # 3. Verify 0 sorryAx and 0 custom axioms across all 23,201 LeanAV.* declarations
-lake env lean scripts/check_axioms.lean
+lean scripts/check_axioms.lean
 
 # 4. Audit all 38 formal modules with turbo-lean (812/812 non_vacuous_and_tight)
 for file in LeanAV/*.lean; do turbo-lean --json audit-spec "$file" || exit; done

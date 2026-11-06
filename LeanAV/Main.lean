@@ -1910,7 +1910,25 @@ def prepareUnifiedMediaPipeline (args : List String) : IO (Option (LeanAV.Unifie
   catch _ => return none
 
 def refinePlanWithInputWithArgs (plan : MediaPlanIR) (args : List String) : IO MediaPlanIR := do
-  let refined ← refinePlanWithInput plan
+  let refined0 ← refinePlanWithInput plan
+  let refined ←
+    if refined0.backend.tier == .independentVerified &&
+        refined0.backend.reasons.contains "ffv1_v3_native_verified_codec" then
+      match LeanAV.Ffv1Pipeline.parseFfv1CliArgs args with
+      | some job =>
+        if job.inFmt == some "rawvideo" || job.inFmt == some "yuv4mpegpipe" ||
+            !(← System.FilePath.pathExists job.inPath) then
+          pure refined0
+        else
+          let bytes ← IO.FS.readBinFile job.inPath
+          match LeanAV.Ffv1Container.demux bytes with
+          | .ok _ => pure refined0
+          | .error err =>
+            if err == "not FFV1" || err == "multi-stream container" then
+              pure (demoteNativePlan refined0)
+            else pure refined0
+      | none => pure refined0
+    else pure refined0
   if standaloneLosslessPlanGateSpec.gate refined || standaloneAacAdtsPlanGateSpec.gate refined ||
      (refined.backend.tier == .independentVerified &&
        (refined.backend.reasons.contains "native_stream_copy" ||

@@ -4,7 +4,7 @@ open LeanAV.PlanIR
 
 -- Runtime regression assertions on production pure functions.
 -- These are tests, not a universal parser/codec-correctness theorem.
--- Run after lake build: lake env lean --run tests/bsf_chain.lean
+-- Run after python3 scripts/build_turbo.py: LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean --run tests/bsf_chain.lean
 
 private def gateVectors : List (String × Bool) :=
   [

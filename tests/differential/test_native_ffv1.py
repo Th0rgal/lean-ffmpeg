@@ -442,6 +442,51 @@ class NativeFfv1Tests(unittest.TestCase):
                             self.assertIn(expected_sar_line, ref_lines)
                             self.assertEqual(lean_lines, ref_lines)
 
+    def test_non_ffv1_mov_routes_through_unified_pipeline_and_ffv1_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw = root / "in.yuv"
+            raw.write_bytes(_make_yuv420p(64, 48, 2))
+            for label, args in (
+                ("prores", ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"]),
+                ("h264", ["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ):
+                mov = root / f"{label}.mov"
+                enc = self.run_ref(
+                    "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "64x48", "-r", "25",
+                    "-i", str(raw), "-frames:v", "2", *args, str(mov),
+                )
+                self.assertEqual(enc.returncode, 0, enc.stderr.decode(errors="replace"))
+                for sink in ("rawvideo", "md5", "null"):
+                    with self.subTest(src=label, sink=sink):
+                        out = root / f"{label}.{sink}"
+                        extra = ["-f", sink, str(out)] if sink != "null" else ["-f", "null", "-"]
+                        res = self.run_isolated("-json", "-y", "-i", str(mov), *extra)
+                        self.assertEqual(res.returncode, 0, res.stderr.decode(errors="replace"))
+                        doc = json.loads(res.stdout.decode())
+                        self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
+                ffv1_out = root / f"{label}_ffv1.mkv"
+                res = self.run_isolated("-json", "-y", "-i", str(mov), "-c:v", "ffv1", str(ffv1_out))
+                self.assertEqual(res.returncode, 0, res.stderr.decode(errors="replace"))
+                doc = json.loads(res.stdout.decode())
+                self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
+                self.assertTrue(ffv1_out.is_file() and ffv1_out.stat().st_size > 0)
+            ffv1_mov = root / "native.mov"
+            enc = self.run_isolated(
+                "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "64x48", "-r", "25",
+                "-i", str(raw), "-frames:v", "2", "-c:v", "ffv1", str(ffv1_mov),
+            )
+            self.assertEqual(enc.returncode, 0, enc.stderr.decode(errors="replace"))
+            for container in ("mov", "mkv"):
+                src = root / f"ffv1.{container}"
+                mux = self.run_ref("-y", "-i", str(ffv1_mov), "-c", "copy", str(src))
+                self.assertEqual(mux.returncode, 0, mux.stderr.decode(errors="replace"))
+                plan = self.run_isolated("plan", "-i", str(src), "-f", "md5", "-")
+                self.assertEqual(plan.returncode, 0, plan.stderr.decode(errors="replace"))
+                doc = json.loads(plan.stdout.decode())
+                reasons = " ".join(doc.get("reasons", []))
+                self.assertNotIn("unified_media_pipeline", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

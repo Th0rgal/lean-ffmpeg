@@ -10,7 +10,7 @@ siloed raw subcommands (`hevc-encode-raw`, `hevc-decode-raw`, `av1-encode-raw`,
 fail-closed rejection of compressed non-silent packets pending P1.2), Apple
 ProRes 422 (`apcn` in `MP4/MOV`), Ogg, and MPEG-TS (`PAT/PMT/PES`) into standard
 `-i` CLI routing, auditing **23,201 declarations with zero sorryAx/custom axioms**
-(`87,081` LOC across 38 formal `LeanAV/*.lean` modules) and **812/812
+(`87,100` LOC across 38 formal `LeanAV/*.lean` modules) and **812/812
 `non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
 `H264IntraTransformProofs`: 70, `Format`: 66, `H264InterDeblockDpbProofs`: 61,
 `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 47, `Encoder`: 37,

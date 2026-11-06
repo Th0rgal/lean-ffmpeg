@@ -7,6 +7,7 @@ counters against independent Python and pure-Lean reference formulas, while
 verifying transcodeMp4GeneralVerifiedIO remains fail-closed.
 """
 from pathlib import Path
+import os
 import shlex
 import subprocess
 import sys
@@ -101,24 +102,29 @@ class U16LeIdentityTests(unittest.TestCase):
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.directory = Path(cls.tmp.name)
         c_file, cls.binary = cls.directory / 'identity.c', cls.directory / 'identity'
-        subprocess.run(['lake', 'env', 'lean', '-c', str(c_file),
-                        str(HERE / 'u16le_identity.lean')], cwd=ROOT, check=True,
+        lean_env = dict(os.environ, LEAN_PATH=os.pathsep.join((
+            str(ROOT / '.lake/build/lib/lean'),
+            str(ROOT.parent / 'lean-sys/.lake/build/lib/lean'),
+        )))
+        subprocess.run(['lean', '-c', str(c_file),
+                        str(HERE / 'u16le_identity.lean')], cwd=ROOT, env=lean_env, check=True,
                        capture_output=True, text=True, timeout=120)
-        args = shlex.split((ROOT / '.lake/build/bin/lffmpeg.rsp').read_text())
-        objects = [s for s in args if s.endswith(('.o.export', '.a')) and
+        rsp_text = (ROOT / '.lake/build/bin/lffmpeg.rsp').read_text()
+        args = [s.strip().strip('"') for s in rsp_text.splitlines() if s.strip()] if '\n' in rsp_text else shlex.split(rsp_text)
+        objects = [s for s in args if s.endswith(('.o.export', '.a', 'leanav_zero_exec_stub.o')) and
                    not s.endswith('/LeanAV/Main.c.o.export')]
-        lean_prefix = subprocess.run(['lake', 'env', 'lean', '--print-prefix'],
-                                     cwd=ROOT, check=True, capture_output=True,
+        lean_prefix = subprocess.run(['lean', '--print-prefix'],
+                                     cwd=ROOT, env=lean_env, check=True, capture_output=True,
                                      text=True, timeout=30).stdout.strip()
         counter = cls.directory / 'counter.o'
         subprocess.run(['cc', '-O3', '-fPIC', '-I', str(Path(lean_prefix) / 'include'),
                         '-c', str(HERE / 'u16le_identity_counter.c'), '-o', str(counter)],
                        cwd=ROOT, check=True, capture_output=True, text=True, timeout=120)
         link_args = [] if sys.platform == 'darwin' else ['-lpthread']
-        result = subprocess.run(['lake', 'env', 'leanc', '-O2', '-o', str(cls.binary),
+        result = subprocess.run(['leanc', '-O2', '-o', str(cls.binary),
                                  str(c_file), str(counter),
                                  *objects, *link_args],
-                                cwd=ROOT, capture_output=True, text=True, timeout=120)
+                                cwd=ROOT, env=lean_env, capture_output=True, text=True, timeout=120)
         if result.returncode or result.stderr:
             raise AssertionError(result.stdout + result.stderr)
 

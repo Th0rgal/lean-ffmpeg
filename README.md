@@ -38,10 +38,11 @@ Published timings are historical and are not a speed claim for this commit. On a
 Requires Lean `v4.35.0`, a sibling checkout of [`lean-sys`](https://github.com/Th0rgal/lean-sys) at `077775ba387f1eeb2976cb8763b4633b8d5ce313`, and `clang`. A system `ffmpeg` is used only as an external oracle for `tests/differential`.
 
 ```bash
-lake build
+export LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean'
+python3 scripts/build_turbo.py
 ./scripts/regen_lnir_c_kernels.sh --check-ir
 ./.lake/build/bin/lffmpeg self-test
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
-lake env lean scripts/check_axioms.lean
+lean scripts/check_axioms.lean
 ```

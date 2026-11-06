@@ -1,5 +1,5 @@
 /- Pure production PlanIR checks. Staged only; not executed during preparation.
-   Later gate: lake env lean --run scripts/check_mpeg_options.lean
+   Later gate: LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean --run scripts/check_mpeg_options.lean
    No media files, process invocation, or timing. -/
 import LeanAV.PlanIR
 

@@ -5,6 +5,7 @@ names and syscall spellings are assembled at runtime so a source grep for the
 deleted spawn surface stays empty. External ffmpeg and ffprobe are never used.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -76,11 +77,15 @@ class ZeroDelegationCert(unittest.TestCase):
         compiler = shutil.which("cc") or next(
             (path for path in ("/usr/bin/cc", "/usr/bin/clang") if Path(path).is_file()), None
         )
-        lake = shutil.which("lake")
+        lean = shutil.which("lean")
         self.assertIsNotNone(compiler, "C compiler is required for the ABI certificate")
-        self.assertIsNotNone(lake, "lake is required for the ABI certificate")
+        self.assertIsNotNone(lean, "lean is required for the ABI certificate")
+        lean_env = dict(os.environ, LEAN_PATH=os.pathsep.join((
+            str(ROOT / ".lake/build/lib/lean"),
+            str(ROOT.parent / "lean-sys/.lake/build/lib/lean"),
+        )))
         prefix = subprocess.run(
-            [lake, "env", "lean", "--print-prefix"], cwd=ROOT,
+            [lean, "--print-prefix"], cwd=ROOT, env=lean_env,
             capture_output=True, text=True, check=True, timeout=90,
         ).stdout.strip()
         spawn_sym = "".join(("lean_io_process_", "spawn"))
@@ -109,7 +114,7 @@ class ZeroDelegationCert(unittest.TestCase):
 
         # Because <lean/lean.h> typedefs both lean_obj_arg and b_lean_obj_arg to
         # lean_object*, C -fsyntax-only cannot catch owned-vs-borrowed mismatches.
-        # Compile Lean wrapper calls via `lake env lean -c` and mechanically verify
+        # Compile Lean wrapper calls via direct `lean -c` and mechanically verify
         # every object parameter's ownership (borrowed iff ___boxed emits lean_dec*)
         # against the LEANAV_ZERO_EXEC_STUB_ONLY C definitions and lean_dec_ref calls.
         io_sp = "".join(("IO.Process.", "spawn"))
@@ -139,8 +144,8 @@ class ZeroDelegationCert(unittest.TestCase):
                 "def wLsAccept (fd t : UInt32) : IO UInt64 := LeanSys.Posix.rawNetAcceptPoll fd t\n"
             )
             subprocess.run(
-                [lake, "env", "lean", "-c", str(probe_c), str(probe_lean)],
-                cwd=ROOT, check=True, capture_output=True, text=True, timeout=120,
+                [lean, "-c", str(probe_c), str(probe_lean)],
+                cwd=ROOT, env=lean_env, check=True, capture_output=True, text=True, timeout=120,
             )
             gen_c = probe_c.read_text()
 

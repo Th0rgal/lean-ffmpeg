@@ -4,13 +4,13 @@ Measured on `campaign/p1-0-unified-pipeline-20261106` under Lean `v4.35.0` and `
 
 ## Kernel check
 
-`lake env lean scripts/check_axioms.lean`:
+`LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean`:
 
 ```
 Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms).
 ```
 
-38 `LeanAV/*.lean` modules, 87,081 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
+38 `LeanAV/*.lean` modules, 87,100 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
 
 ## Tight specifications
 

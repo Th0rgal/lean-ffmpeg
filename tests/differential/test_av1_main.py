@@ -777,7 +777,7 @@ class TestAv1Main(unittest.TestCase):
                 self.assertEqual(probe["frames"], nf)
 
     def test_lffmpeg_encode_to_ffmpeg_and_ffprobe_parity(self):
-        if not libaom_av1_available():
+        if not av1_decoder_available():
             self.skipTest("ffmpeg unavailable")
         has_ffprobe = ffprobe_available()
         cases = [

@@ -80,8 +80,8 @@ Every formal module must pass `turbo-lean --json audit-spec` with zero vacuous, 
 
 A branch is accepted only after passing:
 
-- `lake build` and `turbo-lean --json audit-spec`;
-- `lake env lean scripts/check_axioms.lean` (`0 sorryAx`, `0` custom axioms);
+- `python3 scripts/build_turbo.py` and `turbo-lean --json audit-spec`;
+- `LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean` (`0 sorryAx`, `0` custom axioms);
 - `turbo-lean native-validate-tv` and `turbo-lean native-verify-certs` for `LNIR_WIRE_V1` kernels;
 - differential tests against the pinned FFmpeg build;
 - adversarial corpus and boundary checks for native FFI surfaces;

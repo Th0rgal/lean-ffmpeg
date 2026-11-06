@@ -201,6 +201,56 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(hashlib.sha256(out1.read_bytes()).digest(), hashlib.sha256(out2.read_bytes()).digest())
 
+    def test_prores_pixel_psnr_against_ffmpeg(self):
+        if not _ffmpeg_usable():
+            self.skipTest("ffmpeg unavailable")
+        w, h = 64, 48
+        patterns = {
+            "constant": bytes([140] * (w * h)) + bytes([110] * (w * h // 4)) + bytes([150] * (w * h // 4)),
+            "gradient": bytes((x * 2 + y * 2) for y in range(h) for x in range(w))
+            + bytes((80 + x + y) for y in range(h // 2) for x in range(w // 2))
+            + bytes((160 - x) for y in range(h // 2) for x in range(w // 2)),
+            "high_freq": bytes((200 if ((x // 2 + y // 2) & 1) == 0 else 56) for y in range(h) for x in range(w))
+            + bytes((170 if ((x // 2 + y // 2) & 1) == 0 else 90) for y in range(h // 2) for x in range(w // 2))
+            + bytes((70 if ((x // 2 + y // 2) & 1) == 0 else 150) for y in range(h // 2) for x in range(w // 2)),
+        }
+        for name, raw in patterns.items():
+            with self.subTest(pattern=name):
+                src = self.fixture_dir / f"prores_{name}.yuv"
+                src.write_bytes(raw)
+                lean = self.fixture_dir / f"prores_{name}.mov"
+                res = subprocess.run(
+                    [str(BINARY), "-json", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+                     "-i", str(src), "-frames:v", "1", "-c:v", "prores", str(lean)],
+                    capture_output=True, text=True, env=ISO_ENV, check=False,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                ff = _decode_yuv(lean)
+                self.assertGreaterEqual(_psnr(raw, ff), 40.0)
+                back = self.fixture_dir / f"prores_{name}_back.yuv"
+                res = subprocess.run(
+                    [str(BINARY), "-json", "-y", "-i", str(lean), "-f", "rawvideo", str(back)],
+                    capture_output=True, text=True, env=ISO_ENV, check=False,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertGreaterEqual(_psnr(ff, back.read_bytes()), 40.0)
+                for enc in ("prores_ks", "prores_aw"):
+                    oracle = self.fixture_dir / f"prores_{name}_{enc}.mov"
+                    subprocess.run(
+                        [str(FFMPEG), "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+                         "-s", f"{w}x{h}", "-r", "25", "-i", str(src), "-frames:v", "1",
+                         "-c:v", enc, "-profile:v", "2", "-pix_fmt", "yuv422p10le", str(oracle)],
+                        check=True, capture_output=True,
+                    )
+                    ref = _decode_yuv(oracle)
+                    decoded = self.fixture_dir / f"prores_{name}_{enc}.yuv"
+                    res = subprocess.run(
+                        [str(BINARY), "-json", "-y", "-i", str(oracle), "-f", "rawvideo", str(decoded)],
+                        capture_output=True, text=True, env=ISO_ENV, check=False,
+                    )
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    self.assertGreaterEqual(_psnr(ref, decoded.read_bytes()), 40.0)
+
 
 if __name__ == "__main__":
     unittest.main()

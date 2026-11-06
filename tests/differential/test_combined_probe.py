@@ -1,5 +1,6 @@
 """Pure moov HDR/fps probe: no external process, malformed boxes stay closed."""
 from pathlib import Path
+import os
 import shutil
 import struct
 import subprocess
@@ -10,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def lean_runner():
-    lake = shutil.which("lake") or "lake"
-    lean = subprocess.run([lake, "env", "which", "lean"], cwd=ROOT, check=True,
-                          capture_output=True, text=True, timeout=30).stdout.strip()
-    lean_path = subprocess.run([lake, "env", "printenv", "LEAN_PATH"], cwd=ROOT, check=True,
-                               capture_output=True, text=True, timeout=30).stdout.strip()
+    lean = shutil.which("lean") or "lean"
+    lean_path = os.pathsep.join([
+        str(ROOT / ".lake" / "build" / "lib" / "lean"),
+        str(ROOT.parent / "lean-sys" / ".lake" / "build" / "lib" / "lean"),
+    ])
     return lean, {"PATH": "/nonexistent", "LEAN_PATH": lean_path}
 
 
