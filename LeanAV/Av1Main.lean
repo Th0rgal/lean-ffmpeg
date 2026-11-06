@@ -14563,4 +14563,47 @@ def encodeAv1FromYuv420p (width height : Nat) (yuv : ByteArray) (qidx : Nat := 6
     return some (av1MuxIvf width height ivfSamples)
   return none
 
+/-- Encode planar `yuv420p` frames to an `av1C` decoder configuration record and per-frame
+ISOBMFF sample payloads (`seqHdrObu ++ frameObu` on keyframe `0`, `frameObu` thereafter). -/
+def encodeAv1Mp4TrackPayloads (width height : Nat) (yuv : ByteArray) (qidx : Nat := 60)
+    (tilesLog2Cols : Nat := 0) (tilesLog2Rows : Nat := 0) :
+    Option (ByteArray × Array (ByteArray × Bool)) := Id.run do
+  let frameBytes := (width * height * 3) / 2
+  if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 ||
+     frameBytes == 0 || yuv.size == 0 || yuv.size % frameBytes != 0 then
+    return none
+  let nFrames := yuv.size / frameBytes
+  let qClamped := Nat.min qidx 255
+  let lossless := qClamped == 0
+  let enableCdef := !lossless
+  let lfLevel := if lossless then 0 else 8
+  let seqHdrObu := av1WriteSeqHdrObu width height enableCdef false
+  let some seq0 := av1ParseSeqHdr (seqHdrObu.extract 2 seqHdrObu.size) | return none
+  if !seq0.isMain8Bit420 then return none
+  let cfg : Av1EncoderCfg := {
+    width := width, height := height, qidx := qClamped, lossless := lossless,
+    tilesLog2Cols := tilesLog2Cols, tilesLog2Rows := tilesLog2Rows,
+    enableCdef := enableCdef, lfLevel := lfLevel,
+    seqHdrObu := seqHdrObu, seq := seq0
+  }
+  let cw := (width + 1) >>> 1
+  let ch := (height + 1) >>> 1
+  let ySize := width * height
+  let uvSize := cw * ch
+  let mut refs : Array (Option Av1RefSlot) := Array.replicate 8 none
+  let mut samples : Array (ByteArray × Bool) := Array.mkEmpty nFrames
+  for f in [:nFrames] do
+    let base := f * frameBytes
+    let mut yArr : Array Nat := Array.mkEmpty ySize
+    for i in [:ySize] do yArr := yArr.push ((yuv.get! (base + i)).toNat)
+    let mut uArr : Array Nat := Array.mkEmpty uvSize
+    for i in [:uvSize] do uArr := uArr.push ((yuv.get! (base + ySize + i)).toNat)
+    let mut vArr : Array Nat := Array.mkEmpty uvSize
+    for i in [:uvSize] do vArr := vArr.push ((yuv.get! (base + ySize + uvSize + i)).toNat)
+    let some (frameObu, refs1) := av1EncFrame cfg yArr uArr vArr refs f | return none
+    refs := refs1
+    let seqPart := if f == 0 then seqHdrObu else ByteArray.empty
+    samples := samples.push (seqPart ++ frameObu, f == 0)
+  return some (av1BuildAv1C seqHdrObu seq0, samples)
+
 end LeanAV.Av1Main

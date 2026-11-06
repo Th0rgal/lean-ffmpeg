@@ -122,20 +122,26 @@ class InprocTranscodeRoutingTests(unittest.TestCase):
                 self.assertEqual(plan["backend"]["tier"], "independent_verified")
                 self.assertFalse(plan["backend"]["delegated_container"])
                 self.assertFalse(plan["backend"]["fallback_allowed"])
-                self.assertEqual(plan["backend"]["reasons"], ["inproc_h264_aac_mp4_transcode"])
+                self.assertEqual(plan["backend"]["reasons"], ["unified_media_pipeline"])
 
-    def test_hevc_av1_10bit_444_and_aac_fixed_stay_off_inproc_route_and_fail_closed(self):
+    def test_hevc_av1_promote_while_10bit_444_and_aac_fixed_fail_closed(self):
         out = self.root / "out.mp4"
         for codec in ("hevc", "av1"):
+            out.unlink(missing_ok=True)
             res, plan = self.plan(["-i", str(self.valid_mp4), "-c:v", codec, str(out)])
             self.assertEqual(res.returncode, 0)
-            self.assertEqual(plan["backend"]["tier"], "translated_partial")
+            self.assertEqual(plan["backend"]["tier"], "independent_verified")
+            self.assertEqual(plan["backend"]["reasons"], ["unified_media_pipeline"])
             run_res = subprocess.run(
                 [str(BINARY), "-json", "-y", "-i", str(self.valid_mp4), "-c:v", codec, str(out)],
                 env=ISO_ENV, capture_output=True, text=True, check=False,
             )
-            self.assertNotEqual(run_res.returncode, 0)
-            self.assertFalse(out.exists())
+            self.assertEqual(run_res.returncode, 0, run_res.stderr or run_res.stdout)
+            doc = json.loads(run_res.stdout.strip())
+            self.assertTrue(doc["ok"])
+            self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
+            self.assertTrue(out.is_file() and out.stat().st_size > 64)
+            out.unlink()
         for pix in ("yuv420p10le", "p010le"):
             res, plan = self.plan(["-i", str(self.valid_mp4), "-c:v", "h264", "-pix_fmt", pix, str(out)])
             self.assertEqual(res.returncode, 0)
@@ -176,10 +182,85 @@ class InprocTranscodeRoutingTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         doc = json.loads(res.stdout.strip())
         self.assertTrue(doc["ok"])
-        self.assertEqual(doc["mode"], "ffmpeg-cli-inproc-h264-aac-mp4")
+        self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
         self.assertEqual(doc["tier"], "independent_verified")
         self.assertFalse(self.log.exists(), "in-process transcode must never invoke any external ffmpeg binary")
         self.assertTrue(out.is_file() and out.stat().st_size > 64)
+
+    def test_multi_input_raw_hstack_is_byte_exact_and_reports_filtered_frame_count(self):
+        left = self.root / "left.yuv"
+        right = self.root / "right.yuv"
+        left.write_bytes(bytes([16, 17, 18, 19, 90, 140]) * 2)
+        right.write_bytes(bytes([32, 33, 34, 35, 100, 150]) * 2)
+        out = self.root / "stacked.yuv"
+        args = [
+            "-f", "rawvideo", "-s", "2x2", "-i", str(left),
+            "-f", "rawvideo", "-s", "2x2", "-i", str(right),
+            "-filter_complex", "[0:v:0][1:v:0]hstack=inputs=2[v]",
+            "-map", "[v]", "-frames:v", "1", "-f", "rawvideo", str(out),
+        ]
+        res = subprocess.run([str(BINARY), "-json", "-y", *args], env=ISO_ENV,
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        doc = json.loads(res.stdout)
+        self.assertEqual(doc["frames"], 1)
+        self.assertEqual(doc["out_bytes"], 12)
+        self.assertEqual(out.read_bytes(), bytes([16, 17, 32, 33, 18, 19, 34, 35, 90, 100, 140, 150]))
+
+    def test_multi_input_filter_complex_and_new_routes_execute_and_fail_closed_before_overwrite(self):
+        out = self.root / "stacked.mp4"
+        args = [
+            "-i", str(self.valid_mp4),
+            "-i", str(self.valid_mp4),
+            "-filter_complex", "[0:v][1:v]hstack=inputs=2[v];[0:a][1:a]amix=inputs=2[a]",
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "h264", "-c:a", "aac",
+            str(out),
+        ]
+        res, plan = self.plan(args)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(plan["backend"]["tier"], "independent_verified")
+        self.assertEqual(plan["backend"]["reasons"], ["unified_media_pipeline"])
+        run_res = subprocess.run([str(BINARY), "-json", "-y", *args], env=ISO_ENV,
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(run_res.returncode, 0, run_res.stderr or run_res.stdout)
+        doc = json.loads(run_res.stdout.strip())
+        self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
+        self.assertTrue(out.is_file() and out.stat().st_size > 64)
+
+        ogg = self.root / "audio.ogg"
+        prores = self.root / "video_prores.mov"
+        ts = self.root / "program.ts"
+        for target, extra in (
+            (ogg, ["-vn", "-c:a", "opus"]),
+            (prores, ["-an", "-c:v", "prores"]),
+            (ts, ["-c:v", "h264", "-c:a", "aac"]),
+        ):
+            r = subprocess.run([str(BINARY), "-json", "-y", "-i", str(self.valid_mp4), *extra, str(target)],
+                               env=ISO_ENV, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+            rt = self.root / f"rt_{target.stem}.mp4"
+            extra_rt = ["-c:a", "aac"] if target == ogg else ["-c:v", "h264"]
+            r2 = subprocess.run([str(BINARY), "-json", "-y", "-i", str(target), *extra_rt, str(rt)],
+                                env=ISO_ENV, capture_output=True, text=True, check=False)
+            self.assertEqual(r2.returncode, 0, r2.stderr or r2.stdout)
+            self.assertTrue(rt.is_file() and rt.stat().st_size > 64)
+
+        sentinel = self.root / "existing.mp4"
+        sentinel.write_bytes(b"SENTINEL")
+        for bad in (
+            ["-i", str(self.valid_mp4), "-filter_complex", "[0:v]split=2[v1][v2]", "-map", "[v1]", "-map", "[v2]", "-c:v", "h264", str(sentinel)],
+            ["-i", str(self.valid_mp4), "-filter_complex", "[0:v]null[v]", "-map", "[missing]", "-c:v", "h264", str(sentinel)],
+            ["-i", str(self.valid_mp4), "-filter_complex", "[0:v][0:v:0]hstack=inputs=2[v]", "-map", "[v]", "-c:v", "h264", str(sentinel)],
+        ):
+            bad_res = subprocess.run([str(BINARY), *bad], env=ISO_ENV,
+                                     capture_output=True, text=True, check=False)
+            self.assertNotEqual(bad_res.returncode, 0, (bad, bad_res.stdout, bad_res.stderr))
+            self.assertNotIn("Not overwriting", bad_res.stderr + bad_res.stdout)
+            self.assertEqual(sentinel.read_bytes(), b"SENTINEL")
+        res_s, plan_s = self.plan(["-i", str(self.valid_mp4), "-s", "32x32", "-c:v", "h264", str(out)])
+        self.assertEqual(res_s.returncode, 0)
+        self.assertNotEqual(plan_s["backend"]["reasons"], ["unified_media_pipeline"])
 
 
 if __name__ == "__main__":

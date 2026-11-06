@@ -3928,4 +3928,543 @@ theorem pngDownscale16To8_and_trns_verified :
       some [0, 1] := by
   decide
 
+/-! ## P1.0 Apple ProRes (`icpf`, `apcn`/`apch`/`apcs`/`apco`) Frame & Slice VLC Decode / Encode -/
+
+def proresProgressiveScan : Array Nat := #[
+   0,  1,  8,  9,  2,  3, 10, 11,
+  16, 17, 24, 25, 18, 19, 26, 27,
+   4,  5, 12, 13, 20, 21, 28, 29,
+   6,  7, 14, 15, 22, 23, 30, 31,
+  32, 33, 40, 41, 34, 35, 42, 43,
+  48, 49, 56, 57, 50, 51, 58, 59,
+  36, 37, 44, 45, 52, 53, 60, 61,
+  38, 39, 46, 47, 54, 55, 62, 63
+]
+
+def proresDcCodebook : Array UInt8 := #[0x04, 0x28, 0x28, 0x4D, 0x4D, 0x70, 0x70]
+
+def proresRunCodebook : Array UInt8 := #[
+  0x06, 0x06, 0x05, 0x05, 0x04, 0x29, 0x29, 0x29,
+  0x29, 0x28, 0x28, 0x28, 0x28, 0x28, 0x28, 0x4C
+]
+
+def proresLevCodebook : Array UInt8 := #[
+  0x04, 0x0A, 0x05, 0x06, 0x04, 0x28, 0x28, 0x28, 0x28, 0x4C
+]
+
+def proresFrameDimsValid (w h : Nat) : Bool :=
+  0 < w && w ≤ 8192 && 0 < h && h ≤ 8192 && w % 2 == 0 && h % 2 == 0
+
+def ProResFrameDimsSafe (p : Nat × Nat) : Prop :=
+  0 < p.1 ∧ p.1 ≤ 8192 ∧ 0 < p.2 ∧ p.2 ≤ 8192 ∧ p.1 % 2 = 0 ∧ p.2 % 2 = 0
+
+instance (p : Nat × Nat) : Decidable (ProResFrameDimsSafe p) :=
+  inferInstanceAs (Decidable (0 < p.1 ∧ p.1 ≤ 8192 ∧ 0 < p.2 ∧ p.2 ≤ 8192 ∧ p.1 % 2 = 0 ∧ p.2 % 2 = 0))
+
+def proresFrameDimsGateSpec : AVGateSpec (Nat × Nat) ProResFrameDimsSafe where
+  gate p := decide (ProResFrameDimsSafe p)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := (64, 64)
+  negWitness := (63, 64)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem proresFrameDimsGateSpec_iff (p : Nat × Nat) :
+    proresFrameDimsGateSpec.gate p = true ↔ ProResFrameDimsSafe p :=
+  proresFrameDimsGateSpec.iff_safe p
+
+/-- Decode one ProRes hybrid Rice/Exp-Golomb unsigned codeword (`decode_vlc_codeword` in FFmpeg `proresdec.c`). -/
+def proresReadCodeword (r : BitReader) (codebook : UInt8) : Option (Nat × BitReader) := do
+  let riceOrder := (codebook >>> 5).toNat
+  let expOrder := ((codebook >>> 2) &&& 7).toNat
+  let switchBits := (codebook &&& 3).toNat
+  let (q, r1) ← r.readUnary0 64
+  if q ≤ switchBits then
+    let (rem, r2) ← r1.readBitsMSB riceOrder
+    some ((q <<< riceOrder) ||| rem.toNat, r2)
+  else
+    let bits := expOrder + q * 2 - (switchBits + 1)
+    if bits > 30 then none
+    else
+      let (val, r2) ← r1.readBitsMSB bits
+      let offset := ((switchBits + 1) <<< riceOrder)
+      let raw := ((1 <<< bits) ||| val.toNat) - (1 <<< expOrder) + offset
+      some (raw, r2)
+
+/-- Encode one ProRes hybrid Rice/Exp-Golomb unsigned codeword (exact inverse of `proresReadCodeword`). -/
+def proresWriteCodeword (w : BitWriter) (codebook : UInt8) (val : Nat) : BitWriter :=
+  let riceOrder := (codebook >>> 5).toNat
+  let expOrder := ((codebook >>> 2) &&& 7).toNat
+  let switchBits := (codebook &&& 3).toNat
+  let switchThreshold := (switchBits + 1) <<< riceOrder
+  if val < switchThreshold then
+    let q := val >>> riceOrder
+    let rem := val &&& ((1 <<< riceOrder) - 1)
+    let w1 := w.writeUnary0 q
+    w1.writeBitsMSB rem.toUInt64 riceOrder
+  else
+    let adj := val - switchThreshold + (1 <<< expOrder)
+    let rec bitLen (fuel tmp acc : Nat) : Nat :=
+      match fuel with
+      | 0 => acc
+      | f + 1 => if tmp <= 1 then acc else bitLen f (tmp >>> 1) (acc + 1)
+    let bits := bitLen 32 adj 0
+    let q := (bits + switchBits + 1 - expOrder) / 2
+    let effBits := expOrder + q * 2 - (switchBits + 1)
+    let suffix := adj - (1 <<< effBits)
+    let w1 := w.writeUnary0 q
+    w1.writeBitsMSB suffix.toUInt64 effBits
+
+@[inline]
+def proresUnsignedToSigned (u : Nat) : Int32 :=
+  let mag := ((u + 1) >>> 1)
+  if (u &&& 1) == 1 then -(Int32.ofNat mag) else Int32.ofNat mag
+
+@[inline]
+def proresSignedToUnsigned (v : Int32) : Nat :=
+  if v == 0 then 0
+  else if v < 0 then 2 * v.toInt.natAbs - 1
+  else 2 * v.toInt.natAbs
+
+@[inline]
+def proresDiffSign (v : Int32) : Int32 :=
+  if v < 0 then -1 else 1
+
+def proresDecodeDcCoeffs (r0 : BitReader) (blocksPerSlice : Nat) : Option (Array Int32 × BitReader) := Id.run do
+  if blocksPerSlice == 0 then return some (#[], r0)
+  let mut out : Array Int32 := Array.replicate (blocksPerSlice * 64) 0
+  let some (code0, r1) := proresReadCodeword r0 0xB8 | return none
+  let mut prevDc : Int32 := proresUnsignedToSigned code0
+  out := out.set! 0 prevDc
+  let mut r := r1
+  let mut code : Nat := 5
+  let mut sign : Int32 := 0
+  for i in [1:blocksPerSlice] do
+    let cb := proresDcCodebook.getD (Nat.min 6 code) 0x70
+    let some (cw, rNext) := proresReadCodeword r cb | return none
+    r := rNext
+    code := cw
+    if cw != 0 then
+      sign := sign ^^^ proresDiffSign (proresUnsignedToSigned cw)
+    else
+      sign := 0
+    let mag : Int32 := Int32.ofNat ((cw + 1) >>> 1)
+    let delta : Int32 := if sign < 0 then -mag else mag
+    prevDc := prevDc + delta
+    out := out.set! (i * 64) prevDc
+  return some (out, r)
+
+def proresEncodeDcCoeffs (w0 : BitWriter) (blocksPerSlice : Nat) (coeffs : Array Int32) : BitWriter := Id.run do
+  if blocksPerSlice == 0 then return w0
+  let dc0 := coeffs.getD 0 0
+  let mut w := proresWriteCodeword w0 0xB8 (proresSignedToUnsigned dc0)
+  let mut prevDc : Int32 := dc0
+  let mut code : Nat := 5
+  let mut sign : Int32 := 0
+  for i in [1:blocksPerSlice] do
+    let curDc := coeffs.getD (i * 64) 0
+    let delta := curDc - prevDc
+    prevDc := curDc
+    let cb := proresDcCodebook.getD (Nat.min 6 code) 0x70
+    if delta == 0 then
+      w := proresWriteCodeword w cb 0
+      code := 0
+      sign := 0
+    else
+      let newSign : Int32 := if delta < 0 then -1 else 1
+      let diffSignVal : Int32 := sign ^^^ newSign
+      let mag := delta.toInt.natAbs
+      let cw : Nat := if diffSignVal < 0 then 2 * mag - 1 else 2 * mag
+      w := proresWriteCodeword w cb cw
+      code := cw
+      sign := newSign
+  return w
+
+def proresDecodeAcCoeffs (r0 : BitReader) (blocksPerSlice : Nat) (coeffs0 : Array Int32) : Array Int32 := Id.run do
+  if blocksPerSlice == 0 then return coeffs0
+  let mut out := coeffs0
+  let blockMask := blocksPerSlice - 1
+  let mut log2Blk : Nat := 0
+  let mut tmp := blocksPerSlice
+  while tmp > 1 do
+    log2Blk := log2Blk + 1
+    tmp := tmp >>> 1
+  let maxCoeffs := 64 <<< log2Blk
+  let mut pos : Nat := blocksPerSlice - 1
+  let mut run : Nat := 4
+  let mut lev : Nat := 2
+  let mut r := r0
+  let mut fuel := maxCoeffs + 4
+  while fuel > 0 && r.bitsLeft > 0 do
+    fuel := fuel - 1
+    let remBits := r.bitsLeft
+    if remBits < 32 then
+      if let some (peek, _) := r.readBitsMSB remBits then
+        if peek == 0 then break
+    let runCb := proresRunCodebook.getD (Nat.min 15 run) 0x4C
+    let some (runVal, r1) := proresReadCodeword r runCb | break
+    run := runVal
+    pos := pos + runVal + 1
+    if pos ≥ maxCoeffs then break
+    let levCb := proresLevCodebook.getD (Nat.min 9 lev) 0x4C
+    let some (levMinus1, r2) := proresReadCodeword r1 levCb | break
+    lev := levMinus1 + 1
+    let some (signBit, r3) := r2.readBit | break
+    r := r3
+    let val : Int32 := if signBit == 1 then -(Int32.ofNat lev) else Int32.ofNat lev
+    let blkIdx := pos &&& blockMask
+    let scanIdx := pos >>> log2Blk
+    let coeffIdx := proresProgressiveScan.getD scanIdx 0
+    let flatIdx := blkIdx * 64 + coeffIdx
+    if flatIdx < out.size then
+      out := out.set! flatIdx val
+  return out
+
+def proresEncodeAcCoeffs (w0 : BitWriter) (blocksPerSlice : Nat) (coeffs : Array Int32) : BitWriter := Id.run do
+  if blocksPerSlice == 0 then return w0
+  let mut log2Blk : Nat := 0
+  let mut tmp := blocksPerSlice
+  while tmp > 1 do
+    log2Blk := log2Blk + 1
+    tmp := tmp >>> 1
+  let mut w := w0
+  let mut prevPos : Nat := blocksPerSlice - 1
+  let mut run : Nat := 4
+  let mut lev : Nat := 2
+  for scanIdx in [1:64] do
+    let coeffIdx := proresProgressiveScan.getD scanIdx 0
+    for blkIdx in [:blocksPerSlice] do
+      let pos := (scanIdx <<< log2Blk) + blkIdx
+      let v := coeffs.getD (blkIdx * 64 + coeffIdx) 0
+      if v != 0 then
+        let runVal := pos - prevPos - 1
+        prevPos := pos
+        let runCb := proresRunCodebook.getD (Nat.min 15 run) 0x4C
+        w := proresWriteCodeword w runCb runVal
+        run := runVal
+        let absV := v.toInt.natAbs
+        let levCb := proresLevCodebook.getD (Nat.min 9 lev) 0x4C
+        w := proresWriteCodeword w levCb (absV - 1)
+        lev := absV
+        w := w.writeBit (if v < 0 then 1 else 0)
+  return w
+
+/-- Forward 8x8 DCT matched to `proresIdct8x8Put10Fast` (with `qmat` division). -/
+private def proresFdct1D8 (x0 x1 x2 x3 x4 x5 x6 x7 : Int64) : Array Int64 :=
+  let c1 : Int64 := 22725
+  let c2 : Int64 := 21407
+  let c3 : Int64 := 19265
+  let c4 : Int64 := 16384
+  let c5 : Int64 := 12873
+  let c6 : Int64 := 8867
+  let c7 : Int64 := 4520
+  let s07 := x0 + x7
+  let d07 := x0 - x7
+  let s16 := x1 + x6
+  let d16 := x1 - x6
+  let s25 := x2 + x5
+  let d25 := x2 - x5
+  let s34 := x3 + x4
+  let d34 := x3 - x4
+  let e0 := s07 + s34
+  let e1 := s16 + s25
+  let e2 := s07 - s34
+  let e3 := s16 - s25
+  let y0 := c4 * (e0 + e1)
+  let y4 := c4 * (e0 - e1)
+  let y2 := c2 * e2 + c6 * e3
+  let y6 := c6 * e2 - c2 * e3
+  let y1 := c1 * d07 + c3 * d16 + c5 * d25 + c7 * d34
+  let y3 := c3 * d07 - c7 * d16 - c1 * d25 - c5 * d34
+  let y5 := c5 * d07 - c1 * d16 + c7 * d25 + c3 * d34
+  let y7 := c7 * d07 - c5 * d16 + c3 * d25 - c1 * d34
+  #[y0 >>> 14, y1 >>> 14, y2 >>> 14, y3 >>> 14, y4 >>> 14, y5 >>> 14, y6 >>> 14, y7 >>> 14]
+
+def proresFdct8x8Quant10 (pix64 : Array UInt16) (qmat64 : Array Int32) : Array Int32 := Id.run do
+  -- `proresIdct8x8Put10` adds midpoint `512` (`8192` in `c0Biased`) and scales by `1/8` overall on `dequant`;
+  -- subtract `512` from each 10-bit pixel so `DC` is centered around 0!
+  let mut rows : Array Int64 := Array.mkEmpty 64
+  for r in [:8] do
+    let b := r * 8
+    let rowOut := proresFdct1D8
+      ((pix64.getD b 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 1) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 2) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 3) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 4) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 5) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 6) 512).toNat.toInt64 - 512)
+      ((pix64.getD (b + 7) 512).toNat.toInt64 - 512)
+    for v in rowOut do
+      rows := rows.push v
+  let mut dct : Array Int64 := Array.replicate 64 0
+  for c in [:8] do
+    let colOut := proresFdct1D8
+      (rows.getD c 0) (rows.getD (c + 8) 0) (rows.getD (c + 16) 0) (rows.getD (c + 24) 0)
+      (rows.getD (c + 32) 0) (rows.getD (c + 40) 0) (rows.getD (c + 48) 0) (rows.getD (c + 56) 0)
+    for r in [:8] do
+      dct := dct.set! (r * 8 + c) (colOut.getD r 0)
+  let mut out : Array Int32 := Array.mkEmpty 64
+  for i in [:64] do
+    let q := Int64.ofInt (Nat.max 1 (qmat64.getD i 4).toInt.natAbs : Int)
+    -- `proresIdct8x8Put10` computes `(1/8) * IDCT_orthonormal(c * q)` where `proresFdct1D8^2` has gain `8 * IDCT^-1`,
+    -- so `dct[i]` matches `dequant[i]` directly (`q * c ≈ dct[i]`)!
+    let raw := dct.getD i 0
+    let rounded := if raw >= 0 then (raw + q / 2) / q else -((-raw + q / 2) / q)
+    out := out.push rounded.toInt32
+  return out
+
+private def proresQScaleFromIndex (qIdx : Nat) : Int32 :=
+  if qIdx == 0 then 1
+  else if qIdx ≤ 128 then Int32.ofNat qIdx
+  else Int32.ofNat (128 + ((qIdx - 128) <<< 2))
+
+/-- Decode an Apple ProRes (`icpf`) frame buffer into an 8-bit `YUV420P` `VideoFrame` (downsampling 4:2:2/4:4:4 10-bit to 8-bit 4:2:0). -/
+def decodeProResFrameToYuv420p (s : ByteSlice) (pts : UInt64 := 0) : Option VideoFrame := Id.run do
+  let some hdr := parseProResFrameHeader s | return none
+  let w := hdr.width.toNat
+  let h := hdr.height.toNat
+  if !proresFrameDimsGateSpec.gate (w, h) then return none
+  let hdrBytes := hdr.headerSize.toNat
+  if 8 + hdrBytes + 8 > s.len then return none
+  let mut lumaQmat : Array Int32 := Array.replicate 64 4
+  let mut chromaQmat : Array Int32 := Array.replicate 64 4
+  let mut qOff := 28
+  if hdr.loadLumaQmat && qOff + 64 ≤ 8 + hdrBytes then
+    for i in [:64] do
+      let zigIdx := proresProgressiveScan.getD i i
+      lumaQmat := lumaQmat.set! zigIdx (Int32.ofNat (Nat.max 1 (sliceByteD s (qOff + i)).toNat))
+    qOff := qOff + 64
+  if hdr.loadChromaQmat && qOff + 64 ≤ 8 + hdrBytes then
+    for i in [:64] do
+      let zigIdx := proresProgressiveScan.getD i i
+      chromaQmat := chromaQmat.set! zigIdx (Int32.ofNat (Nat.max 1 (sliceByteD s (qOff + i)).toNat))
+  else
+    chromaQmat := lumaQmat
+  -- Picture header begins at `8 + hdrBytes`
+  let picOff := 8 + hdrBytes
+  let picHdrBits := sliceByteD s picOff
+  let picHdrLen := (picHdrBits >>> 3).toNat
+  if picHdrLen < 8 || picOff + picHdrLen > s.len then return none
+  let numSlices := ((sliceByteD s (picOff + 5)).toNat <<< 8) ||| (sliceByteD s (picOff + 6)).toNat
+  let log2SliceMbW := ((sliceByteD s (picOff + 7)) >>> 4).toNat
+  if numSlices == 0 || log2SliceMbW > 3 || picOff + picHdrLen + numSlices * 2 > s.len then return none
+  let mbWidth := (w + 15) / 16
+  let mbHeight := (h + 15) / 16
+  let is444 := hdr.chromaFormat == 3
+  -- Allocate 10-bit working buffers (`wAligned * hAligned`)
+  let wAl := mbWidth * 16
+  let hAl := mbHeight * 16
+  let cwAl := if is444 then wAl else mbWidth * 8
+  let mut y10 : Array UInt16 := Array.replicate (wAl * hAl) 512
+  let mut u10 : Array UInt16 := Array.replicate (cwAl * hAl) 512
+  let mut v10 : Array UInt16 := Array.replicate (cwAl * hAl) 512
+  -- Walk slice index table and decode slices across MB rows
+  let idxTableOff := picOff + picHdrLen
+  let mut sliceDataOff := idxTableOff + numSlices * 2
+  let mut sliceIdx := 0
+  let mut mbX := 0
+  let mut mbY := 0
+  let mut curSliceMbW := (1 : Nat) <<< log2SliceMbW
+  while sliceIdx < numSlices && mbY < mbHeight do
+    while curSliceMbW > mbWidth - mbX && curSliceMbW > 1 do
+      curSliceMbW := curSliceMbW >>> 1
+    let sliceBytes := ((sliceByteD s (idxTableOff + sliceIdx * 2)).toNat <<< 8) |||
+                      (sliceByteD s (idxTableOff + sliceIdx * 2 + 1)).toNat
+    if sliceBytes < 6 || sliceDataOff + sliceBytes > s.len then return none
+    let some slSlice := s.subSlice? sliceDataOff sliceBytes | return none
+    let slHdrLen := ((slSlice.getByteD 0 0) >>> 3).toNat
+    if slHdrLen < 6 || slHdrLen > sliceBytes then return none
+    let qIdx := (slSlice.getByteD 1 1).toNat
+    let qScale := proresQScaleFromIndex qIdx
+    let yBytes := ((slSlice.getByteD 2 0).toNat <<< 8) ||| (slSlice.getByteD 3 0).toNat
+    let uBytes := ((slSlice.getByteD 4 0).toNat <<< 8) ||| (slSlice.getByteD 5 0).toNat
+    if slHdrLen + yBytes + uBytes > sliceBytes then return none
+    let vBytes := sliceBytes - slHdrLen - yBytes - uBytes
+    let some ySl := slSlice.subSlice? slHdrLen yBytes | return none
+    let some uSl := slSlice.subSlice? (slHdrLen + yBytes) uBytes | return none
+    let some vSl := slSlice.subSlice? (slHdrLen + yBytes + uBytes) vBytes | return none
+    let qLuma := lumaQmat.map (fun q => let s := (q * qScale) >>> 2; if s < 1 then (1 : Int32) else s)
+    let qChroma := chromaQmat.map (fun q => let s := (q * qScale) >>> 2; if s < 1 then (1 : Int32) else s)
+    -- Decode Y (`4 * curSliceMbW` 8x8 blocks)
+    let yBlocks := 4 * curSliceMbW
+    if let some (yDc, rY) := proresDecodeDcCoeffs (BitReader.ofSlice ySl) yBlocks then
+      let yCoeffs := proresDecodeAcCoeffs rY yBlocks yDc
+      for m in [:curSliceMbW] do
+        for sub in [:4] do
+          let blkIdx := m * 4 + sub
+          let subCoeffs := yCoeffs.extract (blkIdx * 64) ((blkIdx + 1) * 64)
+          let blkPx := proresIdct8x8Put10Fast subCoeffs qLuma
+          let bx := (mbX + m) * 16 + (sub % 2) * 8
+          let by0 := mbY * 16 + (sub / 2) * 8
+          for r in [:8] do
+            for c in [:8] do
+              let dstIdx := (by0 + r) * wAl + (bx + c)
+              if dstIdx < y10.size then
+                y10 := y10.set! dstIdx (blkPx.getD (r * 8 + c) 512)
+    -- Decode U & V (`2 * curSliceMbW` blocks for 4:2:2, `4 * curSliceMbW` for 4:4:4)
+    let cBlocks := if is444 then 4 * curSliceMbW else 2 * curSliceMbW
+    if let some (uDc, rU) := proresDecodeDcCoeffs (BitReader.ofSlice uSl) cBlocks then
+      let uCoeffs := proresDecodeAcCoeffs rU cBlocks uDc
+      for m in [:curSliceMbW] do
+        let perMb := if is444 then 4 else 2
+        for sub in [:perMb] do
+          let blkIdx := m * perMb + sub
+          let subCoeffs := uCoeffs.extract (blkIdx * 64) ((blkIdx + 1) * 64)
+          let blkPx := proresIdct8x8Put10Fast subCoeffs qChroma
+          let bx := if is444 then (mbX + m) * 16 + (sub % 2) * 8 else (mbX + m) * 8
+          let by0 := if is444 then mbY * 16 + (sub / 2) * 8 else mbY * 16 + sub * 8
+          for r in [:8] do
+            for c in [:8] do
+              let dstIdx := (by0 + r) * cwAl + (bx + c)
+              if dstIdx < u10.size then
+                u10 := u10.set! dstIdx (blkPx.getD (r * 8 + c) 512)
+    if let some (vDc, rV) := proresDecodeDcCoeffs (BitReader.ofSlice vSl) cBlocks then
+      let vCoeffs := proresDecodeAcCoeffs rV cBlocks vDc
+      for m in [:curSliceMbW] do
+        let perMb := if is444 then 4 else 2
+        for sub in [:perMb] do
+          let blkIdx := m * perMb + sub
+          let subCoeffs := vCoeffs.extract (blkIdx * 64) ((blkIdx + 1) * 64)
+          let blkPx := proresIdct8x8Put10Fast subCoeffs qChroma
+          let bx := if is444 then (mbX + m) * 16 + (sub % 2) * 8 else (mbX + m) * 8
+          let by0 := if is444 then mbY * 16 + (sub / 2) * 8 else mbY * 16 + sub * 8
+          for r in [:8] do
+            for c in [:8] do
+              let dstIdx := (by0 + r) * cwAl + (bx + c)
+              if dstIdx < v10.size then
+                v10 := v10.set! dstIdx (blkPx.getD (r * 8 + c) 512)
+    sliceDataOff := sliceDataOff + sliceBytes
+    sliceIdx := sliceIdx + 1
+    mbX := mbX + curSliceMbW
+    if mbX ≥ mbWidth then
+      mbX := 0
+      mbY := mbY + 1
+      curSliceMbW := (1 : Nat) <<< log2SliceMbW
+  -- Convert 10-bit working planes to `YUV420P` 8-bit `VideoFrame`
+  let mut vf := VideoFrame.allocYuv420p w h pts
+  let mut yPlane := vf.planes[0]!
+  let mut uPlane := vf.planes[1]!
+  let mut vPlane := vf.planes[2]!
+  for r in [:h] do
+    for c in [:w] do
+      let p10 := (y10.getD (r * wAl + c) 512).toNat
+      let p8 := Nat.min 255 ((p10 + 2) >>> 2)
+      yPlane := yPlane.setPixel r c p8.toUInt8
+  let cw := w / 2
+  let ch := h / 2
+  for r in [:ch] do
+    for c in [:cw] do
+      let cSrc := if is444 then c * 2 else c
+      let u0 := (u10.getD ((r * 2) * cwAl + cSrc) 512).toNat
+      let u1 := (u10.getD ((r * 2 + 1) * cwAl + cSrc) 512).toNat
+      let v0 := (v10.getD ((r * 2) * cwAl + cSrc) 512).toNat
+      let v1 := (v10.getD ((r * 2 + 1) * cwAl + cSrc) 512).toNat
+      let u8 := Nat.min 255 ((u0 + u1 + 4) >>> 3)
+      let v8 := Nat.min 255 ((v0 + v1 + 4) >>> 3)
+      uPlane := uPlane.setPixel r c u8.toUInt8
+      vPlane := vPlane.setPixel r c v8.toUInt8
+  return some { vf with planes := #[yPlane, uPlane, vPlane] }
+
+/-- Encode an 8-bit `YUV420P` `VideoFrame` into a standard Apple ProRes 422 (`apcn` / `icpf`) frame packet. -/
+def encodeYuv420pToProResFrame (vf : VideoFrame) (qIdx : UInt8 := 4) : Option ByteArray := Id.run do
+  let w := vf.width
+  let h := vf.height
+  if !proresFrameDimsGateSpec.gate (w, h) || vf.planes.size < 3 then return none
+  let yPlane := vf.planes[0]!
+  let uPlane := vf.planes[1]!
+  let vPlane := vf.planes[2]!
+  let mbWidth := (w + 15) / 16
+  let mbHeight := (h + 15) / 16
+  let qScale := proresQScaleFromIndex (Nat.max 1 qIdx.toNat)
+  let baseQmat : Array Int32 := Array.replicate 64 4
+  let effQmat := baseQmat.map (fun q => let s := (q * qScale) >>> 2; if s < 1 then (1 : Int32) else s)
+  -- Encode 1-MB-wide slices (`log2SliceMbW = 0`) so arbitrary `mbWidth` needs zero slice-width halving edge cases
+  let mut slicePayloads : Array ByteArray := Array.mkEmpty (mbWidth * mbHeight)
+  for mbY in [:mbHeight] do
+    for mbX in [:mbWidth] do
+      -- Gather 4 Y 8x8 blocks (64 * 4 coeffs)
+      let mut yCoeffs : Array Int32 := Array.mkEmpty 256
+      for sub in [:4] do
+        let bx := mbX * 16 + (sub % 2) * 8
+        let by0 := mbY * 16 + (sub / 2) * 8
+        let mut blk10 : Array UInt16 := Array.mkEmpty 64
+        for r in [:8] do
+          for c in [:8] do
+            let ry := Nat.min (h - 1) (by0 + r)
+            let cx := Nat.min (w - 1) (bx + c)
+            let p8 := (yPlane.getPixel ry cx).toNat
+            blk10 := blk10.push (clipProRes10 (Int64.ofInt ((p8 <<< 2) : Int)))
+        yCoeffs := yCoeffs ++ proresFdct8x8Quant10 blk10 effQmat
+      -- Gather 2 U and 2 V 8x8 blocks (4:2:2 upsampled vertically from 4:2:0)
+      let mut uCoeffs : Array Int32 := Array.mkEmpty 128
+      let mut vCoeffs : Array Int32 := Array.mkEmpty 128
+      for sub in [:2] do
+        let bx := mbX * 8
+        let by0 := mbY * 16 + sub * 8
+        let mut uBlk10 : Array UInt16 := Array.mkEmpty 64
+        let mut vBlk10 : Array UInt16 := Array.mkEmpty 64
+        for r in [:8] do
+          for c in [:8] do
+            let ry := Nat.min ((h / 2) - 1) ((by0 + r) / 2)
+            let cx := Nat.min ((w / 2) - 1) (bx + c)
+            let pu8 := (uPlane.getPixel ry cx).toNat
+            let pv8 := (vPlane.getPixel ry cx).toNat
+            uBlk10 := uBlk10.push (clipProRes10 (Int64.ofInt ((pu8 <<< 2) : Int)))
+            vBlk10 := vBlk10.push (clipProRes10 (Int64.ofInt ((pv8 <<< 2) : Int)))
+        uCoeffs := uCoeffs ++ proresFdct8x8Quant10 uBlk10 effQmat
+        vCoeffs := vCoeffs ++ proresFdct8x8Quant10 vBlk10 effQmat
+      let yW := proresEncodeAcCoeffs (proresEncodeDcCoeffs BitWriter.empty 4 yCoeffs) 4 yCoeffs
+      let uW := proresEncodeAcCoeffs (proresEncodeDcCoeffs BitWriter.empty 2 uCoeffs) 2 uCoeffs
+      let vW := proresEncodeAcCoeffs (proresEncodeDcCoeffs BitWriter.empty 2 vCoeffs) 2 vCoeffs
+      let yBytes := yW.toByteArray
+      let uBytes := uW.toByteArray
+      let vBytes := vW.toByteArray
+      let mut slHdr := ByteArray.emptyWithCapacity (6 + yBytes.size + uBytes.size + vBytes.size)
+      slHdr := slHdr.push (0x30 : UInt8) -- hdr_size = 6 bytes (`6 <<< 3`)
+      slHdr := slHdr.push (Nat.max 1 qIdx.toNat).toUInt8
+      slHdr := slHdr.push ((yBytes.size >>> 8) &&& 0xFF).toUInt8 |>.push (yBytes.size &&& 0xFF).toUInt8
+      slHdr := slHdr.push ((uBytes.size >>> 8) &&& 0xFF).toUInt8 |>.push (uBytes.size &&& 0xFF).toUInt8
+      slicePayloads := slicePayloads.push (slHdr ++ yBytes ++ uBytes ++ vBytes)
+  let numSlices := slicePayloads.size
+  let slicesDataBytes := slicePayloads.foldl (fun acc b => acc + b.size) 0
+  let picSize := 8 + numSlices * 2 + slicesDataBytes
+  -- Frame header: 20 bytes base + 128 bytes custom luma+chroma 4-filled qmats = 148 bytes (`0x0094`)
+  let hdrSize : Nat := 148
+  let totalFrameSize := 8 + hdrSize + picSize
+  let mut out := ByteArray.emptyWithCapacity totalFrameSize
+  -- 8-byte `frameSize` + `"icpf"`
+  out := out.push ((totalFrameSize >>> 24) &&& 0xFF).toUInt8
+         |>.push ((totalFrameSize >>> 16) &&& 0xFF).toUInt8
+         |>.push ((totalFrameSize >>> 8) &&& 0xFF).toUInt8
+         |>.push (totalFrameSize &&& 0xFF).toUInt8
+  out := out ++ "icpf".toUTF8
+  -- Frame header (`148` bytes): `[hdrSz(2), ver(2), creator(4)="Lavc", w(2), h(2), flags(1)=0x80(4:2:2), res(1)=0, prim(1)=1, trc(1)=1, col(1)=1, alpha(1)=0, res(1)=0, qflags(1)=0x03, lumaQ(64), chromaQ(64)]`
+  out := out.push 0x00 |>.push 0x94 -- 148
+  out := out.push 0x00 |>.push 0x00 -- version 0
+  out := out ++ "Lavc".toUTF8
+  out := out.push ((w >>> 8) &&& 0xFF).toUInt8 |>.push (w &&& 0xFF).toUInt8
+  out := out.push ((h >>> 8) &&& 0xFF).toUInt8 |>.push (h &&& 0xFF).toUInt8
+  out := out.push 0x80 -- chromaFormat = 2 (4:2:2), progressive
+  out := out.push 0x00 -- reserved
+  out := out.push 0x01 |>.push 0x01 |>.push 0x01 -- BT.709 primaries/trc/matrix
+  out := out.push 0x00 |>.push 0x00 -- no alpha, reserved
+  out := out.push 0x03 -- loadLumaQmat = true, loadChromaQmat = true
+  for _ in [:128] do
+    out := out.push 0x04
+  -- Picture header (8 bytes): `[hdrBits=0x40 (8 bytes), picSize(32b BE), numSlices(16b BE), log2SliceMbW=0x00]`
+  out := out.push 0x40
+  out := out.push ((picSize >>> 24) &&& 0xFF).toUInt8
+         |>.push ((picSize >>> 16) &&& 0xFF).toUInt8
+         |>.push ((picSize >>> 8) &&& 0xFF).toUInt8
+         |>.push (picSize &&& 0xFF).toUInt8
+  out := out.push ((numSlices >>> 8) &&& 0xFF).toUInt8 |>.push (numSlices &&& 0xFF).toUInt8
+  out := out.push 0x00 -- log2_slice_mb_width = 0 (1 MB per slice)
+  for sl in slicePayloads do
+    out := out.push ((sl.size >>> 8) &&& 0xFF).toUInt8 |>.push (sl.size &&& 0xFF).toUInt8
+  for sl in slicePayloads do
+    out := out ++ sl
+  return some out
+
 end LeanAV.Video

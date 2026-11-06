@@ -2070,8 +2070,8 @@ theorem pipelinedEncodeWriteGateSpec_iff (hasEncChild prevWriteOk : Bool) (frame
 
 /--
   Zero-delegation fail-closed general MP4 fallback (`transcodeMp4GeneralVerifiedIO`):
-  In-scope MP4 stream copy (`runNativeStreamCopy`) and in-process H.264 + AAC-LC transcoding
-  (`runInprocH264TranscodeCli`) execute natively without external processes. Out-of-scope MP4
+  In-scope MP4 stream copy (`runNativeStreamCopy`) and unified multi-stream transcoding
+  (`runUnifiedMediaPipelineCli`) execute natively without external processes. Out-of-scope MP4
   codec/profile/filter combinations fail closed (`0`) without spawning or writing output.
 -/
 def transcodeMp4GeneralVerifiedIO

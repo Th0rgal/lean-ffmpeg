@@ -137,7 +137,7 @@ class InprocTranscodeDifferentialTests(unittest.TestCase):
                     out = self.fixture_dir / f"{case}_{tag}.mp4"
                     doc = self._run_inproc(src, out, ["-c:v", "h264", "-crf", "10", *args])
                     self.assertTrue(doc["ok"])
-                    self.assertEqual(doc["mode"], "ffmpeg-cli-inproc-h264-aac-mp4")
+                    self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
                     self.assertEqual(doc["tier"], "independent_verified")
                     probe = subprocess.run(
                         [str(FFPROBE), "-v", "error", "-show_streams", "-of", "json", str(out)],

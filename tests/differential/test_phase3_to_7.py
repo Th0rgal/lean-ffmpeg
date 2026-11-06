@@ -348,7 +348,7 @@ class Phase3To7Tests(unittest.TestCase):
             ])
             self.assertEqual(r_mixed.returncode, 0, r_mixed.stderr)
             mixed_doc = json.loads(r_mixed.stdout.strip())
-            self.assertEqual(mixed_doc["mode"], "ffmpeg-cli-inproc-h264-aac-mp4")
+            self.assertEqual(mixed_doc["mode"], "ffmpeg-cli-unified-pipeline")
             self.assertEqual(mixed_doc["tier"], "independent_verified")
             mixed_probe = self.probe_json(mixed_out)
             v_streams = [s for s in mixed_probe["streams"] if s["codec_type"] == "video"]

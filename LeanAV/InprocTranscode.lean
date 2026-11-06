@@ -2177,4 +2177,231 @@ def inprocTranscodeMp4FileIO
   | .ok digest => return .ok digest
   | .error e => return .error s!"inproc_write_failed:{reprStr e}"
 
+/-! ## Unified Pipeline H.264 & AAC-LC Codec Entrypoints -/
+
+/-- Decode an ISOBMFF `avc1`/`avc3` video track into display-ordered `yuv420p` `VideoFrame`s
+along with output frame durations (in `video.timescale` units) and source SPS level. -/
+def decodeMp4AvcTrackToFrames
+    (raw : ByteArray) (video : NativeMp4Track) : Option (Array VideoFrame × Array Nat × UInt8) := do
+  if (video.stsdFourcc != "avc1" && video.stsdFourcc != "avc3") ||
+     video.hasEncrypted || video.multiStsd || video.timescale == 0 ||
+     !samplesInBounds raw.size video.samples then
+    none
+  else
+    let avccBody ← LeanAV.Format.extractMp4StsdAvcCBody video.stsdBox
+    let avcc ← LeanAV.H264Syntax.parseAvcDecoderConfigRecord avccBody
+    let nalLenSize := avcc.lengthSizeMinusOne.toNat + 1
+    let spsNal ← avcc.spsNalus[0]?
+    let ppsNal ← avcc.ppsNalus[0]?
+    let sps ← LeanAV.H264Syntax.parseH264SpsFull (ByteSlice.ofByteArray spsNal)
+    let pps ← LeanAV.H264Syntax.parseH264PpsFull (ByteSlice.ofByteArray ppsNal) (some sps)
+    let srcW := sps.widthPx.toNat
+    let srcH := sps.heightPx.toNat
+    let scope := buildScopeForSpsPps sps pps srcW srcH 0 LeanAV.Encoder.inprocRingDefaultCap
+    if !inprocTranscodeGateSpec.gate scope then
+      none
+    else
+      let mut decSt : InprocDecoderState := {}
+      for sN in avcc.spsNalus do
+        let st' ← registerSpsNalu decSt sN
+        decSt := st'
+      for pN in avcc.ppsNalus do
+        let st' ← registerPpsNalu decSt pN
+        decSt := st'
+      let mut allFrames : Array VideoFrame := #[]
+      for s in video.samples do
+        let pkt := raw.extract s.fileOff (s.fileOff + s.byteLen)
+        let nalus ← LeanAV.H264Syntax.splitAvccPacket pkt nalLenSize
+        if nalus.isEmpty then none
+        let (stNext, emitted) ← decodeAccessUnitNalus decSt nalus srcW srcH 0
+        decSt := stNext
+        for vf in emitted do
+          allFrames := allFrames.push vf
+      let (_, flushed) ← flushDecoderFrames decSt
+      for vf in flushed do
+        allFrames := allFrames.push vf
+      if allFrames.isEmpty then none
+      else
+        let durs := deriveOutputVideoDurations video.samples allFrames.size
+        some (allFrames, durs, sps.levelIdc)
+
+/-- Decode an Annex-B H.264 byte stream (`.h264`/`.264` or MPEG-TS PES payloads) into `yuv420p` `VideoFrame`s. -/
+def decodeAnnexBH264StreamToFrames (annexB : ByteArray) : Option (Array VideoFrame) := do
+  let nals := LeanAV.H264Entropy.splitAnnexB annexB
+  if nals.isEmpty then none
+  else
+    let mut decSt : InprocDecoderState := {}
+    let mut allFrames : Array VideoFrame := #[]
+    let mut curVcl : Array ByteArray := #[]
+    let mut prevFirstMb? : Option Nat := none
+    for nal in nals do
+      if nal.size > 0 then
+        let hdr := nal.data.getD 0 0
+        if (hdr &&& 0x80) != 0 then none
+        let nalType := (hdr &&& 0x1F).toNat
+        if nalType == 7 then
+          if !curVcl.isEmpty then
+            let sps0 ← (decSt.spsTable.findSome? id)
+            let w := sps0.syn.widthPx.toNat
+            let h := sps0.syn.heightPx.toNat
+            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            decSt := stNext
+            for vf in emitted do allFrames := allFrames.push vf
+            curVcl := #[]
+            prevFirstMb? := none
+          let st' ← registerSpsNalu decSt nal
+          decSt := st'
+        else if nalType == 8 then
+          if !curVcl.isEmpty then
+            let sps0 ← (decSt.spsTable.findSome? id)
+            let w := sps0.syn.widthPx.toNat
+            let h := sps0.syn.heightPx.toNat
+            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            decSt := stNext
+            for vf in emitted do allFrames := allFrames.push vf
+            curVcl := #[]
+            prevFirstMb? := none
+          let st' ← registerPpsNalu decSt nal
+          decSt := st'
+        else if nalType == 9 then
+          if !curVcl.isEmpty then
+            let sps0 ← (decSt.spsTable.findSome? id)
+            let w := sps0.syn.widthPx.toNat
+            let h := sps0.syn.heightPx.toNat
+            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            decSt := stNext
+            for vf in emitted do allFrames := allFrames.push vf
+            curVcl := #[]
+            prevFirstMb? := none
+        else if nalType == 1 || nalType == 5 then
+          let rbsp := LeanAV.H264Entropy.stripNalEmulationBytes nal
+          let entSpsArr := decSt.spsTable.map (fun o => o.map (·.ent))
+          let entPpsArr := decSt.ppsTable.map (fun o => o.map (·.ent))
+          let (shEnt, _) ← LeanAV.H264Entropy.parseSliceHeaderFull rbsp entSpsArr entPpsArr
+          if shEnt.firstMbInSlice == 0 && !curVcl.isEmpty then
+            let sps0 ← (decSt.spsTable.findSome? id)
+            let w := sps0.syn.widthPx.toNat
+            let h := sps0.syn.heightPx.toNat
+            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            decSt := stNext
+            for vf in emitted do allFrames := allFrames.push vf
+            curVcl := #[nal]
+          else
+            curVcl := curVcl.push nal
+          prevFirstMb? := some shEnt.firstMbInSlice
+        else if nalType == 2 || nalType == 3 || nalType == 4 || nalType == 19 then
+          none
+    if !curVcl.isEmpty then
+      let sps0 ← (decSt.spsTable.findSome? id)
+      let w := sps0.syn.widthPx.toNat
+      let h := sps0.syn.heightPx.toNat
+      let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+      decSt := stNext
+      for vf in emitted do allFrames := allFrames.push vf
+    let (_, flushed) ← flushDecoderFrames decSt
+    for vf in flushed do allFrames := allFrames.push vf
+    if allFrames.isEmpty then none else some allFrames
+
+/-- Encode `yuv420p` `VideoFrame`s into CAVLC all-intra H.264: returns `(avccBody, spsNal, ppsNal, avccPackets)`. -/
+def encodeFramesToH264Cavlc
+    (frames : Array VideoFrame) (qpY : Nat := 20) (srcLevel : UInt8 := 31)
+    : Option (ByteArray × ByteArray × ByteArray × Array ByteArray) := do
+  if frames.isEmpty then none
+  else
+    let vf0 := frames[0]!
+    let (_, _, spsEnt, ppsEnt, spsNal, ppsNal, avccBody) ← buildEncoderSpsPps vf0.width vf0.height srcLevel
+    let mut pkts : Array ByteArray := Array.mkEmpty frames.size
+    for idx in [:frames.size] do
+      let pkt ← encodeVideoFrameIdrCavlc frames[idx]! idx spsEnt ppsEnt qpY
+      pkts := pkts.push pkt
+    some (avccBody, spsNal, ppsNal, pkts)
+
+/-- Encode `yuv420p` `VideoFrame`s into Annex-B H.264 access units (with SPS/PPS prepended to frame 0). -/
+def encodeFramesToH264AnnexBPackets
+    (frames : Array VideoFrame) (qpY : Nat := 20) (srcLevel : UInt8 := 31)
+    : Option (Array ByteArray) := do
+  let (_, spsNal, ppsNal, avccPkts) ← encodeFramesToH264Cavlc frames qpY srcLevel
+  let mut aus : Array ByteArray := Array.mkEmpty avccPkts.size
+  for i in [:avccPkts.size] do
+    let sliceNals ← LeanAV.H264Syntax.splitAvccPacket avccPkts[i]! 4
+    let nals := if i == 0 then #[spsNal, ppsNal] ++ sliceNals else sliceNals
+    aus := aus.push (LeanAV.H264Entropy.joinAnnexB nals)
+  some aus
+
+/-- Decode an ISOBMFF `mp4a` AAC-LC audio track into `(pcmChannels, sampleRate, bps)`. -/
+def decodeMp4AacTrackToChannels
+    (raw : ByteArray) (aTrk : NativeMp4Track) : Option (Array (Array Int32) × UInt32 × Nat) := do
+  if aTrk.stsdFourcc != "mp4a" || aTrk.hasEncrypted || aTrk.multiStsd ||
+     aTrk.timescale == 0 || !samplesInBounds raw.size aTrk.samples then
+    none
+  else
+    let esds ← LeanAV.Format.extractMp4StsdMp4aEsdsBox aTrk.stsdBox
+    let asc ← LeanAV.AacLc.parseMp4EsdsAsc (ByteSlice.ofByteArray esds)
+    if asc.channelConfiguration.toNat == 0 || asc.channelConfiguration.toNat > 2 then
+      none
+    else
+      let mut adtsStream := ByteArray.empty
+      for s in aTrk.samples do
+        let pkt := raw.extract s.fileOff (s.fileOff + s.byteLen)
+        let f ← LeanAV.AacLc.muxAdtsFrame asc.samplingFrequencyIndex asc.channelConfiguration pkt false
+        adtsStream := adtsStream ++ f
+      LeanAV.AacLc.aacDecodeAdtsStream (ByteSlice.ofByteArray adtsStream) false
+
+/-- Copy an ISOBMFF `mp4a` AAC-LC audio track into a `SynthMp4Track` (`-c:a copy`). -/
+def copyMp4AacTrackToSynth (raw : ByteArray) (tr : NativeMp4Track) : Option SynthMp4Track := do
+  if tr.stsdFourcc != "mp4a" || tr.hasEncrypted || tr.multiStsd ||
+     tr.timescale == 0 || !samplesInBounds raw.size tr.samples then
+    none
+  else
+    let esds ← LeanAV.Format.extractMp4StsdMp4aEsdsBox tr.stsdBox
+    let asc ← LeanAV.AacLc.parseMp4EsdsAsc (ByteSlice.ofByteArray esds)
+    let entry ← LeanAV.AacLc.buildMp4aSampleEntryBox asc
+    let mut copied : Array SynthMp4Sample := Array.mkEmpty tr.samples.size
+    for s in tr.samples do
+      let pkt := raw.extract s.fileOff (s.fileOff + s.byteLen)
+      if pkt.size == 0 then none
+      copied := copied.push { data := pkt, dur := s.dur, cttsOff := 0, isSync := true }
+    some {
+      kind := .audio
+      timescale := tr.timescale
+      width := 0
+      height := 0
+      stsdBox := LeanAV.Format.buildMp4aStsdBoxFromEntry entry
+      samples := copied
+    }
+
+/-- Encode per-channel 16-bit PCM into an ISOBMFF `mp4a` `SynthMp4Track`. -/
+def encodeChannelsToMp4AacTrack
+    (pcmChans : Array (Array Int32)) (sampleRate : UInt32) (bitrateBps : Nat := 128000)
+    : Option SynthMp4Track := do
+  if pcmChans.isEmpty || pcmChans.size > 2 then none
+  else
+    let srIdx ← LeanAV.AacLc.aacSampleRateToIndex sampleRate
+    let encAdts ← LeanAV.AacLc.aacEncodeAdtsStream pcmChans sampleRate 16 bitrateBps true
+    let (_, rawSlices) ← LeanAV.AacLc.demuxAdtsStream (ByteSlice.ofByteArray encAdts) false
+    if rawSlices.isEmpty then none
+    else
+      let mut outSamples : Array SynthMp4Sample := Array.mkEmpty rawSlices.size
+      for sl in rawSlices do
+        let b := sl.toByteArray
+        if b.size == 0 then none
+        outSamples := outSamples.push { data := b, dur := 1024, cttsOff := 0, isSync := true }
+      let outAsc : LeanAV.AacLc.AacLcAsc := {
+        audioObjectType := 2
+        samplingFrequencyIndex := srIdx
+        channelConfiguration := pcmChans.size.toUInt8
+        frameLengthFlag := false
+        dependsOnCoreCoder := false
+        extensionFlag := false
+      }
+      let entry ← LeanAV.AacLc.buildMp4aSampleEntryBox outAsc
+      some {
+        kind := .audio
+        timescale := sampleRate.toNat
+        width := 0
+        height := 0
+        stsdBox := LeanAV.Format.buildMp4aStsdBoxFromEntry entry
+        samples := outSamples
+      }
+
 end LeanAV.InprocTranscode

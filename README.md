@@ -4,9 +4,12 @@
 
 ## Native, in-process
 
-- H.264 High 8-bit 4:2:0 with AAC-LC in MP4 (Baseline/Main/High, CAVLC and CABAC, I/P/B, 8x8 transform, frame crop, explicit and implicit weighted prediction, Q8 bilinear scale, mono/stereo AAC-LC)
-- HEVC Main 8-bit 4:2:0 (`hevc-encode-raw`, `hevc-decode-raw`, `hevc-probe`; Annex-B, `hvcC`, and MP4)
-- AV1 Main 8-bit 4:2:0 (`av1-encode-raw`, `av1-decode-raw`, `av1-probe`; OBU, IVF, and MP4)
+- H.264 High 8-bit 4:2:0 with AAC-LC or Opus in MP4/MOV/MPEG-TS (Baseline/Main/High, CAVLC and CABAC, I/P/B, 8x8 transform, frame crop, explicit and implicit weighted prediction, Q8 bilinear scale, mono/stereo AAC-LC)
+- HEVC Main 8-bit 4:2:0 (`-i` / `-c:v hevc` and `hevc-probe`; Annex-B, `hvcC`, MP4/MOV, and MPEG-TS)
+- AV1 Main 8-bit 4:2:0 (`-i` / `-c:v av1` and `av1-probe`; OBU, IVF, and MP4/MOV)
+- Apple ProRes 422 (`-i` / `-c:v prores` in MP4/MOV)
+- Opus audio (`-i` / `-c:a opus` in Ogg/Opus and MP4/MOV)
+- MPEG-TS (`-i` / `-f mpegts` PAT/PMT/PES mux and demux) and Ogg (`-i` / `-f ogg` mux and demux)
 - FFV1 version 3
 - PNG (Zlib/DEFLATE)
 - FLAC
@@ -16,7 +19,7 @@
 
 ## Fail-closed
 
-Unsupported input is rejected. It is not silently delegated to another binary. That includes codecs outside the native set (`aac_fixed`, ProRes, VP9, Opus, VVC, and the rest), H.264 / HEVC / AV1 10-bit, 4:4:4, 4:2:2, High-10, RExt, and professional profiles, GPU acceleration (`-hwaccel`, CUDA, VAAPI, VideoToolbox), network and unsafe protocols, and `-filter_complex` graphs the lavfi typechecker rejects. The process exits non-zero, prints a structured diagnostic, and writes no output file.
+Unsupported input is rejected. It is not silently delegated to another binary. That includes codecs outside the native set (`aac_fixed`, VP9, VVC, and the rest), H.264 / HEVC / AV1 10-bit, 4:4:4, 4:2:2, High-10, RExt, and professional profiles, GPU acceleration (`-hwaccel`, CUDA, VAAPI, VideoToolbox), network and unsafe protocols, and `-filter_complex` graphs the lavfi typechecker rejects. The process exits non-zero, prints a structured diagnostic, and writes no output file.
 
 ## What the proofs cover
 

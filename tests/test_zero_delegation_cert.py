@@ -271,12 +271,12 @@ class ZeroDelegationCert(unittest.TestCase):
         self.assert_ok(["-y", "-i", str(wav), "-c:a", "flac", str(flac)])
         self.assert_ok(["-y", "-i", str(flac), str(d / "dec.wav")])
         hevc = d / "out.265"
-        self.assert_ok(["hevc-encode-raw", "32", "32", str(d / "in.yuv"), str(hevc)])
-        self.assert_ok(["hevc-decode-raw", str(hevc), str(d / "hevc.yuv")])
+        self.assert_ok(["-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "32x32", "-i", str(d / "in.yuv"), "-c:v", "hevc", str(hevc)])
+        self.assert_ok(["-y", "-i", str(hevc), "-f", "rawvideo", "-pix_fmt", "yuv420p", str(d / "hevc.yuv")])
         self.assert_ok(["hevc-probe", str(hevc)])
         av1 = d / "out.obu"
-        self.assert_ok(["av1-encode-raw", "32", "32", str(d / "in.yuv"), str(av1)])
-        self.assert_ok(["av1-decode-raw", str(av1), str(d / "av1.yuv")])
+        self.assert_ok(["-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "32x32", "-i", str(d / "in.yuv"), "-c:v", "av1", str(av1)])
+        self.assert_ok(["-y", "-i", str(av1), "-f", "rawvideo", "-pix_fmt", "yuv420p", str(d / "av1.yuv")])
         self.assert_ok(["av1-probe", str(av1)])
         md5 = self.assert_ok(["-f", "lavfi", "-i", "color=c=blue:s=16x16:r=10:d=0.1", "-f", "md5", "-"])
         self.assertIn(b"MD5=", md5.stdout)

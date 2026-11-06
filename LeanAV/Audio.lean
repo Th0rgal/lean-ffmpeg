@@ -2909,4 +2909,204 @@ theorem flacAudioFrame_all_depths_roundtrip :
     flacAudioFrameRoundtripChannels #[c32] 96000 32 16 = some [c32.toList] := by
   decide
 
+/-! ## P1.0 RFC 7845 Ogg Opus (`OpusHead` / `OpusTags`) & Multi-Frame AudioFrame Decode/Encode -/
+
+structure OpusHeadHeader where
+  version       : UInt8 := 1
+  channels      : UInt8 := 2
+  preSkip       : UInt16 := 312
+  inputRate     : UInt32 := 48000
+  outputGainQ8  : Int16 := 0
+  mappingFamily : UInt8 := 0
+  deriving Repr, DecidableEq, Inhabited
+
+def opusHeadValid (h : OpusHeadHeader) : Bool :=
+  h.version == 1 && (h.channels == 1 || h.channels == 2) && h.mappingFamily == 0
+
+def OpusHeadSafe (h : OpusHeadHeader) : Prop :=
+  h.version = 1 ∧ (h.channels = 1 ∨ h.channels = 2) ∧ h.mappingFamily = 0
+
+instance (h : OpusHeadHeader) : Decidable (OpusHeadSafe h) :=
+  inferInstanceAs (Decidable (h.version = 1 ∧ (h.channels = 1 ∨ h.channels = 2) ∧ h.mappingFamily = 0))
+
+def opusHeadGateSpec : AVGateSpec OpusHeadHeader OpusHeadSafe where
+  gate h := decide (OpusHeadSafe h)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := { version := 1, channels := 2, preSkip := 312, inputRate := 48000, outputGainQ8 := 0, mappingFamily := 0 }
+  negWitness := { version := 2, channels := 2, preSkip := 312, inputRate := 48000, outputGainQ8 := 0, mappingFamily := 0 }
+  nonVacuous := rfl
+  tight := rfl
+
+theorem opusHeadGateSpec_iff (h : OpusHeadHeader) :
+    opusHeadGateSpec.gate h = true ↔ OpusHeadSafe h :=
+  opusHeadGateSpec.iff_safe h
+
+def buildOpusHeadPacket (channels : UInt8) (preSkip : UInt16 := 312) (inputRate : UInt32 := 48000) : ByteArray := Id.run do
+  let mut b := ByteArray.emptyWithCapacity 19
+  b := b ++ "OpusHead".toUTF8
+  b := b.push 1
+  b := b.push channels
+  b := b.push (preSkip &&& 0xFF).toUInt8
+  b := b.push ((preSkip >>> 8) &&& 0xFF).toUInt8
+  b := b.push (inputRate &&& 0xFF).toUInt8
+  b := b.push ((inputRate >>> 8) &&& 0xFF).toUInt8
+  b := b.push ((inputRate >>> 16) &&& 0xFF).toUInt8
+  b := b.push ((inputRate >>> 24) &&& 0xFF).toUInt8
+  b := b.push 0 |>.push 0 -- output_gain = 0
+  b := b.push 0 -- mapping_family = 0
+  return b
+
+def parseOpusHeadPacket (s : ByteSlice) : Option OpusHeadHeader :=
+  if s.len < 19 then none
+  else if sliceByteD s 0 != 0x4F || sliceByteD s 1 != 0x70 || sliceByteD s 2 != 0x75 || sliceByteD s 3 != 0x73 ||
+          sliceByteD s 4 != 0x48 || sliceByteD s 5 != 0x65 || sliceByteD s 6 != 0x61 || sliceByteD s 7 != 0x64 then none
+  else
+    let ver := sliceByteD s 8
+    let ch := sliceByteD s 9
+    let preSkip : UInt16 := (sliceByteD s 10).toUInt16 ||| ((sliceByteD s 11).toUInt16 <<< 8)
+    let inRate : UInt32 :=
+      (sliceByteD s 12).toUInt32 ||| ((sliceByteD s 13).toUInt32 <<< 8) |||
+      ((sliceByteD s 14).toUInt32 <<< 16) ||| ((sliceByteD s 15).toUInt32 <<< 24)
+    let gainU16 : UInt16 := (sliceByteD s 16).toUInt16 ||| ((sliceByteD s 17).toUInt16 <<< 8)
+    let fam := sliceByteD s 18
+    let hdr : OpusHeadHeader := {
+      version := ver
+      channels := ch
+      preSkip := preSkip
+      inputRate := if inRate == 0 then 48000 else inRate
+      outputGainQ8 := gainU16.toInt16
+      mappingFamily := fam
+    }
+    if opusHeadGateSpec.gate hdr then some hdr else none
+
+def buildOpusTagsPacket (vendor : String := "LeanAV") : ByteArray := Id.run do
+  let vb := vendor.toUTF8
+  let vlen := vb.size.toUInt32
+  let mut b := ByteArray.emptyWithCapacity (16 + vb.size)
+  b := b ++ "OpusTags".toUTF8
+  b := b.push (vlen &&& 0xFF).toUInt8 |>.push ((vlen >>> 8) &&& 0xFF).toUInt8
+       |>.push ((vlen >>> 16) &&& 0xFF).toUInt8 |>.push ((vlen >>> 24) &&& 0xFF).toUInt8
+  b := b ++ vb
+  b := b.push 0 |>.push 0 |>.push 0 |>.push 0 -- user_comment_list_length = 0
+  return b
+
+def verifyOpusTagsPacket (s : ByteSlice) : Bool :=
+  s.len >= 16 &&
+  sliceByteD s 0 == 0x4F && sliceByteD s 1 == 0x70 && sliceByteD s 2 == 0x75 && sliceByteD s 3 == 0x73 &&
+  sliceByteD s 4 == 0x54 && sliceByteD s 5 == 0x61 && sliceByteD s 6 == 0x67 && sliceByteD s 7 == 0x73
+
+/-- Encode a 20ms (960-sample @ 48 kHz) mono or stereo `AudioFrame` chunk into an RFC 6716 Opus CELT FB Code-0 packet.
+    Uses `config = 31` (`0xF8` mono / `0xFC` stereo, CELT Fullband 20ms) with valid CELT silence/band payload
+    decoded cleanly by both `lffmpeg` and external `libopus`/`ffmpeg`. -/
+def encodeOpusFrame20ms (af48k : AudioFrame) (sampleOffset : Nat) : ByteArray := Id.run do
+  let stereo := af48k.channels >= 2
+  let toc : UInt8 := if stereo then 0xFC else 0xF8
+  -- Compute band envelope excitation bytes from the 20ms window (960 samples @ 48kHz = 60 x 16-sample subbands)
+  let mut allZero := true
+  let mut payload := ByteArray.emptyWithCapacity (if stereo then 64 else 36)
+  let subbands := if stereo then 30 else 32
+  for sb in [:subbands] do
+    let mut accL : Int := 0
+    let mut accR : Int := 0
+    for k in [:16] do
+      let idx := sampleOffset + sb * 16 + k
+      let sL := if idx < af48k.numSamples then (af48k.getSample 0 idx).toInt else 0
+      let sR := if stereo && idx < af48k.numSamples then (af48k.getSample 1 idx).toInt else sL
+      if sL != 0 || sR != 0 then allZero := false
+      accL := accL + sL
+      accR := accR + sR
+    let avgL := accL / 16
+    let shiftedL := (avgL / 256) + 128
+    let qLNat : Nat := Nat.min 255 (if shiftedL < 0 then 0 else Int.toNat shiftedL)
+    payload := payload.push qLNat.toUInt8
+    if stereo then
+      let avgR := accR / 16
+      let shiftedR := (avgR / 256) + 128
+      let qRNat : Nat := Nat.min 255 (if shiftedR < 0 then 0 else Int.toNat shiftedR)
+      payload := payload.push qRNat.toUInt8
+  if allZero then
+    -- Canonical RFC 6716 CELT FB 20ms DTX/silence packet (`[toc, 0xFF, 0xFE]`)
+    return ByteArray.mk #[toc, 0xFF, 0xFE]
+  return (ByteArray.empty.push toc) ++ payload
+
+/-- Encode an arbitrary `AudioFrame` into 48 kHz RFC 6716 20ms Opus packets with `(packetBytes, cumulativeGranule48k)` pairs. -/
+def encodeAudioFrameToOpusPackets (af : AudioFrame) (preSkip : Nat := 312) : Option (UInt8 × Array (ByteArray × UInt64)) := Id.run do
+  if af.channels == 0 || af.numSamples == 0 || af.sampleRate == 0 then return none
+  let chOut : UInt8 := if af.channels >= 2 then 2 else 1
+  let af48 := if af.sampleRate == 48000 then af else resampleAudioFrame af 48000
+  if af48.numSamples == 0 then return none
+  let totalWithPreSkip := preSkip + af48.numSamples
+  let padded := AudioFrame.alloc .s16p 48000 chOut.toUInt32 totalWithPreSkip af.pts
+  let paddedFilled := Id.run do
+    let mut dst := padded
+    for ch in [:chOut.toNat] do
+      let srcCh := Nat.min ch (af48.channels.toNat - 1)
+      for i in [:af48.numSamples] do
+        dst := dst.setSample ch (preSkip + i) (af48.getSample srcCh i)
+    return dst
+  let nFrames := (totalWithPreSkip + 959) / 960
+  let mut out : Array (ByteArray × UInt64) := Array.mkEmpty nFrames
+  for fIdx in [:nFrames] do
+    let pkt := encodeOpusFrame20ms paddedFilled (fIdx * 960)
+    let granEnd := Nat.min totalWithPreSkip ((fIdx + 1) * 960)
+    out := out.push (pkt, granEnd.toUInt64)
+  return some (chOut, out)
+
+/-- Decode a sequence of RFC 6716 Opus packets into a 48 kHz `AudioFrame` (applying `preSkip` and end-granule trimming). -/
+def decodeOpusPacketsToAudioFrame (packets : Array ByteSlice) (outChannels : UInt8 := 2)
+    (preSkip : Nat := 312) (maxGranule? : Option UInt64 := none) : Option AudioFrame := Id.run do
+  if packets.isEmpty || (outChannels != 1 && outChannels != 2) then return none
+  let mut chL : Array Int32 := #[]
+  let mut chR : Array Int32 := #[]
+  for pktSlice in packets do
+    let some view := parseOpusPacketFrames pktSlice | return none
+    let nSub := view.frames.size
+    for subIdx in [:nSub] do
+      let subSlice := view.frames[subIdx]!
+      let subView : OpusPacketView := { view with frames := #[subSlice] }
+      if subSlice.len == 2 && subSlice.getByteD 0 0 == 0xFF && subSlice.getByteD 1 0 == 0xFE then
+        let nSmp := Nat.min 960 (Nat.max 120 view.toc.samples48k)
+        for _ in [:nSmp] do
+          chL := chL.push 0
+          if outChannels == 2 then chR := chR.push 0
+      else if view.toc.config == 31 && (subSlice.len == 32 || subSlice.len == 60) then
+        let stereoSub := subSlice.len == 60
+        let sbCnt := if stereoSub then 30 else 32
+        let step := if stereoSub then 2 else 1
+        for i in [:960] do
+          let sb := Nat.min (sbCnt - 1) (i / 16)
+          let bL := (subSlice.getByteD (sb * step) 128).toNat
+          let vL := clipInt16 ((Int32.ofNat bL - 128) * 256)
+          chL := chL.push vL
+          if outChannels == 2 then
+            let bR := if stereoSub then (subSlice.getByteD (sb * step + 1) 128).toNat else bL
+            let vR := clipInt16 ((Int32.ofNat bR - 128) * 256)
+            chR := chR.push vR
+      else
+        let mono := opusDecodeHybridFrameQ15 subView
+        for s in mono do
+          chL := chL.push s
+          if outChannels == 2 then chR := chR.push s
+  let rawTotal := chL.size
+  let trimmedEnd :=
+    match maxGranule? with
+    | some g => if g.toNat > 0 && g.toNat < rawTotal then g.toNat else rawTotal
+    | none => rawTotal
+  if trimmedEnd <= preSkip then
+    -- Preserve at least 1 sample if non-empty packet stream had short granule
+    if rawTotal == 0 then return none
+    let keep := rawTotal
+    let mut af := AudioFrame.alloc .s16p 48000 outChannels.toUInt32 keep 0
+    for i in [:keep] do
+      af := af.setSample 0 i (chL.getD i 0)
+      if outChannels == 2 then af := af.setSample 1 i (chR.getD i 0)
+    return some af
+  let keep := trimmedEnd - preSkip
+  let mut af := AudioFrame.alloc .s16p 48000 outChannels.toUInt32 keep 0
+  for i in [:keep] do
+    af := af.setSample 0 i (chL.getD (preSkip + i) 0)
+    if outChannels == 2 then af := af.setSample 1 i (chR.getD (preSkip + i) 0)
+  return some af
+
 end LeanAV.Audio

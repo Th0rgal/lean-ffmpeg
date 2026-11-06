@@ -58,6 +58,32 @@ def psnr_db(ref_bytes, got_bytes):
     return 10.0 * math.log10((255.0 * 255.0) / mse)
 
 
+def decode_args(in_path, out_path):
+    out_str = str(out_path)
+    fmt = "null" if out_str == "-" else "rawvideo"
+    return [LFFMPEG, "-json", "-y", "-i", in_path, "-an", "-f", fmt, out_path]
+
+
+def encode_args(w, h, in_path, out_path, qp=28, fmt=None, ctb=6, tc=1, tr=1):
+    out_str = str(out_path)
+    if fmt is None:
+        mux_fmt = "mp4" if out_str.endswith(".mp4") else "hevc"
+    elif fmt in ("mp4", "hvcc"):
+        mux_fmt = "mp4"
+    elif fmt in ("annexb", "hevc"):
+        mux_fmt = "hevc"
+    else:
+        mux_fmt = fmt
+    return [
+        LFFMPEG, "-json", "-y",
+        "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+        "-i", in_path,
+        "-an", "-c:v", "hevc", "-qp", str(qp),
+        "-x265-params", f"ctu={1 << ctb}:tiles={tc}x{tr}",
+        "-f", mux_fmt, out_path,
+    ]
+
+
 class TestHevcMain(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -106,7 +132,7 @@ class TestHevcMain(unittest.TestCase):
 
                 ref_yuv = self._ffmpeg_decode_yuv420p(stream_path)
                 lean_yuv_path = self.dir / f"lean_{name}.yuv"
-                dec_proc = run(LFFMPEG, "hevc-decode-raw", stream_path, lean_yuv_path, env=ISO_ENV)
+                dec_proc = run(*decode_args(stream_path, lean_yuv_path), env=ISO_ENV)
                 dec_meta = json.loads(dec_proc.stdout.decode())
                 self.assertTrue(dec_meta["ok"])
                 self.assertEqual(dec_meta["width"], w)
@@ -144,14 +170,14 @@ class TestHevcMain(unittest.TestCase):
                 in_path.write_bytes(raw_in)
 
                 enc_proc = run(
-                    LFFMPEG, "hevc-encode-raw", w, h, in_path, out_bs, qp, fmt, ctb, tc, tr,
+                    *encode_args(w, h, in_path, out_bs, qp, fmt, ctb, tc, tr),
                     env=ISO_ENV,
                 )
                 enc_meta = json.loads(enc_proc.stdout.decode())
                 self.assertTrue(enc_meta["ok"])
                 self.assertGreater(out_bs.stat().st_size, 0)
 
-                run(LFFMPEG, "hevc-decode-raw", out_bs, lean_dec, env=ISO_ENV)
+                run(*decode_args(out_bs, lean_dec), env=ISO_ENV)
                 ff_yuv = self._ffmpeg_decode_yuv420p(out_bs)
                 lean_bytes = lean_dec.read_bytes()
                 self.assertEqual(lean_bytes, ff_yuv)
@@ -169,13 +195,13 @@ class TestHevcMain(unittest.TestCase):
         bad_trunc = self.dir / "trunc.265"
         bad_trunc.write_bytes(b"\x00\x00\x00\x01\x42\x01\xff")
         for p in (bad_empty, bad_trunc):
-            self.assertNotEqual(run(LFFMPEG, "hevc-decode-raw", p, "-", env=ISO_ENV, check=False).returncode, 0)
+            self.assertNotEqual(run(*decode_args(p, "-"), env=ISO_ENV, check=False).returncode, 0)
             self.assertNotEqual(run(LFFMPEG, "hevc-probe", p, env=ISO_ENV, check=False).returncode, 0)
 
         in_odd = self.dir / "odd.yuv"
         in_odd.write_bytes(b"\x80" * (63 * 48 * 3 // 2))
         self.assertNotEqual(
-            run(LFFMPEG, "hevc-encode-raw", 63, 48, in_odd, self.dir / "odd.265", env=ISO_ENV, check=False).returncode,
+            run(*encode_args(63, 48, in_odd, self.dir / "odd.265"), env=ISO_ENV, check=False).returncode,
             0,
         )
 
@@ -192,7 +218,7 @@ class TestHevcMain(unittest.TestCase):
                 "-c:v", "libx265", "-pix_fmt", pix_fmt,
                 "-x265-params", "log-level=none", "-f", "hevc", neg_path,
             )
-            self.assertNotEqual(run(LFFMPEG, "hevc-decode-raw", neg_path, "-", env=ISO_ENV, check=False).returncode, 0)
+            self.assertNotEqual(run(*decode_args(neg_path, "-"), env=ISO_ENV, check=False).returncode, 0)
             self.assertNotEqual(run(LFFMPEG, "hevc-probe", neg_path, env=ISO_ENV, check=False).returncode, 0)
 
     def test_strace_zero_child_spawns(self):
@@ -200,16 +226,16 @@ class TestHevcMain(unittest.TestCase):
         in_path.write_bytes(synth_yuv420p(64, 48, 2))
         bs_path = self.dir / "iso.265"
         out_yuv = self.dir / "iso_out.yuv"
-        run(LFFMPEG, "hevc-encode-raw", 64, 48, in_path, bs_path, 28, "annexb", 6, 1, 1, env=ISO_ENV)
-        run(LFFMPEG, "hevc-decode-raw", bs_path, out_yuv, env=ISO_ENV)
+        run(*encode_args(64, 48, in_path, bs_path, 28, "annexb", 6, 1, 1), env=ISO_ENV)
+        run(*decode_args(bs_path, out_yuv), env=ISO_ENV)
         run(LFFMPEG, "hevc-probe", bs_path, env=ISO_ENV)
         if STRACE is None:
             return
         trace = "".join(["exec", "ve"])
         needle = trace + "("
         for cmd in (
-            [STRACE, "-f", "-e", "trace=" + trace, LFFMPEG, "hevc-encode-raw", 64, 48, in_path, self.dir / "s.265"],
-            [STRACE, "-f", "-e", "trace=" + trace, LFFMPEG, "hevc-decode-raw", bs_path, self.dir / "s.yuv"],
+            [STRACE, "-f", "-e", "trace=" + trace, *encode_args(64, 48, in_path, self.dir / "s.265")],
+            [STRACE, "-f", "-e", "trace=" + trace, *decode_args(bs_path, self.dir / "s.yuv")],
             [STRACE, "-f", "-e", "trace=" + trace, LFFMPEG, "hevc-probe", bs_path],
         ):
             proc = run(*cmd, env=ISO_ENV)
