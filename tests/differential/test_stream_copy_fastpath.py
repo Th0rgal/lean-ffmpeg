@@ -63,7 +63,7 @@ class StreamCopyFastpathTests(unittest.TestCase):
                         doc = json.loads(result.stdout)
                         self.assertTrue(doc["ok"])
                         if mode == "scale":
-                            self.assertEqual(doc["mode"], "ffmpeg-cli-inproc-h264-aac-mp4")
+                            self.assertEqual(doc["mode"], "ffmpeg-cli-unified-pipeline")
                             self.assertEqual(doc["tier"], "independent_verified")
                     video = next(s for s in self.probe_json(out)["streams"] if s["codec_type"] == "video")
                     self.assertEqual(video["width"], 16 if mode == "scale" else 32)

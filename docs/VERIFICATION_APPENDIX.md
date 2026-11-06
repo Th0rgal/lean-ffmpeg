@@ -1,33 +1,33 @@
 # Verification appendix
 
-Measured on `campaign/m3-d-zero-exec-20261104` after the zero-delegation deletion, under Lean `v4.35.0` and `turbo-lean@dc1656dc948f1d7bfc25d165575ae3819a2e8b97` (`audit-spec` v2.1).
+Measured on `campaign/p1-0-unified-pipeline-20261106` under Lean `v4.35.0` and `turbo-lean@dc1656dc948f1d7bfc25d165575ae3819a2e8b97` (`audit-spec` v2.1).
 
 ## Kernel check
 
-`lake env lean scripts/check_axioms.lean`:
+`LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean`:
 
 ```
-Verified 22820 LeanAV declarations (0 sorryAx, 0 custom axioms).
+Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms).
 ```
 
-37 `LeanAV/*.lean` modules, 84,983 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
+38 `LeanAV/*.lean` modules, 87,100 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
 
 ## Tight specifications
 
-`turbo-lean --json audit-spec` on every `LeanAV/*.lean`: **807/807** `non_vacuous_and_tight`, 0 vacuous, 0 trivial, 0 shadowed.
+`turbo-lean --json audit-spec` on every `LeanAV/*.lean`: **812/812** `non_vacuous_and_tight`, 0 vacuous, 0 trivial, 0 shadowed.
 
 | Module | Specs |
 | :--- | ---: |
 | `AacLcProofs` | 84 |
 | `H264IntraTransformProofs` | 70 |
-| `Format` | 64 |
+| `Format` | 66 |
 | `H264InterDeblockDpbProofs` | 61 |
 | `Ffv1Proofs` | 60 |
 | `NativeKernels` | 59 |
-| `Video` | 46 |
+| `Video` | 47 |
 | `Encoder` | 37 |
 | `LavfiGraphProofs` | 36 |
-| `Audio` | 34 |
+| `Audio` | 35 |
 | `H264EntropyProofs` | 31 |
 | `Scale` | 28 |
 | `Bitstream` | 27 |
@@ -43,6 +43,7 @@ Verified 22820 LeanAV declarations (0 sorryAx, 0 custom axioms).
 | `Cli` | 6 |
 | `Filter` | 6 |
 | `LavfiGraph` | 5 |
+| `UnifiedPipeline` | 1 |
 
 The other 12 modules (`AacLc`, `Av1Main`, `Ffv1`, `Ffv1Container`, `Ffv1Pipeline`, `H264Entropy`, `H264InterDeblockDpb`, `H264IntraTransform`, `H264Syntax`, `HevcMain`, `IO`, `Main`) audit as zero specs.
 

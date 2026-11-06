@@ -1,5 +1,25 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-06 P1.0 unified multi-stream pipeline qualification
+(`campaign/p1-0-unified-pipeline-20261106` over `627b45e1`) under Lean v4.35.0 and
+`turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) replaces
+siloed raw subcommands (`hevc-encode-raw`, `hevc-decode-raw`, `av1-encode-raw`,
+`av1-decode-raw`) and `inproc_h264_aac_mp4_transcode` with a unified multi-stream
+`-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline
+(`LeanAV/UnifiedPipeline.lean`), wiring Opus (`Ogg/Opus` and `MP4/MOV`, RFC 6716 CELT FB silence `0xFF 0xFE` with
+fail-closed rejection of compressed non-silent packets pending P1.2), Apple
+ProRes 422 (`apcn` in `MP4/MOV`), Ogg, and MPEG-TS (`PAT/PMT/PES`) into standard
+`-i` CLI routing, auditing **23,201 declarations with zero sorryAx/custom axioms**
+(`87,100` LOC across 38 formal `LeanAV/*.lean` modules) and **812/812
+`non_vacuous_and_tight` specifications** (`AacLcProofs`: 84,
+`H264IntraTransformProofs`: 70, `Format`: 66, `H264InterDeblockDpbProofs`: 61,
+`Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 47, `Encoder`: 37,
+`LavfiGraphProofs`: 36, `Audio`: 35, `H264EntropyProofs`: 31, `Scale`: 28,
+`Bitstream`: 27, `Av1MainProofs`: 26, `H264SyntaxProofs`: 26, `HevcMainProofs`:
+23, `Spec`: 23, `PlanIR`: 21, `Core`: 11, `Domain`: 8, `InprocTranscode`: 8,
+`Md5`: 7, `Cli`: 6, `Filter`: 6, `LavfiGraph`: 5, `UnifiedPipeline`: 1; `0`
+vacuous, `0` trivial, `0` shadowed).
+
 The 2026-11-05 M3-D standalone zero-exec integration & runtime certification
 (`campaign/m3-d-zero-exec-20261104`, integrating M3-A `7beef63e`, M3-B `c944e1dc`,
 and M3-C `644b0056` over `741fb1d0`) under Lean v4.35.0 and `turbo-lean`

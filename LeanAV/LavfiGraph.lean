@@ -627,6 +627,8 @@ inductive TypedFilterOp where
   | vfVstack (inputs : Nat)
   | vfHstack (inputs : Nat)
   | vfConcatVideo (segments : Nat)
+  | vfColorspace (target : String)
+  | vfTonemap (mode : String)
   -- 9 audio filters:
   | afVolume (gainQ8 : Int32)
   | afAresample (dstRate : Nat)
@@ -833,6 +835,21 @@ def compileFilterNode (node : FilterNode) (inFmts : List PadFormat) :
     let [fmt] := inFmts | throw "null expects 1 video input"
     if fmt.kind != .video || node.outputs.length != 1 then throw "null media kind/arity mismatch"
     return (.vfNull, [fmt])
+  else if nm == "colorspace" || nm == "bt2020_to_bt709" then
+    let [fmt] := inFmts | throw "colorspace expects 1 video input"
+    if fmt.kind != .video || node.outputs.length != 1 then throw "colorspace media kind/arity mismatch"
+    let tgt := if nm == "bt2020_to_bt709" then "bt709"
+      else (FilterArg.lookup args "all" 0).orElse (fun _ => FilterArg.lookup args "space" 0) |>.getD "bt709" |>.toLower
+    if tgt != "bt709" && tgt != "bt601" && tgt != "bt2020" then
+      throw s!"unsupported colorspace target: {tgt}"
+    return (.vfColorspace tgt, [fmt])
+  else if nm == "tonemap" then
+    let [fmt] := inFmts | throw "tonemap expects 1 video input"
+    if fmt.kind != .video || node.outputs.length != 1 then throw "tonemap media kind/arity mismatch"
+    let md := (FilterArg.lookup args "tonemap" 0).getD "reinhard" |>.toLower
+    if md != "reinhard" && md != "hable" && md != "mobius" && md != "clip" && md != "linear" then
+      throw s!"unsupported tonemap mode: {md}"
+    return (.vfTonemap md, [fmt])
   else if nm == "split" then
     let [fmt] := inFmts | throw "split expects 1 video input"
     if fmt.kind != .video then throw "split expects video input"
@@ -1583,6 +1600,15 @@ def executeTypedNode (node : TypedNode) (padMap : List (String × EdgeBufferQueu
     let qs ← node.inputs.mapM lookupQ
     let outFrames := qs.foldl (fun acc q => acc ++ drainVideoQueue q) #[]
     return singleOut (buildVideoQueue (Nat.max queueCap outFrames.size) outFrames)
+  | .vfColorspace tgt =>
+    let q ← lookupQ (node.inputs.headD "")
+    let cm : ColorMatrix := if tgt == "bt601" then .bt601 else if tgt == "bt2020" then .bt2020ncl else .bt709
+    let vfs := (drainVideoQueue q).map (fun vf => { vf with colorMatrix := cm })
+    return singleOut (buildVideoQueue queueCap vfs)
+  | .vfTonemap _ =>
+    let q ← lookupQ (node.inputs.headD "")
+    let vfs := (drainVideoQueue q).map (fun vf => execVideoEq vf 280 0 false)
+    return singleOut (buildVideoQueue queueCap vfs)
   | .afVolume gQ8 =>
     let af := drainAudioQueue (← lookupQ (node.inputs.headD ""))
     return singleOut (buildAudioQueue 4 (filterAudioVolumeQ8 af gQ8))
@@ -1692,14 +1718,15 @@ def audioFrameToChannelArrays (af : AudioFrame) : Array (Array Int32) := Id.run 
   return chans
 
 /-- Convert per-channel `Array (Array Int32)` into a planar `AudioFrame`. -/
-def channelArraysToAudioFrame (chans : Array (Array Int32)) (sampleRate : UInt32) : AudioFrame := Id.run do
+def channelArraysToAudioFrame (chans : Array (Array Int32)) (sampleRate : UInt32)
+    (bitsPerSample : Nat := 16) : AudioFrame := Id.run do
   let nCh := Nat.max 1 chans.size
   let nS := (chans.getD 0 #[]).size
-  let mut af := AudioFrame.alloc .s16p sampleRate nCh.toUInt32 nS 0
+  let mut af := AudioFrame.alloc (if bitsPerSample > 16 then .s32p else .s16p) sampleRate nCh.toUInt32 nS 0
   for ch in [:chans.size] do
     let arr := chans[ch]!
     for i in [:Nat.min nS arr.size] do
-      af := af.setSample ch i (clipInt16 arr[i]!)
+      af := af.setSample ch i (if bitsPerSample > 16 then arr[i]! else clipInt16 arr[i]!)
   return af
 
 /-! ## 10. Lossless All-Intra `I_PCM` H.264 + AAC-LC Synthetic MP4 Muxer -/
@@ -1906,6 +1933,67 @@ def muxLavfiFrameMd5Bytes (vfs : Array VideoFrame) (fps : Nat) : Option ByteArra
     let vf0 := vfs[0]!
     let rawFrames := vfs.map (fun vf => packVideoFramesYuv420pRaw #[vf])
     some (LeanAV.Md5.formatFrameMd5Muxer vf0.width vf0.height 1 (Nat.max 1 fps) 0 1 rawFrames).toUTF8
+
+/-- Run a single-stream `-vf` chain through `parseFilterGraph` -> `typecheckFilterGraph` ->
+`executeTypedFilterGraph`, bridging decoded `VideoFrame` streams directly into `LavfiGraph`. -/
+def runSingleStreamVideoFilterGraph (vfChain : String) (frames : Array VideoFrame) (fps : Nat := 25) :
+    Except String (Array VideoFrame × Nat) := do
+  let effFps := Nat.max 1 fps
+  if vfChain.trimAscii.toString == "" then
+    return (frames, effFps)
+  if frames.isEmpty then
+    return (frames, effFps)
+  let vf0 := frames[0]!
+  let spec := "[0:v]" ++ vfChain ++ "[vout]"
+  let g ← parseFilterGraph spec
+  let extFmt : PadFormat := { kind := .video, width := vf0.width, height := vf0.height, fpsNum := effFps }
+  let tg ← typecheckFilterGraph g [("0:v", extFmt)]
+  let inQ := buildVideoQueue (Nat.max maxLavfiVideoFrames frames.size) frames
+  let outs ← executeTypedFilterGraph tg [("0:v", inQ)]
+  match outs.find? (fun (lbl, fmt, _) => lbl == "vout" && fmt.kind == .video) with
+  | some (_, fmt, outQ) => return (drainVideoQueue outQ, Nat.max 1 fmt.fpsNum)
+  | none =>
+    match outs.find? (fun (_, fmt, _) => fmt.kind == .video) with
+    | some (_, fmt, outQ) => return (drainVideoQueue outQ, Nat.max 1 fmt.fpsNum)
+    | none => throw "video filter graph produced no video output pad"
+
+/-- Run a single-stream `-af` chain through `parseFilterGraph` -> `typecheckFilterGraph` ->
+`executeTypedFilterGraph`, bridging decoded `AudioFrame` streams directly into `LavfiGraph`. -/
+def runSingleStreamAudioFilterGraph (afChain : String) (af : AudioFrame) :
+    Except String AudioFrame := do
+  if afChain.trimAscii.toString == "" then
+    return af
+  let spec := "[0:a]" ++ afChain ++ "[aout]"
+  let g ← parseFilterGraph spec
+  let extFmt : PadFormat := { kind := .audio, sampleRate := Nat.max 1 af.sampleRate.toNat, channels := Nat.max 1 af.channels.toNat }
+  let tg ← typecheckFilterGraph g [("0:a", extFmt)]
+  let inQ := buildAudioQueue 4 af
+  let outs ← executeTypedFilterGraph tg [("0:a", inQ)]
+  match outs.find? (fun (lbl, fmt, _) => lbl == "aout" && fmt.kind == .audio) with
+  | some (_, _, outQ) => return drainAudioQueue outQ
+  | none =>
+    match outs.find? (fun (_, fmt, _) => fmt.kind == .audio) with
+    | some (_, _, outQ) => return drainAudioQueue outQ
+    | none => throw "audio filter graph produced no audio output pad"
+
+/-- Run an arbitrary multi-stream `-filter_complex` DAG over external video and audio input streams. -/
+def runMultiStreamFilterGraph (graphSpec : String)
+    (videoInputs : List (String × Array VideoFrame × Nat))
+    (audioInputs : List (String × AudioFrame)) :
+    Except String (List (String × PadFormat × EdgeBufferQueue)) := do
+  let g ← parseFilterGraph graphSpec
+  let mut extFmts : List (String × PadFormat) := []
+  let mut extQs : List (String × EdgeBufferQueue) := []
+  for (lbl, vfs, fps) in videoInputs do
+    let w := if vfs.isEmpty then 16 else vfs[0]!.width
+    let h := if vfs.isEmpty then 16 else vfs[0]!.height
+    extFmts := extFmts ++ [(lbl, { kind := .video, width := w, height := h, fpsNum := Nat.max 1 fps })]
+    extQs := extQs ++ [(lbl, buildVideoQueue (Nat.max maxLavfiVideoFrames vfs.size) vfs)]
+  for (lbl, af) in audioInputs do
+    extFmts := extFmts ++ [(lbl, { kind := .audio, sampleRate := Nat.max 1 af.sampleRate.toNat, channels := Nat.max 1 af.channels.toNat })]
+    extQs := extQs ++ [(lbl, buildAudioQueue 4 af)]
+  let tg ← typecheckFilterGraph g extFmts
+  executeTypedFilterGraph tg extQs
 
 end LeanAV.LavfiGraph
 

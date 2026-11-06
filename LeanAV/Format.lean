@@ -9747,6 +9747,18 @@ def synthSamplesToNative (t : SynthMp4Track) : Array NativeMp4Sample := Id.run d
     curDts := curDts + d
   return out
 
+def extractMp4StsdFourcc (stsdBox : ByteArray) : Option String := Id.run do
+  let top := ByteSlice.ofByteArray stsdBox
+  let some tops := mp4SubBoxesExact top | return none
+  let some stsd := tops.find? (fun b => b.fourcc == "stsd") | return none
+  if stsd.bodySlice.len < 16 then return none
+  let entryCnt := (readU32BE stsd.bodySlice 4).toNat
+  if entryCnt != 1 then return none
+  let some entrySub := stsd.bodySlice.subSlice? 8 (stsd.bodySlice.len - 8) | return none
+  let some entries := mp4SubBoxesExact entrySub | return none
+  if entries.size != 1 then return none
+  return some (entries[0]!).fourcc
+
 def synthTrackToNative (t : SynthMp4Track) : NativeMp4Track :=
   let matrix :=
     let m := pushU32BE ByteArray.empty 0x00010000
@@ -9780,6 +9792,7 @@ def synthTrackToNative (t : SynthMp4Track) : NativeMp4Track :=
   let urlBox := wrapMp4Box 'u' 'r' 'l' ' ' (pushU32BE ByteArray.empty 1)
   let dref := wrapMp4Box 'd' 'r' 'e' 'f' (pushU32BE (pushU32BE ByteArray.empty 0) 1 ++ urlBox)
   let dinf := wrapMp4Box 'd' 'i' 'n' 'f' dref
+  let fourcc := (extractMp4StsdFourcc t.stsdBox).getD (if t.kind == .video then "avc1" else "mp4a")
   {
     kind := t.kind
     timescale := t.timescale
@@ -9792,7 +9805,7 @@ def synthTrackToNative (t : SynthMp4Track) : NativeMp4Track :=
     mediaHdrBox := mediaHdr
     dinfBox := dinf
     stsdBox := t.stsdBox
-    stsdFourcc := if t.kind == .video then "avc1" else "mp4a"
+    stsdFourcc := fourcc
     multiStsd := false
     origEdtsBox? := none
     origPreRoll := 0
@@ -9901,5 +9914,527 @@ def demuxNativeMp4ContainerTracks (s : ByteSlice) : Option (Array NativeMp4Track
       tracks := tracks.push trk
   if tracks.isEmpty then return none
   return some tracks
+
+/-! ## P1.0 Multi-Codec ISOBMFF `stsd` Builders, Full Ogg (`OggS` + CRC-32) & MPEG-TS (`PAT`/`PMT`/`PES`) -/
+
+def buildVideoCodecStsdBox (entryFourcc cfgFourcc : Char × Char × Char × Char)
+    (width height : Nat) (cfgBody : ByteArray) : ByteArray := Id.run do
+  let (e0, e1, e2, e3) := entryFourcc
+  let (c0, c1, c2, c3) := cfgFourcc
+  let cfgBox :=
+    if cfgBody.isEmpty then ByteArray.empty
+    else wrapMp4Box c0 c1 c2 c3 cfgBody
+  let mut vse := ByteArray.emptyWithCapacity (78 + cfgBox.size)
+  vse := pushZeros vse 6
+  vse := pushU16BE vse 1
+  vse := pushZeros vse 16
+  vse := pushU16BE vse width.toUInt16
+  vse := pushU16BE vse height.toUInt16
+  vse := pushU32BE vse 0x00480000
+  vse := pushU32BE vse 0x00480000
+  vse := pushU32BE vse 0
+  vse := pushU16BE vse 1
+  vse := pushZeros vse 32
+  vse := pushU16BE vse 0x0018
+  vse := pushU16BE vse 0xFFFF
+  vse := vse ++ cfgBox
+  let entryBox := wrapMp4Box e0 e1 e2 e3 vse
+  let mut stsdBody := ByteArray.emptyWithCapacity (8 + entryBox.size)
+  stsdBody := pushU32BE stsdBody 0
+  stsdBody := pushU32BE stsdBody 1
+  stsdBody := stsdBody ++ entryBox
+  return wrapMp4Box 's' 't' 's' 'd' stsdBody
+
+def buildHvc1StsdBox (width height : Nat) (hvcCBody : ByteArray) : ByteArray :=
+  buildVideoCodecStsdBox ('h', 'v', 'c', '1') ('h', 'v', 'c', 'C') width height hvcCBody
+
+def buildAv01StsdBox (width height : Nat) (av1CBody : ByteArray) : ByteArray :=
+  buildVideoCodecStsdBox ('a', 'v', '0', '1') ('a', 'v', '1', 'C') width height av1CBody
+
+def buildApcnStsdBox (width height : Nat) : ByteArray :=
+  buildVideoCodecStsdBox ('a', 'p', 'c', 'n') ('f', 'i', 'e', 'l') width height ByteArray.empty
+
+def buildOpusMp4StsdBox (channels : Nat) (sampleRate : Nat := 48000) (preSkip : Nat := 312) : ByteArray := Id.run do
+  let mut dops := ByteArray.emptyWithCapacity 11
+  dops := dops.push 0
+  dops := dops.push channels.toUInt8
+  dops := pushU16BE dops preSkip.toUInt16
+  dops := pushU32BE dops sampleRate.toUInt32
+  dops := pushU16BE dops 0
+  dops := dops.push 0
+  let dopsBox := wrapMp4Box 'd' 'O' 'p' 's' dops
+  let mut ase := ByteArray.emptyWithCapacity (28 + dopsBox.size)
+  ase := pushZeros ase 6
+  ase := pushU16BE ase 1
+  ase := pushZeros ase 8
+  ase := pushU16BE ase channels.toUInt16
+  ase := pushU16BE ase 16
+  ase := pushU16BE ase 0
+  ase := pushU16BE ase 0
+  ase := pushU32BE ase ((sampleRate &&& 0xFFFF) <<< 16).toUInt32
+  ase := ase ++ dopsBox
+  let opusBox := wrapMp4Box 'O' 'p' 'u' 's' ase
+  return buildMp4aStsdBoxFromEntry opusBox
+
+def extractMp4StsdChildBody (stsdBox : ByteArray) (entryFourccs : List String) (childFourcc : String) : Option ByteArray := Id.run do
+  let top := ByteSlice.ofByteArray stsdBox
+  let some tops := mp4SubBoxesExact top | return none
+  let some stsd := tops.find? (fun b => b.fourcc == "stsd") | return none
+  if stsd.bodySlice.len < 16 then return none
+  let entryCnt := (readU32BE stsd.bodySlice 4).toNat
+  if entryCnt != 1 then return none
+  let some entrySub := stsd.bodySlice.subSlice? 8 (stsd.bodySlice.len - 8) | return none
+  let some entries := mp4SubBoxesExact entrySub | return none
+  if entries.size != 1 then return none
+  let entry := entries[0]!
+  if !entryFourccs.contains entry.fourcc then return none
+  let hdrSkip := if entry.fourcc == "Opus" || entry.fourcc == "mp4a" then 28 else 78
+  if entry.bodySlice.len < hdrSkip then return none
+  let some kidsSub := entry.bodySlice.subSlice? hdrSkip (entry.bodySlice.len - hdrSkip) | return none
+  let some kids := mp4SubBoxesExact kidsSub | return none
+  let some child := kids.find? (fun b => b.fourcc == childFourcc) | return none
+  return some child.bodySlice.toByteArray
+
+private def crc32MsbStep (poly : UInt32) : Nat → UInt32 → UInt32
+  | 0, c => c
+  | k + 1, c =>
+    let next := if (c &&& 0x80000000) != 0 then (c <<< 1) ^^^ poly else c <<< 1
+    crc32MsbStep poly k next
+
+def oggCrc32Bytes (ba : ByteArray) : UInt32 := Id.run do
+  let mut crc : UInt32 := 0
+  for i in [:ba.size] do
+    let b := ba.get! i
+    crc := crc32MsbStep 0x04C11DB7 8 (crc ^^^ (b.toUInt32 <<< 24))
+  return crc
+
+def mpegTsPsiCrc32 (ba : ByteArray) : UInt32 := Id.run do
+  let mut crc : UInt32 := 0xFFFFFFFF
+  for i in [:ba.size] do
+    let b := ba.get! i
+    crc := crc32MsbStep 0x04C11DB7 8 (crc ^^^ (b.toUInt32 <<< 24))
+  return crc
+
+structure OggLogicalPacket where
+  data       : ByteArray
+  granulePos : UInt64
+  serialNo   : UInt32
+  headerType : UInt8
+  deriving Inhabited
+
+def buildOggPageBytes (headerType : UInt8) (granulePos : UInt64) (serialNo seqNo : UInt32)
+    (segTable payload : ByteArray) : ByteArray := Id.run do
+  let mut page := ByteArray.emptyWithCapacity (27 + segTable.size + payload.size)
+  page := pushFourCC page 'O' 'g' 'g' 'S'
+  page := page.push 0
+  page := page.push headerType
+  page := pushU64LE page granulePos
+  page := pushU32LE page serialNo
+  page := pushU32LE page seqNo
+  page := pushU32LE page 0
+  page := page.push segTable.size.toUInt8
+  page := page ++ segTable ++ payload
+  let crc := oggCrc32Bytes page
+  page := page.set! 22 (crc &&& 0xFF).toUInt8
+  page := page.set! 23 ((crc >>> 8) &&& 0xFF).toUInt8
+  page := page.set! 24 ((crc >>> 16) &&& 0xFF).toUInt8
+  page := page.set! 25 ((crc >>> 24) &&& 0xFF).toUInt8
+  return page
+
+def muxOggLogicalStream (packets : Array (ByteArray × UInt64)) (serialNo : UInt32 := 0x4C45414E) : Option ByteArray := Id.run do
+  if packets.isEmpty then return none
+  let mut out := ByteArray.empty
+  let mut seqNo : UInt32 := 0
+  for pIdx in [:packets.size] do
+    let (pkt, gran) := packets[pIdx]!
+    let isFirstPkt := pIdx == 0
+    let isLastPkt := pIdx + 1 == packets.size
+    let mut segs : Array UInt8 := #[]
+    let mut rem := pkt.size
+    while rem >= 255 do
+      segs := segs.push 255
+      rem := rem - 255
+    segs := segs.push rem.toUInt8
+    let mut segCursor := 0
+    let mut byteCursor := 0
+    let mut subPage := 0
+    while segCursor < segs.size do
+      let chunkSegs := Nat.min 255 (segs.size - segCursor)
+      let isLastSubPage := segCursor + chunkSegs == segs.size
+      let mut segTable := ByteArray.emptyWithCapacity chunkSegs
+      let mut chunkBytes := 0
+      for k in [:chunkSegs] do
+        let sb := segs[segCursor + k]!
+        segTable := segTable.push sb
+        chunkBytes := chunkBytes + sb.toNat
+      let payload := pkt.extract byteCursor (byteCursor + chunkBytes)
+      let mut hdrType : UInt8 := 0
+      if subPage > 0 then hdrType := hdrType ||| 0x01
+      if isFirstPkt && subPage == 0 then hdrType := hdrType ||| 0x02
+      if isLastPkt && isLastSubPage then hdrType := hdrType ||| 0x04
+      let pageGran : UInt64 := if isLastSubPage then gran else 0xFFFFFFFFFFFFFFFF
+      out := out ++ buildOggPageBytes hdrType pageGran serialNo seqNo segTable payload
+      seqNo := seqNo + 1
+      segCursor := segCursor + chunkSegs
+      byteCursor := byteCursor + chunkBytes
+      subPage := subPage + 1
+  return some out
+
+def demuxOggLogicalPackets (s : ByteSlice) : Option (Array OggLogicalPacket) := Id.run do
+  if s.len < 27 then return none
+  let mut pos : Nat := 0
+  let mut fuel : Nat := s.len / 27 + 2
+  let mut out : Array OggLogicalPacket := #[]
+  let mut curBuf : ByteArray := ByteArray.empty
+  let mut curHdr : UInt8 := 0
+  let mut curSerial : UInt32 := 0
+  let mut inCont : Bool := false
+  while pos < s.len && fuel > 0 do
+    fuel := fuel - 1
+    if pos + 27 > s.len then return none
+    if !fourCCEq s pos 'O' 'g' 'g' 'S' then return none
+    if s.getByteD (pos + 4) 0 != 0 then return none
+    let hdrType := s.getByteD (pos + 5) 0
+    let gran := readU64LE s (pos + 6)
+    let serial := readU32LE s (pos + 14)
+    let storedCrc := readU32LE s (pos + 22)
+    let numSegs := (s.getByteD (pos + 26) 0).toNat
+    if pos + 27 + numSegs > s.len then return none
+    let mut payloadBytes : Nat := 0
+    for i in [:numSegs] do
+      payloadBytes := payloadBytes + (s.getByteD (pos + 27 + i) 0).toNat
+    let pageLen := 27 + numSegs + payloadBytes
+    if pos + pageLen > s.len then return none
+    let some rawPageSlice := s.subSlice? pos pageLen | return none
+    let mut zeroedPage := rawPageSlice.toByteArray
+    zeroedPage := zeroedPage.set! 22 0 |>.set! 23 0 |>.set! 24 0 |>.set! 25 0
+    if oggCrc32Bytes zeroedPage != storedCrc then return none
+    if (hdrType &&& 0x01) != 0 && !inCont then return none
+    if (hdrType &&& 0x01) == 0 && inCont then return none
+    let mut dataCursor := pos + 27 + numSegs
+    for i in [:numSegs] do
+      let segLen := (s.getByteD (pos + 27 + i) 0).toNat
+      let some segSlice := s.subSlice? dataCursor segLen | return none
+      if !inCont then
+        curHdr := hdrType
+        curSerial := serial
+      curBuf := curBuf ++ segSlice.toByteArray
+      dataCursor := dataCursor + segLen
+      if segLen < 255 then
+        out := out.push {
+          data := curBuf
+          granulePos := gran
+          serialNo := curSerial
+          headerType := curHdr
+        }
+        curBuf := ByteArray.empty
+        inCont := false
+      else
+        inCont := true
+    pos := pos + pageLen
+  if pos != s.len || inCont || out.isEmpty then return none
+  return some out
+
+structure MpegTsElementaryStream where
+  pid        : UInt16
+  streamType : UInt8
+  packets    : Array (ByteArray × UInt64)
+  deriving Inhabited
+
+private def pushPesPts5 (b : ByteArray) (markerTop4 : UInt8) (pts90k : UInt64) : ByteArray :=
+  let b0 := ((markerTop4 &&& 0x0F) <<< 4) ||| ((((pts90k >>> 30) &&& 0x07).toUInt8) <<< 1) ||| 1
+  let b1 := ((pts90k >>> 22) &&& 0xFF).toUInt8
+  let b2 := ((((pts90k >>> 15) &&& 0x7F).toUInt8) <<< 1) ||| 1
+  let b3 := ((pts90k >>> 7) &&& 0xFF).toUInt8
+  let b4 := (((pts90k &&& 0x7F).toUInt8) <<< 1) ||| 1
+  b.push b0 |>.push b1 |>.push b2 |>.push b3 |>.push b4
+
+private def parsePesPts5 (b : ByteArray) (off : Nat) : Option UInt64 :=
+  if off + 5 > b.size then none
+  else
+    let b0 := (b.get! off).toUInt64
+    let b1 := (b.get! (off + 1)).toUInt64
+    let b2 := (b.get! (off + 2)).toUInt64
+    let b3 := (b.get! (off + 3)).toUInt64
+    let b4 := (b.get! (off + 4)).toUInt64
+    if (b0 &&& 1) != 1 || (b2 &&& 1) != 1 || (b4 &&& 1) != 1 then none
+    else
+      some ((((b0 >>> 1) &&& 0x07) <<< 30) |||
+            (b1 <<< 22) |||
+            (((b2 >>> 1) &&& 0x7F) <<< 15) |||
+            (b3 <<< 7) |||
+            ((b4 >>> 1) &&& 0x7F))
+
+private def packTsPsiPacket (pid : UInt16) (cc : UInt8) (sectionNoCrc : ByteArray) : ByteArray := Id.run do
+  let crc := mpegTsPsiCrc32 sectionNoCrc
+  let mut sec := sectionNoCrc
+  sec := pushU32BE sec crc
+  let mut pkt := ByteArray.emptyWithCapacity 188
+  pkt := pkt.push 0x47
+  pkt := pkt.push ((0x40 : UInt8) ||| ((pid >>> 8) &&& 0x1F).toUInt8)
+  pkt := pkt.push (pid &&& 0xFF).toUInt8
+  pkt := pkt.push ((0x10 : UInt8) ||| (cc &&& 0x0F))
+  pkt := pkt.push 0x00 -- pointer_field = 0
+  pkt := pkt ++ sec
+  while pkt.size < 188 do
+    pkt := pkt.push 0xFF
+  return pkt.extract 0 188
+
+private def packPesIntoTsPackets (pid : UInt16) (ccStart : UInt8) (pes : ByteArray) : ByteArray × UInt8 := Id.run do
+  let mut out := ByteArray.empty
+  let mut cursor := 0
+  let mut cc := ccStart
+  let mut first := true
+  while cursor < pes.size do
+    let rem := pes.size - cursor
+    let pusi : UInt8 := if first then 0x40 else 0x00
+    first := false
+    if rem >= 184 then
+      let mut pkt := ByteArray.emptyWithCapacity 188
+      pkt := pkt.push 0x47
+      pkt := pkt.push (pusi ||| ((pid >>> 8) &&& 0x1F).toUInt8)
+      pkt := pkt.push (pid &&& 0xFF).toUInt8
+      pkt := pkt.push (0x10 ||| (cc &&& 0x0F))
+      pkt := pkt ++ pes.extract cursor (cursor + 184)
+      out := out ++ pkt
+      cursor := cursor + 184
+    else
+      let stuffTotal := 184 - rem
+      let mut pkt := ByteArray.emptyWithCapacity 188
+      pkt := pkt.push 0x47
+      pkt := pkt.push (pusi ||| ((pid >>> 8) &&& 0x1F).toUInt8)
+      pkt := pkt.push (pid &&& 0xFF).toUInt8
+      pkt := pkt.push (0x30 ||| (cc &&& 0x0F))
+      if stuffTotal == 1 then
+        pkt := pkt.push 0x00
+      else
+        let afLen := stuffTotal - 1
+        pkt := pkt.push afLen.toUInt8
+        pkt := pkt.push 0x00
+        for _ in [:(afLen - 1)] do
+          pkt := pkt.push 0xFF
+      pkt := pkt ++ pes.extract cursor pes.size
+      out := out ++ pkt
+      cursor := pes.size
+    cc := (cc + 1) &&& 0x0F
+  return (out, cc)
+
+def muxMpegTsProgram (streams : Array MpegTsElementaryStream) : Option ByteArray := Id.run do
+  if streams.isEmpty then return none
+  if streams.any (fun es => es.packets.isEmpty || es.pid < 0x0020 || es.pid >= 0x1FFF) then return none
+  -- Build PAT (PID 0x0000 -> PMT PID 0x1000)
+  let mut patSec := ByteArray.empty
+  patSec := patSec.push 0x00
+  patSec := pushU16BE patSec (0xB000 ||| 13)
+  patSec := pushU16BE patSec 0x0001
+  patSec := patSec.push 0xC1
+  patSec := patSec.push 0x00
+  patSec := patSec.push 0x00
+  patSec := pushU16BE patSec 0x0001
+  patSec := pushU16BE patSec (0xE000 ||| 0x1000)
+  let patPkt := packTsPsiPacket 0x0000 0 patSec
+  -- Build PMT (PID 0x1000)
+  let pcrPid := (streams[0]!).pid
+  let esEntriesLen := streams.size * 5
+  let pmtSecLen := 13 + esEntriesLen
+  let mut pmtSec := ByteArray.empty
+  pmtSec := pmtSec.push 0x02
+  pmtSec := pushU16BE pmtSec (0xB000 ||| pmtSecLen.toUInt16)
+  pmtSec := pushU16BE pmtSec 0x0001
+  pmtSec := pmtSec.push 0xC1
+  pmtSec := pmtSec.push 0x00
+  pmtSec := pmtSec.push 0x00
+  pmtSec := pushU16BE pmtSec (0xE000 ||| pcrPid)
+  pmtSec := pushU16BE pmtSec 0xF000
+  for es in streams do
+    pmtSec := pmtSec.push es.streamType
+    pmtSec := pushU16BE pmtSec (0xE000 ||| es.pid)
+    pmtSec := pushU16BE pmtSec 0xF000
+  let pmtPkt := packTsPsiPacket 0x1000 0 pmtSec
+  let mut out := patPkt ++ pmtPkt
+  let mut ccs : Array UInt8 := Array.replicate streams.size 0
+  let maxPkts := streams.foldl (fun acc es => Nat.max acc es.packets.size) 0
+  for pIdx in [:maxPkts] do
+    for sIdx in [:streams.size] do
+      let es := streams[sIdx]!
+      if pIdx < es.packets.size then
+        let (auBytes, pts90k) := es.packets[pIdx]!
+        let isVid := es.streamType == 0x1B || es.streamType == 0x24 || es.streamType == 0x02
+        let streamId : UInt8 := if isVid then 0xE0 else 0xC0
+        let pesTotalAfterLen := 3 + 5 + auBytes.size
+        let pesLen16 : UInt16 := if isVid || pesTotalAfterLen > 65535 then 0 else pesTotalAfterLen.toUInt16
+        let mut pes := ByteArray.emptyWithCapacity (14 + auBytes.size)
+        pes := pes.push 0x00 |>.push 0x00 |>.push 0x01 |>.push streamId
+        pes := pushU16BE pes pesLen16
+        pes := pes.push 0x80 |>.push 0x80 |>.push 0x05
+        pes := pushPesPts5 pes 0x02 pts90k
+        pes := pes ++ auBytes
+        let (tsChunk, cc1) := packPesIntoTsPackets es.pid (ccs[sIdx]!) pes
+        ccs := ccs.set! sIdx cc1
+        out := out ++ tsChunk
+  return some out
+
+private def flushPesUnit (pesBuf : ByteArray) : Option (ByteArray × UInt64) :=
+  if pesBuf.size < 9 then none
+  else if pesBuf.get! 0 != 0x00 || pesBuf.get! 1 != 0x00 || pesBuf.get! 2 != 0x01 then none
+  else
+    let flags2 := pesBuf.get! 7
+    let hdrDataLen := (pesBuf.get! 8).toNat
+    let payloadOff := 9 + hdrDataLen
+    if payloadOff > pesBuf.size then none
+    else
+      let pts : UInt64 :=
+        if (flags2 &&& 0x80) != 0 && hdrDataLen >= 5 then
+          (parsePesPts5 pesBuf 9).getD 0xFFFFFFFFFFFFFFFF
+        else 0xFFFFFFFFFFFFFFFF
+      let payload := pesBuf.extract payloadOff pesBuf.size
+      if payload.isEmpty then none else some (payload, pts)
+
+def demuxMpegTsProgram (s : ByteSlice) : Option (Array MpegTsElementaryStream) := Id.run do
+  if s.len < 188 || s.len % 188 != 0 then return none
+  let nPkts := s.len / 188
+  let mut pmtPid? : Option UInt16 := none
+  let mut esDefs : Array (UInt16 × UInt8) := #[]
+  -- First pass: discover PAT -> PMT -> elementary stream table
+  for i in [:nPkts] do
+    let base := i * 188
+    if s.getByteD base 0 != 0x47 then return none
+    let b1 := s.getByteD (base + 1) 0
+    if (b1 &&& 0x80) != 0 then return none -- TEI error
+    let pusi := (b1 &&& 0x40) != 0
+    let pid : UInt16 := (((b1 &&& 0x1F).toUInt16) <<< 8) ||| (s.getByteD (base + 2) 0).toUInt16
+    let afc := (s.getByteD (base + 3) 0 >>> 4) &&& 0x03
+    let payOff : Nat :=
+      if afc == 0x01 then 4
+      else if afc == 0x03 then 5 + (s.getByteD (base + 4) 0).toNat
+      else 188
+    if payOff > 188 then return none
+    if pusi && payOff < 188 then
+      let ptr := (s.getByteD (base + payOff) 0).toNat
+      let secOff := base + payOff + 1 + ptr
+      if pid == 0x0000 && pmtPid?.isNone && secOff + 12 <= base + 188 then
+        if s.getByteD secOff 0 == 0x00 then
+          let secLen := ((readU16BE s (secOff + 1)).toNat) &&& 0x0FFF
+          if secLen >= 9 && secOff + 3 + secLen <= base + 188 then
+            let mut pCur := secOff + 8
+            let pEnd := secOff + 3 + secLen - 4
+            while pCur + 4 <= pEnd do
+              let progNum := readU16BE s pCur
+              let pPid := (readU16BE s (pCur + 2)) &&& 0x1FFF
+              if progNum != 0 && pmtPid?.isNone then
+                pmtPid? := some pPid
+              pCur := pCur + 4
+      else if some pid == pmtPid? && esDefs.isEmpty && secOff + 12 <= base + 188 then
+        if s.getByteD secOff 0 == 0x02 then
+          let secLen := ((readU16BE s (secOff + 1)).toNat) &&& 0x0FFF
+          if secLen >= 13 && secOff + 3 + secLen <= base + 188 then
+            let progInfoLen := ((readU16BE s (secOff + 10)).toNat) &&& 0x0FFF
+            let mut eCur := secOff + 12 + progInfoLen
+            let eEnd := secOff + 3 + secLen - 4
+            while eCur + 5 <= eEnd do
+              let stype := s.getByteD eCur 0
+              let epid := (readU16BE s (eCur + 1)) &&& 0x1FFF
+              let esInfoLen := ((readU16BE s (eCur + 3)).toNat) &&& 0x0FFF
+              if !esDefs.any (fun p => p.1 == epid) then
+                esDefs := esDefs.push (epid, stype)
+              eCur := eCur + 5 + esInfoLen
+  if esDefs.isEmpty then return none
+  -- Second pass: reassemble PES packets per elementary PID
+  let mut pesAccum : Array ByteArray := Array.replicate esDefs.size ByteArray.empty
+  let mut pesOut : Array (Array (ByteArray × UInt64)) := Array.replicate esDefs.size #[]
+  for i in [:nPkts] do
+    let base := i * 188
+    let b1 := s.getByteD (base + 1) 0
+    let pusi := (b1 &&& 0x40) != 0
+    let pid : UInt16 := (((b1 &&& 0x1F).toUInt16) <<< 8) ||| (s.getByteD (base + 2) 0).toUInt16
+    let afc := (s.getByteD (base + 3) 0 >>> 4) &&& 0x03
+    let payOff : Nat :=
+      if afc == 0x01 then 4
+      else if afc == 0x03 then 5 + (s.getByteD (base + 4) 0).toNat
+      else 188
+    if payOff < 188 then
+      if let some sIdx := esDefs.findIdx? (fun p => p.1 == pid) then
+        let some chunkSlice := s.subSlice? (base + payOff) (188 - payOff) | return none
+        let chunk := chunkSlice.toByteArray
+        if pusi then
+          let prev := pesAccum[sIdx]!
+          if !prev.isEmpty then
+            let some flushed := flushPesUnit prev | return none
+            pesOut := pesOut.set! sIdx ((pesOut[sIdx]!).push flushed)
+          pesAccum := pesAccum.set! sIdx chunk
+        else
+          let prev := pesAccum[sIdx]!
+          if !prev.isEmpty then
+            pesAccum := pesAccum.set! sIdx (prev ++ chunk)
+  for sIdx in [:esDefs.size] do
+    let prev := pesAccum[sIdx]!
+    if !prev.isEmpty then
+      let some flushed := flushPesUnit prev | return none
+      pesOut := pesOut.set! sIdx ((pesOut[sIdx]!).push flushed)
+  let mut result : Array MpegTsElementaryStream := #[]
+  for sIdx in [:esDefs.size] do
+    let (epid, stype) := esDefs[sIdx]!
+    let pkts := pesOut[sIdx]!
+    if !pkts.isEmpty then
+      result := result.push { pid := epid, streamType := stype, packets := pkts }
+  if result.isEmpty then return none
+  return some result
+
+def oggLogicalPageBoundsInRange (numSegs payloadBytes pageOff totalLen : Nat) : Bool :=
+  numSegs ≤ 255 && pageOff + 27 + numSegs + payloadBytes ≤ totalLen
+
+def OggLogicalPageBoundsSafe (x : Nat × Nat × Nat × Nat) : Prop :=
+  let (numSegs, payloadBytes, pageOff, totalLen) := x
+  numSegs ≤ 255 ∧ pageOff + 27 + numSegs + payloadBytes ≤ totalLen
+
+def oggLogicalPageBoundsGateSpec : AVGateSpec (Nat × Nat × Nat × Nat) OggLogicalPageBoundsSafe where
+  gate x := oggLogicalPageBoundsInRange x.1 x.2.1 x.2.2.1 x.2.2.2
+  posWitness := (2, 300, 0, 329)
+  negWitness := (2, 300, 1, 329)
+  sound x h := by
+    unfold oggLogicalPageBoundsInRange at h
+    unfold OggLogicalPageBoundsSafe
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+    exact ⟨h.1, h.2⟩
+  complete x h := by
+    unfold oggLogicalPageBoundsInRange
+    unfold OggLogicalPageBoundsSafe at h
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨h.1, h.2⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem oggLogicalPageBoundsGateSpec_iff (x : Nat × Nat × Nat × Nat) :
+    oggLogicalPageBoundsGateSpec.gate x = true ↔ OggLogicalPageBoundsSafe x :=
+  oggLogicalPageBoundsGateSpec.iff_safe x
+
+def mpegTsProgramStreamValid (es : MpegTsElementaryStream) : Bool :=
+  0 < es.packets.size && 0x0020 ≤ es.pid.toNat && es.pid.toNat < 0x1FFF &&
+  (es.streamType == 0x1B || es.streamType == 0x24 || es.streamType == 0x0F ||
+   es.streamType == 0x06 || es.streamType == 0x02 || es.streamType == 0x03)
+
+def MpegTsProgramStreamSafe (es : MpegTsElementaryStream) : Prop :=
+  0 < es.packets.size ∧ 0x0020 ≤ es.pid.toNat ∧ es.pid.toNat < 0x1FFF ∧
+  (es.streamType = 0x1B ∨ es.streamType = 0x24 ∨ es.streamType = 0x0F ∨
+   es.streamType = 0x06 ∨ es.streamType = 0x02 ∨ es.streamType = 0x03)
+
+instance (es : MpegTsElementaryStream) : Decidable (MpegTsProgramStreamSafe es) :=
+  inferInstanceAs (Decidable
+    (0 < es.packets.size ∧ 0x0020 ≤ es.pid.toNat ∧ es.pid.toNat < 0x1FFF ∧
+     (es.streamType = 0x1B ∨ es.streamType = 0x24 ∨ es.streamType = 0x0F ∨
+      es.streamType = 0x06 ∨ es.streamType = 0x02 ∨ es.streamType = 0x03)))
+
+def mpegTsProgramStreamGateSpec : AVGateSpec MpegTsElementaryStream MpegTsProgramStreamSafe where
+  gate es := decide (MpegTsProgramStreamSafe es)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := { pid := 0x0100, streamType := 0x1B, packets := #[({ data := #[0, 0, 0, 1, 0x67, 0x42] }, 9000)] }
+  negWitness := { pid := 0x0010, streamType := 0x1B, packets := #[({ data := #[0, 0, 0, 1, 0x67, 0x42] }, 9000)] }
+  nonVacuous := rfl
+  tight := rfl
+
+theorem mpegTsProgramStreamGateSpec_iff (es : MpegTsElementaryStream) :
+    mpegTsProgramStreamGateSpec.gate es = true ↔ MpegTsProgramStreamSafe es :=
+  mpegTsProgramStreamGateSpec.iff_safe es
 
 end LeanAV.Format

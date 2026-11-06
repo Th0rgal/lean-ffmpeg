@@ -193,7 +193,7 @@ class CliRoutingTests(unittest.TestCase):
             subprocess.run(
                 [FFMPEG, "-hide_banner", "-v", "error", "-y",
                  "-f", "lavfi", "-i", "color=c=blue:s=32x32:r=10:d=0.2",
-                 "-c:v", "libx265", "-pix_fmt", "yuv420p", str(hevc_mp4)],
+                 "-c:v", "libx265", "-pix_fmt", "yuv420p10le", str(hevc_mp4)],
                 check=True, capture_output=True,
             )
             h264_mkv = root / "h264_in.mkv"

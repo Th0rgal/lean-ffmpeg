@@ -561,6 +561,34 @@ def psnr_db(ref_bytes, got_bytes):
     return 10.0 * math.log10((255.0 * 255.0) / mse)
 
 
+def decode_args(in_path, out_path):
+    out_str = str(out_path)
+    fmt = "null" if out_str == "-" else "rawvideo"
+    return [LFFMPEG, "-json", "-y", "-i", in_path, "-an", "-f", fmt, out_path]
+
+
+def encode_args(w, h, in_path, out_path, qidx=60, fmt=None, tc=1, tr=1):
+    out_str = str(out_path)
+    if fmt is None or fmt == "auto":
+        if out_str.endswith(".mp4"):
+            mux_fmt = "mp4"
+        elif out_str.endswith(".ivf"):
+            mux_fmt = "ivf"
+        else:
+            mux_fmt = "obu"
+    else:
+        mux_fmt = fmt
+    return [
+        LFFMPEG, "-json", "-y",
+        "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+        "-i", in_path,
+        "-an", "-c:v", "av1", "-qp", str(qidx),
+        "-tile-columns", str(tc.bit_length() - 1),
+        "-tile-rows", str(tr.bit_length() - 1),
+        "-f", mux_fmt, out_path,
+    ]
+
+
 @unittest.skipUnless(LFFMPEG.exists(), "lffmpeg is not built")
 class TestAv1Main(unittest.TestCase):
     def setUp(self):
@@ -646,7 +674,7 @@ class TestAv1Main(unittest.TestCase):
 
                 ref_yuv = self._ffmpeg_decode_yuv420p(stream_path)
                 lean_yuv_path = self.dir / f"lean_{name}.yuv"
-                dec_proc = run(LFFMPEG, "av1-decode-raw", stream_path, lean_yuv_path, env=ISO_ENV)
+                dec_proc = run(*decode_args(stream_path, lean_yuv_path), env=ISO_ENV)
                 dec_meta = json.loads(dec_proc.stdout.decode())
                 self.assertTrue(dec_meta["ok"])
                 self.assertEqual(dec_meta["width"], w)
@@ -673,7 +701,7 @@ class TestAv1Main(unittest.TestCase):
         stream_path = self.dir / name
         stream_path.write_bytes(base64.b64decode(b64))
         lean_yuv_path = self.dir / f"lean_{name}.yuv"
-        dec_proc = run(LFFMPEG, "av1-decode-raw", stream_path, lean_yuv_path, env=ISO_ENV)
+        dec_proc = run(*decode_args(stream_path, lean_yuv_path), env=ISO_ENV)
         dec_meta = json.loads(dec_proc.stdout.decode())
         self.assertTrue(dec_meta["ok"])
         self.assertEqual(dec_meta["width"], w)
@@ -706,7 +734,7 @@ class TestAv1Main(unittest.TestCase):
         scaled_path = self.dir / "scaled_inter_superres.ivf"
         scaled_path.write_bytes(base64.b64decode(SCALED_INTER_SUPERRES_IVF_B64))
         self.assertNotEqual(
-            run(LFFMPEG, "av1-decode-raw", scaled_path, "-", env=ISO_ENV, check=False).returncode,
+            run(*decode_args(scaled_path, "-"), env=ISO_ENV, check=False).returncode,
             0,
         )
         self.assertNotEqual(
@@ -736,7 +764,7 @@ class TestAv1Main(unittest.TestCase):
                 )
                 ref_yuv = self._ffmpeg_decode_yuv420p(stream_path)
                 lean_yuv_path = self.dir / f"lean_{name}.yuv"
-                dec_proc = run(LFFMPEG, "av1-decode-raw", stream_path, lean_yuv_path, env=ISO_ENV)
+                dec_proc = run(*decode_args(stream_path, lean_yuv_path), env=ISO_ENV)
                 dec_meta = json.loads(dec_proc.stdout.decode())
                 self.assertTrue(dec_meta["ok"])
                 self.assertEqual(dec_meta["width"], w)
@@ -749,7 +777,7 @@ class TestAv1Main(unittest.TestCase):
                 self.assertEqual(probe["frames"], nf)
 
     def test_lffmpeg_encode_to_ffmpeg_and_ffprobe_parity(self):
-        if not libaom_av1_available():
+        if not av1_decoder_available():
             self.skipTest("ffmpeg unavailable")
         has_ffprobe = ffprobe_available()
         cases = [
@@ -773,7 +801,7 @@ class TestAv1Main(unittest.TestCase):
                 in_path.write_bytes(raw_in)
 
                 enc_proc = run(
-                    LFFMPEG, "av1-encode-raw", w, h, in_path, out_bs, qidx, fmt, tc, tr,
+                    *encode_args(w, h, in_path, out_bs, qidx, fmt, tc, tr),
                     env=ISO_ENV,
                 )
                 enc_meta = json.loads(enc_proc.stdout.decode())
@@ -786,7 +814,7 @@ class TestAv1Main(unittest.TestCase):
                     self.assertIn(b"av1C", mp4_boxes)
                     self.assertNotIn(b"ctts", mp4_boxes)
 
-                run(LFFMPEG, "av1-decode-raw", out_bs, lean_dec, env=ISO_ENV)
+                run(*decode_args(out_bs, lean_dec), env=ISO_ENV)
                 ff_yuv = self._ffmpeg_decode_yuv420p(out_bs)
                 lean_bytes = lean_dec.read_bytes()
                 self.assertEqual(lean_bytes, ff_yuv)
@@ -823,7 +851,7 @@ class TestAv1Main(unittest.TestCase):
         in_good = self.dir / "good.yuv"
         in_good.write_bytes(synth_yuv420p(64, 48, 1))
         good_obu = self.dir / "good.obu"
-        run(LFFMPEG, "av1-encode-raw", 64, 48, in_good, good_obu, 60, "obu", env=ISO_ENV)
+        run(*encode_args(64, 48, in_good, good_obu, 60, "obu"), env=ISO_ENV)
         good_raw = good_obu.read_bytes()
 
         bad_cases = {
@@ -836,7 +864,7 @@ class TestAv1Main(unittest.TestCase):
             p = self.dir / tag
             p.write_bytes(payload)
             self.assertNotEqual(
-                run(LFFMPEG, "av1-decode-raw", p, "-", env=ISO_ENV, check=False).returncode,
+                run(*decode_args(p, "-"), env=ISO_ENV, check=False).returncode,
                 0,
                 tag,
             )
@@ -852,7 +880,7 @@ class TestAv1Main(unittest.TestCase):
         in_odd = self.dir / "odd.yuv"
         in_odd.write_bytes(b"\x80" * (63 * 48 * 3 // 2))
         self.assertNotEqual(
-            run(LFFMPEG, "av1-encode-raw", 63, 48, in_odd, self.dir / "odd.obu", env=ISO_ENV, check=False).returncode,
+            run(*encode_args(63, 48, in_odd, self.dir / "odd.obu"), env=ISO_ENV, check=False).returncode,
             0,
         )
 
@@ -870,7 +898,7 @@ class TestAv1Main(unittest.TestCase):
                 "-frames:v", "1", "-f", "ivf", neg_path,
             )
             self.assertNotEqual(
-                run(LFFMPEG, "av1-decode-raw", neg_path, "-", env=ISO_ENV, check=False).returncode,
+                run(*decode_args(neg_path, "-"), env=ISO_ENV, check=False).returncode,
                 0,
                 tag,
             )
@@ -890,7 +918,7 @@ class TestAv1Main(unittest.TestCase):
             "-frames:v", "1", "-f", "ivf", fg_path,
         )
         self.assertNotEqual(
-            run(LFFMPEG, "av1-decode-raw", fg_path, "-", env=ISO_ENV, check=False).returncode,
+            run(*decode_args(fg_path, "-"), env=ISO_ENV, check=False).returncode,
             0,
             "film_grain_active.ivf",
         )
@@ -910,7 +938,7 @@ class TestAv1Main(unittest.TestCase):
                 "-frames:v", "4", "-f", "ivf", scaled_path,
             )
             self.assertNotEqual(
-                run(LFFMPEG, "av1-decode-raw", scaled_path, "-", env=ISO_ENV, check=False).returncode,
+                run(*decode_args(scaled_path, "-"), env=ISO_ENV, check=False).returncode,
                 0,
                 "scaled_inter_superres.ivf",
             )
@@ -924,7 +952,7 @@ class TestAv1Main(unittest.TestCase):
         ivf_path = self.dir / "uni_compound_cpu2_96x80.ivf"
         ivf_path.write_bytes(base64.b64decode(UNI_COMPOUND_CPU2_96X80_IVF_B64))
         lean_yuv = self.dir / "uni_compound_cpu2_96x80.yuv"
-        dec_proc = run(LFFMPEG, "av1-decode-raw", ivf_path, lean_yuv, env=ISO_ENV)
+        dec_proc = run(*decode_args(ivf_path, lean_yuv), env=ISO_ENV)
         dec_meta = json.loads(dec_proc.stdout.decode())
         self.assertTrue(dec_meta["ok"])
         self.assertEqual(dec_meta["width"], 96)
@@ -940,7 +968,7 @@ class TestAv1Main(unittest.TestCase):
         ivf_path = self.dir / "refmv_compound_uncap_m11_32x32.ivf"
         ivf_path.write_bytes(base64.b64decode(REFMV_COMPOUND_UNCAP_M11_IVF_B64))
         lean_yuv = self.dir / "refmv_compound_uncap_m11_32x32.yuv"
-        dec_proc = run(LFFMPEG, "av1-decode-raw", ivf_path, lean_yuv, env=ISO_ENV)
+        dec_proc = run(*decode_args(ivf_path, lean_yuv), env=ISO_ENV)
         dec_meta = json.loads(dec_proc.stdout.decode())
         self.assertTrue(dec_meta["ok"])
         self.assertEqual(dec_meta["width"], 32)
@@ -957,8 +985,8 @@ class TestAv1Main(unittest.TestCase):
         in_path.write_bytes(synth_yuv420p(64, 48, 2))
         bs_path = self.dir / "iso.obu"
         out_yuv = self.dir / "iso_out.yuv"
-        run(LFFMPEG, "av1-encode-raw", 64, 48, in_path, bs_path, 60, "obu", 1, 1, env=ISO_ENV)
-        run(LFFMPEG, "av1-decode-raw", bs_path, out_yuv, env=ISO_ENV)
+        run(*encode_args(64, 48, in_path, bs_path, 60, "obu", 1, 1), env=ISO_ENV)
+        run(*decode_args(bs_path, out_yuv), env=ISO_ENV)
         run(LFFMPEG, "av1-probe", bs_path, env=ISO_ENV)
         if STRACE is None:
             return
@@ -966,8 +994,8 @@ class TestAv1Main(unittest.TestCase):
         needle = trace + "("
         for cmd in (
             [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, LFFMPEG, "av1-probe", bs_path],
-            [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, LFFMPEG, "av1-encode-raw", 64, 48, in_path, self.dir / "s.obu"],
-            [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, LFFMPEG, "av1-decode-raw", bs_path, self.dir / "s.yuv"],
+            [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, *encode_args(64, 48, in_path, self.dir / "s.obu")],
+            [STRACE, "-f", "-s", "4096", "-e", "trace=" + trace, *decode_args(bs_path, self.dir / "s.yuv")],
         ):
             proc = run(*cmd, env=ISO_ENV)
             spawn_lines = [ln for ln in proc.stderr.decode(errors="replace").splitlines() if needle in ln]
@@ -995,7 +1023,7 @@ class TestAv1Main(unittest.TestCase):
         self.assertEqual(probe["frames"], 2)
 
         lean_yuv = self.dir / f"lean_{mp4_path.name}.yuv"
-        dec = json.loads(run(LFFMPEG, "av1-decode-raw", mp4_path, lean_yuv, env=ISO_ENV).stdout.decode())
+        dec = json.loads(run(*decode_args(mp4_path, lean_yuv), env=ISO_ENV).stdout.decode())
         self.assertTrue(dec["ok"])
         self.assertEqual(dec["width"], 128)
         self.assertEqual(dec["height"], 96)
@@ -1026,7 +1054,7 @@ class TestAv1Main(unittest.TestCase):
                 tag,
             )
             self.assertNotEqual(
-                run(LFFMPEG, "av1-decode-raw", bad_path, "-", env=ISO_ENV, check=False).returncode,
+                run(*decode_args(bad_path, "-"), env=ISO_ENV, check=False).returncode,
                 0,
                 tag,
             )
@@ -1078,7 +1106,7 @@ class TestAv1Main(unittest.TestCase):
                 self.assertEqual(probe["frames"], expected_frames)
 
                 lean_yuv = self.dir / f"lean_{tag}.yuv"
-                dec = json.loads(run(LFFMPEG, "av1-decode-raw", mp4_path, lean_yuv, env=ISO_ENV).stdout.decode())
+                dec = json.loads(run(*decode_args(mp4_path, lean_yuv), env=ISO_ENV).stdout.decode())
                 self.assertTrue(dec["ok"])
                 self.assertEqual(dec["frames"], expected_frames)
                 self.assertEqual(lean_yuv.read_bytes(), ref_yuv)
@@ -1098,7 +1126,7 @@ class TestAv1Main(unittest.TestCase):
             0,
         )
         self.assertNotEqual(
-            run(LFFMPEG, "av1-decode-raw", fmp4_path, "-", env=ISO_ENV, check=False).returncode,
+            run(*decode_args(fmp4_path, "-"), env=ISO_ENV, check=False).returncode,
             0,
         )
 

@@ -86,10 +86,12 @@ class BsfRoutingTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_pure_token_and_name_gate_regressions(self):
-        # lake may launch Lean, so a timeout must reap the whole owned group.
-        child = subprocess.Popen(["lake", "env", "lean", "--run", "tests/bsf_chain.lean"],
-                                 cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 text=True, start_new_session=True)
+        child = subprocess.Popen(
+            ["lean", "--run", "tests/bsf_chain.lean"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+            env={**os.environ, "LEAN_PATH": ".lake/build/lib/lean:../lean-sys/.lake/build/lib/lean"},
+        )
         try:
             stdout, stderr = child.communicate(timeout=60)
         except BaseException:

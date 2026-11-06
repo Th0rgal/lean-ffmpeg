@@ -22,6 +22,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export LEAN_PATH="${ROOT}/.lake/build/lib/lean:${ROOT}/../lean-sys/.lake/build/lib/lean"
 
 MODE="${1:-regen}"
 
@@ -35,7 +36,7 @@ def main (args : List String) : IO Unit := do
   | [out] => IO.FS.writeFile out LeanAV.NativeKernels.emitLeanAvLnirWire
   | _ => throw (IO.userError "expected output path")
 LEAN
-  lake env lean --run "$TMP_DIR/EmitLnir.lean" "$TMP_DIR/kernels.lnir"
+  lean --run "$TMP_DIR/EmitLnir.lean" "$TMP_DIR/kernels.lnir"
   if ! cmp -s "$TMP_DIR/kernels.lnir" "$ROOT/c/leanav_lnir_kernels.lnir"; then
     echo "ERROR: c/leanav_lnir_kernels.lnir is out of sync with LeanAV.NativeKernels.emitLeanAvLnirWire" >&2
     exit 1
@@ -83,7 +84,7 @@ def main (args : List String) : IO Unit := do
   | [out] => IO.FS.writeFile out LeanAV.NativeKernels.emitLeanAvLnirWire
   | _ => throw (IO.userError "expected output path")
 LEAN
-lake env lean --run "$TMP_DIR/EmitLnir.lean" "$TMP_DIR/kernels.lnir"
+lean --run "$TMP_DIR/EmitLnir.lean" "$TMP_DIR/kernels.lnir"
 
 cp "$TMP_DIR/kernels.lnir" "$ROOT/c/leanav_lnir_kernels.lnir"
 

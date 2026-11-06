@@ -2,11 +2,15 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    env:
+      TURBO_LEAN_NO_DAEMON: "1"
+      TURBO_LEAN_MODULE_TIMEOUT_SECS: "3600"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
@@ -18,13 +22,29 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: Install clang and strace (no libav, no ffmpeg yet)
         run: sudo apt-get update && sudo apt-get install -y clang strace && sudo rm -f /usr/bin/ffmpeg /usr/bin/ffprobe /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-      - name: Build
-        run: lake build
       - name: Install & cache turbo-lean
         uses: Th0rgal/turbo-lean@dc1656dc948f1d7bfc25d165575ae3819a2e8b97
         with:
           project-dir: "."
           command: cache-only
+      - name: Restore turbo-lean CAS and lean-sys build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/turbo-lean
+            ../lean-sys/.lake/build
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
+          restore-keys: |
+            turbo-lean-postbuild-${{ runner.os }}-
+      - name: Remove elan lake so the build cannot fall back to it
+        run: |
+          rm -f "$HOME/.elan/bin/lake" "$HOME/.elan/toolchains/"*/bin/lake
+          ! command -v lake
+      - name: Build
+        run: python3 scripts/build_turbo.py
+        env:
+          LEAN_PATH: .lake/build/lib/lean:../lean-sys/.lake/build/lib/lean
+          TURBO_LEAN_EMIT_C: "1"
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
         run: |
           python3 - <<'PY'
@@ -45,7 +65,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 807 or total_tight != 807:
+          if total_audited != 812 or total_tight != 812:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -57,9 +77,9 @@ jobs:
           .lake/build/bin/lffmpeg verify-kernels
       - name: Axiom audit
         run: |
-          out="$(lake env lean scripts/check_axioms.lean 2>&1)"
+          out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 22820 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           ! command -v ffmpeg
@@ -68,7 +88,13 @@ jobs:
       - name: Install reference ffmpeg oracle
         run: sudo apt-get install -y ffmpeg
       - name: Differential oracle suite
-        run: python3 -m unittest discover -s tests/differential -p "test_*.py"
+        run: |
+          python3 - <<'PY'
+          import sys, unittest
+          suite = unittest.defaultTestLoader.discover("tests/differential", pattern="test_*.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
       - name: CLI smoke tests
         run: |
           set +e
@@ -82,6 +108,10 @@ jobs:
 
   macos:
     runs-on: macos-15
+    env:
+      TURBO_LEAN_NO_DAEMON: "1"
+      TURBO_LEAN_MODULE_TIMEOUT_SECS: "3600"
+      TURBO_LEAN_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
@@ -100,13 +130,30 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
           "$HOME/.elan/bin/lean" --version
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - run: lake build
       - name: Install & cache turbo-lean
         uses: Th0rgal/turbo-lean@dc1656dc948f1d7bfc25d165575ae3819a2e8b97
         with:
           project-dir: "."
           command: cache-only
           cache-key-prefix: turbo-lean-cas-macos
+      - name: Restore turbo-lean CAS and lean-sys build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/turbo-lean
+            ../lean-sys/.lake/build
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
+          restore-keys: |
+            turbo-lean-postbuild-${{ runner.os }}-
+      - name: Remove elan lake so the build cannot fall back to it
+        run: |
+          rm -f "$HOME/.elan/bin/lake" "$HOME/.elan/toolchains/"*/bin/lake
+          ! command -v lake
+      - name: Build
+        run: python3 scripts/build_turbo.py
+        env:
+          LEAN_PATH: .lake/build/lib/lean:../lean-sys/.lake/build/lib/lean
+          TURBO_LEAN_EMIT_C: "1"
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
         run: |
           python3 - <<'PY'
@@ -127,7 +174,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 807 or total_tight != 807:
+          if total_audited != 812 or total_tight != 812:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -137,9 +184,9 @@ jobs:
       - run: .lake/build/bin/lffmpeg verify-kernels
       - name: Axiom audit
         run: |
-          out="$(lake env lean scripts/check_axioms.lean 2>&1)"
+          out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 22820 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           python3 - <<'PY'
@@ -150,7 +197,15 @@ jobs:
               env = dict(os.environ, PATH=":".join([empty, *dirs]))
               sys.exit(subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], env=env))
           PY
-      - name: Install reference ffmpeg oracle
-        run: brew install ffmpeg
+      - name: Install reference ffmpeg oracle (ffmpeg-full ships libaom-av1)
+        run: |
+          brew install ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
       - name: Differential oracle suite
-        run: python3 -m unittest discover -s tests/differential -p "test_*.py"
+        run: |
+          python3 - <<'PY'
+          import sys, unittest
+          suite = unittest.defaultTestLoader.discover("tests/differential", pattern="test_*.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
