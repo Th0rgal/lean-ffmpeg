@@ -41,7 +41,7 @@ jobs:
           path: |
             ~/.cache/turbo-lean
             ../lean-sys/.lake/build
-          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**', '../lean-sys/**') }}
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
           restore-keys: |
             turbo-lean-postbuild-${{ runner.os }}-
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
@@ -149,7 +149,7 @@ jobs:
           path: |
             ~/.cache/turbo-lean
             ../lean-sys/.lake/build
-          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**', '../lean-sys/**') }}
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
           restore-keys: |
             turbo-lean-postbuild-${{ runner.os }}-
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
