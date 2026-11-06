@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -9,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TURBO_LEAN_NO_DAEMON: "1"
-      TURBO_LEAN_MODULE_TIMEOUT_SECS: "900"
+      TURBO_LEAN_MODULE_TIMEOUT_SECS: "3600"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
@@ -26,6 +27,15 @@ jobs:
         with:
           project-dir: "."
           command: cache-only
+      - name: Restore turbo-lean CAS and lean-sys build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/turbo-lean
+            ../lean-sys/.lake/build
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
+          restore-keys: |
+            turbo-lean-postbuild-${{ runner.os }}-
       - name: Remove elan lake so the build cannot fall back to it
         run: |
           rm -f "$HOME/.elan/bin/lake" "$HOME/.elan/toolchains/"*/bin/lake
@@ -35,15 +45,6 @@ jobs:
         env:
           LEAN_PATH: .lake/build/lib/lean:../lean-sys/.lake/build/lib/lean
           TURBO_LEAN_EMIT_C: "1"
-      - name: Cache turbo-lean CAS and lean-sys build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/turbo-lean
-            ../lean-sys/.lake/build
-          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
-          restore-keys: |
-            turbo-lean-postbuild-${{ runner.os }}-
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
         run: |
           python3 - <<'PY'
@@ -109,7 +110,8 @@ jobs:
     runs-on: macos-15
     env:
       TURBO_LEAN_NO_DAEMON: "1"
-      TURBO_LEAN_MODULE_TIMEOUT_SECS: "900"
+      TURBO_LEAN_MODULE_TIMEOUT_SECS: "3600"
+      TURBO_LEAN_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout lean-sys dependency
@@ -134,6 +136,15 @@ jobs:
           project-dir: "."
           command: cache-only
           cache-key-prefix: turbo-lean-cas-macos
+      - name: Restore turbo-lean CAS and lean-sys build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/turbo-lean
+            ../lean-sys/.lake/build
+          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
+          restore-keys: |
+            turbo-lean-postbuild-${{ runner.os }}-
       - name: Remove elan lake so the build cannot fall back to it
         run: |
           rm -f "$HOME/.elan/bin/lake" "$HOME/.elan/toolchains/"*/bin/lake
@@ -143,15 +154,6 @@ jobs:
         env:
           LEAN_PATH: .lake/build/lib/lean:../lean-sys/.lake/build/lib/lean
           TURBO_LEAN_EMIT_C: "1"
-      - name: Cache turbo-lean CAS and lean-sys build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/turbo-lean
-            ../lean-sys/.lake/build
-          key: turbo-lean-postbuild-${{ runner.os }}-${{ hashFiles('LeanAV/**', 'scripts/build_turbo.py', 'c/**') }}
-          restore-keys: |
-            turbo-lean-postbuild-${{ runner.os }}-
       - name: Zero-Trust Spec Audit across all LeanAV modules (turbo-lean)
         run: |
           python3 - <<'PY'
