@@ -243,6 +243,9 @@ structure CliConfig where
   threads        : Option Nat := none
   movflags       : Option String := none
   errors         : List CliError := []
+  colorPrimaries : Option String := none
+  colorTrc       : Option String := none
+  colorspace     : Option String := none
   deriving Repr, DecidableEq, Inhabited
 
 /-- Parse a positive decimal `Nat` from a `List Char` using pure structural recursion (kernel-reducible). -/
@@ -368,6 +371,79 @@ def supportedPreset (s : String) : Bool :=
 def nativeMp4PixFmt (s : String) : Bool :=
   s == "yuv420p" || s == "yuv420p10le" || s == "p010le"
 
+/-- P1.1 high-bit-depth / HDR pixel formats across 10/12-bit YUV, GBR planar, and 16-bit RGBA. -/
+def p11HighBitDepthPixFmt (s : String) : Bool :=
+  s == "yuv420p10le" || s == "p010le" || s == "yuv422p10le" || s == "yuv444p10le" ||
+  s == "yuv420p12le" || s == "yuv422p12le" || s == "yuv444p12le" ||
+  s == "gbrp10le" || s == "rgba64le"
+
+/-- Map an FFmpeg `-color_primaries` token (or ISO/IEC 23091-2 integer) to its CICP `colour_primaries` code. -/
+def parseColorPrimariesCicp (s : String) : Option UInt16 :=
+  if s == "bt709" || s == "1" then some 1
+  else if s == "unknown" || s == "unspecified" || s == "2" then some 2
+  else if s == "bt470m" || s == "4" then some 4
+  else if s == "bt470bg" || s == "5" then some 5
+  else if s == "smpte170m" || s == "6" then some 6
+  else if s == "smpte240m" || s == "7" then some 7
+  else if s == "film" || s == "8" then some 8
+  else if s == "bt2020" || s == "9" then some 9
+  else if s == "smpte428" || s == "smpte428_1" || s == "10" then some 10
+  else if s == "smpte431" || s == "11" then some 11
+  else if s == "smpte432" || s == "12" then some 12
+  else if s == "jedec-p22" || s == "ebu3213" || s == "22" then some 22
+  else none
+
+/-- Supported `-color_primaries` CLI tokens. -/
+def supportedColorPrimaries (s : String) : Bool :=
+  (parseColorPrimariesCicp s).isSome
+
+/-- Map an FFmpeg `-color_trc` token (or ISO/IEC 23091-2 integer) to its CICP `transfer_characteristics` code. -/
+def parseColorTrcCicp (s : String) : Option UInt16 :=
+  if s == "bt709" || s == "1" then some 1
+  else if s == "unknown" || s == "unspecified" || s == "2" then some 2
+  else if s == "gamma22" || s == "4" then some 4
+  else if s == "gamma28" || s == "5" then some 5
+  else if s == "smpte170m" || s == "6" then some 6
+  else if s == "smpte240m" || s == "7" then some 7
+  else if s == "linear" || s == "8" then some 8
+  else if s == "log100" || s == "log" || s == "9" then some 9
+  else if s == "log316" || s == "log_sqrt" || s == "10" then some 10
+  else if s == "iec61966-2-4" || s == "iec61966_2_4" || s == "11" then some 11
+  else if s == "bt1361e" || s == "bt1361" || s == "12" then some 12
+  else if s == "iec61966-2-1" || s == "iec61966_2_1" || s == "13" then some 13
+  else if s == "bt2020-10" || s == "bt2020_10bit" || s == "14" then some 14
+  else if s == "bt2020-12" || s == "bt2020_12bit" || s == "15" then some 15
+  else if s == "smpte2084" || s == "16" then some 16
+  else if s == "smpte428" || s == "smpte428_1" || s == "17" then some 17
+  else if s == "arib-std-b67" || s == "18" then some 18
+  else none
+
+/-- Supported `-color_trc` CLI tokens. -/
+def supportedColorTrc (s : String) : Bool :=
+  (parseColorTrcCicp s).isSome
+
+/-- Map an FFmpeg `-colorspace` token (or ISO/IEC 23091-2 integer) to its CICP `matrix_coefficients` code. -/
+def parseColorspaceCicp (s : String) : Option UInt16 :=
+  if s == "rgb" || s == "0" then some 0
+  else if s == "bt709" || s == "1" then some 1
+  else if s == "unknown" || s == "unspecified" || s == "2" then some 2
+  else if s == "fcc" || s == "4" then some 4
+  else if s == "bt470bg" || s == "5" then some 5
+  else if s == "smpte170m" || s == "6" then some 6
+  else if s == "smpte240m" || s == "7" then some 7
+  else if s == "ycgco" || s == "ycocg" || s == "8" then some 8
+  else if s == "bt2020nc" || s == "bt2020_ncl" || s == "9" then some 9
+  else if s == "bt2020c" || s == "bt2020_cl" || s == "10" then some 10
+  else if s == "smpte2085" || s == "11" then some 11
+  else if s == "chroma-derived-nc" || s == "12" then some 12
+  else if s == "chroma-derived-c" || s == "13" then some 13
+  else if s == "ictcp" || s == "14" then some 14
+  else none
+
+/-- Supported `-colorspace` CLI tokens. -/
+def supportedColorspace (s : String) : Bool :=
+  (parseColorspaceCicp s).isSome
+
 /-- Supported `-pix_fmt` tokens across native and delegated execution. -/
 def supportedPixFmt (s : String) : Bool :=
   nativeMp4PixFmt s ||
@@ -457,7 +533,8 @@ def flagTakesValue (s : String) : Bool :=
    "-vf", "-filter:v", "-af", "-filter:a", "-s", "-video_size",
    "-ss", "-t", "-f", "-daemon", "-golden", "-frames:v", "-vframes", "-frames",
    "-ar", "-ac", "-pix_fmt", "-pixel_format", "-loglevel", "-v", "-threads",
-   "-preset", "-crf", "-bf", "-g", "-r", "-framerate", "-b:v", "-vb", "-b", "-b:a", "-ab", "-movflags"].contains s
+   "-preset", "-crf", "-bf", "-g", "-r", "-framerate", "-b:v", "-vb", "-b", "-b:a", "-ab",
+   "-movflags", "-color_primaries", "-color_trc", "-colorspace"].contains s
 
 /-- Apply a 1-value CLI flag `(flag, value)` to `CliConfig`. -/
 def applyCliFlagValue (flag value : String) (cfg : CliConfig) : CliConfig :=
@@ -553,6 +630,15 @@ def applyCliFlagValue (flag value : String) (cfg : CliConfig) : CliConfig :=
   else if flag == "-movflags" then
     if value == "" then cfg.fail (.emptyValue "-movflags")
     else { cfg with movflags := some value }
+  else if flag == "-color_primaries" then
+    if supportedColorPrimaries value then { cfg with colorPrimaries := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-color_primaries " ++ value))
+  else if flag == "-color_trc" then
+    if supportedColorTrc value then { cfg with colorTrc := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-color_trc " ++ value))
+  else if flag == "-colorspace" then
+    if supportedColorspace value then { cfg with colorspace := some value }
+    else cfg.fail (.unsupportedCodecOrFlag ("-colorspace " ++ value))
   else if flag == "-daemon" then
     if value == "" then cfg.fail (.emptyValue "-daemon")
     else { cfg with daemon := some value }
@@ -759,6 +845,52 @@ theorem cli_encoder_options_retained_and_invalid_rejected :
     nativeMp4PixFmt "nv12" = false ∧
     supportedPixFmt "nv12" = true ∧
     supportedPixFmt "bogus_pix_fmt" = false := by
+  decide
+
+def P11HdrColorCliSafe (t : String × String × String × String) : Prop :=
+  p11HighBitDepthPixFmt t.1 = true ∧
+  supportedColorPrimaries t.2.1 = true ∧
+  supportedColorTrc t.2.2.1 = true ∧
+  supportedColorspace t.2.2.2 = true
+
+instance (t : String × String × String × String) : Decidable (P11HdrColorCliSafe t) :=
+  inferInstanceAs (Decidable (_ ∧ _ ∧ _ ∧ _))
+
+/-- Tight `AVGateSpec` for P1.1 high-bit-depth pixel format & HDR CICP colorimetry CLI flags. -/
+def p11HdrColorCliGateSpec :
+    AVGateSpec (String × String × String × String) P11HdrColorCliSafe where
+  gate t := decide (P11HdrColorCliSafe t)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := ("yuv420p10le", "bt2020", "smpte2084", "bt2020nc")
+  negWitness := ("yuv420p", "bt2020", "smpte2084", "bt2020nc")
+  nonVacuous := by decide
+  tight := by decide
+
+theorem p11_hdr_colorimetry_and_high_bitdepth_cli_verified :
+    let hdrCfg := parseFFmpegArgs [
+      "-i", "in.mp4", "-pix_fmt", "gbrp10le",
+      "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+      "out.mp4"
+    ]
+    let hlgCfg := parseFFmpegArgs [
+      "-i", "in.mp4", "-pix_fmt", "rgba64le",
+      "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
+      "out.mp4"
+    ]
+    let badColor := parseFFmpegArgs ["-i", "in.mp4", "-color_trc", "bogus_trc", "out.mp4"]
+    hdrCfg.pixelFormat = some "gbrp10le" ∧
+    hdrCfg.colorPrimaries = some "bt2020" ∧
+    hdrCfg.colorTrc = some "smpte2084" ∧
+    hdrCfg.colorspace = some "bt2020nc" ∧
+    hdrCfg.errors = [] ∧
+    hlgCfg.pixelFormat = some "rgba64le" ∧
+    hlgCfg.colorTrc = some "arib-std-b67" ∧
+    hlgCfg.errors = [] ∧
+    badColor.errors ≠ [] ∧
+    (["yuv420p10le", "p010le", "yuv422p10le", "yuv444p10le",
+      "yuv420p12le", "yuv422p12le", "yuv444p12le", "gbrp10le", "rgba64le"].all
+      fun pf => p11HighBitDepthPixFmt pf && supportedPixFmt pf) = true := by
   decide
 
 end LeanAV.Cli

@@ -370,6 +370,9 @@ structure OutputSpec where
   noData        : Bool := false
   globalCopy    : Bool := false
   copyData      : Bool := false
+  colorPrimaries : Option String := none
+  colorTrc       : Option String := none
+  colorspace     : Option String := none
   deriving Repr, DecidableEq, Inhabited
 
 /-- Typed program descriptor in `MediaPlanIR`. -/
@@ -871,6 +874,12 @@ def isValidExtendedFlagValue (tok value : String) : Bool :=
     isValidBitrateSpec value
   else if strStartsWithFast tok "-pix_fmt:" || strStartsWithFast tok "-pixel_format:" then
     supportedPixFmt value
+  else if strStartsWithFast tok "-color_primaries:" then
+    supportedColorPrimaries value
+  else if strStartsWithFast tok "-color_trc:" then
+    supportedColorTrc value
+  else if strStartsWithFast tok "-colorspace:" then
+    supportedColorspace value
   else if strStartsWithFast tok "-frames:" || tok == "-aframes" || tok == "-dframes" || tok == "-max_frames" then
     (parseNonNegNatSpec value).isSome
   else if tok == "-to" then
@@ -1199,7 +1208,8 @@ def isPassthroughBaseOneFlag (tok : String) : Bool :=
   tok == "-b:a" || tok == "-ab" || tok == "-threads" ||
   tok == "-bf" || tok == "-g" || tok == "-movflags" || tok == "-frames:v" ||
   tok == "-vframes" || tok == "-frames" || tok == "-v" || tok == "-loglevel" ||
-  tok == "-daemon" || tok == "-golden"
+  tok == "-daemon" || tok == "-golden" ||
+  tok == "-color_primaries" || tok == "-color_trc" || tok == "-colorspace"
 
 def extractExtendedPlanFlagsStep : List String → Option String → ExtendedPlanFlags → ExtendedPlanFlags
   | [], none, acc => acc
@@ -1263,7 +1273,7 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       cfgNoVideo cfgNoAudio cfgJsonOutput cfgHideBanner cfgShowStats cfgLogLevel
       cfgVideoSize cfgVideoFrames cfgAudioRate cfgAudioChannels cfgPixelFormat cfgPreset
       cfgCrf cfgVideoBitrate cfgAudioBitrate cfgFrameRate cfgBFrames cfgGopSize
-      cfgThreads cfgMovflags cfgErrors =>
+      cfgThreads cfgMovflags cfgErrors cfgColorPrimaries cfgColorTrc cfgColorspace =>
   ExtendedPlanFlags.casesOn ext fun _extBaseArgs _extPassthroughArgs extMaps extMetadataEntries
       extMapMetadataSource extMapChaptersSource extSubtitleCodec extNoSubtitle extNoData
       extGlobalCopy extCopyData extBsfs extDumpPlan _extSeenInput _extSeenStartSec _extSeenDurSec
@@ -1362,7 +1372,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
          noSubtitle := extNoSubtitle
          noData := extNoData
          globalCopy := extGlobalCopy
-         copyData := extCopyData }] ++ extraOutSpecs
+         copyData := extCopyData
+         colorPrimaries := cfgColorPrimaries
+         colorTrc := cfgColorTrc
+         colorspace := cfgColorspace }] ++ extraOutSpecs
 
   let defaultStreams : List StreamMapSpec :=
     (if cfgNoVideo then [] else [{ inputIdx := 0, kind := .video, streamIdx := some 0, optional := false }]) ++
@@ -1453,7 +1466,10 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
       cfgCrf.isNone &&
       cfgVideoBitrate.isNone &&
       cfgAudioBitrate.isNone &&
-      cfgFrameRate.isNone
+      cfgFrameRate.isNone &&
+      cfgColorPrimaries.isNone &&
+      cfgColorTrc.isNone &&
+      cfgColorspace.isNone
     | _ => false
 
   let isStandalonePngRoute : Bool :=
@@ -1566,6 +1582,9 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
      cfgBFrames.isSome ||
      cfgGopSize.isSome ||
      cfgMovflags.isSome ||
+     cfgColorPrimaries.isSome ||
+     cfgColorTrc.isSome ||
+     cfgColorspace.isSome ||
      isMixedCopyTranscode ||
      isDelegatedVideoFilter ||
      isDelegatedPixFmt ||
@@ -1605,7 +1624,8 @@ def lowerCliWithExtToPlanIR (cfg : CliConfig) (ext : ExtendedPlanFlags := {}) : 
     cfgVideoFrames.isNone && cfgVideoSize.isNone && cfgAudioRate.isNone && cfgAudioChannels.isNone &&
     cfgPixelFormat.isNone && cfgThreads.isNone && cfgBFrames.isNone && cfgGopSize.isNone &&
     cfgMovflags.isNone && cfgPreset.isNone && cfgCrf.isNone && cfgVideoBitrate.isNone &&
-    cfgAudioBitrate.isNone && cfgFrameRate.isNone
+    cfgAudioBitrate.isNone && cfgFrameRate.isNone &&
+    cfgColorPrimaries.isNone && cfgColorTrc.isNone && cfgColorspace.isNone
 
   let (tier, reasons) : BackendTier × List String :=
     if !allErrors.isEmpty then
@@ -1846,7 +1866,8 @@ def resolveStandaloneAacAdtsPlan (args : List String) (cfg : CliConfig) (plan : 
          cfg.startSec.isSome || cfg.durationSec.isSome || cfg.threads.isSome || cfg.bFrames.isSome ||
          cfg.gopSize.isSome || cfg.movflags.isSome || cfg.preset.isSome || cfg.crf.isSome ||
          cfg.videoBitrate.isSome || cfg.frameRate.isSome || cfg.videoSize.isSome ||
-         cfg.videoFrames.isSome || cfg.pixelFormat.isSome then none
+         cfg.videoFrames.isSome || cfg.pixelFormat.isSome ||
+         cfg.colorPrimaries.isSome || cfg.colorTrc.isSome || cfg.colorspace.isSome then none
       else
         match splitAtFirstInput args [] with
         | none => none
@@ -2007,7 +2028,8 @@ def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :
       OutputSpec.casesOn o fun oPath _oSafe oFormat _oOverwrite oVideoCodec oAudioCodec
           oSubtitleCodec oPixelFormat oPreset oCrf oVideoBitrate oAudioBitrate oFrameRate
           oVideoSize oVideoFrames oAudioRate oAudioChannels oBFrames oGopSize oMovflags
-          oNoVideo oNoAudio oNoSubtitle oNoData oGlobalCopy oCopyData =>
+          oNoVideo oNoAudio oNoSubtitle oNoData oGlobalCopy oCopyData
+          oColorPrimaries oColorTrc oColorspace =>
       (if oNoVideo then ["-vn"] else []) ++
       (if oNoAudio then ["-an"] else []) ++
       (if oNoSubtitle then ["-sn"] else []) ++
@@ -2032,6 +2054,9 @@ def renderPlanIRArgv (plan : MediaPlanIR) (forDelegation : Bool) : List String :
       (match oAudioRate with | some r => ["-ar", s!"{r}"] | none => []) ++
       (match oAudioChannels with | some ch => ["-ac", s!"{ch}"] | none => []) ++
       (match oPixelFormat with | some pf => ["-pix_fmt", pf] | none => []) ++
+      (match oColorPrimaries with | some cp => ["-color_primaries", cp] | none => []) ++
+      (match oColorTrc with | some trc => ["-color_trc", trc] | none => []) ++
+      (match oColorspace with | some cs => ["-colorspace", cs] | none => []) ++
       (match oPreset with | some pr => ["-preset", pr] | none => []) ++
       (match oCrf with | some c => ["-crf", c] | none => []) ++
       (match oBFrames with | some bf => ["-bf", s!"{bf}"] | none => []) ++
@@ -2797,6 +2822,43 @@ theorem losslessDecode3Way_trichotomy_verified :
     (classifyWavDemux3Way rf64Hdr).tag = ("fallbackDelegated", "out_of_domain_wav_format_or_channel_count") ∧
     (classifyWavDemux3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_wav_stream") ∧
     (classifyPngDecode3Way corrupt).tag = ("invalidCorrupt", "invalid_or_corrupt_png_stream") := by
+  decide
+
+def P11HdrPlanSafe (plan : MediaPlanIR) : Prop :=
+  plan.errors = [] ∧
+  match plan.outputs with
+  | [o] =>
+    o.colorPrimaries = some "bt2020" ∧
+    (o.colorTrc = some "smpte2084" ∨ o.colorTrc = some "arib-std-b67") ∧
+    o.colorspace = some "bt2020nc"
+  | _ => False
+
+instance (plan : MediaPlanIR) : Decidable (P11HdrPlanSafe plan) := by
+  unfold P11HdrPlanSafe
+  cases plan.outputs with
+  | nil => exact inferInstanceAs (Decidable (_ ∧ False))
+  | cons o rest =>
+    cases rest with
+    | nil => exact inferInstanceAs (Decidable (_ ∧ (_ ∧ (_ ∨ _) ∧ _)))
+    | cons _ _ => exact inferInstanceAs (Decidable (_ ∧ False))
+
+def p11HdrPlanGateSpec : AVGateSpec MediaPlanIR P11HdrPlanSafe where
+  gate plan := decide (P11HdrPlanSafe plan)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := parseArgsToPlanIR [
+    "-i", "in.mp4", "-c:v", "hevc", "-pix_fmt", "yuv420p10le",
+    "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "out.mp4"]
+  negWitness := parseArgsToPlanIR ["-i", "in.mp4", "-c:v", "hevc", "out.mp4"]
+  nonVacuous := by decide
+  tight := by decide
+
+theorem p11_hdr_plan_roundtrip_verified :
+    let args := [
+      "-y", "-nostats", "-i", "in.mp4", "-c:v", "hevc", "-pix_fmt", "gbrp10le",
+      "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "out.mp4"]
+    let p := parseArgsToPlanIR args
+    planIRToCliArgs p = args ∧ p11HdrPlanGateSpec.gate p = true := by
   decide
 
 end LeanAV.PlanIR
