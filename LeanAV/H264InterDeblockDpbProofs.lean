@@ -737,5 +737,214 @@ def annexBPpsValidSpec : AVGateSpec (Array UInt8)
   nonVacuous := by decide
   tight := by decide
 
+/-! ## High-Bit-Depth & Multi-Chroma MC, Weighted Prediction, Deblocking & Picture Proofs -/
+
+def hbdBitDepthGateSpec : AVGateSpec Nat (fun bd => 8 ≤ bd ∧ bd ≤ 12) where
+  gate := isValidHbdBitDepth
+  sound := by
+    intro bd hg
+    unfold isValidHbdBitDepth at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact hg
+  complete := by
+    intro bd ⟨h8, h12⟩
+    unfold isValidHbdBitDepth
+    simp [h8, h12]
+  posWitness := 10
+  negWitness := 14
+  nonVacuous := by decide
+  tight := by decide
+
+def hbdChromaArrayTypeGateSpec : AVGateSpec Nat (fun cat => cat ≤ 3) where
+  gate := isValidChromaArrayType
+  sound := by
+    intro cat hg
+    unfold isValidChromaArrayType at hg
+    exact of_decide_eq_true hg
+  complete := by
+    intro cat hle
+    unfold isValidChromaArrayType
+    exact decide_eq_true hle
+  posWitness := 2
+  negWitness := 4
+  nonVacuous := by decide
+  tight := by decide
+
+def hbdSampleRangeGate (p : Nat × Nat) : Bool :=
+  isValidHbdBitDepth p.1 && p.2 < (1 <<< p.1)
+
+def hbdSampleRangeGateSpec : AVGateSpec (Nat × Nat)
+    (fun p => (8 ≤ p.1 ∧ p.1 ≤ 12) ∧ p.2 < (1 <<< p.1)) where
+  gate := hbdSampleRangeGate
+  sound := by
+    intro p hg
+    unfold hbdSampleRangeGate isValidHbdBitDepth at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact hg
+  complete := by
+    intro p ⟨⟨h8, h12⟩, hs⟩
+    unfold hbdSampleRangeGate isValidHbdBitDepth
+    simp [h8, h12, hs]
+  posWitness := (10, 1023)
+  negWitness := (10, 1024)
+  nonVacuous := by decide
+  tight := by decide
+
+def hbdPictureValidGateSpec : AVGateSpec H264PictureHbd
+    (fun pic => isValidPictureHbd pic = true) where
+  gate := isValidPictureHbd
+  sound := by intro _ h; exact h
+  complete := by intro _ h; exact h
+  posWitness := {
+    width := 16, height := 16, chromaFormatIdc := 2, bitDepthY := 10, bitDepthC := 10,
+    y := PlaneHbd.alloc 16 16 10 512,
+    u := PlaneHbd.alloc 8 16 10 512,
+    v := PlaneHbd.alloc 8 16 10 512
+  }
+  negWitness := {
+    width := 16, height := 16, chromaFormatIdc := 2, bitDepthY := 10, bitDepthC := 10,
+    y := PlaneHbd.alloc 16 16 10 512,
+    u := PlaneHbd.alloc 8 8 10 512,
+    v := PlaneHbd.alloc 8 8 10 512
+  }
+  nonVacuous := by decide
+  tight := by decide
+
+def hbdDeblockBypassBothGate (flags : Bool × Bool) : Bool :=
+  flags.1 && flags.2
+
+def hbdDeblockBypassBothSpec : AVGateSpec (Bool × Bool)
+    (fun flags => flags.1 = true ∧ flags.2 = true) where
+  gate := hbdDeblockBypassBothGate
+  sound := by
+    intro flags hg
+    unfold hbdDeblockBypassBothGate at hg
+    simp only [Bool.and_eq_true] at hg
+    exact hg
+  complete := by
+    intro flags ⟨hp, hq⟩
+    unfold hbdDeblockBypassBothGate
+    simp [hp, hq]
+  posWitness := (true, true)
+  negWitness := (true, false)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem h264MaxSample_8_10_12_exact :
+    h264MaxSample 8 = 255 ∧ h264MaxSample 10 = 1023 ∧ h264MaxSample 12 = 4095 := by
+  decide
+
+theorem clip1Hbd_bounds (bitDepth : Nat) (x : Int) :
+    clip1Hbd bitDepth x ≤ (1 <<< bitDepth) - 1 := by
+  unfold clip1Hbd h264MaxSample clip3
+  simp only [Int.ofNat_eq_natCast]
+  split
+  · omega
+  · split <;> omega
+
+theorem clip1Hbd_id_in_range (bitDepth : Nat) (v : Nat) (hv : v ≤ (1 <<< bitDepth) - 1) :
+    clip1Hbd bitDepth (Int.ofNat v) = v := by
+  unfold clip1Hbd h264MaxSample clip3
+  simp only [Int.ofNat_eq_natCast]
+  split
+  · omega
+  · split <;> omega
+
+theorem h264Round5Hbd_dc_exact (bitDepth : Nat) (v : Int)
+    (hv0 : 0 ≤ v) (hv1 : v ≤ h264MaxSample bitDepth) :
+    h264Round5Hbd bitDepth (h264Tap6 v v v v v v) = v := by
+  rw [h264Tap6_dc_gain_32]
+  unfold h264Round5Hbd clip3
+  have hf : (32 * v + 16) / 32 = v := by omega
+  rw [hf]
+  split
+  · omega
+  · split <;> omega
+
+theorem h264Round6Hbd_dc_exact (bitDepth : Nat) (v : Int)
+    (hv0 : 0 ≤ v) (hv1 : v ≤ h264MaxSample bitDepth) :
+    h264Round6Hbd bitDepth (h264Tap6 (32 * v) (32 * v) (32 * v) (32 * v) (32 * v) (32 * v)) = v := by
+  rw [h264Tap6_dc_gain_32]
+  unfold h264Round6Hbd clip3
+  have hf : (32 * (32 * v) + 512) / 1024 = v := by omega
+  rw [hf]
+  split
+  · omega
+  · split <;> omega
+
+theorem h264LumaFracHbd_bounds (p : PlaneHbd) (xInt yInt : Int) (xf yf : Nat) :
+    h264LumaFracHbd p xInt yInt xf yf ≤ (1 <<< p.bitDepth) - 1 :=
+  clip1Hbd_bounds p.bitDepth _
+
+theorem h264ChromaFracHbd_bounds (p : PlaneHbd) (xIntC yIntC : Int) (xf yf : Nat) :
+    h264ChromaFracHbd p xIntC yIntC xf yf ≤ (1 <<< p.bitDepth) - 1 :=
+  clip1Hbd_bounds p.bitDepth _
+
+theorem h264LumaFracHbd_10bit_dc_all_16_exact :
+    let p := PlaneHbd.alloc 8 8 10 731
+    (List.range 4).all (fun yf =>
+      (List.range 4).all (fun xf =>
+        h264LumaFracHbd p 3 3 xf yf == 731)) = true := by
+  decide
+
+theorem h264ChromaFracHbd_12bit_dc_all_64_exact :
+    let p := PlaneHbd.alloc 4 4 12 2917
+    (List.range 8).all (fun yf =>
+      (List.range 8).all (fun xf =>
+        h264ChromaFracHbd p 1 1 xf yf == 2917)) = true := by
+  decide
+
+theorem h264ChromaMcSampleHbd_444_matches_luma_qpel (p : PlaneHbd) (xC yC mvX mvY : Int) :
+    h264ChromaMcSampleHbd 3 p xC yC mvX mvY = h264LumaQpelHbd p (4 * xC + mvX) (4 * yC + mvY) := by
+  rfl
+
+theorem h264ChromaMcSampleHbd_monochrome_zero (p : PlaneHbd) (xC yC mvX mvY : Int) :
+    h264ChromaMcSampleHbd 0 p xC yC mvX mvY = 0 := by
+  rfl
+
+theorem weightedUniPredPixelHbd_bounds (bitDepth p0 : Nat) (w0 rawO0 : Int) (log2Wd : Nat) :
+    weightedUniPredPixelHbd bitDepth p0 w0 rawO0 log2Wd ≤ (1 <<< bitDepth) - 1 :=
+  clip1Hbd_bounds bitDepth _
+
+theorem weightedBiPredPixelHbd_bounds (bitDepth p0 p1 : Nat) (w0 w1 rawO0 rawO1 : Int) (log2Wd : Nat) :
+    weightedBiPredPixelHbd bitDepth p0 p1 w0 w1 rawO0 rawO1 log2Wd ≤ (1 <<< bitDepth) - 1 :=
+  clip1Hbd_bounds bitDepth _
+
+theorem weightedUniPredPixelHbd_10bit_offset_shift_exact :
+    weightedUniPredPixelHbd 10 300 32 7 5 = 328 ∧
+    weightedBiPredPixelHbd 10 300 500 32 32 3 5 5 = 416 := by
+  decide
+
+theorem filterLumaSamples8Hbd_bypass_both_noop (bitDepth : Nat) (s : DeblockSamples8Hbd)
+    (bS : Nat) (qPav aOff bOff : Int) :
+    filterLumaSamples8Hbd bitDepth s bS qPav aOff bOff true true = s := by
+  unfold filterLumaSamples8Hbd
+  simp
+
+theorem filterChromaSamples4Hbd_bypass_both_noop (bitDepth p1 p0 q0 q1 bS : Nat)
+    (qPav aOff bOff : Int) :
+    filterChromaSamples4Hbd bitDepth p1 p0 q0 q1 bS qPav aOff bOff true true = (p0, q0) := by
+  unfold filterChromaSamples4Hbd
+  simp
+
+theorem filterLumaAndChromaHbd_10bit_unshifted_tc_increment_exact :
+    let sIn : DeblockSamples8Hbd := ⟨324, 328, 332, 336, 383, 383, 383, 383⟩
+    let sOut := filterLumaSamples8Hbd 10 sIn 2 32 0 0
+    let cOut := filterChromaSamples4Hbd 10 377 391 476 476 2 29 0 0
+    sOut = ⟨324, 328, 340, 346, 373, 375, 383, 383⟩ ∧
+    cOut = (396, 471) := by
+  decide
+
+theorem deblockChromaVertStepHbd_444_uses_strong_4tap :
+    let p0 : PlaneHbd := {
+      width := 32, height := 1, stride := 32, bitDepth := 10,
+      data := (List.replicate 16 501 ++ List.replicate 16 507).toArray
+    }
+    let p1 := deblockChromaVertStepHbd 3 p0 1 0 0 0 4 false 28 0 0
+    (p1.getPixel 0 13, p1.getPixel 0 14, p1.getPixel 0 15,
+     p1.getPixel 0 16, p1.getPixel 0 17, p1.getPixel 0 18) =
+      (502, 503, 503, 505, 506, 506) := by
+  decide
+
 end LeanAV.H264InterDeblockDpbProofs
 

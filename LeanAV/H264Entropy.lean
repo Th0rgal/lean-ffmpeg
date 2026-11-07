@@ -280,7 +280,7 @@ def parseSpsFull (nal : ByteArray) : Option SpsFull := do
             pure (cIdc, sFlag, bdY, bdC, byp, rg)
           else
             pure (1, 0, 0, 0, 0, r1)
-        if (chromaIdc != 0 && chromaIdc != 1) || sep != 0 || bdLuma > 6 || bdChroma > 6 then none
+        if chromaIdc > 3 || bdLuma > 4 || bdChroma > 4 || (chromaIdc != 3 && sep != 0) then none
         else do
           let (l2fnM4, r3) ← readUENat r2
           let (pocType, r4) ← readUENat r3
@@ -335,10 +335,14 @@ def upgradeSpsForCabac (sps : SpsFull) : ByteArray :=
   let rbsp := stripNalEmulationBytes sps.rawNal
   if rbsp.data.size < 4 then sps.rawNal
   else
+    let prof := rbsp.data.getD 1 0
+    let c := rbsp.data.getD 2 0
     let rbsp' : ByteArray :=
-      if rbsp.data.getD 1 0 == 66 then
-        let c' := (rbsp.data.getD 2 0) &&& (0x7F : UInt8)
+      if prof == 66 then
+        let c' := c &&& (0x7F : UInt8)
         { data := (rbsp.data.set! 1 (77 : UInt8)).set! 2 c' }
+      else if (c &&& (0x80 : UInt8)) != 0 then
+        { data := rbsp.data.set! 2 (c &&& (0x7F : UInt8)) }
       else
         rbsp
     packRawRbspToNal rbsp'
@@ -484,6 +488,7 @@ structure SliceHeaderFull where
   numRefL0        : Nat
   numRefL1        : Nat
   sliceQpY        : Int
+  colourPlaneId   : Nat := 0
   deriving Repr, Inhabited
 
 private def skipRefPicListModOne (r : BitReader) : Nat → Option BitReader
@@ -576,12 +581,17 @@ def parseSliceHeaderFull (rbsp : ByteArray) (spsList : Array (Option SpsFull))
       let (ppsId, r3) ← readUENat r2
       let pps ← findPps ppsList ppsId
       let sps ← findSps spsList pps.spsId
-      if sps.frameMbsOnlyFlag != 1 || sps.separateColourPlaneFlag != 0 then none
+      if sps.frameMbsOnlyFlag != 1 then none
       else do
+        let pPrefixStart := r3.bitOffset
+        let (planeId, r3b) ←
+          if sps.separateColourPlaneFlag != 0 then readUNat r3 2 else pure (0, r3)
+        if planeId > 2 then none
+        else do
         let totalMbs := sps.picWidthInMbs * sps.picHeightInMapUnits
         if firstMb ≥ totalMbs then none
         else do
-          let pPrefixStart := r3.bitOffset
+          let r3 := r3b
           let (_, r4) ← readUNat r3 sps.log2MaxFrameNum
           let r5 ← if idr then (readUENat r4).map Prod.snd else some r4
           let r6 ←
@@ -633,6 +643,9 @@ def parseSliceHeaderFull (rbsp : ByteArray) (spsList : Array (Option SpsFull))
                 else some r14
               let pSuffixEnd := r15.bitOffset
               let sliceQpY := (26 : Int) + pps.picInitQpMinus26 + sliceQpDelta
+              let qpMin : Int := -6 * Int.ofNat sps.bitDepthLumaMinus8
+              if sliceQpY < qpMin || sliceQpY > 51 then none
+              else
               pure ({
                 nalHdr := nalHdr
                 firstMbInSlice := firstMb
@@ -646,6 +659,7 @@ def parseSliceHeaderFull (rbsp : ByteArray) (spsList : Array (Option SpsFull))
                 numRefL0 := numL0
                 numRefL1 := numL1
                 sliceQpY := sliceQpY
+                colourPlaneId := planeId
               }, r15.bitOffset)
 
 def writeSliceHeaderFull (w : BitWriter) (sh : SliceHeaderFull) (isCabac : Bool) : BitWriter :=
@@ -700,6 +714,12 @@ def cavlcCtChromaDcEnc : Array UInt32 := #[
   196609, 0, 393219, 458755, 458754, 393221, 393218, 524291, 524290, 458752
 ]
 
+def cavlcCtChromaDc2x4Enc : Array UInt32 := #[
+  65537, 0, 0, 0, 458767, 131073, 0, 0, 458766, 458765, 196609, 0,
+  589831, 458764, 458763, 327681, 589830, 589829, 458762, 393217, 655367, 655366, 589828, 458761,
+  720903, 720902, 655365, 458760, 786439, 786438, 720901, 655364, 851975, 786437, 786436, 720900
+]
+
 def cavlcTz16Enc : Array UInt32 := #[
   65537, 196611, 196610, 262147, 262146, 327683, 327682, 393219, 393218, 458755, 458754, 524291,
   524290, 589827, 589826, 589825, 196615, 196614, 196613, 196612, 196611, 262149, 262148, 262147,
@@ -725,6 +745,16 @@ def cavlcTz16Enc : Array UInt32 := #[
 
 def cavlcTz4Enc : Array UInt32 := #[
   65537, 131073, 196609, 196608, 65537, 131073, 131072, 0, 65537, 65536, 0, 0
+]
+
+def cavlcTz8Enc : Array UInt32 := #[
+  65537, 196610, 196611, 262146, 262147, 262145, 327681, 327680,
+  196608, 131073, 196609, 196612, 196613, 196614, 196615, 0,
+  196608, 196609, 131073, 131074, 196614, 196615, 0, 0,
+  196614, 131072, 131073, 131074, 196615, 0, 0, 0,
+  131072, 131073, 131074, 131075, 0, 0, 0, 0,
+  131072, 131073, 65537, 0, 0, 0, 0, 0,
+  65536, 65537, 0, 0, 0, 0, 0, 0
 ]
 
 def cavlcRunBeforeEnc : Array UInt32 := #[
@@ -1052,6 +1082,7 @@ private def decodeCavlcRunsLoop (r : BitReader) :
 def cavlcDecodeBlock (r : BitReader) (maxCoeff nC : Nat) : Option (Array Int × Nat × BitReader) := do
   let (sym, r1) ←
     if maxCoeff == 4 then readPackedVlc r cavlcCtChromaDcEnc 0 20
+    else if maxCoeff == 8 then readPackedVlc r cavlcCtChromaDc2x4Enc 0 36
     else readPackedVlc r (cavlcCtTable nC) 0 68
   let tc := sym >>> 2
   let t1 := sym &&& 3
@@ -1065,6 +1096,7 @@ def cavlcDecodeBlock (r : BitReader) (maxCoeff nC : Nat) : Option (Array Int × 
     let (zerosLeft, r4) ←
       if tc < maxCoeff then
         if maxCoeff == 4 then readPackedVlc r3 cavlcTz4Enc ((tc - 1) * 4) 4
+        else if maxCoeff == 8 then readPackedVlc r3 cavlcTz8Enc ((tc - 1) * 8) 8
         else readPackedVlc r3 cavlcTz16Enc ((tc - 1) * 16) 16
       else
         pure (0, r3)
@@ -1113,6 +1145,7 @@ def cavlcEncodeBlock (w : BitWriter) (coeffs : Array Int) (maxCoeff nC : Nat) : 
   else if tc == 0 then do
     let packed :=
       if maxCoeff == 4 then cavlcCtChromaDcEnc.getD 0 0
+      else if maxCoeff == 8 then cavlcCtChromaDc2x4Enc.getD 0 0
       else (cavlcCtTable nC).getD 0 0
     let w1 ← writePackedVlc w packed
     some (w1, 0)
@@ -1127,6 +1160,7 @@ def cavlcEncodeBlock (w : BitWriter) (coeffs : Array Int) (maxCoeff nC : Nat) : 
     let sym := (tc <<< 2) ||| t1
     let packedCt :=
       if maxCoeff == 4 then cavlcCtChromaDcEnc.getD sym 0
+      else if maxCoeff == 8 then cavlcCtChromaDc2x4Enc.getD sym 0
       else (cavlcCtTable nC).getD sym 0
     let mut cur ← writePackedVlc w packedCt
     for i in [:t1] do
@@ -1166,6 +1200,7 @@ def cavlcEncodeBlock (w : BitWriter) (coeffs : Array Int) (maxCoeff nC : Nat) : 
     if tc < maxCoeff then
       let packedTz :=
         if maxCoeff == 4 then cavlcTz4Enc.getD ((tc - 1) * 4 + totalZeros) 0
+        else if maxCoeff == 8 then cavlcTz8Enc.getD ((tc - 1) * 8 + totalZeros) 0
         else cavlcTz16Enc.getD ((tc - 1) * 16 + totalZeros) 0
       cur ← writePackedVlc cur packedTz
     let mut zLeft := totalZeros
@@ -1188,19 +1223,45 @@ private def unpackInitState (packed : Nat) (qp : Int) : UInt8 :=
   if pre ≤ 63 then (((63 - pre) <<< 1)).toUInt8
   else ((((pre - 64) <<< 1) ||| 1)).toUInt8
 
-def initCabacStates (sliceTypeNos cabacInitIdc : Nat) (sliceQpY : Int) : Array UInt8 := Id.run do
+def mapCabacHighCtxToBase (idx : Nat) : Nat :=
+  if idx < 460 then idx
+  else if idx < 472 then 85 + (idx - 460)
+  else if idx < 484 then 85 + (idx - 472)
+  else if idx < 528 then 105 + (idx - 484)
+  else if idx < 572 then 105 + (idx - 528)
+  else if idx < 616 then 166 + (idx - 572)
+  else if idx < 660 then 166 + (idx - 616)
+  else if idx < 675 then 402 + (idx - 660)
+  else if idx < 690 then 436 + (idx - 675)
+  else if idx < 699 then 417 + (idx - 690)
+  else if idx < 708 then 451 + (idx - 699)
+  else if idx < 718 then 426 + (idx - 708)
+  else if idx < 733 then 402 + (idx - 718)
+  else if idx < 748 then 436 + (idx - 733)
+  else if idx < 757 then 417 + (idx - 748)
+  else if idx < 766 then 451 + (idx - 757)
+  else if idx < 776 then 426 + (idx - 766)
+  else if idx < 820 then 277 + (idx - 776)
+  else if idx < 864 then 277 + (idx - 820)
+  else if idx < 908 then 338 + (idx - 864)
+  else if idx < 952 then 338 + (idx - 908)
+  else if idx < 982 then 227 + (idx - 952)
+  else 227 + (idx - 982)
+
+def initCabacStates (sliceTypeNos cabacInitIdc : Nat) (sliceQpY : Int) : Array UInt8 :=
   let qp : Int := if sliceQpY < 0 then 0 else if sliceQpY > 51 then 51 else sliceQpY
   let (tabLo, tabHi) :=
     if sliceTypeNos == 2 then (cabacInitI460, cabacInitI1012)
     else if cabacInitIdc == 0 then (cabacInitPB460_0, cabacInitPB1012_0)
     else if cabacInitIdc == 1 then (cabacInitPB460_1, cabacInitPB1012_1)
     else (cabacInitPB460_2, cabacInitPB1012_2)
-  let mut st := Array.replicate 1024 (0 : UInt8)
-  for idx in [:tabLo.size] do
-    st := st.set! idx (unpackInitState (tabLo.getD idx 32896) qp)
-  for k in [:tabHi.size] do
-    st := st.set! (1012 + k) (unpackInitState (tabHi.getD k 32896) qp)
-  return st
+  let st0 := (List.range 460).foldl (fun acc idx =>
+    acc.push (unpackInitState (tabLo.getD idx 32896) qp)) (Array.emptyWithCapacity 1024)
+  let st1 := (List.range 552).foldl (fun acc k =>
+    let baseIdx := mapCabacHighCtxToBase (460 + k)
+    acc.push (acc.getD baseIdx 0)) st0
+  (List.range 12).foldl (fun acc k =>
+    acc.push (unpackInitState (tabHi.getD k 32896) qp)) st1
 
 structure CabacDec where
   rbsp    : ByteArray
@@ -1492,8 +1553,12 @@ structure MbSyntax where
   i16Dc          : Array Int := Array.replicate 16 0
   lumaAcOr4x4    : Array (Array Int) := Array.replicate 16 (Array.replicate 16 0)
   luma8x8        : Array (Array Int) := Array.replicate 4 (Array.replicate 64 0)
-  chromaDc       : Array (Array Int) := #[Array.replicate 4 0, Array.replicate 4 0]
-  chromaAc       : Array (Array Int) := Array.replicate 8 (Array.replicate 15 0)
+  chromaDc       : Array (Array Int) := #[Array.replicate 8 0, Array.replicate 8 0]
+  chromaAc       : Array (Array Int) := Array.replicate 16 (Array.replicate 15 0)
+  chroma444Dc    : Array (Array Int) := #[Array.replicate 16 0, Array.replicate 16 0]
+  chroma444AcOr4x4 : Array (Array Int) := Array.replicate 32 (Array.replicate 16 0)
+  chroma444_8x8  : Array (Array (Array Int)) :=
+    #[Array.replicate 4 (Array.replicate 64 0), Array.replicate 4 (Array.replicate 64 0)]
   deriving Inhabited
 
 structure MbGridRecord where
@@ -1511,7 +1576,8 @@ structure MbGridRecord where
   cdcNz         : Array Nat := #[0, 0]
   lumaNnzCavlc  : Array Nat := Array.replicate 16 0
   lumaCbfCabac  : Array Nat := Array.replicate 16 0
-  chromaNnz     : Array (Array Nat) := #[Array.replicate 4 0, Array.replicate 4 0]
+  chromaNnz     : Array (Array Nat) := #[Array.replicate 16 0, Array.replicate 16 0]
+  chromaCbfCabac : Array (Array Nat) := #[Array.replicate 16 0, Array.replicate 16 0]
   refGrid       : Array (Array Int) := #[Array.replicate 16 (-1), Array.replicate 16 (-1)]
   directPart    : Array Bool := Array.replicate 16 false
   mvdGrid       : Array (Array (Int × Int)) := #[Array.replicate 16 (0, 0), Array.replicate 16 (0, 0)]
@@ -1543,9 +1609,18 @@ def MbGrid.setMb (g : MbGrid) (mx my : Nat) (r : MbGridRecord) : MbGrid :=
   let idx := my * g.w + mx
   if idx < g.mbs.size then { g with mbs := g.mbs.set! idx r } else g
 
+def chromaArrayType (sps : SpsFull) : Nat :=
+  if sps.chromaFormatIdc == 3 && sps.separateColourPlaneFlag != 0 then 0
+  else sps.chromaFormatIdc
+
 def pcmByteCount (sps : SpsFull) : Nat :=
   let lumaBits := 256 * (8 + sps.bitDepthLumaMinus8)
-  let chromaBits := if sps.chromaFormatIdc == 0 then 0 else 128 * (8 + sps.bitDepthChromaMinus8)
+  let chromaSamples :=
+    if sps.chromaFormatIdc == 0 || (sps.chromaFormatIdc == 3 && sps.separateColourPlaneFlag != 0) then 0
+    else if sps.chromaFormatIdc == 3 then 512
+    else if sps.chromaFormatIdc == 2 then 256
+    else 128
+  let chromaBits := chromaSamples * (8 + sps.bitDepthChromaMinus8)
   (lumaBits + chromaBits) / 8
 
 def cavlcLumaNC (g : MbGrid) (mx my : Nat) (curNnz : Array Nat) (blkIdx : Nat) : Nat :=
@@ -1577,9 +1652,43 @@ def cavlcChromaNC (g : MbGrid) (mx my : Nat) (curCnnz : Array Nat) (plane cidx :
   | none, some nb => nb
   | none, none => 0
 
+def cavlcChromaNCGen (g : MbGrid) (mx my : Nat) (chType : Nat)
+    (curCnnz : Array Nat) (plane cidx : Nat) : Nat :=
+  if chType == 3 then
+    let (bx, by0) := blk4XY.getD cidx (0, 0)
+    let naOpt : Option Nat :=
+      if bx > 0 then some (curCnnz.getD (xyToBlk4 (bx - 1) by0) 0)
+      else (g.leftMb mx my).map (fun mba => (mba.chromaNnz.getD plane #[]).getD (xyToBlk4 3 by0) 0)
+    let nbOpt : Option Nat :=
+      if by0 > 0 then some (curCnnz.getD (xyToBlk4 bx (by0 - 1)) 0)
+      else (g.topMb mx my).map (fun mbb => (mbb.chromaNnz.getD plane #[]).getD (xyToBlk4 bx 3) 0)
+    match naOpt, nbOpt with
+    | some na, some nb => (na + nb + 1) >>> 1
+    | some na, none => na
+    | none, some nb => nb
+    | none, none => 0
+  else
+    let nRows := if chType == 2 then 4 else 2
+    let cx := cidx &&& 1
+    let cy := (cidx >>> 1) % nRows
+    let naOpt : Option Nat :=
+      if cx > 0 then some (curCnnz.getD (cy * 2 + (cx - 1)) 0)
+      else (g.leftMb mx my).map (fun mba => (mba.chromaNnz.getD plane #[]).getD (cy * 2 + 1) 0)
+    let nbOpt : Option Nat :=
+      if cy > 0 then some (curCnnz.getD ((cy - 1) * 2 + cx) 0)
+      else (g.topMb mx my).map (fun mbb => (mbb.chromaNnz.getD plane #[]).getD ((nRows - 1) * 2 + cx) 0)
+    match naOpt, nbOpt with
+    | some na, some nb => (na + nb + 1) >>> 1
+    | some na, none => na
+    | none, some nb => nb
+    | none, none => 0
+
+def cabacCbfBaseTable : Array Nat :=
+  #[85, 89, 93, 97, 101, 1012, 460, 464, 468, 1016, 472, 476, 480, 1020]
+
 def cabacCbfCtx (g : MbGrid) (mx my : Nat) (isCurIntra : Bool) (cat : Nat)
     (curCbfLuma : Array Nat) (curCbfChroma : Array (Array Nat)) (idx : Nat) : Nat :=
-  let baseCtx := (#[85, 89, 93, 97, 101, 1012]).getD cat 85
+  let baseCtx := cabacCbfBaseTable.getD cat 85
   let unavail := if isCurIntra then 1 else 0
   if cat == 0 then
     let ca := match g.leftMb mx my with
@@ -1589,6 +1698,15 @@ def cabacCbfCtx (g : MbGrid) (mx my : Nat) (isCurIntra : Bool) (cat : Nat)
       | none => unavail
       | some mbb => if mbb.isIpcm || mbb.i16DcNz != 0 then 1 else 0
     baseCtx + ca + 2 * cb
+  else if cat == 6 || cat == 10 then
+    let plane := if cat == 6 then 0 else 1
+    let ca := match g.leftMb mx my with
+      | none => unavail
+      | some mba => if mba.isIpcm || mba.cdcNz.getD plane 0 != 0 then 1 else 0
+    let cb := match g.topMb mx my with
+      | none => unavail
+      | some mbb => if mbb.isIpcm || mbb.cdcNz.getD plane 0 != 0 then 1 else 0
+    baseCtx + ca + 2 * cb
   else if cat == 3 then
     let ca := match g.leftMb mx my with
       | none => unavail
@@ -1597,34 +1715,60 @@ def cabacCbfCtx (g : MbGrid) (mx my : Nat) (isCurIntra : Bool) (cat : Nat)
       | none => unavail
       | some mbb => if mbb.isIpcm || mbb.cdcNz.getD idx 0 != 0 then 1 else 0
     baseCtx + ca + 2 * cb
-  else if cat == 1 || cat == 2 then
-    let (bx, by0) := blk4XY.getD idx (0, 0)
+  else if cat == 1 || cat == 2 || cat == 5 then
+    let blkIdx := if cat == 5 then 4 * idx else idx
+    let (bx, by0) := blk4XY.getD blkIdx (0, 0)
     let ca :=
       if bx > 0 then curCbfLuma.getD (xyToBlk4 (bx - 1) by0) 0
       else match g.leftMb mx my with
         | none => unavail
-        | some mba => mba.lumaCbfCabac.getD (xyToBlk4 3 by0) 0
+        | some mba =>
+          if cat == 5 && !mba.is8x8Dct then (if mba.isIpcm then 1 else 0)
+          else mba.lumaCbfCabac.getD (xyToBlk4 3 by0) 0
     let cb :=
       if by0 > 0 then curCbfLuma.getD (xyToBlk4 bx (by0 - 1)) 0
       else match g.topMb mx my with
         | none => unavail
-        | some mbb => mbb.lumaCbfCabac.getD (xyToBlk4 bx 3) 0
+        | some mbb =>
+          if cat == 5 && !mbb.is8x8Dct then (if mbb.isIpcm then 1 else 0)
+          else mbb.lumaCbfCabac.getD (xyToBlk4 bx 3) 0
+    baseCtx + ca + 2 * cb
+  else if cat == 7 || cat == 8 || cat == 9 || cat == 11 || cat == 12 || cat == 13 then
+    let plane := if cat == 7 || cat == 8 || cat == 9 then 0 else 1
+    let blkIdx := if cat == 9 || cat == 13 then 4 * idx else idx
+    let (bx, by0) := blk4XY.getD blkIdx (0, 0)
+    let ca :=
+      if bx > 0 then (if (curCbfChroma.getD plane #[]).getD (xyToBlk4 (bx - 1) by0) 0 > 0 then 1 else 0)
+      else match g.leftMb mx my with
+        | none => unavail
+        | some mba =>
+          if (cat == 9 || cat == 13) && !mba.is8x8Dct then (if mba.isIpcm then 1 else 0)
+          else if (mba.chromaCbfCabac.getD plane #[]).getD (xyToBlk4 3 by0) 0 > 0 then 1 else 0
+    let cb :=
+      if by0 > 0 then (if (curCbfChroma.getD plane #[]).getD (xyToBlk4 bx (by0 - 1)) 0 > 0 then 1 else 0)
+      else match g.topMb mx my with
+        | none => unavail
+        | some mbb =>
+          if (cat == 9 || cat == 13) && !mbb.is8x8Dct then (if mbb.isIpcm then 1 else 0)
+          else if (mbb.chromaCbfCabac.getD plane #[]).getD (xyToBlk4 bx 3) 0 > 0 then 1 else 0
     baseCtx + ca + 2 * cb
   else
-    let plane := idx / 4
-    let cidx := idx % 4
+    let nBlocks := Nat.max 4 ((curCbfChroma.getD 0 #[]).size)
+    let nRows := nBlocks / 2
+    let plane := idx / nBlocks
+    let cidx := idx % nBlocks
     let cx := cidx &&& 1
-    let cy := (cidx >>> 1) &&& 1
+    let cy := cidx >>> 1
     let ca :=
       if cx > 0 then (if (curCbfChroma.getD plane #[]).getD (cy * 2 + (cx - 1)) 0 > 0 then 1 else 0)
       else match g.leftMb mx my with
         | none => unavail
-        | some mba => if (mba.chromaNnz.getD plane #[]).getD (cy * 2 + 1) 0 > 0 then 1 else 0
+        | some mba => if (mba.chromaCbfCabac.getD plane #[]).getD (cy * 2 + 1) 0 > 0 then 1 else 0
     let cb :=
       if cy > 0 then (if (curCbfChroma.getD plane #[]).getD ((cy - 1) * 2 + cx) 0 > 0 then 1 else 0)
       else match g.topMb mx my with
         | none => unavail
-        | some mbb => if (mbb.chromaNnz.getD plane #[]).getD (2 + cx) 0 > 0 then 1 else 0
+        | some mbb => if (mbb.chromaCbfCabac.getD plane #[]).getD ((nRows - 1) * 2 + cx) 0 > 0 then 1 else 0
     baseCtx + ca + 2 * cb
 
 def fillRect4x4 {α : Type} (arr : Array α) (blk0 bw bh : Nat) (val : α) : Array α := Id.run do
@@ -1662,8 +1806,9 @@ def interDct8x8Allowed (pps : PpsFull) (sps : SpsFull) (mb : MbSyntax) : Bool :=
       true
   | _ => false
 
-def applyMbHeaderToRecord (mb : MbSyntax) (r0 : MbGridRecord) : MbGridRecord :=
+def applyMbHeaderToRecord (mb : MbSyntax) (chType : Nat) (r0 : MbGridRecord) : MbGridRecord :=
   let r1 := { r0 with inSlice := true }
+  let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
   if mb.isSkip then
     { r1 with isSkip := true, isDirectMb := true, directPart := Array.replicate 16 true }
   else if mb.kind.isIntra then
@@ -1677,10 +1822,11 @@ def applyMbHeaderToRecord (mb : MbSyntax) (r0 : MbGridRecord) : MbGridRecord :=
     if mb.kind == .iPcm then
       { r2 with
         cbpLuma := 0xF
-        cbpChroma := 2
+        cbpChroma := if chType == 1 || chType == 2 then 2 else 0
         lumaNnzCavlc := Array.replicate 16 16
         lumaCbfCabac := Array.replicate 16 1
-        chromaNnz := #[Array.replicate 4 16, Array.replicate 4 16]
+        chromaNnz := #[Array.replicate chromaBlocks 16, Array.replicate chromaBlocks 16]
+        chromaCbfCabac := #[Array.replicate chromaBlocks 1, Array.replicate chromaBlocks 1]
         i16DcNz := 1
         cdcNz := #[1, 1]
       }
@@ -1756,13 +1902,15 @@ private def countNonZeroPrefix (arr : Array Int) (limit : Nat) : Nat := Id.run d
     if arr.getD i 0 != 0 then cnt := cnt + 1
   return cnt
 
-def populateResidualGrid (mb : MbSyntax) (r0 : MbGridRecord) (hasChroma : Bool) : MbGridRecord := Id.run do
+def populateResidualGrid (mb : MbSyntax) (r0 : MbGridRecord) (chType : Nat) : MbGridRecord := Id.run do
   if mb.isSkip || mb.kind == .iPcm then return r0
+  let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
   let mut i16Nz := r0.i16DcNz
   let mut cdcNz := r0.cdcNz
   let mut lNnz := r0.lumaNnzCavlc
   let mut lCbf := r0.lumaCbfCabac
   let mut cNnz := r0.chromaNnz
+  let mut cCbf := r0.chromaCbfCabac
   if mb.kind == .i16x16 then
     i16Nz := if countNonZeroPrefix mb.i16Dc 16 > 0 then 1 else 0
     if (mb.cbp &&& 0xF) != 0 then
@@ -1791,28 +1939,68 @@ def populateResidualGrid (mb : MbSyntax) (r0 : MbGridRecord) (hasChroma : Bool) 
             let tc := countNonZeroPrefix (mb.lumaAcOr4x4.getD idx #[]) 16
             lNnz := lNnz.set! idx tc
             lCbf := lCbf.set! idx (if tc > 0 then 1 else 0)
-  if hasChroma && (mb.cbp &&& 0x30) != 0 then
-    for pl in [:2] do
-      cdcNz := cdcNz.set! pl (if countNonZeroPrefix (mb.chromaDc.getD pl #[]) 4 > 0 then 1 else 0)
-    if (mb.cbp &&& 0x20) != 0 then
+  if chType == 1 || chType == 2 then
+    if (mb.cbp &&& 0x30) != 0 then
       for pl in [:2] do
-        let mut pArr := cNnz.getD pl (Array.replicate 4 0)
-        for ci in [:4] do
-          let tc := countNonZeroPrefix (mb.chromaAc.getD (pl * 4 + ci) #[]) 15
-          pArr := pArr.set! ci tc
-        cNnz := cNnz.set! pl pArr
+        cdcNz := cdcNz.set! pl (if countNonZeroPrefix (mb.chromaDc.getD pl #[]) 16 > 0 then 1 else 0)
+      if (mb.cbp &&& 0x20) != 0 then
+        for pl in [:2] do
+          let mut pArr := Array.replicate chromaBlocks 0
+          let mut pCbf := Array.replicate chromaBlocks 0
+          for ci in [:chromaBlocks] do
+            let tc := countNonZeroPrefix (mb.chromaAc.getD (pl * chromaBlocks + ci) #[]) 16
+            pArr := pArr.set! ci tc
+            pCbf := pCbf.set! ci (if tc > 0 then 1 else 0)
+          cNnz := cNnz.set! pl pArr
+          cCbf := cCbf.set! pl pCbf
+  else if chType == 3 then
+    for pl in [:2] do
+      let src8 := mb.chroma444_8x8.getD pl #[]
+      let mut pArr := Array.replicate 16 0
+      let mut pCbf := Array.replicate 16 0
+      if mb.kind == .i16x16 then
+        cdcNz := cdcNz.set! pl (if countNonZeroPrefix (mb.chroma444Dc.getD pl #[]) 16 > 0 then 1 else 0)
+        if (mb.cbp &&& 0xF) != 0 then
+          for idx in [:16] do
+            let tc := countNonZeroPrefix (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]) 15
+            pArr := pArr.set! idx tc
+            pCbf := pCbf.set! idx (if tc > 0 then 1 else 0)
+      else
+        for i8 in [:4] do
+          if (mb.cbp &&& (1 <<< i8)) != 0 then
+            if mb.transform8x8 != 0 then
+              let c8 := src8.getD i8 #[]
+              let mut tot := 0
+              for sub in [:4] do
+                let mut stc := 0
+                for k in [:16] do
+                  if c8.getD (4 * k + sub) 0 != 0 then stc := stc + 1
+                pArr := pArr.set! (4 * i8 + sub) stc
+                tot := tot + stc
+              let cbf := if tot > 0 then 1 else 0
+              for sub in [:4] do
+                pCbf := pCbf.set! (4 * i8 + sub) cbf
+            else
+              for sub in [:4] do
+                let idx := 4 * i8 + sub
+                let tc := countNonZeroPrefix (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]) 16
+                pArr := pArr.set! idx tc
+                pCbf := pCbf.set! idx (if tc > 0 then 1 else 0)
+      cNnz := cNnz.set! pl pArr
+      cCbf := cCbf.set! pl pCbf
   return { r0 with
     i16DcNz := i16Nz
     cdcNz := cdcNz
     lumaNnzCavlc := lNnz
     lumaCbfCabac := lCbf
     chromaNnz := cNnz
+    chromaCbfCabac := cCbf
   }
 
-def buildCompleteMbRecord (mb : MbSyntax) (hasChroma : Bool) : MbGridRecord :=
-  let r1 := applyMbHeaderToRecord mb {}
+def buildCompleteMbRecord (mb : MbSyntax) (chType : Nat) : MbGridRecord :=
+  let r1 := applyMbHeaderToRecord mb chType {}
   let r2 := populateInterMotionGrid mb r1
-  populateResidualGrid mb r2 hasChroma
+  populateResidualGrid mb r2 chType
 
 def cavlcReadRef (r : BitReader) (refCount : Nat) : Option (Nat × BitReader) :=
   if refCount ≤ 1 then some (0, r)
@@ -1917,19 +2105,23 @@ private def cavlcDecodeInterMotion (r0 : BitReader) (sh : SliceHeaderFull)
     some (#[], refs.getD 0 #[], refs.getD 1 #[], mvds.getD 0 #[], mvds.getD 1 #[], rCur)
 
 private def cavlcDecodeResidualMb (r0 : BitReader) (g : MbGrid) (mx my : Nat)
-    (hasChroma : Bool) (mb0 : MbSyntax) : Option (MbSyntax × BitReader) := do
+    (chType : Nat) (mb0 : MbSyntax) : Option (MbSyntax × BitReader) := do
   if mb0.cbp == 0 && mb0.kind != .i16x16 then
     some (mb0, r0)
   else do
     let (dqp, r1) ← readSEInt r0
+    let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
     let mut rCur := r1
     let mut curNnz := Array.replicate 16 0
-    let mut curCnnz := #[Array.replicate 4 0, Array.replicate 4 0]
+    let mut curCnnz := #[Array.replicate chromaBlocks 0, Array.replicate chromaBlocks 0]
     let mut i16Dc := mb0.i16Dc
     let mut luma4 := mb0.lumaAcOr4x4
     let mut luma8 := mb0.luma8x8
     let mut cdc := mb0.chromaDc
     let mut cac := mb0.chromaAc
+    let mut c444dc := mb0.chroma444Dc
+    let mut c444ac := mb0.chroma444AcOr4x4
+    let mut c444_8 := mb0.chroma444_8x8
     if mb0.kind == .i16x16 then
       let nc0 := cavlcLumaNC g mx my curNnz 0
       let (dcCoeffs, _, rn) ← cavlcDecodeBlock rCur 16 nc0
@@ -1964,29 +2156,73 @@ private def cavlcDecodeResidualMb (r0 : BitReader) (g : MbGrid) (mx my : Nat)
               rCur := rn2
               luma4 := luma4.set! idx coeffs
               curNnz := curNnz.set! idx tc
-    if hasChroma && (mb0.cbp &&& 0x30) != 0 then
-      for pl in [:2] do
-        let (dcCoeffs, _, rn2) ← cavlcDecodeBlock rCur 4 0
-        rCur := rn2
-        cdc := cdc.set! pl dcCoeffs
-      if (mb0.cbp &&& 0x20) != 0 then
+    if chType == 1 || chType == 2 then
+      if (mb0.cbp &&& 0x30) != 0 then
         for pl in [:2] do
-          let mut pNnz := curCnnz.getD pl (Array.replicate 4 0)
-          for ci in [:4] do
-            let nc := cavlcChromaNC g mx my pNnz pl ci
-            let (coeffs, tc, rn2) ← cavlcDecodeBlock rCur 15 nc
-            rCur := rn2
-            cac := cac.set! (pl * 4 + ci) coeffs
-            pNnz := pNnz.set! ci tc
-          curCnnz := curCnnz.set! pl pNnz
+          let (dcCoeffs, _, rn2) ← cavlcDecodeBlock rCur chromaBlocks 0
+          rCur := rn2
+          cdc := cdc.set! pl dcCoeffs
+        if (mb0.cbp &&& 0x20) != 0 then
+          for pl in [:2] do
+            let mut pNnz := curCnnz.getD pl (Array.replicate chromaBlocks 0)
+            for ci in [:chromaBlocks] do
+              let nc := cavlcChromaNCGen g mx my chType pNnz pl ci
+              let (coeffs, tc, rn2) ← cavlcDecodeBlock rCur 15 nc
+              rCur := rn2
+              cac := cac.set! (pl * chromaBlocks + ci) coeffs
+              pNnz := pNnz.set! ci tc
+            curCnnz := curCnnz.set! pl pNnz
+    else if chType == 3 then
+      for pl in [:2] do
+        let mut pNnz := curCnnz.getD pl (Array.replicate 16 0)
+        if mb0.kind == .i16x16 then
+          let nc0 := cavlcChromaNCGen g mx my 3 pNnz pl 0
+          let (dcCoeffs, _, rn2) ← cavlcDecodeBlock rCur 16 nc0
+          rCur := rn2
+          c444dc := c444dc.set! pl dcCoeffs
+          if (mb0.cbp &&& 0xF) != 0 then
+            for idx in [:16] do
+              let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+              let (acCoeffs, tc, rn3) ← cavlcDecodeBlock rCur 15 nc
+              rCur := rn3
+              c444ac := c444ac.set! (pl * 16 + idx) (acCoeffs.push 0)
+              pNnz := pNnz.set! idx tc
+        else if mb0.transform8x8 != 0 then
+          let mut plane8 : Array (Array Int) := Array.replicate 4 (Array.replicate 64 0)
+          for i8 in [:4] do
+            if (mb0.cbp &&& (1 <<< i8)) != 0 then
+              let mut c8 := Array.replicate 64 (0 : Int)
+              for sub in [:4] do
+                let idx := 4 * i8 + sub
+                let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+                let (coeffs, tc, rn2) ← cavlcDecodeBlock rCur 16 nc
+                rCur := rn2
+                pNnz := pNnz.set! idx tc
+                for k in [:16] do
+                  c8 := c8.set! (4 * k + sub) (coeffs.getD k 0)
+              plane8 := plane8.set! i8 c8
+          c444_8 := c444_8.set! pl plane8
+        else
+          for i8 in [:4] do
+            if (mb0.cbp &&& (1 <<< i8)) != 0 then
+              for sub in [:4] do
+                let idx := 4 * i8 + sub
+                let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+                let (coeffs, tc, rn2) ← cavlcDecodeBlock rCur 16 nc
+                rCur := rn2
+                pNnz := pNnz.set! idx tc
+                c444ac := c444ac.set! (pl * 16 + idx) coeffs
+        curCnnz := curCnnz.set! pl pNnz
     some ({ mb0 with
       mbQpDelta := dqp, i16Dc := i16Dc, lumaAcOr4x4 := luma4,
-      luma8x8 := luma8, chromaDc := cdc, chromaAc := cac
+      luma8x8 := luma8, chromaDc := cdc, chromaAc := cac,
+      chroma444Dc := c444dc, chroma444AcOr4x4 := c444ac, chroma444_8x8 := c444_8
     }, rCur)
 
 private def cavlcDecodeNonSkipMb (r0 : BitReader) (sh : SliceHeaderFull) (sps : SpsFull)
     (pps : PpsFull) (g : MbGrid) (mx my : Nat) : Option (MbSyntax × BitReader) := do
-  let hasChroma := sps.chromaFormatIdc == 1
+  let chType := chromaArrayType sps
+  let hasChroma := chType == 1 || chType == 2
   let (rawMbt, r1) ← readUENat r0
   let (isIntra, intraMbt, interKind, interIdx) ←
     if sh.sliceTypeNos == 2 then
@@ -2034,7 +2270,7 @@ private def cavlcDecodeNonSkipMb (r0 : BitReader) (sh : SliceHeaderFull) (sps : 
             kind := kind, intraIdx := intraMbt, transform8x8 := t8,
             intraPred := preds, chromaPredMode := cMode, cbp := cbpVal
           }
-          cavlcDecodeResidualMb r4 g mx my hasChroma mb0
+          cavlcDecodeResidualMb r4 g mx my chType mb0
   else do
     let (subs, rl0, rl1, ml0, ml1, r2) ← cavlcDecodeInterMotion r1 sh interKind interIdx
     let (code, r3) ← readUENat r2
@@ -2049,7 +2285,7 @@ private def cavlcDecodeNonSkipMb (r0 : BitReader) (sh : SliceHeaderFull) (sps : 
       let (t8, r4) ←
         if (cbpVal &&& 0xF) != 0 && interDct8x8Allowed pps sps mbBase then readU1Nat r3
         else pure (0, r3)
-      cavlcDecodeResidualMb r4 g mx my hasChroma { mbBase with transform8x8 := t8 }
+      cavlcDecodeResidualMb r4 g mx my chType { mbBase with transform8x8 := t8 }
 
 private def decodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : PpsFull)
     (rbspEnd totalMbs : Nat) :
@@ -2060,18 +2296,18 @@ private def decodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
     else
       let mx := mbIdx % sps.picWidthInMbs
       let my := mbIdx / sps.picWidthInMbs
-      let hasChroma := sps.chromaFormatIdc == 1
+      let chType := chromaArrayType sps
       if sh.sliceTypeNos != 2 then
         match skipOpt with
         | some (k + 1) =>
           let mb : MbSyntax := { isSkip := true, kind := .skip }
-          let g' := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+          let g' := g.setMb mx my (buildCompleteMbRecord mb chType)
           decodeSliceCavlcLoop sh sps pps rbspEnd totalMbs fuel (mbIdx + 1) r g' (some k) (acc.push mb)
         | some 0 =>
           if !moreRbspData r rbspEnd then some acc
           else do
             let (mb, r') ← cavlcDecodeNonSkipMb r sh sps pps g mx my
-            let g' := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+            let g' := g.setMb mx my (buildCompleteMbRecord mb chType)
             decodeSliceCavlcLoop sh sps pps rbspEnd totalMbs fuel (mbIdx + 1) r' g' none (acc.push mb)
         | none =>
           if !moreRbspData r rbspEnd then some acc
@@ -2080,19 +2316,19 @@ private def decodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
             if srun > totalMbs - mbIdx then none
             else if srun > 0 then
               let mb : MbSyntax := { isSkip := true, kind := .skip }
-              let g' := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+              let g' := g.setMb mx my (buildCompleteMbRecord mb chType)
               decodeSliceCavlcLoop sh sps pps rbspEnd totalMbs fuel (mbIdx + 1) r1 g' (some (srun - 1)) (acc.push mb)
             else if !moreRbspData r1 rbspEnd then
               some acc
             else do
               let (mb, r2) ← cavlcDecodeNonSkipMb r1 sh sps pps g mx my
-              let g' := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+              let g' := g.setMb mx my (buildCompleteMbRecord mb chType)
               decodeSliceCavlcLoop sh sps pps rbspEnd totalMbs fuel (mbIdx + 1) r2 g' none (acc.push mb)
       else
         if acc.size > 0 && !moreRbspData r rbspEnd then some acc
         else do
           let (mb, r') ← cavlcDecodeNonSkipMb r sh sps pps g mx my
-          let g' := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+          let g' := g.setMb mx my (buildCompleteMbRecord mb chType)
           decodeSliceCavlcLoop sh sps pps rbspEnd totalMbs fuel (mbIdx + 1) r' g' none (acc.push mb)
 
 def decodeSliceCavlc (rbsp : ByteArray) (sh : SliceHeaderFull) (bitStart : Nat)
@@ -2161,13 +2397,14 @@ private def cavlcEncodeInterMotion (w0 : BitWriter) (sh : SliceHeaderFull) (mb :
     some wCur
 
 private def cavlcEncodeResidualMb (w0 : BitWriter) (g : MbGrid) (mx my : Nat)
-    (hasChroma : Bool) (mb : MbSyntax) : Option BitWriter := do
+    (chType : Nat) (mb : MbSyntax) : Option BitWriter := do
   if mb.cbp == 0 && mb.kind != .i16x16 then
     some w0
   else do
+    let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
     let mut wCur := writeSEInt w0 mb.mbQpDelta
     let mut curNnz := Array.replicate 16 0
-    let mut curCnnz := #[Array.replicate 4 0, Array.replicate 4 0]
+    let mut curCnnz := #[Array.replicate chromaBlocks 0, Array.replicate chromaBlocks 0]
     if mb.kind == .i16x16 then
       let nc0 := cavlcLumaNC g mx my curNnz 0
       let (wNext, _) ← cavlcEncodeBlock wCur mb.i16Dc 16 nc0
@@ -2200,24 +2437,64 @@ private def cavlcEncodeResidualMb (w0 : BitWriter) (g : MbGrid) (mx my : Nat)
               let (wNext2, tc) ← cavlcEncodeBlock wCur (mb.lumaAcOr4x4.getD idx #[]) 16 nc
               wCur := wNext2
               curNnz := curNnz.set! idx tc
-    if hasChroma && (mb.cbp &&& 0x30) != 0 then
-      for pl in [:2] do
-        let (wNext2, _) ← cavlcEncodeBlock wCur (mb.chromaDc.getD pl #[]) 4 0
-        wCur := wNext2
-      if (mb.cbp &&& 0x20) != 0 then
+    if chType == 1 || chType == 2 then
+      if (mb.cbp &&& 0x30) != 0 then
         for pl in [:2] do
-          let mut pNnz := curCnnz.getD pl (Array.replicate 4 0)
-          for ci in [:4] do
-            let nc := cavlcChromaNC g mx my pNnz pl ci
-            let (wNext2, tc) ← cavlcEncodeBlock wCur (mb.chromaAc.getD (pl * 4 + ci) #[]) 15 nc
-            wCur := wNext2
-            pNnz := pNnz.set! ci tc
-          curCnnz := curCnnz.set! pl pNnz
+          let (wNext2, _) ← cavlcEncodeBlock wCur (mb.chromaDc.getD pl #[]) chromaBlocks 0
+          wCur := wNext2
+        if (mb.cbp &&& 0x20) != 0 then
+          for pl in [:2] do
+            let mut pNnz := curCnnz.getD pl (Array.replicate chromaBlocks 0)
+            for ci in [:chromaBlocks] do
+              let nc := cavlcChromaNCGen g mx my chType pNnz pl ci
+              let (wNext2, tc) ← cavlcEncodeBlock wCur (mb.chromaAc.getD (pl * chromaBlocks + ci) #[]) 15 nc
+              wCur := wNext2
+              pNnz := pNnz.set! ci tc
+            curCnnz := curCnnz.set! pl pNnz
+    else if chType == 3 then
+      for pl in [:2] do
+        let mut pNnz := curCnnz.getD pl (Array.replicate 16 0)
+        if mb.kind == .i16x16 then
+          let nc0 := cavlcChromaNCGen g mx my 3 pNnz pl 0
+          let (wNext, _) ← cavlcEncodeBlock wCur (mb.chroma444Dc.getD pl #[]) 16 nc0
+          wCur := wNext
+          if (mb.cbp &&& 0xF) != 0 then
+            for idx in [:16] do
+              let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+              let acArr := (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]).extract 0 15
+              let (wNext2, tc) ← cavlcEncodeBlock wCur acArr 15 nc
+              wCur := wNext2
+              pNnz := pNnz.set! idx tc
+        else if mb.transform8x8 != 0 then
+          let plane8 := mb.chroma444_8x8.getD pl #[]
+          for i8 in [:4] do
+            if (mb.cbp &&& (1 <<< i8)) != 0 then
+              let c8 := plane8.getD i8 #[]
+              for sub in [:4] do
+                let idx := 4 * i8 + sub
+                let mut coeffs : Array Int := Array.emptyWithCapacity 16
+                for k in [:16] do
+                  coeffs := coeffs.push (c8.getD (4 * k + sub) 0)
+                let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+                let (wNext2, tc) ← cavlcEncodeBlock wCur coeffs 16 nc
+                wCur := wNext2
+                pNnz := pNnz.set! idx tc
+        else
+          for i8 in [:4] do
+            if (mb.cbp &&& (1 <<< i8)) != 0 then
+              for sub in [:4] do
+                let idx := 4 * i8 + sub
+                let nc := cavlcChromaNCGen g mx my 3 pNnz pl idx
+                let (wNext2, tc) ← cavlcEncodeBlock wCur (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]) 16 nc
+                wCur := wNext2
+                pNnz := pNnz.set! idx tc
+        curCnnz := curCnnz.set! pl pNnz
     some wCur
 
 private def cavlcEncodeNonSkipMb (w0 : BitWriter) (sh : SliceHeaderFull) (sps : SpsFull)
     (pps : PpsFull) (g : MbGrid) (mx my : Nat) (mb : MbSyntax) : Option BitWriter := do
-  let hasChroma := sps.chromaFormatIdc == 1
+  let chType := chromaArrayType sps
+  let hasChroma := chType == 1 || chType == 2
   if mb.kind.isIntra then
     let off := if sh.sliceTypeNos == 2 then 0 else if sh.sliceTypeNos == 0 then 5 else 23
     let w1 := writeUENat w0 (mb.intraIdx + off)
@@ -2238,7 +2515,7 @@ private def cavlcEncodeNonSkipMb (w0 : BitWriter) (sh : SliceHeaderFull) (sps : 
         let tab := if hasChroma then cavlcCbpIntraDec else cavlcCbpIntraGrayDec
         let cbpCode ← cavlcLookupCbpCode tab mb.cbp
         wCur := writeUENat wCur cbpCode
-      cavlcEncodeResidualMb wCur g mx my hasChroma mb
+      cavlcEncodeResidualMb wCur g mx my chType mb
   else do
     let w1 := writeUENat w0 mb.interIdx
     let w2 ← cavlcEncodeInterMotion w1 sh mb
@@ -2248,7 +2525,7 @@ private def cavlcEncodeNonSkipMb (w0 : BitWriter) (sh : SliceHeaderFull) (sps : 
     let w4 :=
       if (mb.cbp &&& 0xF) != 0 && interDct8x8Allowed pps sps mb then writeU1Nat w3 mb.transform8x8
       else w3
-    cavlcEncodeResidualMb w4 g mx my hasChroma mb
+    cavlcEncodeResidualMb w4 g mx my chType mb
 
 private def countSkipRunFrom (mbs : Array MbSyntax) (idx : Nat) : Nat → Nat → Nat
   | 0, run => run
@@ -2264,7 +2541,7 @@ private def encodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
   | fuel + 1, i, mbIdx, w, g =>
     if i ≥ mbs.size then some w
     else
-      let hasChroma := sps.chromaFormatIdc == 1
+      let chType := chromaArrayType sps
       if sh.sliceTypeNos != 2 then
         let run := countSkipRunFrom mbs i (mbs.size - i) 0
         let w1 := writeUENat w run
@@ -2275,7 +2552,7 @@ private def encodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
             let mxk := curMbIdx % sps.picWidthInMbs
             let myk := curMbIdx / sps.picWidthInMbs
             let mbSkip := mbs.getD (i + k) { isSkip := true, kind := .skip }
-            gCur := gCur.setMb mxk myk (buildCompleteMbRecord mbSkip hasChroma)
+            gCur := gCur.setMb mxk myk (buildCompleteMbRecord mbSkip chType)
           return gCur
         let iNext := i + run
         let mbIdxNext := mbIdx + run
@@ -2285,14 +2562,14 @@ private def encodeSliceCavlcLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
           let mx := mbIdxNext % sps.picWidthInMbs
           let my := mbIdxNext / sps.picWidthInMbs
           let w2 ← cavlcEncodeNonSkipMb w1 sh sps pps g1 mx my mb
-          let g2 := g1.setMb mx my (buildCompleteMbRecord mb hasChroma)
+          let g2 := g1.setMb mx my (buildCompleteMbRecord mb chType)
           encodeSliceCavlcLoop sh sps pps mbs fuel (iNext + 1) (mbIdxNext + 1) w2 g2
       else do
         let mb := mbs.getD i {}
         let mx := mbIdx % sps.picWidthInMbs
         let my := mbIdx / sps.picWidthInMbs
         let w1 ← cavlcEncodeNonSkipMb w sh sps pps g mx my mb
-        let g1 := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+        let g1 := g.setMb mx my (buildCompleteMbRecord mb chType)
         encodeSliceCavlcLoop sh sps pps mbs fuel (i + 1) (mbIdx + 1) w1 g1
 
 def encodeSliceCavlc (sh : SliceHeaderFull) (mbs : Array MbSyntax)
@@ -2302,28 +2579,40 @@ def encodeSliceCavlc (sh : SliceHeaderFull) (mbs : Array MbSyntax)
   let wEnd ← encodeSliceCavlcLoop sh sps pps mbs (mbs.size + 1) 0 sh.firstMbInSlice w0 g0
   some (writerToNal (writeRbspTrailing wEnd))
 
-def cabacSigBase : Array Nat := #[105, 120, 134, 149, 152, 402]
-def cabacLastBase : Array Nat := #[166, 181, 195, 210, 213, 417]
-def cabacLevelBase : Array Nat := #[227, 237, 247, 257, 266, 426]
+def cabacSigBase : Array Nat := #[
+  105, 120, 134, 149, 152, 402, 484, 499, 513, 660, 528, 543, 557, 718
+]
+def cabacLastBase : Array Nat := #[
+  166, 181, 195, 210, 213, 417, 572, 587, 601, 690, 616, 631, 645, 748
+]
+def cabacLevelBase : Array Nat := #[
+  227, 237, 247, 257, 266, 426, 952, 962, 972, 708, 982, 992, 1002, 766
+]
 def cabacLvl1Ctx : Array Nat := #[1, 2, 3, 4, 0, 0, 0, 0]
 def cabacLvlGt1Ctx : Array Nat := #[5, 5, 5, 5, 6, 7, 8, 9]
+def cabacLvlGt1CtxChromaDc : Array Nat := #[5, 5, 5, 5, 6, 7, 8, 8]
 def cabacLvlTr0 : Array Nat := #[1, 2, 3, 3, 4, 5, 6, 7]
 def cabacLvlTr1 : Array Nat := #[4, 4, 4, 4, 5, 6, 7, 7]
 
-private def cabacDecSigLastLoop (maxCoeff sigB lastB : Nat) :
+private def cabacSigLastInc (maxCoeff cat k : Nat) : Nat :=
+  if maxCoeff == 64 then cabacSig8x8Frame.getD k 0
+  else if maxCoeff == 8 && cat == 3 then Nat.min (k >>> 1) 2
+  else k
+
+private def cabacDecSigLastLoop (maxCoeff sigB lastB cat : Nat) :
     Nat → Nat → CabacDec → Array UInt8 → Array Nat → Array Nat × CabacDec × Array UInt8
   | 0, _, dec, st, acc => (acc.push (maxCoeff - 1), dec, st)
   | rem + 1, k, dec, st, acc =>
-    let so := if maxCoeff == 64 then cabacSig8x8Frame.getD k 0 else k
-    let lo := if maxCoeff == 64 then cabacLast8x8.getD k 0 else k
+    let so := cabacSigLastInc maxCoeff cat k
+    let lo := if maxCoeff == 64 then cabacLast8x8.getD k 0 else so
     let (sig, dec1, st1) := dec.decodeDecision st (sigB + so)
     if sig == 1 then
       let acc1 := acc.push k
       let (last, dec2, st2) := dec1.decodeDecision st1 (lastB + lo)
       if last == 1 then (acc1, dec2, st2)
-      else cabacDecSigLastLoop maxCoeff sigB lastB rem (k + 1) dec2 st2 acc1
+      else cabacDecSigLastLoop maxCoeff sigB lastB cat rem (k + 1) dec2 st2 acc1
     else
-      cabacDecSigLastLoop maxCoeff sigB lastB rem (k + 1) dec1 st1 acc
+      cabacDecSigLastLoop maxCoeff sigB lastB cat rem (k + 1) dec1 st1 acc
 
 private def cabacDecBypassUnary : Nat → CabacDec → Nat → Option (Nat × CabacDec)
   | 0, _, _ => none
@@ -2362,7 +2651,7 @@ def cabacDecodeResidualBlock (dec0 : CabacDec) (st0 : Array UInt8) (cat maxCoeff
     let lvlB := cabacLevelBase.getD cat 227
     let (nzPos, dec2, st2) :=
       if maxCoeff ≤ 1 then (#[0], dec1, st1)
-      else cabacDecSigLastLoop maxCoeff sigB lastB (maxCoeff - 1) 0 dec1 st1 #[]
+      else cabacDecSigLastLoop maxCoeff sigB lastB cat (maxCoeff - 1) 0 dec1 st1 #[]
     let mut coeffs := Array.replicate maxCoeff (0 : Int)
     let mut decCur := dec2
     let mut stCur := st2
@@ -2375,7 +2664,8 @@ def cabacDecodeResidualBlock (dec0 : CabacDec) (st0 : Array UInt8) (cat maxCoeff
           node := cabacLvlTr0.getD node 0
           pure (1, dA, sA)
         else do
-          let gctx := lvlB + cabacLvlGt1Ctx.getD node 5
+          let gt1Tab := if cat == 3 then cabacLvlGt1CtxChromaDc else cabacLvlGt1Ctx
+          let gctx := lvlB + gt1Tab.getD node 5
           node := cabacLvlTr1.getD node 4
           let (abs0, dG, sG) := cabacDecGt1Loop gctx 13 dA sA 2
           if abs0 == 15 then
@@ -2437,8 +2727,8 @@ def cabacEncodeResidualBlock (enc0 : CabacEnc) (st0 : Array UInt8) (coeffs : Arr
   if maxCoeff > 1 then
     for k in [:maxCoeff - 1] do
       if nzCursor < nz.size then
-        let so := if maxCoeff == 64 then cabacSig8x8Frame.getD k 0 else k
-        let lo := if maxCoeff == 64 then cabacLast8x8.getD k 0 else k
+        let so := cabacSigLastInc maxCoeff cat k
+        let lo := if maxCoeff == 64 then cabacLast8x8.getD k 0 else so
         let nextPos := (nz.getD nzCursor (maxCoeff, 0)).1
         if k == nextPos then
           nzCursor := nzCursor + 1
@@ -2467,7 +2757,8 @@ def cabacEncodeResidualBlock (enc0 : CabacEnc) (st0 : Array UInt8) (coeffs : Arr
       node := cabacLvlTr0.getD node 0
     else
       let (eA, sA) := encCur.encodeDecision stCur (lvlB + cabacLvl1Ctx.getD node 0) 1
-      let gctx := lvlB + cabacLvlGt1Ctx.getD node 5
+      let gt1Tab := if cat == 3 then cabacLvlGt1CtxChromaDc else cabacLvlGt1Ctx
+      let gctx := lvlB + gt1Tab.getD node 5
       node := cabacLvlTr1.getD node 4
       let uOnes := Nat.min (absC - 2) 13
       let mut eG := eA
@@ -2910,7 +3201,7 @@ private def cabacDecDqpLoop :
     else some (v, d1, s1)
 
 private def cabacDecodeResidualMb (dec0 : CabacDec) (st0 : Array UInt8) (g : MbGrid) (mx my : Nat)
-    (hasChroma : Bool) (lastDqp : Int) (mb0 : MbSyntax) :
+    (chType : Nat) (lastDqp : Int) (mb0 : MbSyntax) :
     Option (MbSyntax × Int × CabacDec × Array UInt8) := do
   if mb0.cbp == 0 && mb0.kind != .i16x16 then
     some (mb0, 0, dec0, st0)
@@ -2922,15 +3213,19 @@ private def cabacDecodeResidualMb (dec0 : CabacDec) (st0 : Array UInt8) (g : MbG
         let (v, dU, sU) ← cabacDecDqpLoop 256 d1 s1 62 1
         let mag : Int := Int.ofNat ((v + 1) >>> 1)
         pure (if (v &&& 1) == 1 then mag else -mag, dU, sU)
+    let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
     let mut decCur := decA
     let mut stCur := stA
     let mut curCbfL := Array.replicate 16 0
-    let mut curCbfC := #[Array.replicate 4 0, Array.replicate 4 0]
+    let mut curCbfC := #[Array.replicate chromaBlocks 0, Array.replicate chromaBlocks 0]
     let mut i16Dc := mb0.i16Dc
     let mut luma4 := mb0.lumaAcOr4x4
     let mut luma8 := mb0.luma8x8
     let mut cdc := mb0.chromaDc
     let mut cac := mb0.chromaAc
+    let mut c444dc := mb0.chroma444Dc
+    let mut c444ac := mb0.chroma444AcOr4x4
+    let mut c444_8 := mb0.chroma444_8x8
     let isIntra := mb0.kind.isIntra
     if mb0.kind == .i16x16 then
       let c0 := cabacCbfCtx g mx my true 0 curCbfL curCbfC 0
@@ -2950,12 +3245,14 @@ private def cabacDecodeResidualMb (dec0 : CabacDec) (st0 : Array UInt8) (g : MbG
       for i8 in [:4] do
         if (mb0.cbp &&& (1 <<< i8)) != 0 then
           if mb0.transform8x8 != 0 then
-            let (coeffs64, _, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 5 64 none
+            let cbfOpt := if chType == 3 then some (cabacCbfCtx g mx my isIntra 5 curCbfL curCbfC i8) else none
+            let (coeffs64, nz8, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 5 64 cbfOpt
             decCur := dn2
             stCur := sn2
             luma8 := luma8.set! i8 coeffs64
+            let cbfVal := if chType == 3 then nz8 else 1
             for sub in [:4] do
-              curCbfL := curCbfL.set! (4 * i8 + sub) 1
+              curCbfL := curCbfL.set! (4 * i8 + sub) cbfVal
           else
             for sub in [:4] do
               let idx := 4 * i8 + sub
@@ -2965,26 +3262,72 @@ private def cabacDecodeResidualMb (dec0 : CabacDec) (st0 : Array UInt8) (g : MbG
               stCur := sn2
               luma4 := luma4.set! idx coeffs
               curCbfL := curCbfL.set! idx nz
-    if hasChroma && (mb0.cbp &&& 0x30) != 0 then
-      for pl in [:2] do
-        let cc := cabacCbfCtx g mx my isIntra 3 curCbfL curCbfC pl
-        let (dcCoeffs, _, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 3 4 (some cc)
-        decCur := dn2
-        stCur := sn2
-        cdc := cdc.set! pl dcCoeffs
-      if (mb0.cbp &&& 0x20) != 0 then
+    if chType == 1 || chType == 2 then
+      if (mb0.cbp &&& 0x30) != 0 then
         for pl in [:2] do
-          for ci in [:4] do
-            let cc := cabacCbfCtx g mx my isIntra 4 curCbfL curCbfC (pl * 4 + ci)
-            let (coeffs, nz, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 4 15 (some cc)
-            decCur := dn2
-            stCur := sn2
-            cac := cac.set! (pl * 4 + ci) coeffs
-            let pArr := (curCbfC.getD pl (Array.replicate 4 0)).set! ci nz
-            curCbfC := curCbfC.set! pl pArr
+          let cc := cabacCbfCtx g mx my isIntra 3 curCbfL curCbfC pl
+          let (dcCoeffs, _, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 3 chromaBlocks (some cc)
+          decCur := dn2
+          stCur := sn2
+          cdc := cdc.set! pl dcCoeffs
+        if (mb0.cbp &&& 0x20) != 0 then
+          for pl in [:2] do
+            for ci in [:chromaBlocks] do
+              let cc := cabacCbfCtx g mx my isIntra 4 curCbfL curCbfC (pl * chromaBlocks + ci)
+              let (coeffs, nz, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur 4 15 (some cc)
+              decCur := dn2
+              stCur := sn2
+              cac := cac.set! (pl * chromaBlocks + ci) coeffs
+              let pArr := (curCbfC.getD pl (Array.replicate chromaBlocks 0)).set! ci nz
+              curCbfC := curCbfC.set! pl pArr
+    else if chType == 3 then
+      for pl in [:2] do
+        let catBase := if pl == 0 then 6 else 10
+        let mut pCbf := curCbfC.getD pl (Array.replicate 16 0)
+        if mb0.kind == .i16x16 then
+          let c0 := cabacCbfCtx g mx my true catBase curCbfL curCbfC 0
+          let (dcCoeffs, _, dn, sn) ← cabacDecodeResidualBlock decCur stCur catBase 16 (some c0)
+          c444dc := c444dc.set! pl dcCoeffs
+          decCur := dn
+          stCur := sn
+          if (mb0.cbp &&& 0xF) != 0 then
+            for idx in [:16] do
+              let cc := cabacCbfCtx g mx my true (catBase + 1) curCbfL curCbfC idx
+              let (acCoeffs, nz, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur (catBase + 1) 15 (some cc)
+              decCur := dn2
+              stCur := sn2
+              c444ac := c444ac.set! (pl * 16 + idx) (acCoeffs.push 0)
+              pCbf := pCbf.set! idx nz
+              curCbfC := curCbfC.set! pl pCbf
+        else
+          let mut plane8 := c444_8.getD pl (Array.replicate 4 (Array.replicate 64 0))
+          for i8 in [:4] do
+            if (mb0.cbp &&& (1 <<< i8)) != 0 then
+              if mb0.transform8x8 != 0 then
+                let cc := cabacCbfCtx g mx my isIntra (catBase + 3) curCbfL curCbfC i8
+                let (coeffs64, nz8, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur (catBase + 3) 64 (some cc)
+                decCur := dn2
+                stCur := sn2
+                plane8 := plane8.set! i8 coeffs64
+                for sub in [:4] do
+                  pCbf := pCbf.set! (4 * i8 + sub) nz8
+                curCbfC := curCbfC.set! pl pCbf
+              else
+                for sub in [:4] do
+                  let idx := 4 * i8 + sub
+                  let cc := cabacCbfCtx g mx my isIntra (catBase + 2) curCbfL curCbfC idx
+                  let (coeffs, nz, dn2, sn2) ← cabacDecodeResidualBlock decCur stCur (catBase + 2) 16 (some cc)
+                  decCur := dn2
+                  stCur := sn2
+                  c444ac := c444ac.set! (pl * 16 + idx) coeffs
+                  pCbf := pCbf.set! idx nz
+                  curCbfC := curCbfC.set! pl pCbf
+          if mb0.transform8x8 != 0 then
+            c444_8 := c444_8.set! pl plane8
     some ({ mb0 with
       mbQpDelta := dqp, i16Dc := i16Dc, lumaAcOr4x4 := luma4,
-      luma8x8 := luma8, chromaDc := cdc, chromaAc := cac
+      luma8x8 := luma8, chromaDc := cdc, chromaAc := cac,
+      chroma444Dc := c444dc, chroma444AcOr4x4 := c444ac, chroma444_8x8 := c444_8
     }, dqp, decCur, stCur)
 
 private def cabacDecodeCbp (dec0 : CabacDec) (st0 : Array UInt8) (hasChroma : Bool)
@@ -3014,7 +3357,8 @@ private def cabacDecodeCbp (dec0 : CabacDec) (st0 : Array UInt8) (hasChroma : Bo
 private def cabacDecodeNonSkipMb (dec0 : CabacDec) (st0 : Array UInt8) (sh : SliceHeaderFull)
     (sps : SpsFull) (pps : PpsFull) (g : MbGrid) (mx my : Nat) (lastDqp : Int) :
     Option (MbSyntax × MbGridRecord × Int × CabacDec × Array UInt8) := do
-  let hasChroma := sps.chromaFormatIdc == 1
+  let chType := chromaArrayType sps
+  let hasChroma := chType == 1 || chType == 2
   let leftRec := g.leftMb mx my
   let topRec := g.topMb mx my
   let (isIntra, intraMbt, interKind, interIdx, dec1, st1) :=
@@ -3048,7 +3392,7 @@ private def cabacDecodeNonSkipMb (dec0 : CabacDec) (st0 : Array UInt8) (sh : Sli
     if intraMbt == 25 then do
       let (pcm, decPcm) ← dec1.readPcmAndReinit (pcmByteCount sps)
       let mbPcm : MbSyntax := { kind := .iPcm, intraIdx := 25, pcmBytes := pcm }
-      some (mbPcm, applyMbHeaderToRecord mbPcm {}, 0, decPcm, st1)
+      some (mbPcm, applyMbHeaderToRecord mbPcm chType {}, 0, decPcm, st1)
     else do
       let kind : MbKind := if intraMbt == 0 then .iNxN else .i16x16
       let mut decCur := dec1
@@ -3094,8 +3438,8 @@ private def cabacDecodeNonSkipMb (dec0 : CabacDec) (st0 : Array UInt8) (sh : Sli
         kind := kind, intraIdx := intraMbt, transform8x8 := t8,
         intraPred := preds, chromaPredMode := cMode, cbp := cbpVal
       }
-      let (mbDone, dqpOut, decEnd, stEnd) ← cabacDecodeResidualMb decCur stCur g mx my hasChroma lastDqp mb0
-      let recDone := populateResidualGrid mbDone (applyMbHeaderToRecord mbDone {}) hasChroma
+      let (mbDone, dqpOut, decEnd, stEnd) ← cabacDecodeResidualMb decCur stCur g mx my chType lastDqp mb0
+      let recDone := populateResidualGrid mbDone (applyMbHeaderToRecord mbDone chType {}) chType
       some (mbDone, recDone, dqpOut, decEnd, stEnd)
   else do
     let (subs, rl0, rl1, ml0, ml1, recMot, dec2, st2) ← cabacDecodeInterMotion dec1 st1 sh g mx my interKind interIdx
@@ -3109,8 +3453,8 @@ private def cabacDecodeNonSkipMb (dec0 : CabacDec) (st0 : Array UInt8) (sh : Sli
         dec3.decodeDecision st3 (399 + t8CtxOff)
       else (0, dec3, st3)
     let (mbDone, dqpOut, decEnd, stEnd) ←
-      cabacDecodeResidualMb dec4 st4 g mx my hasChroma lastDqp { mbBase with transform8x8 := t8 }
-    let recDone := populateResidualGrid mbDone (applyMbHeaderToRecord mbDone recMot) hasChroma
+      cabacDecodeResidualMb dec4 st4 g mx my chType lastDqp { mbBase with transform8x8 := t8 }
+    let recDone := populateResidualGrid mbDone (applyMbHeaderToRecord mbDone chType recMot) chType
     some (mbDone, recDone, dqpOut, decEnd, stEnd)
 
 def zigzagScan4x4 : Array Nat := #[
@@ -3161,7 +3505,7 @@ private def decodeSliceCabacLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
     else
       let mx := mbIdx % sps.picWidthInMbs
       let my := mbIdx / sps.picWidthInMbs
-      let hasChroma := sps.chromaFormatIdc == 1
+      let chType := chromaArrayType sps
       let leftRec := g.leftMb mx my
       let topRec := g.topMb mx my
       let (isSkip, dec1, st1) :=
@@ -3174,7 +3518,7 @@ private def decodeSliceCabacLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
         else (false, dec, st)
       if isSkip then
         let mb : MbSyntax := { isSkip := true, kind := .skip }
-        let g1 := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+        let g1 := g.setMb mx my (buildCompleteMbRecord mb chType)
         let acc1 := acc.push mb
         let (term, dec2) := dec1.decodeTerminate
         if term == 1 then some acc1
@@ -3286,15 +3630,28 @@ private def cabacEncodeInterMotion (enc0 : CabacEnc) (st0 : Array UInt8) (sh : S
           rCur := { rCur with mvdGrid := rCur.mvdGrid.set! lst (fillRect4x4 (rCur.mvdGrid.getD lst #[]) blk0 bw bh (mvx, mvy)) }
     some (rCur, encCur, stCur)
 
-private def cabacEffectiveCbp (mb : MbSyntax) : Nat :=
+private def cabacEffectiveCbp (mb : MbSyntax) (chType : Nat) : Nat :=
   if mb.kind != .i16x16 && mb.transform8x8 != 0 then
-    let lumaMask := Id.run do
-      let mut m := 0
-      for i8 in [:4] do
-        if (mb.cbp &&& (1 <<< i8)) != 0 && countNonZeroPrefix (mb.luma8x8.getD i8 #[]) 64 > 0 then
-          m := m ||| (1 <<< i8)
-      return m
-    (mb.cbp &&& 0x30) ||| lumaMask
+    if chType == 3 then
+      let mask := Id.run do
+        let mut m := 0
+        for i8 in [:4] do
+          if (mb.cbp &&& (1 <<< i8)) != 0 then
+            let lNz := countNonZeroPrefix (mb.luma8x8.getD i8 #[]) 64 > 0
+            let cbNz := countNonZeroPrefix ((mb.chroma444_8x8.getD 0 #[]).getD i8 #[]) 64 > 0
+            let crNz := countNonZeroPrefix ((mb.chroma444_8x8.getD 1 #[]).getD i8 #[]) 64 > 0
+            if lNz || cbNz || crNz then
+              m := m ||| (1 <<< i8)
+        return m
+      mask
+    else
+      let lumaMask := Id.run do
+        let mut m := 0
+        for i8 in [:4] do
+          if (mb.cbp &&& (1 <<< i8)) != 0 && countNonZeroPrefix (mb.luma8x8.getD i8 #[]) 64 > 0 then
+            m := m ||| (1 <<< i8)
+        return m
+      (mb.cbp &&& 0x30) ||| lumaMask
   else
     mb.cbp
 
@@ -3324,7 +3681,7 @@ private def cabacEncodeCbp (enc0 : CabacEnc) (st0 : Array UInt8) (effCbp : Nat) 
       e5.encodeDecision s5 (77 + ctx1) (if cbpC == 2 then 1 else 0)
 
 private def cabacEncodeResidualMb (enc0 : CabacEnc) (st0 : Array UInt8) (g : MbGrid) (mx my : Nat)
-    (hasChroma : Bool) (lastDqp : Int) (effCbp : Nat) (mb : MbSyntax) :
+    (chType : Nat) (lastDqp : Int) (effCbp : Nat) (mb : MbSyntax) :
     Option (Int × CabacEnc × Array UInt8) := do
   if effCbp == 0 && mb.kind != .i16x16 then
     some (0, enc0, st0)
@@ -3347,10 +3704,11 @@ private def cabacEncodeResidualMb (enc0 : CabacEnc) (st0 : Array UInt8) (g : MbG
           return (eCur, sCur, cIdx)
         let (e3, s3) := e2.encodeDecision s2 cEnd 0
         (e3, s3, dqp)
+    let chromaBlocks := if chType == 3 then 16 else if chType == 2 then 8 else 4
     let mut encCur := encA
     let mut stCur := stA
     let mut curCbfL := Array.replicate 16 0
-    let mut curCbfC := #[Array.replicate 4 0, Array.replicate 4 0]
+    let mut curCbfC := #[Array.replicate chromaBlocks 0, Array.replicate chromaBlocks 0]
     let isIntra := mb.kind.isIntra
     if mb.kind == .i16x16 then
       let c0 := cabacCbfCtx g mx my true 0 curCbfL curCbfC 0
@@ -3367,10 +3725,12 @@ private def cabacEncodeResidualMb (enc0 : CabacEnc) (st0 : Array UInt8) (g : MbG
       for i8 in [:4] do
         if (effCbp &&& (1 <<< i8)) != 0 then
           if mb.transform8x8 != 0 then
-            let (_, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.luma8x8.getD i8 #[]) 5 64 none
+            let cbfOpt := if chType == 3 then some (cabacCbfCtx g mx my isIntra 5 curCbfL curCbfC i8) else none
+            let (nz8, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.luma8x8.getD i8 #[]) 5 64 cbfOpt
             encCur := en2; stCur := sn2
+            let cbfVal := if chType == 3 then nz8 else 1
             for sub in [:4] do
-              curCbfL := curCbfL.set! (4 * i8 + sub) 1
+              curCbfL := curCbfL.set! (4 * i8 + sub) cbfVal
           else
             for sub in [:4] do
               let idx := 4 * i8 + sub
@@ -3378,25 +3738,62 @@ private def cabacEncodeResidualMb (enc0 : CabacEnc) (st0 : Array UInt8) (g : MbG
               let (nz, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.lumaAcOr4x4.getD idx #[]) 2 16 (some cc)
               encCur := en2; stCur := sn2
               curCbfL := curCbfL.set! idx nz
-    if hasChroma && (effCbp &&& 0x30) != 0 then
-      for pl in [:2] do
-        let cc := cabacCbfCtx g mx my isIntra 3 curCbfL curCbfC pl
-        let (_, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.chromaDc.getD pl #[]) 3 4 (some cc)
-        encCur := en2; stCur := sn2
-      if (effCbp &&& 0x20) != 0 then
+    if chType == 1 || chType == 2 then
+      if (effCbp &&& 0x30) != 0 then
         for pl in [:2] do
-          for ci in [:4] do
-            let cc := cabacCbfCtx g mx my isIntra 4 curCbfL curCbfC (pl * 4 + ci)
-            let (nz, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.chromaAc.getD (pl * 4 + ci) #[]) 4 15 (some cc)
-            encCur := en2; stCur := sn2
-            let pArr := (curCbfC.getD pl (Array.replicate 4 0)).set! ci nz
-            curCbfC := curCbfC.set! pl pArr
+          let cc := cabacCbfCtx g mx my isIntra 3 curCbfL curCbfC pl
+          let (_, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.chromaDc.getD pl #[]) 3 chromaBlocks (some cc)
+          encCur := en2; stCur := sn2
+        if (effCbp &&& 0x20) != 0 then
+          for pl in [:2] do
+            for ci in [:chromaBlocks] do
+              let cc := cabacCbfCtx g mx my isIntra 4 curCbfL curCbfC (pl * chromaBlocks + ci)
+              let (nz, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.chromaAc.getD (pl * chromaBlocks + ci) #[]) 4 15 (some cc)
+              encCur := en2; stCur := sn2
+              let pArr := (curCbfC.getD pl (Array.replicate chromaBlocks 0)).set! ci nz
+              curCbfC := curCbfC.set! pl pArr
+    else if chType == 3 then
+      for pl in [:2] do
+        let catBase := if pl == 0 then 6 else 10
+        let mut pCbf := curCbfC.getD pl (Array.replicate 16 0)
+        if mb.kind == .i16x16 then
+          let c0 := cabacCbfCtx g mx my true catBase curCbfL curCbfC 0
+          let (_, en, sn) ← cabacEncodeResidualBlock encCur stCur (mb.chroma444Dc.getD pl #[]) catBase 16 (some c0)
+          encCur := en; stCur := sn
+          if (effCbp &&& 0xF) != 0 then
+            for idx in [:16] do
+              let cc := cabacCbfCtx g mx my true (catBase + 1) curCbfL curCbfC idx
+              let acArr := (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]).extract 0 15
+              let (nz, en2, sn2) ← cabacEncodeResidualBlock encCur stCur acArr (catBase + 1) 15 (some cc)
+              encCur := en2; stCur := sn2
+              pCbf := pCbf.set! idx nz
+              curCbfC := curCbfC.set! pl pCbf
+        else
+          let plane8 := mb.chroma444_8x8.getD pl #[]
+          for i8 in [:4] do
+            if (effCbp &&& (1 <<< i8)) != 0 then
+              if mb.transform8x8 != 0 then
+                let cc := cabacCbfCtx g mx my isIntra (catBase + 3) curCbfL curCbfC i8
+                let (nz8, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (plane8.getD i8 #[]) (catBase + 3) 64 (some cc)
+                encCur := en2; stCur := sn2
+                for sub in [:4] do
+                  pCbf := pCbf.set! (4 * i8 + sub) nz8
+                curCbfC := curCbfC.set! pl pCbf
+              else
+                for sub in [:4] do
+                  let idx := 4 * i8 + sub
+                  let cc := cabacCbfCtx g mx my isIntra (catBase + 2) curCbfL curCbfC idx
+                  let (nz, en2, sn2) ← cabacEncodeResidualBlock encCur stCur (mb.chroma444AcOr4x4.getD (pl * 16 + idx) #[]) (catBase + 2) 16 (some cc)
+                  encCur := en2; stCur := sn2
+                  pCbf := pCbf.set! idx nz
+                  curCbfC := curCbfC.set! pl pCbf
     some (dqpOut, encCur, stCur)
 
 private def cabacEncodeNonSkipMb (enc0 : CabacEnc) (st0 : Array UInt8) (sh : SliceHeaderFull)
     (sps : SpsFull) (pps : PpsFull) (g : MbGrid) (mx my : Nat) (lastDqp : Int) (mb : MbSyntax) :
     Option (MbGridRecord × Int × CabacEnc × Array UInt8) := do
-  let hasChroma := sps.chromaFormatIdc == 1
+  let chType := chromaArrayType sps
+  let hasChroma := chType == 1 || chType == 2
   let leftRec := g.leftMb mx my
   let topRec := g.topMb mx my
   let isIntra := mb.kind.isIntra
@@ -3431,11 +3828,11 @@ private def cabacEncodeNonSkipMb (enc0 : CabacEnc) (st0 : Array UInt8) (sh : Sli
         cabacEncodeBMbType enc0 st0 mb.interIdx leftRec topRec
   let t8CtxOff := (match leftRec with | some r => if r.is8x8Dct then 1 else 0 | none => 0) +
                   (match topRec with | some r => if r.is8x8Dct then 1 else 0 | none => 0)
-  let effCbp := cabacEffectiveCbp mb
+  let effCbp := cabacEffectiveCbp mb chType
   if isIntra then
     if mb.kind == MbKind.iPcm then
       let encPcm := enc1.writePcmAndReinit mb.pcmBytes
-      some (applyMbHeaderToRecord mb {}, 0, encPcm, st1)
+      some (applyMbHeaderToRecord mb chType {}, 0, encPcm, st1)
     else do
       let mut encCur := enc1
       let mut stCur := st1
@@ -3470,13 +3867,13 @@ private def cabacEncodeNonSkipMb (enc0 : CabacEnc) (st0 : Array UInt8) (sh : Sli
       if mb.kind != MbKind.i16x16 then
         let (en, sn) := cabacEncodeCbp encCur stCur effCbp hasChroma leftRec topRec
         encCur := en; stCur := sn
-      let (dqpOut, encEnd, stEnd) ← cabacEncodeResidualMb encCur stCur g mx my hasChroma lastDqp effCbp mb
+      let (dqpOut, encEnd, stEnd) ← cabacEncodeResidualMb encCur stCur g mx my chType lastDqp effCbp mb
       let mbRecCopy : MbSyntax := {
         mb with
         cbp := effCbp,
         transform8x8 := if mb.kind == MbKind.iNxN || (effCbp &&& 0xF) != 0 then mb.transform8x8 else 0
       }
-      let recDone := populateResidualGrid mbRecCopy (applyMbHeaderToRecord mbRecCopy {}) hasChroma
+      let recDone := populateResidualGrid mbRecCopy (applyMbHeaderToRecord mbRecCopy chType {}) chType
       some (recDone, dqpOut, encEnd, stEnd)
   else do
     let (recMot, enc2, st2) ← cabacEncodeInterMotion enc1 st1 sh g mx my mb
@@ -3487,14 +3884,14 @@ private def cabacEncodeNonSkipMb (enc0 : CabacEnc) (st0 : Array UInt8) (sh : Sli
       if (effCbp &&& 0xF) != 0 && interDct8x8Allowed pps sps mbChk then
         enc3.encodeDecision st3 (399 + t8CtxOff) mb.transform8x8
       else (enc3, st3)
-    let (dqpOut, encEnd, stEnd) ← cabacEncodeResidualMb enc4 st4 g mx my hasChroma lastDqp effCbp mb
+    let (dqpOut, encEnd, stEnd) ← cabacEncodeResidualMb enc4 st4 g mx my chType lastDqp effCbp mb
     let mbRecCopy : MbSyntax := {
       mb with
       interIdx := if mb.kind == .pInter && mb.interIdx == 4 then 3 else mb.interIdx,
       cbp := effCbp,
       transform8x8 := if (effCbp &&& 0xF) != 0 then mb.transform8x8 else 0
     }
-    let recDone := populateResidualGrid mbRecCopy (applyMbHeaderToRecord mbRecCopy recMot) hasChroma
+    let recDone := populateResidualGrid mbRecCopy (applyMbHeaderToRecord mbRecCopy chType recMot) chType
     some (recDone, dqpOut, encEnd, stEnd)
 
 private def encodeSliceCabacLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : PpsFull)
@@ -3508,7 +3905,7 @@ private def encodeSliceCabacLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
       let mb := mbs.getD i {}
       let mx := mbIdx % sps.picWidthInMbs
       let my := mbIdx / sps.picWidthInMbs
-      let hasChroma := sps.chromaFormatIdc == 1
+      let chType := chromaArrayType sps
       let leftRec := g.leftMb mx my
       let topRec := g.topMb mx my
       let sCtx := (match leftRec with | some r => if !r.isSkip then 1 else 0 | none => 0) +
@@ -3516,7 +3913,7 @@ private def encodeSliceCabacLoop (sh : SliceHeaderFull) (sps : SpsFull) (pps : P
                   (if sh.sliceTypeNos == 1 then 13 else 0)
       if sh.sliceTypeNos != 2 && mb.isSkip then
         let (enc1, st1) := enc.encodeDecision st (11 + sCtx) 1
-        let g1 := g.setMb mx my (buildCompleteMbRecord mb hasChroma)
+        let g1 := g.setMb mx my (buildCompleteMbRecord mb chType)
         let enc2 := enc1.encodeTerminate (if isLast then 1 else 0)
         encodeSliceCabacLoop sh sps pps mbs fuel (i + 1) (mbIdx + 1) 0 enc2 st1 g1
       else do

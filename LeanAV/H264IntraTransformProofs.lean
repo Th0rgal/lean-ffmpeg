@@ -1215,4 +1215,226 @@ theorem h264Ipcm_nz_beyond_chroma (blkIdx : Nat) (h : 24 ≤ blkIdx) :
   unfold ipcmBlockNonZeroCount
   simp [h]
 
+/-! ## High / High10 / High 4:2:2 / High 4:4:4 Predictive Specifications -/
+
+def h264HighTierQpPrimeGateSpec :
+    AVGateSpec (Nat × Int)
+      (fun p => p.1 ≥ 8 ∧ p.1 ≤ 12 ∧ 0 ≤ p.2 ∧ p.2 ≤ 51 + 6 * ((p.1 : Int) - 8)) where
+  gate := fun p => isValidHighTierQpPrime p.1 p.2
+  sound := by
+    intro p h
+    simpa [isValidHighTierQpPrime] using h
+  complete := by
+    intro p h
+    simpa [isValidHighTierQpPrime] using h
+  posWitness := (10, 63)
+  negWitness := (10, 64)
+  nonVacuous := by decide
+  tight := by decide
+
+def h264HighTierSampleGateSpec :
+    AVGateSpec (Nat × Nat)
+      (fun p => p.1 ≥ 8 ∧ p.1 ≤ 12 ∧ p.2 ≤ (1 <<< p.1) - 1) where
+  gate := fun p => isValidHighTierSample p.1 p.2
+  sound := by
+    intro p h
+    simpa [isValidHighTierSample] using h
+  complete := by
+    intro p h
+    simpa [isValidHighTierSample] using h
+  posWitness := (10, 1023)
+  negWitness := (10, 1024)
+  nonVacuous := by decide
+  tight := by decide
+
+def h264HighTierChromaGateSpec :
+    AVGateSpec Nat (fun c => c ≤ 3) where
+  gate := isValidHighTierChroma
+  sound := by
+    intro c h
+    simpa [isValidHighTierChroma] using h
+  complete := by
+    intro c h
+    simpa [isValidHighTierChroma] using h
+  posWitness := 2
+  negWitness := 4
+  nonVacuous := by decide
+  tight := by decide
+
+def IntraNxNModeHbdLegalSafe (mode : Nat) (n : IntraNeighborsHbd) : Prop :=
+  ((mode = 0 ∨ mode = 3 ∨ mode = 7) ∧ n.topAvail = true) ∨
+  ((mode = 1 ∨ mode = 8) ∧ n.leftAvail = true) ∨
+  mode = 2 ∨
+  ((mode = 4 ∨ mode = 5 ∨ mode = 6) ∧
+    n.topAvail = true ∧ n.leftAvail = true ∧ n.topLeftAvail = true)
+
+theorem isLegalIntraNxNModeHbd_iff (mode : Nat) (n : IntraNeighborsHbd) :
+    isLegalIntraNxNModeHbd mode n = true ↔ IntraNxNModeHbdLegalSafe mode n := by
+  unfold isLegalIntraNxNModeHbd IntraNxNModeHbdLegalSafe
+  match mode with
+  | 0 | 3 | 7 => simp
+  | 1 | 8 => simp
+  | 2 => simp
+  | 4 | 5 | 6 => simp [Bool.and_eq_true, and_assoc]
+  | n + 9 => simp
+
+def h264IntraNxNHbdLegalityGateSpec :
+    AVGateSpec (Nat × IntraNeighborsHbd) (fun p => IntraNxNModeHbdLegalSafe p.1 p.2) where
+  gate := fun p => isLegalIntraNxNModeHbd p.1 p.2
+  sound := by
+    intro p h
+    exact (isLegalIntraNxNModeHbd_iff p.1 p.2).mp h
+  complete := by
+    intro p h
+    exact (isLegalIntraNxNModeHbd_iff p.1 p.2).mpr h
+  posWitness := (4, { topAvail := true, leftAvail := true, topLeftAvail := true, topLeft := 512 })
+  negWitness := (4, { topAvail := true, leftAvail := true, topLeftAvail := false, topLeft := 512 })
+  nonVacuous := by decide
+  tight := by decide
+
+theorem h264Hadamard2x4_involution_8x (x : Array Int) (hx : x.size = 8) :
+    hadamard2x4 (hadamard2x4 x) = x.map (fun v => 8 * v) := by
+  apply Array.ext
+  · simp [hadamard2x4, hx]
+  · intro idx h1 h2
+    have hlt : idx < 8 := by simpa [hadamard2x4] using h1
+    rcases (by omega : idx = 0 ∨ idx = 1 ∨ idx = 2 ∨ idx = 3 ∨
+        idx = 4 ∨ idx = 5 ∨ idx = 6 ∨ idx = 7) with
+      rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      simp [hadamard2x4, hadamard4Butterfly1D, Array.getD, hx] <;> omega
+
+theorem h264ChromaDcScan2x4_bijection :
+    ∀ k : Fin 8,
+      let r := chromaDcScan2x4.getD k.val 0
+      r < 8 ∧ ∀ j : Fin 8, chromaDcScan2x4.getD j.val 0 = r → j = k := by
+  decide
+
+theorem h264ChromaDcScan2x4_roundtrip (scan8 : Array Int) (hsz : scan8.size = 8) :
+    chromaDcRasterToScan2x4 (chromaDcScan2x4ToRaster scan8) = scan8 := by
+  apply Array.ext
+  · simp [chromaDcRasterToScan2x4, hsz]
+  · intro idx h1 h2
+    have hlt : idx < 8 := by simpa [chromaDcRasterToScan2x4] using h1
+    rcases (by omega : idx = 0 ∨ idx = 1 ∨ idx = 2 ∨ idx = 3 ∨
+        idx = 4 ∨ idx = 5 ∨ idx = 6 ∨ idx = 7) with
+      rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      simp [chromaDcRasterToScan2x4, chromaDcScan2x4ToRaster, chromaDcScan2x4,
+            chromaDcRaster2x4Inv, Array.getD, hsz]
+
+theorem h264QpcFromQpyHbd_8bit_compat :
+    ∀ qp : Fin 52,
+      qpcFromQpyHbd qp.val 0 8 = qpcFromQpy qp.val 0 ∧
+      qpcFromQpyHbd qp.val (-12) 8 = qpcFromQpy qp.val (-12) ∧
+      qpcFromQpyHbd qp.val 12 8 = qpcFromQpy qp.val 12 ∧
+      qpcFromQpyHbd qp.val (-6) 8 = qpcFromQpy qp.val (-6) ∧
+      qpcFromQpyHbd qp.val 6 8 = qpcFromQpy qp.val 6 := by
+  decide
+
+theorem h264QpcFromQpyHbd_10bit_table8_15_anchors :
+    qpcFromQpyHbd 0 0 10 = 0 ∧
+    qpcFromQpyHbd 0 (-12) 10 = 0 ∧
+    qpcFromQpyHbd 12 (-6) 10 = 6 ∧
+    qpcFromQpyHbd 41 0 10 = 41 ∧
+    qpcFromQpyHbd 42 0 10 = 41 ∧
+    qpcFromQpyHbd 63 0 10 = 51 ∧
+    qpcFromQpyHbd 63 12 10 = 51 := by
+  decide
+
+theorem h264ClipSampleHbd_id_on_valid (v bitDepth : Nat)
+    (hle : v ≤ h264SampleMax bitDepth) :
+    clipSampleHbd (v : Int) bitDepth = v := by
+  unfold clipSampleHbd clip3
+  have hv0 : ¬ ((v : Int) < 0) := by omega
+  have hv1 : ¬ ((h264SampleMax bitDepth : Int) < (v : Int)) := by omega
+  simp [hv0, hv1]
+
+theorem h264ClipSampleHbd_in_range (v : Int) (bitDepth : Nat) :
+    clipSampleHbd v bitDepth ≤ h264SampleMax bitDepth := by
+  unfold clipSampleHbd clip3
+  dsimp only
+  split
+  · omega
+  · split <;> omega
+
+theorem h264LosslessBypass4x4_roundtrip (src pred : Array Nat) (mode bitDepth : Nat)
+    (hsrc : src.size = 16)
+    (hvalid : ∀ i : Fin 16, src[i.val]'(by omega) ≤ h264SampleMax bitDepth) :
+    reconstructLosslessBypass pred (encodeLosslessBypass src pred mode 4) mode 4 bitDepth = src := by
+  unfold reconstructLosslessBypass encodeLosslessBypass
+  simp only [beq_self_eq_true, ↓reduceIte]
+  have hres_sz : (Array.ofFn fun idx : Fin (4 * 4) =>
+      (src.getD idx.val 0 : Int) - (pred.getD idx.val 0 : Int)).size = 16 := Array.size_ofFn
+  rw [h264ResidualDpcm4x4_roundtrip mode _ hres_sz]
+  apply Array.ext
+  · simp [hsrc]
+  · intro idx h1 h2
+    have hlt : idx < 16 := by simpa using h1
+    simp only [Array.getElem_ofFn]
+    have hget : ((Array.ofFn fun i : Fin (4 * 4) =>
+        (src.getD i.val 0 : Int) - (pred.getD i.val 0 : Int)).getD idx 0) =
+        (src.getD idx 0 : Int) - (pred.getD idx 0 : Int) := by
+      simp [Array.getD, hlt]
+    rw [hget]
+    have hsrc_get : src.getD idx 0 = src[idx]'h2 := by simp [Array.getD, h2]
+    have hsum : (pred.getD idx 0 : Int) + ((src.getD idx 0 : Int) - (pred.getD idx 0 : Int)) =
+        (src[idx]'h2 : Int) := by
+      rw [hsrc_get]; omega
+    rw [hsum]
+    exact h264ClipSampleHbd_id_on_valid (src[idx]'h2) bitDepth (hvalid ⟨idx, hlt⟩)
+
+theorem h264LosslessBypass8x8_roundtrip (src pred : Array Nat) (mode bitDepth : Nat)
+    (hsrc : src.size = 64)
+    (hvalid : ∀ i : Fin 64, src[i.val]'(by omega) ≤ h264SampleMax bitDepth) :
+    reconstructLosslessBypass pred (encodeLosslessBypass src pred mode 8) mode 8 bitDepth = src := by
+  unfold reconstructLosslessBypass encodeLosslessBypass
+  have h84 : ((8 : Nat) == 4) = false := by decide
+  simp only [h84, Bool.false_eq_true, ↓reduceIte, beq_self_eq_true]
+  have hres_sz : (Array.ofFn fun idx : Fin (8 * 8) =>
+      (src.getD idx.val 0 : Int) - (pred.getD idx.val 0 : Int)).size = 64 := Array.size_ofFn
+  rw [h264ResidualDpcm8x8_roundtrip mode _ hres_sz]
+  apply Array.ext
+  · simp [hsrc]
+  · intro idx h1 h2
+    have hlt : idx < 64 := by simpa using h1
+    simp only [Array.getElem_ofFn]
+    have hget : ((Array.ofFn fun i : Fin (8 * 8) =>
+        (src.getD i.val 0 : Int) - (pred.getD i.val 0 : Int)).getD idx 0) =
+        (src.getD idx 0 : Int) - (pred.getD idx 0 : Int) := by
+      simp [Array.getD, hlt]
+    rw [hget]
+    have hsrc_get : src.getD idx 0 = src[idx]'h2 := by simp [Array.getD, h2]
+    have hsum : (pred.getD idx 0 : Int) + ((src.getD idx 0 : Int) - (pred.getD idx 0 : Int)) =
+        (src[idx]'h2 : Int) := by
+      rw [hsrc_get]; omega
+    rw [hsum]
+    exact h264ClipSampleHbd_id_on_valid (src[idx]'h2) bitDepth (hvalid ⟨idx, hlt⟩)
+
+theorem h264PredHbd_sizes_exact (m : Nat) (n : IntraNeighborsHbd)
+    (l16 t16 l8 t8 : Array Nat) (tl : Nat) (la ta : Bool) (bd : Nat) :
+    (pred4x4Hbd m n bd).size = 16 ∧
+    (pred8x8Hbd m n bd).size = 64 ∧
+    (pred16x16Hbd m l16 t16 tl la ta bd).size = 256 ∧
+    (predChroma420Hbd m l8 t8 tl la ta bd).size = 64 ∧
+    (predChroma422 m l16 t8 tl la ta bd).size = 128 ∧
+    (predChroma444 m l16 t16 tl la ta bd).size = 256 := by
+  refine ⟨by unfold pred4x4Hbd; exact Array.size_ofFn,
+          by unfold pred8x8Hbd; exact Array.size_ofFn,
+          by unfold pred16x16Hbd; exact Array.size_ofFn,
+          by unfold predChroma420Hbd; exact Array.size_ofFn,
+          ?_,
+          by unfold predChroma444 pred16x16Hbd; exact Array.size_ofFn⟩
+  unfold predChroma422
+  match m with
+  | 0 => unfold predChroma422Dc; exact Array.size_ofFn
+  | 1 => exact Array.size_ofFn
+  | 2 => exact Array.size_ofFn
+  | _ + 3 => unfold predChroma422Plane; exact Array.size_ofFn
+
+theorem h264LosslessChromaDpcmMode_mapping :
+    losslessChromaDpcmMode 0 = 2 ∧
+    losslessChromaDpcmMode 1 = 1 ∧
+    losslessChromaDpcmMode 2 = 0 ∧
+    losslessChromaDpcmMode 3 = 2 := by
+  decide
+
 end LeanAV.H264IntraTransformProofs
