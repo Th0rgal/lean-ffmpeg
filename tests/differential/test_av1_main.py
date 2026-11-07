@@ -3,7 +3,9 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -589,14 +591,225 @@ def encode_args(w, h, in_path, out_path, qidx=60, fmt=None, tc=1, tr=1):
     ]
 
 
+PIX_SPECS = {
+    "yuv420p":     (0, 8,  1, 1, "4:2:0"),
+    "yuv422p":     (2, 8,  1, 0, "4:2:2"),
+    "yuv444p":     (1, 8,  0, 0, "4:4:4"),
+    "yuv420p10le": (0, 10, 1, 1, "4:2:0"),
+    "yuv422p10le": (2, 10, 1, 0, "4:2:2"),
+    "yuv444p10le": (1, 10, 0, 0, "4:4:4"),
+    "yuv420p12le": (2, 12, 1, 1, "4:2:0"),
+    "yuv422p12le": (2, 12, 1, 0, "4:2:2"),
+    "yuv444p12le": (2, 12, 0, 0, "4:4:4"),
+}
+
+
+def synth_raw_planar(w, h, pix_fmt, frames):
+    _, bd, ss_h, ss_v, _ = PIX_SPECS[pix_fmt]
+    cw = (w + ss_h) >> ss_h
+    ch = (h + ss_v) >> ss_v
+    mx = (1 << bd) - 1
+    out = bytearray()
+    for f in range(frames):
+        y_vals = [((x * 19 + y * 31 + f * 37 + (x ^ y) * 7) % (mx + 1)) for y in range(h) for x in range(w)]
+        u_vals = [((x * 23 + y * 13 + f * 29 + 100) % (mx + 1)) for y in range(ch) for x in range(cw)]
+        v_vals = [((x * 17 + y * 29 + f * 41 + 200) % (mx + 1)) for y in range(ch) for x in range(cw)]
+        for arr in (y_vals, u_vals, v_vals):
+            if bd == 8:
+                out.extend(arr)
+            else:
+                out.extend(struct.pack(f"<{len(arr)}H", *arr))
+    return bytes(out)
+
+
+def psnr_raw_db(ref_bytes, got_bytes, bd):
+    if len(ref_bytes) != len(got_bytes) or not ref_bytes:
+        return 0.0
+    if ref_bytes == got_bytes:
+        return 99.0
+    if bd == 8:
+        a = list(ref_bytes)
+        b = list(got_bytes)
+    else:
+        n = len(ref_bytes) // 2
+        a = struct.unpack(f"<{n}H", ref_bytes)
+        b = struct.unpack(f"<{n}H", got_bytes)
+    mse = sum((x - y) * (x - y) for x, y in zip(a, b)) / len(a)
+    if mse == 0.0:
+        return 99.0
+    mx = float((1 << bd) - 1)
+    return 10.0 * math.log10((mx * mx) / mse)
+
+
+def _find_lean_tool(name):
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    for cand in (
+        Path.home() / ".elan/bin" / name,
+        Path("/var/lib/sandboxed-node/work/caches/elan/bin") / name,
+    ):
+        if cand.exists():
+            return cand
+    raise RuntimeError(f"Unable to locate {name} binary")
+
+
+AV1_RAW_DRIVER_LEAN_SRC = """import LeanAV.Av1Main
+
+open LeanAV.Av1Main
+
+def sampleFilmGrain (seed : Nat) (update : Bool) (chromaFromLuma : Bool) (overlap : Bool) : Av1FilmGrainParams :=
+  { applyGrain := true
+  , grainSeed := seed % 65536
+  , updateGrain := update
+  , filmGrainParamsRefIdx := 0
+  , numYPoints := 4
+  , yPoints := #[(0, 20), (64, 45), (160, 60), (255, 35)]
+  , chromaScalingFromLuma := chromaFromLuma
+  , numCbPoints := if chromaFromLuma then 0 else 3
+  , cbPoints := if chromaFromLuma then #[] else #[(0, 15), (128, 30), (255, 25)]
+  , numCrPoints := if chromaFromLuma then 0 else 3
+  , crPoints := if chromaFromLuma then #[] else #[(0, 18), (128, 32), (255, 22)]
+  , grainScalingMinus8 := 3
+  , arCoeffLag := 2
+  , arCoeffsY := #[1, -2, 3, -1, 2, 0, -3, 4, -2, 1, 2, -4]
+  , arCoeffsCb := #[1, -1, 2, -2, 1, 0, -2, 3, -1, 1, 0, -2, 3]
+  , arCoeffsCr := #[-1, 2, -2, 1, 0, -1, 2, -3, 1, -1, 2, 1, -4]
+  , arCoeffShiftMinus6 := 2
+  , grainScaleShift := 1
+  , cbMult := 128
+  , cbLumaMult := 192
+  , cbOffset := 256
+  , crMult := 128
+  , crLumaMult := 192
+  , crOffset := 256
+  , overlapFlag := overlap
+  , clipToRestrictedRange := false
+  }
+
+def main (args : List String) : IO UInt32 := do
+  match args with
+  | ["decode", inPath, outPath] =>
+    let data ← IO.FS.readBinFile inPath
+    match decodeAv1ToRaw data with
+    | none => return 1
+    | some (w, h, nFrames, bd, pixFmt, raw) =>
+      IO.FS.writeBinFile outPath raw
+      IO.println s!"{w},{h},{nFrames},{bd},{pixFmt},{raw.size}"
+      return 0
+  | ["decode420", inPath, outPath] =>
+    let data ← IO.FS.readBinFile inPath
+    match decodeAv1ToYuv420p data with
+    | none => return 1
+    | some (w, h, nFrames, raw) =>
+      IO.FS.writeBinFile outPath raw
+      IO.println s!"{w},{h},{nFrames},{raw.size}"
+      return 0
+  | ["encode", wStr, hStr, pixFmt, qStr, fmt, tcStr, trStr, fgMode, inPath, outPath] =>
+    let some w := wStr.toNat? | return 2
+    let some h := hStr.toNat? | return 2
+    let some q := qStr.toNat? | return 2
+    let some tc := tcStr.toNat? | return 2
+    let some tr := trStr.toNat? | return 2
+    let fg? : Option Av1FilmGrainParams :=
+      match fgMode with
+      | "none" => none
+      | "fg1" => some (sampleFilmGrain 7391 true false true)
+      | "fg_cfl" => some (sampleFilmGrain 12345 true true false)
+      | "fg_reuse" => some (sampleFilmGrain 9999 false false true)
+      | _ => none
+    let raw ← IO.FS.readBinFile inPath
+    match encodeAv1FromRaw w h pixFmt raw q fmt tc tr fg? with
+    | none => return 1
+    | some bytes =>
+      IO.FS.writeBinFile outPath bytes
+      IO.println s!"{bytes.size}"
+      return 0
+  | ["encode_mp4_payloads", wStr, hStr, pixFmt, qStr, inPath, outPath] =>
+    let some w := wStr.toNat? | return 2
+    let some h := hStr.toNat? | return 2
+    let some q := qStr.toNat? | return 2
+    let raw ← IO.FS.readBinFile inPath
+    match encodeAv1Mp4TrackPayloadsRaw w h pixFmt raw q with
+    | none => return 1
+    | some (av1c, samples) =>
+      IO.FS.writeBinFile outPath av1c
+      IO.println s!"{av1c.size},{samples.size}"
+      return 0
+  | _ => return 2
+"""
+
+
 @unittest.skipUnless(LFFMPEG.exists(), "lffmpeg is not built")
 class TestAv1Main(unittest.TestCase):
+    _cls_tmp = None
+    _raw_driver = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._cls_tmp is not None:
+            cls._cls_tmp.cleanup()
+            cls._cls_tmp = None
+            cls._raw_driver = None
+
+    @classmethod
+    def _get_raw_driver(cls):
+        if cls._raw_driver is not None:
+            return cls._raw_driver
+        cls._cls_tmp = tempfile.TemporaryDirectory()
+        d = Path(cls._cls_tmp.name)
+        lean_bin = _find_lean_tool("lean")
+        leanc_bin = _find_lean_tool("leanc")
+        lean_src = d / "av1_raw_driver.lean"
+        c_file = d / "av1_raw_driver.c"
+        driver_bin = d / "av1_raw_driver"
+        lean_src.write_text(AV1_RAW_DRIVER_LEAN_SRC)
+        lean_env = dict(
+            os.environ,
+            PATH=f"{lean_bin.parent}:{os.environ.get('PATH', '')}:/var/lib/sandboxed-node/work/caches/elan/bin:/usr/local/bin:/usr/bin:/bin",
+            LEAN_PATH=f"{ROOT / '.lake/build/lib/lean'}:{ROOT.parent / 'lean-sys/.lake/build/lib/lean'}",
+        )
+        try:
+            subprocess.run(
+                [str(lean_bin), "-c", str(c_file), str(lean_src)],
+                cwd=d, env=lean_env, check=True, capture_output=True, timeout=180,
+            )
+            rsp_text = (ROOT / ".lake/build/bin/lffmpeg.rsp").read_text()
+            rsp_args = (
+                [s.strip().strip('"') for s in rsp_text.splitlines() if s.strip()]
+                if "\n" in rsp_text else shlex.split(rsp_text)
+            )
+            objects = [
+                s for s in rsp_args
+                if s.endswith((".o.export", ".a", "leanav_zero_exec_stub.o"))
+                and not s.endswith("/LeanAV/Main.c.o.export")
+            ]
+            subprocess.run(
+                [str(leanc_bin), "-O2", "-o", str(driver_bin), str(c_file), *objects, "-lpthread"],
+                cwd=ROOT, env=lean_env, check=True, capture_output=True, timeout=180,
+            )
+        except Exception:
+            cls._cls_tmp.cleanup()
+            cls._cls_tmp = None
+            raise
+        cls._raw_driver = driver_bin
+        return driver_bin
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def _ffmpeg_decode_raw(self, in_path, pix_fmt, mux_fmt=None):
+        out_raw = self.dir / f"{Path(in_path).name}.{pix_fmt}.ff.raw"
+        cmd = [FFMPEG, "-y", "-v", "error"]
+        if mux_fmt == "obu" or str(in_path).endswith(".obu"):
+            cmd += ["-f", "obu"]
+        cmd += ["-i", in_path, "-f", "rawvideo", "-pix_fmt", pix_fmt, out_raw]
+        run(*cmd)
+        return out_raw.read_bytes()
 
     def _ffmpeg_decode_yuv420p(self, in_path):
         out_yuv = self.dir / f"{Path(in_path).name}.ff.yuv"
@@ -888,7 +1101,10 @@ class TestAv1Main(unittest.TestCase):
             return
         src_yuv = self.dir / "neg_src.yuv"
         src_yuv.write_bytes(synth_yuv420p(64, 48, 1))
-        for tag, pix_fmt in (("av1_10bit.ivf", "yuv420p10le"), ("av1_444.ivf", "yuv444p")):
+        for tag, pix_fmt, exp_prof, exp_bd, exp_cs in (
+            ("av1_10bit.ivf", "yuv420p10le", 0, 10, "4:2:0"),
+            ("av1_444.ivf", "yuv444p", 1, 8, "4:4:4"),
+        ):
             neg_path = self.dir / tag
             run(
                 FFMPEG, "-y", "-v", "error",
@@ -902,11 +1118,30 @@ class TestAv1Main(unittest.TestCase):
                 0,
                 tag,
             )
-            self.assertNotEqual(
-                run(LFFMPEG, "av1-probe", neg_path, env=ISO_ENV, check=False).returncode,
-                0,
-                tag,
-            )
+            probe = json.loads(run(LFFMPEG, "av1-probe", neg_path, env=ISO_ENV).stdout.decode())
+            self.assertTrue(probe["ok"])
+            self.assertEqual(probe["profile"], exp_prof)
+            self.assertEqual(probe["bit_depth"], exp_bd)
+            self.assertEqual(probe["chroma_subsampling"], exp_cs)
+
+        mono_path = self.dir / "av1_mono.ivf"
+        run(
+            FFMPEG, "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "64x48", "-r", "25",
+            "-i", src_yuv,
+            "-c:v", "libaom-av1", "-cpu-used", "8", "-pix_fmt", "gray",
+            "-frames:v", "1", "-f", "ivf", mono_path,
+        )
+        self.assertNotEqual(
+            run(*decode_args(mono_path, "-"), env=ISO_ENV, check=False).returncode,
+            0,
+            "av1_mono.ivf",
+        )
+        self.assertNotEqual(
+            run(LFFMPEG, "av1-probe", mono_path, env=ISO_ENV, check=False).returncode,
+            0,
+            "av1_mono.ivf",
+        )
 
         fg_path = self.dir / "film_grain_active.ivf"
         run(
@@ -917,16 +1152,13 @@ class TestAv1Main(unittest.TestCase):
             "-aom-params", "film-grain-test=1",
             "-frames:v", "1", "-f", "ivf", fg_path,
         )
-        self.assertNotEqual(
-            run(*decode_args(fg_path, "-"), env=ISO_ENV, check=False).returncode,
-            0,
-            "film_grain_active.ivf",
-        )
-        self.assertNotEqual(
-            run(LFFMPEG, "av1-probe", fg_path, env=ISO_ENV, check=False).returncode,
-            0,
-            "film_grain_active.ivf",
-        )
+        fg_lean_yuv = self.dir / "film_grain_active.lean.yuv"
+        fg_dec = json.loads(run(*decode_args(fg_path, fg_lean_yuv), env=ISO_ENV).stdout.decode())
+        self.assertTrue(fg_dec["ok"])
+        self.assertEqual(fg_lean_yuv.read_bytes(), self._ffmpeg_decode_yuv420p(fg_path))
+        fg_probe = json.loads(run(LFFMPEG, "av1-probe", fg_path, env=ISO_ENV).stdout.decode())
+        self.assertTrue(fg_probe["ok"])
+        self.assertEqual(fg_probe["frames"], 1)
 
         if sys.platform != "darwin" and libsvtav1_available():
             scaled_path = self.dir / "scaled_inter_superres.ivf"
@@ -1127,6 +1359,212 @@ class TestAv1Main(unittest.TestCase):
         )
         self.assertNotEqual(
             run(*decode_args(fmp4_path, "-"), env=ISO_ENV, check=False).returncode,
+            0,
+        )
+
+    def test_libaom_high_bitdepth_and_subsampling_decode_matrix(self):
+        self.assertTrue(libaom_av1_available(), "ffmpeg with libaom-av1 required")
+        self.assertTrue(av1_decoder_available(), "ffmpeg AV1 decoder required")
+        drv = self._get_raw_driver()
+        cases = [
+            ("main10_420_ivf", 64, 48, 4, "yuv420p10le", "ivf", ["-cpu-used", "4", "-crf", "28"]),
+            ("main10_420_mp4", 64, 48, 3, "yuv420p10le", "mp4", ["-cpu-used", "6", "-crf", "30"]),
+            ("main10_420_lossless", 48, 32, 2, "yuv420p10le", "ivf", ["-cpu-used", "8", "-crf", "0", "-aom-params", "lossless=1"]),
+            ("high8_444_odd", 47, 35, 3, "yuv444p", "ivf", ["-cpu-used", "6", "-crf", "28"]),
+            ("high10_444_ivf", 64, 48, 4, "yuv444p10le", "ivf", ["-cpu-used", "4", "-crf", "28"]),
+            ("high10_444_mp4_odd", 53, 39, 3, "yuv444p10le", "mp4", ["-cpu-used", "6", "-crf", "30"]),
+            ("high10_444_lossless", 37, 29, 2, "yuv444p10le", "obu", ["-cpu-used", "8", "-crf", "0", "-aom-params", "lossless=1"]),
+            ("prof8_422_odd_h", 50, 35, 3, "yuv422p", "ivf", ["-cpu-used", "6", "-crf", "28"]),
+            ("prof10_422_ivf", 64, 48, 4, "yuv422p10le", "ivf", ["-cpu-used", "4", "-crf", "28"]),
+            ("prof10_422_mp4", 64, 48, 3, "yuv422p10le", "mp4", ["-cpu-used", "6", "-crf", "30"]),
+            ("prof12_420_ivf", 64, 48, 3, "yuv420p12le", "ivf", ["-cpu-used", "6", "-crf", "28"]),
+            ("prof12_422_ivf", 64, 48, 4, "yuv422p12le", "ivf", ["-cpu-used", "4", "-crf", "28"]),
+            ("prof12_422_mp4", 48, 35, 3, "yuv422p12le", "mp4", ["-cpu-used", "6", "-crf", "30"]),
+            ("prof12_444_ivf", 53, 39, 3, "yuv444p12le", "ivf", ["-cpu-used", "6", "-crf", "28"]),
+            ("prof12_444_lossless", 37, 29, 2, "yuv444p12le", "ivf", ["-cpu-used", "8", "-crf", "0", "-aom-params", "lossless=1"]),
+        ]
+        for name, w, h, nf, pix_fmt, mux_fmt, aom_opts in cases:
+            with self.subTest(case=name):
+                exp_prof, exp_bd, _, _, exp_cs = PIX_SPECS[pix_fmt]
+                raw_src = synth_raw_planar(w, h, pix_fmt, nf)
+                src_path = self.dir / f"{name}.src.raw"
+                src_path.write_bytes(raw_src)
+                stream_path = self.dir / f"{name}.{mux_fmt}"
+                cmd = [
+                    FFMPEG, "-y", "-v", "error",
+                    "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{w}x{h}", "-r", "25",
+                    "-i", src_path,
+                    "-c:v", "libaom-av1", "-pix_fmt", pix_fmt,
+                    *aom_opts,
+                ]
+                if mux_fmt in ("ivf", "obu"):
+                    cmd += ["-f", mux_fmt]
+                cmd.append(stream_path)
+                run(*cmd)
+
+                ref_raw = self._ffmpeg_decode_raw(stream_path, pix_fmt, mux_fmt=mux_fmt)
+                lean_out = self.dir / f"{name}.lean.raw"
+                dec_res = run(drv, "decode", stream_path, lean_out, env=ISO_ENV)
+                parts = dec_res.stdout.decode().strip().split(",")
+                self.assertEqual(int(parts[0]), w)
+                self.assertEqual(int(parts[1]), h)
+                self.assertEqual(int(parts[2]), nf)
+                self.assertEqual(int(parts[3]), exp_bd)
+                self.assertEqual(parts[4], pix_fmt)
+                lean_bytes = lean_out.read_bytes()
+                self.assertEqual(lean_bytes, ref_raw)
+                if "lossless" in name:
+                    self.assertEqual(lean_bytes, raw_src)
+
+                probe = json.loads(run(LFFMPEG, "av1-probe", stream_path, env=ISO_ENV).stdout.decode())
+                self.assertTrue(probe["ok"])
+                self.assertEqual(probe["profile"], exp_prof)
+                self.assertEqual(probe["bit_depth"], exp_bd)
+                self.assertEqual(probe["chroma_subsampling"], exp_cs)
+                self.assertEqual(probe["width"], w)
+                self.assertEqual(probe["height"], h)
+                self.assertEqual(probe["frames"], nf)
+
+    def test_libaom_film_grain_apply_grain_bit_exact_matrix(self):
+        self.assertTrue(libaom_av1_available(), "ffmpeg with libaom-av1 required")
+        self.assertTrue(av1_decoder_available(), "ffmpeg AV1 decoder required")
+        drv = self._get_raw_driver()
+        cases = [
+            ("fg_main8_t1", 64, 48, 3, "yuv420p", "ivf", ["-aom-params", "film-grain-test=1"]),
+            ("fg_main8_t3", 80, 64, 3, "yuv420p", "ivf", ["-aom-params", "film-grain-test=3"]),
+            ("fg_main8_t11_fullrange", 64, 48, 2, "yuv420p", "mp4", ["-color_range", "pc", "-aom-params", "film-grain-test=11"]),
+            ("fg_main10_t2", 80, 64, 4, "yuv420p10le", "ivf", ["-aom-params", "film-grain-test=2"]),
+            ("fg_main10_denoise", 64, 48, 4, "yuv420p10le", "mp4", ["-denoise-noise-level", "22"]),
+            ("fg_high10_444_t5", 53, 39, 3, "yuv444p10le", "ivf", ["-aom-params", "film-grain-test=5"]),
+            ("fg_high10_444_t14", 64, 48, 3, "yuv444p10le", "mp4", ["-color_range", "pc", "-aom-params", "film-grain-test=14"]),
+            ("fg_prof10_422_t7", 64, 45, 3, "yuv422p10le", "ivf", ["-aom-params", "film-grain-test=7"]),
+            ("fg_prof12_422_t9", 64, 48, 3, "yuv422p12le", "ivf", ["-aom-params", "film-grain-test=9"]),
+            ("fg_prof12_444_t16", 51, 37, 3, "yuv444p12le", "ivf", ["-aom-params", "film-grain-test=16"]),
+        ]
+        for name, w, h, nf, pix_fmt, mux_fmt, fg_opts in cases:
+            with self.subTest(case=name):
+                _, exp_bd, _, _, _ = PIX_SPECS[pix_fmt]
+                raw_src = synth_raw_planar(w, h, pix_fmt, nf)
+                src_path = self.dir / f"{name}.src.raw"
+                src_path.write_bytes(raw_src)
+                stream_path = self.dir / f"{name}.{mux_fmt}"
+                cmd = [
+                    FFMPEG, "-y", "-v", "error",
+                    "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{w}x{h}", "-r", "25",
+                    "-i", src_path,
+                    "-c:v", "libaom-av1", "-cpu-used", "6", "-crf", "28", "-pix_fmt", pix_fmt,
+                    *fg_opts,
+                ]
+                if mux_fmt == "ivf":
+                    cmd += ["-f", "ivf"]
+                cmd.append(stream_path)
+                run(*cmd)
+
+                ref_raw = self._ffmpeg_decode_raw(stream_path, pix_fmt, mux_fmt=mux_fmt)
+                lean_out = self.dir / f"{name}.lean.raw"
+                dec_res = run(drv, "decode", stream_path, lean_out, env=ISO_ENV)
+                parts = dec_res.stdout.decode().strip().split(",")
+                self.assertEqual(int(parts[0]), w)
+                self.assertEqual(int(parts[1]), h)
+                self.assertEqual(int(parts[2]), nf)
+                self.assertEqual(int(parts[3]), exp_bd)
+                self.assertEqual(parts[4], pix_fmt)
+                self.assertEqual(lean_out.read_bytes(), ref_raw)
+
+                strict420_out = self.dir / f"{name}.strict420.yuv"
+                strict420_res = run(drv, "decode420", stream_path, strict420_out, env=ISO_ENV, check=False)
+                if pix_fmt == "yuv420p":
+                    self.assertEqual(strict420_res.returncode, 0)
+                    self.assertEqual(strict420_out.read_bytes(), ref_raw)
+                else:
+                    self.assertNotEqual(strict420_res.returncode, 0)
+
+    def test_encode_raw_high_bitdepth_subsampling_and_film_grain_parity(self):
+        self.assertTrue(av1_decoder_available(), "ffmpeg AV1 decoder required")
+        drv = self._get_raw_driver()
+        for pix_fmt, (exp_prof, bd, ss_h, ss_v, exp_cs) in PIX_SPECS.items():
+            with self.subTest(pix_fmt=pix_fmt, mode="lossless"):
+                w = 37 if ss_h == 0 else 48
+                h = 29 if ss_v == 0 else 32
+                src_bytes = synth_raw_planar(w, h, pix_fmt, 2)
+                src_path = self.dir / f"{pix_fmt}_ll.src.raw"
+                enc_path = self.dir / f"{pix_fmt}_ll.ivf"
+                lean_dec = self.dir / f"{pix_fmt}_ll.lean.raw"
+                src_path.write_bytes(src_bytes)
+                run(drv, "encode", w, h, pix_fmt, 0, "ivf", 0, 0, "none", src_path, enc_path, env=ISO_ENV)
+                run(drv, "decode", enc_path, lean_dec, env=ISO_ENV)
+                ff_bytes = self._ffmpeg_decode_raw(enc_path, pix_fmt, mux_fmt="ivf")
+                self.assertEqual(lean_dec.read_bytes(), src_bytes)
+                self.assertEqual(ff_bytes, src_bytes)
+
+            with self.subTest(pix_fmt=pix_fmt, mode="lossy_mp4_and_ivf"):
+                w, h = 80, 64
+                src_bytes = synth_raw_planar(w, h, pix_fmt, 3)
+                src_path = self.dir / f"{pix_fmt}_lossy.src.raw"
+                ivf_path = self.dir / f"{pix_fmt}_lossy.ivf"
+                mp4_path = self.dir / f"{pix_fmt}_lossy.mp4"
+                av1c_path = self.dir / f"{pix_fmt}.av1c"
+                lean_ivf_dec = self.dir / f"{pix_fmt}_lossy_ivf.lean.raw"
+                lean_mp4_dec = self.dir / f"{pix_fmt}_lossy_mp4.lean.raw"
+                src_path.write_bytes(src_bytes)
+
+                run(drv, "encode", w, h, pix_fmt, 52, "ivf", 1, 0, "none", src_path, ivf_path, env=ISO_ENV)
+                run(drv, "decode", ivf_path, lean_ivf_dec, env=ISO_ENV)
+                ff_ivf = self._ffmpeg_decode_raw(ivf_path, pix_fmt, mux_fmt="ivf")
+                self.assertEqual(lean_ivf_dec.read_bytes(), ff_ivf)
+                self.assertGreater(psnr_raw_db(src_bytes, ff_ivf, bd), 32.0)
+
+                run(drv, "encode", w, h, pix_fmt, 52, "mp4", 0, 0, "none", src_path, mp4_path, env=ISO_ENV)
+                run(drv, "decode", mp4_path, lean_mp4_dec, env=ISO_ENV)
+                ff_mp4 = self._ffmpeg_decode_raw(mp4_path, pix_fmt, mux_fmt="mp4")
+                self.assertEqual(lean_mp4_dec.read_bytes(), ff_mp4)
+                self.assertGreater(psnr_raw_db(src_bytes, ff_mp4, bd), 32.0)
+
+                probe = json.loads(run(LFFMPEG, "av1-probe", mp4_path, env=ISO_ENV).stdout.decode())
+                self.assertEqual(probe["profile"], exp_prof)
+                self.assertEqual(probe["bit_depth"], bd)
+                self.assertEqual(probe["chroma_subsampling"], exp_cs)
+
+                pay_res = run(drv, "encode_mp4_payloads", w, h, pix_fmt, 52, src_path, av1c_path, env=ISO_ENV)
+                av1c_bytes = av1c_path.read_bytes()
+                self.assertGreaterEqual(len(av1c_bytes), 4)
+                self.assertEqual(av1c_bytes[0], 0x81)
+                self.assertEqual(int(pay_res.stdout.decode().strip().split(",")[1]), 3)
+
+        for pix_fmt in ("yuv420p10le", "yuv444p10le", "yuv422p10le", "yuv422p12le"):
+            for fg_mode in ("fg1", "fg_cfl", "fg_reuse"):
+                with self.subTest(pix_fmt=pix_fmt, fg_mode=fg_mode):
+                    w, h = 64, 48
+                    src_bytes = synth_raw_planar(w, h, pix_fmt, 3)
+                    src_path = self.dir / f"{pix_fmt}_{fg_mode}.src.raw"
+                    no_fg_path = self.dir / f"{pix_fmt}_{fg_mode}_nofg.ivf"
+                    fg_path = self.dir / f"{pix_fmt}_{fg_mode}.ivf"
+                    no_fg_dec = self.dir / f"{pix_fmt}_{fg_mode}_nofg.lean.raw"
+                    fg_dec = self.dir / f"{pix_fmt}_{fg_mode}.lean.raw"
+                    src_path.write_bytes(src_bytes)
+
+                    run(drv, "encode", w, h, pix_fmt, 48, "ivf", 0, 0, "none", src_path, no_fg_path, env=ISO_ENV)
+                    run(drv, "encode", w, h, pix_fmt, 48, "ivf", 0, 0, fg_mode, src_path, fg_path, env=ISO_ENV)
+                    run(drv, "decode", no_fg_path, no_fg_dec, env=ISO_ENV)
+                    run(drv, "decode", fg_path, fg_dec, env=ISO_ENV)
+                    ff_fg = self._ffmpeg_decode_raw(fg_path, pix_fmt, mux_fmt="ivf")
+                    self.assertEqual(fg_dec.read_bytes(), ff_fg)
+                    self.assertNotEqual(fg_dec.read_bytes(), no_fg_dec.read_bytes())
+
+        bad_10bit = bytearray(synth_raw_planar(16, 16, "yuv420p10le", 1))
+        struct.pack_into("<H", bad_10bit, 0, 1024)
+        bad_10bit_path = self.dir / "bad_10bit_sample.raw"
+        bad_10bit_path.write_bytes(bytes(bad_10bit))
+        self.assertNotEqual(
+            run(drv, "encode", 16, 16, "yuv420p10le", 52, "ivf", 0, 0, "none", bad_10bit_path, self.dir / "bad10.ivf", env=ISO_ENV, check=False).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            run(drv, "encode", 15, 16, "yuv422p10le", 52, "ivf", 0, 0, "none", bad_10bit_path, self.dir / "bad422w.ivf", env=ISO_ENV, check=False).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            run(drv, "encode", 16, 16, "gray10le", 52, "ivf", 0, 0, "none", bad_10bit_path, self.dir / "badfmt.ivf", env=ISO_ENV, check=False).returncode,
             0,
         )
 

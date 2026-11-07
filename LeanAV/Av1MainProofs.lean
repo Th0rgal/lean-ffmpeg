@@ -501,4 +501,209 @@ theorem av1Rav1e_4byte_av1C_and_unsized_trailing_obu_verified :
     checkAv1Rav1e4ByteAv1CAndUnsizedTrailingObu = true := by
   decide
 
+def av1SupportedSeqSafe (seq : Av1SeqHdr) : Prop :=
+  av1ProfileAdmitsHbdSubsampling seq.profile seq.hbd seq.monochrome seq.ssHor seq.ssVer = true ∧
+    seq.monochrome = false
+
+def av1SupportedSeqGate (seq : Av1SeqHdr) : Bool :=
+  av1IsSupportedSeq seq && !seq.monochrome
+
+def av1SupportedSeqSpec :
+    AVGateSpec Av1SeqHdr av1SupportedSeqSafe where
+  gate := av1SupportedSeqGate
+  sound seq hg := by
+    unfold av1SupportedSeqGate av1SupportedSeqSafe av1IsSupportedSeq at *
+    simp only [Bool.and_eq_true, Bool.not_eq_true'] at hg
+    exact ⟨hg.1, hg.2⟩
+  complete seq hs := by
+    rcases hs with ⟨ha, hm⟩
+    unfold av1SupportedSeqGate av1IsSupportedSeq
+    simp only [Bool.and_eq_true, Bool.not_eq_true']
+    exact ⟨ha, hm⟩
+  posWitness := { profile := 2, hbd := 2, monochrome := false, ssHor := 1, ssVer := 0 }
+  negWitness := { profile := 0, hbd := 2, monochrome := false, ssHor := 1, ssVer := 1 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1SupportedSeqSpec_iff (seq : Av1SeqHdr) :
+    av1SupportedSeqSpec.gate seq = true ↔ av1SupportedSeqSafe seq :=
+  av1SupportedSeqSpec.iff_safe seq
+
+def av1RawLayoutSafe (bd ssHor ssVer : Nat) : Prop :=
+  ∃ name, av1PixFmtName bd ssHor ssVer = some name ∧ (bd = 8 ∨ bd = 10 ∨ bd = 12)
+
+def av1RawLayoutGate (bd ssHor ssVer : Nat) : Bool :=
+  (av1PixFmtName bd ssHor ssVer).isSome && ((bd == 8) || (bd == 10) || (bd == 12))
+
+def av1RawLayoutSpec :
+    AVGateSpec (Nat × Nat × Nat) (fun p => av1RawLayoutSafe p.1 p.2.1 p.2.2) where
+  gate p := av1RawLayoutGate p.1 p.2.1 p.2.2
+  sound p hg := by
+    rcases p with ⟨bd, ssHor, ssVer⟩
+    unfold av1RawLayoutGate av1RawLayoutSafe at *
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hg
+    rcases hg with ⟨hsome, hbd⟩
+    cases hname : av1PixFmtName bd ssHor ssVer with
+    | none => simp [hname] at hsome
+    | some name =>
+      rcases hbd with (rfl | rfl) | rfl
+      · exact ⟨name, rfl, Or.inl rfl⟩
+      · exact ⟨name, rfl, Or.inr (Or.inl rfl)⟩
+      · exact ⟨name, rfl, Or.inr (Or.inr rfl)⟩
+  complete p hs := by
+    rcases p with ⟨bd, ssHor, ssVer⟩
+    rcases hs with ⟨name, hname, hbd⟩
+    unfold av1RawLayoutGate
+    simp only [hname, Option.isSome_some, Bool.true_and, Bool.or_eq_true, beq_iff_eq]
+    rcases hbd with rfl | rfl | rfl
+    · exact Or.inl (Or.inl rfl)
+    · exact Or.inl (Or.inr rfl)
+    · exact Or.inr rfl
+  posWitness := (12, 1, 0)
+  negWitness := (10, 0, 1)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1RawLayoutSpec_iff (p : Nat × Nat × Nat) :
+    av1RawLayoutSpec.gate p = true ↔ av1RawLayoutSafe p.1 p.2.1 p.2.2 :=
+  av1RawLayoutSpec.iff_safe p
+
+theorem av1RawFrameByteSize_hbd_even (w h bd ssHor ssVer : Nat) (hbd : bd ≠ 8) :
+    av1RawFrameByteSize w h bd ssHor ssVer % 2 = 0 := by
+  unfold av1RawFrameByteSize
+  simp [hbd]
+
+def av1SampleBoundSafe (v bd : Nat) : Prop :=
+  (bd = 8 ∨ bd = 10 ∨ bd = 12) ∧ v ≤ av1MaxSampleBd bd
+
+def av1SampleBoundGate (v bd : Nat) : Bool :=
+  ((bd == 8) || (bd == 10) || (bd == 12)) && decide (v ≤ av1MaxSampleBd bd)
+
+def av1SampleBoundSpec :
+    AVGateSpec (Nat × Nat) (fun p => av1SampleBoundSafe p.1 p.2) where
+  gate p := av1SampleBoundGate p.1 p.2
+  sound p hg := by
+    rcases p with ⟨v, bd⟩
+    unfold av1SampleBoundGate av1SampleBoundSafe at *
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq] at hg
+    rcases hg with ⟨(h8 | h10) | h12, hv⟩
+    · exact ⟨Or.inl h8, hv⟩
+    · exact ⟨Or.inr (Or.inl h10), hv⟩
+    · exact ⟨Or.inr (Or.inr h12), hv⟩
+  complete p hs := by
+    rcases p with ⟨v, bd⟩
+    rcases hs with ⟨hbd, hv⟩
+    unfold av1SampleBoundGate
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq]
+    rcases hbd with h8 | h10 | h12
+    · exact ⟨Or.inl (Or.inl h8), hv⟩
+    · exact ⟨Or.inl (Or.inr h10), hv⟩
+    · exact ⟨Or.inr h12, hv⟩
+  posWitness := (1023, 10)
+  negWitness := (1024, 10)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1SampleBoundSpec_iff (p : Nat × Nat) :
+    av1SampleBoundSpec.gate p = true ↔ av1SampleBoundSafe p.1 p.2 :=
+  av1SampleBoundSpec.iff_safe p
+
+def av1FilmGrainBoundsSafe (seed lag shift scale numY : Nat) : Prop :=
+  seed < 65536 ∧ lag < 4 ∧ shift < 4 ∧ scale < 4 ∧ numY ≤ 14
+
+def av1FilmGrainBoundsGate (seed lag shift scale numY : Nat) : Bool :=
+  seed < 65536 && lag < 4 && shift < 4 && scale < 4 && numY <= 14
+
+def av1FilmGrainBoundsSpec :
+    AVGateSpec (Nat × Nat × Nat × Nat × Nat)
+      (fun p => av1FilmGrainBoundsSafe p.1 p.2.1 p.2.2.1 p.2.2.2.1 p.2.2.2.2) where
+  gate p := av1FilmGrainBoundsGate p.1 p.2.1 p.2.2.1 p.2.2.2.1 p.2.2.2.2
+  sound p hg := by
+    rcases p with ⟨seed, lag, shift, scale, numY⟩
+    simp only [av1FilmGrainBoundsGate] at hg
+    unfold av1FilmGrainBoundsSafe
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact ⟨hg.1.1.1.1, hg.1.1.1.2, hg.1.1.2, hg.1.2, hg.2⟩
+  complete p hs := by
+    rcases p with ⟨seed, lag, shift, scale, numY⟩
+    simp only [av1FilmGrainBoundsGate]
+    unfold av1FilmGrainBoundsSafe at hs
+    rcases hs with ⟨hs, hl, hsh, hsc, hn⟩
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨⟨⟨⟨hs, hl⟩, hsh⟩, hsc⟩, hn⟩
+  posWitness := (1, 3, 3, 3, 14)
+  negWitness := (65536, 0, 0, 0, 0)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1FilmGrainBoundsSpec_iff (p : Nat × Nat × Nat × Nat × Nat) :
+    av1FilmGrainBoundsSpec.gate p = true ↔
+      av1FilmGrainBoundsSafe p.1 p.2.1 p.2.2.1 p.2.2.2.1 p.2.2.2.2 :=
+  av1FilmGrainBoundsSpec.iff_safe p
+
+def av1CHeaderSupportedSafe (h : Av1CHeaderBytes) : Prop :=
+  ∃ s, av1SeqFromAv1CHeaderBytes { data := #[h.b0, h.b1, h.b2, h.b3] } = some s ∧
+    av1IsSupportedSeq s = true
+
+def av1CHeaderSupportedGate (h : Av1CHeaderBytes) : Bool :=
+  match av1SeqFromAv1CHeaderBytes { data := #[h.b0, h.b1, h.b2, h.b3] } with
+  | some s => av1IsSupportedSeq s
+  | none => false
+
+def av1CHeaderSupportedSpec :
+    AVGateSpec Av1CHeaderBytes av1CHeaderSupportedSafe where
+  gate := av1CHeaderSupportedGate
+  sound h hg := by
+    unfold av1CHeaderSupportedGate av1CHeaderSupportedSafe at *
+    cases hs : av1SeqFromAv1CHeaderBytes { data := #[h.b0, h.b1, h.b2, h.b3] } with
+    | none => simp [hs] at hg
+    | some s => simp [hs] at hg; exact ⟨s, rfl, hg⟩
+  complete h hs := by
+    rcases hs with ⟨s, hseq, hsup⟩
+    unfold av1CHeaderSupportedGate
+    simp [hseq, hsup]
+  posWitness := { b0 := 0x81, b1 := 0x45, b2 := 0x68, b3 := 0x00 }
+  negWitness := { b0 := 0x81, b1 := 0x05, b2 := 0x6C, b3 := 0x00 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem av1CHeaderSupportedSpec_iff (h : Av1CHeaderBytes) :
+    av1CHeaderSupportedSpec.gate h = true ↔ av1CHeaderSupportedSafe h :=
+  av1CHeaderSupportedSpec.iff_safe h
+
+def checkAv1HbdAndFilmGrainInvariants : Bool :=
+  let fmts := ["yuv420p", "yuv422p", "yuv444p",
+               "yuv420p10le", "yuv422p10le", "yuv444p10le",
+               "yuv420p12le", "yuv422p12le", "yuv444p12le"]
+  let fmtRoundtrip := fmts.all fun f =>
+    match av1PixFmtParams f with
+    | some (prof, hbd, ssH, ssV) =>
+      let bd := if hbd == 0 then 8 else if hbd == 1 then 10 else 12
+      av1ProfileAdmitsHbdSubsampling prof hbd false ssH ssV &&
+        av1PixFmtName bd ssH ssV == some f
+    | none => false
+  let main10Cfg := av1BuildAv1C ByteArray.empty { profile := 0, hbd := 1, monochrome := false, ssHor := 1, ssVer := 1 }
+  let high10Cfg := av1BuildAv1C ByteArray.empty { profile := 1, hbd := 1, monochrome := false, ssHor := 0, ssVer := 0 }
+  let prof12Cfg := av1BuildAv1C ByteArray.empty { profile := 2, hbd := 2, monochrome := false, ssHor := 1, ssVer := 0 }
+  let (r0, s1) := av1FgRandomNumber 11 7391
+  let (r1, _) := av1FgRandomNumber 8 s1
+  fmtRoundtrip &&
+  (av1IclipBd 5000 10 == 1023) &&
+  (av1IclipBd 5000 12 == 4095) &&
+  (av1FgRound2 (-31) 4 == -2) &&
+  (match av1SeqFromAv1CHeaderBytes main10Cfg with
+   | some s => av1IsSupportedSeq s && s.profile == 0 && s.hbd == 1 && s.ssHor == 1 && s.ssVer == 1
+   | none => false) &&
+  (match av1SeqFromAv1CHeaderBytes high10Cfg with
+   | some s => av1IsSupportedSeq s && s.profile == 1 && s.hbd == 1 && s.ssHor == 0 && s.ssVer == 0
+   | none => false) &&
+  (match av1SeqFromAv1CHeaderBytes prof12Cfg with
+   | some s => av1IsSupportedSeq s && s.profile == 2 && s.hbd == 2 && s.ssHor == 1 && s.ssVer == 0
+   | none => false) &&
+  (r0 < 2048) && (r1 < 256)
+
+theorem av1Hbd_and_film_grain_invariants_verified :
+    checkAv1HbdAndFilmGrainInvariants = true := by
+  decide
+
 end LeanAV.Av1MainProofs
