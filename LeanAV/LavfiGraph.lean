@@ -813,7 +813,10 @@ def compileFilterNode (node : FilterNode) (inFmts : List PadFormat) :
     let [fmt] := inFmts | throw "format expects 1 video input"
     if fmt.kind != .video || node.outputs.length != 1 then throw "format media kind/arity mismatch"
     let pf := (FilterArg.lookup args "pix_fmts" 0).getD "yuv420p" |>.toLower
-    if pf != "yuv420p" && pf != "rgb24" && pf != "gray" then
+    if pf != "yuv420p" && pf != "rgb24" && pf != "gray" &&
+        pf != "yuv420p10le" && pf != "yuv422p10le" && pf != "yuv444p10le" &&
+        pf != "yuv420p12le" && pf != "yuv422p12le" && pf != "yuv444p12le" &&
+        pf != "p010le" && pf != "gbrp10le" && pf != "rgba64le" then
       throw s!"unsupported format pix_fmts: {pf}"
     return (.vfFormat pf, [fmt])
   else if nm == "fps" then
@@ -1325,14 +1328,25 @@ def execVideoVflip (vf : VideoFrame) : VideoFrame :=
         filterPlaneVFlip vf.planes[1]!,
         filterPlaneVFlip vf.planes[2]!] }
 
-/-- Apply `format` (`gray` neutralizes chroma to `128`; `yuv420p`/`rgb24` preserve planes). -/
+/-- Apply `format` (`gray` neutralizes chroma to `128`; named high-bit formats select their matrix). -/
 def execVideoFormat (vf : VideoFrame) (pf : String) : VideoFrame :=
   if vf.planes.size < 3 then vf
   else if pf == "gray" then
     let cw := (vf.width + 1) / 2
     let ch := (vf.height + 1) / 2
     { vf with planes := #[vf.planes[0]!, Plane2D.alloc cw ch cw 128, Plane2D.alloc cw ch cw 128] }
-  else vf
+  else
+    match PixelFormat.parse pf with
+    | some parsed =>
+      let cm :=
+        if parsed.bitDepth ≥ 10 &&
+            (parsed == .yuv420p10le || parsed == .yuv422p10le || parsed == .yuv444p10le ||
+             parsed == .yuv420p12le || parsed == .yuv422p12le || parsed == .yuv444p12le ||
+             parsed == .p010le || parsed == .gbrp10le) then
+          .bt2020ncl
+        else vf.colorMatrix
+      { vf with colorMatrix := cm }
+    | none => vf
 
 /-- Composite opaque foreground `fg` onto background `bg` at `(ox, oy)` via `filterPlaneOverlay` (`alphaQ8=256`). -/
 def execVideoOverlay (bg fg : VideoFrame) (ox oy : Nat) : VideoFrame :=
@@ -1602,12 +1616,11 @@ def executeTypedNode (node : TypedNode) (padMap : List (String × EdgeBufferQueu
     return singleOut (buildVideoQueue (Nat.max queueCap outFrames.size) outFrames)
   | .vfColorspace tgt =>
     let q ← lookupQ (node.inputs.headD "")
-    let cm : ColorMatrix := if tgt == "bt601" then .bt601 else if tgt == "bt2020" then .bt2020ncl else .bt709
-    let vfs := (drainVideoQueue q).map (fun vf => { vf with colorMatrix := cm })
+    let vfs := (drainVideoQueue q).map (fun vf => filterVideoColorspace vf tgt)
     return singleOut (buildVideoQueue queueCap vfs)
-  | .vfTonemap _ =>
+  | .vfTonemap mode =>
     let q ← lookupQ (node.inputs.headD "")
-    let vfs := (drainVideoQueue q).map (fun vf => execVideoEq vf 280 0 false)
+    let vfs := (drainVideoQueue q).map (fun vf => filterVideoTonemap vf mode)
     return singleOut (buildVideoQueue queueCap vfs)
   | .afVolume gQ8 =>
     let af := drainAudioQueue (← lookupQ (node.inputs.headD ""))
@@ -1994,6 +2007,29 @@ def runMultiStreamFilterGraph (graphSpec : String)
     extQs := extQs ++ [(lbl, buildAudioQueue 4 af)]
   let tg ← typecheckFilterGraph g extFmts
   executeTypedFilterGraph tg extQs
+
+/-- Admitted lavfi HDR filter names and modes (`colorspace` and `tonemap`). -/
+def LavfiHdrFilterAdmitted (a : String × String) : Prop :=
+  let (nm, arg) := a
+  (nm = "colorspace" ∧ (arg = "bt709" ∨ arg = "bt601" ∨ arg = "bt2020")) ∨
+  (nm = "tonemap" ∧ (arg = "reinhard" ∨ arg = "hable" ∨ arg = "mobius" ∨ arg = "clip" ∨ arg = "linear"))
+
+instance (a : String × String) : Decidable (LavfiHdrFilterAdmitted a) := by
+  unfold LavfiHdrFilterAdmitted
+  infer_instance
+
+def lavfiHdrFilterGateSpec : AVGateSpec (String × String) LavfiHdrFilterAdmitted where
+  gate := fun a => decide (LavfiHdrFilterAdmitted a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := ("tonemap", "hable")
+  negWitness := ("tonemap", "bogus")
+  nonVacuous := by decide
+  tight := by decide
+
+theorem lavfiHdrFilterGateSpec_iff (a : String × String) :
+    lavfiHdrFilterGateSpec.gate a = true ↔ LavfiHdrFilterAdmitted a :=
+  lavfiHdrFilterGateSpec.iff_safe a
 
 end LeanAV.LavfiGraph
 

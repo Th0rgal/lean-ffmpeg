@@ -586,4 +586,100 @@ theorem yuv420pFilterPlaneSkipGateSpec_iff
     yuv420pFilterPlaneSkipGateSpec.gate a = true ↔ Yuv420pFilterPlaneSkipSafe a :=
   yuv420pFilterPlaneSkipGateSpec.iff_safe a
 
+/-! ## P1.1 HDR colorspace, tonemap, and dither stages -/
+
+/-- Parse a lavfi colorspace target into the matrix used by the real converter. -/
+def parseHdrColorMatrix (target : String) : ColorMatrix :=
+  let low := String.ofList (target.toList.map Char.toLower)
+  if low == "bt601" || low == "smpte170m" then .bt601
+  else if low == "bt2020" || low == "bt2020nc" || low == "bt2020ncl" then .bt2020ncl
+  else .bt709
+
+/-- Admitted tonemap operators. Unknown names fail closed to Reinhard. -/
+def normalizeTonemapMode (mode : String) : String :=
+  let low := String.ofList (mode.toList.map Char.toLower)
+  if low == "hable" then "hable"
+  else if low == "mobius" then "mobius"
+  else if low == "clip" then "clip"
+  else if low == "linear" then "linear"
+  else "reinhard"
+
+/-- Real colorspace stage: BT.2020/BT.709/BT.601 matrix conversion, not a tag rewrite. -/
+def filterVideoColorspace (vf : VideoFrame) (target : String) : VideoFrame :=
+  convertVideoFrameColorspace vf (parseHdrColorMatrix target)
+
+/-- Real PQ HDR-to-SDR stage. The output matrix is always BT.709. -/
+def filterVideoTonemap (vf : VideoFrame) (mode : String) : VideoFrame :=
+  tonemapVideoFrameHdrToSdr vf (normalizeTonemapMode mode)
+
+/-- Ordered Bayer reduction of one 10-bit or 12-bit plane to 8-bit. -/
+def filterPlane16BayerToU8 (src : Plane16) (srcBits : Nat) : Plane2D := Id.run do
+  let bits := if srcBits == 12 then 12 else 10
+  let packed := ditherPlaneBayerToU8 src.data src.width src.height bits
+  let mut out := Plane2D.alloc src.width src.height src.stride 0
+  for r in [:src.height] do
+    for c in [:src.width] do
+      let i := r * src.width + c
+      out := out.setPixel r c (packed.get! i)
+  return out
+
+/-- Floyd–Steinberg reduction of one 10-bit or 12-bit plane to 8-bit. -/
+def filterPlane16FloydSteinbergToU8 (src : Plane16) (srcBits : Nat) : Plane2D := Id.run do
+  let bits := if srcBits == 12 then 12 else 10
+  let packed := ditherPlaneFloydSteinbergToU8 src.data src.width src.height bits
+  let mut out := Plane2D.alloc src.width src.height src.stride 0
+  for r in [:src.height] do
+    for c in [:src.width] do
+      let i := r * src.width + c
+      out := out.setPixel r c (packed.get! i)
+  return out
+
+/-- Phase-indexed colorspace stage built on `lawfulStageColorConvert`. -/
+def lawfulStageColorspace (pf : PixelFormat) (w h : Nat) (dstCs : ColorSpaceTag := .bt709) :
+    LawfulTranscodeStage .Decoded (.pix pf) w h .Decoded (.pix pf) w h :=
+  lawfulStageColorConvert pf w h dstCs id
+
+/-- Phase-indexed HDR-to-SDR tonemap stage transitioning `colorSpace` to `.bt709`. -/
+def lawfulStageTonemap (pf : PixelFormat) (w h : Nat) (mode : String) :
+    LawfulTranscodeStage .Decoded (.pix pf) w h .Decoded (.pix pf) w h :=
+  lawfulStageColorConvert pf w h .bt709 (fun p => Id.run do
+    let mut out := Plane2D.alloc p.width p.height p.stride 16
+    for r in [:p.height] do
+      for c in [:p.width] do
+        let y := p.getPixel r c
+        let lin := pqEotf10ToLinearQ16 ((y.toNat * 1023 + 127) / 255)
+        out := out.setPixel r c (bt709OetfLinearQ16ToU8 (tonemapCurveQ16 (normalizeTonemapMode mode) lin))
+    return out)
+
+/-- A real tonemap result is BT.709 and keeps the frame geometry. -/
+def TonemapFrameSafe (a : VideoFrame × String × VideoFrame) : Prop :=
+  let (src, _, dst) := a
+  dst.width = src.width ∧ dst.height = src.height ∧ dst.colorMatrix = .bt709 ∧
+    dst.planes.size = 3
+
+instance (a : VideoFrame × String × VideoFrame) : Decidable (TonemapFrameSafe a) := by
+  unfold TonemapFrameSafe
+  infer_instance
+
+def tonemapFrameGate (a : VideoFrame × String × VideoFrame) : Bool :=
+  decide (TonemapFrameSafe a)
+
+/-- Positive and negative witnesses are concrete decoded frames. -/
+def tonemapFrameGateSpec : AVGateSpec (VideoFrame × String × VideoFrame) TonemapFrameSafe where
+  gate := tonemapFrameGate
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness :=
+    let src := VideoFrame.allocYuv420p 2 2 0 AVRational.tb90kHz .bt2020ncl
+    (src, "hable", filterVideoTonemap src "hable")
+  negWitness :=
+    let src := VideoFrame.allocYuv420p 2 2 0 AVRational.tb90kHz .bt2020ncl
+    (src, "hable", src)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem tonemapFrameGateSpec_iff (a : VideoFrame × String × VideoFrame) :
+    tonemapFrameGateSpec.gate a = true ↔ TonemapFrameSafe a :=
+  tonemapFrameGateSpec.iff_safe a
+
 end LeanAV.Filter

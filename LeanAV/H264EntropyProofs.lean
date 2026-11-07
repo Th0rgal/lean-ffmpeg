@@ -537,7 +537,7 @@ theorem cabacCbfCtx_unavailable_defaults_intra_one_inter_zero :
 theorem populateResidualGrid_8x8_cavlc_subblock0_not_overwritten_by_sum :
     let c8 : Array Int := #[5, 3, 7, 9,  0, -2, -1, 2,  0, 4, 0, -6,  0, 0, 0, 8]
     let mb : MbSyntax := { transform8x8 := 1, cbp := 1, luma8x8 := #[c8] }
-    let rec0 := populateResidualGrid mb {} false
+    let rec0 := populateResidualGrid mb {} 0
     let g := MbGrid.init 2 1
     (rec0.lumaNnzCavlc.getD 0 99 == 1 &&
      rec0.lumaNnzCavlc.getD 1 99 == 3 &&
@@ -612,6 +612,115 @@ theorem transcodeAnnexB_rejects_empty_and_data_partitioned_nal :
       "Unsupported H.264 data-partitioned slice NAL" = true ∧
     isErr (transcodeAnnexB ({ data := #[0x00, 0x00, 0x00, 0x01, 0x67, 0x42] }) .preserve)
       "Unsupported or malformed H.264 SPS NAL" = true := by
+  decide
+
+def highTierEntropyChromaBitDepthGate (p : Nat × Nat × Nat × Nat) : Bool :=
+  let (chromaIdc, sepFlag, bdY, bdC) := p
+  chromaIdc ≤ 3 && (chromaIdc == 3 || sepFlag == 0) && bdY ≤ 6 && bdC ≤ 6
+
+def highTierEntropyChromaBitDepthSpec :
+    AVGateSpec (Nat × Nat × Nat × Nat)
+      (fun p => p.1 ≤ 3 ∧ (p.1 = 3 ∨ p.2.1 = 0) ∧ p.2.2.1 ≤ 6 ∧ p.2.2.2 ≤ 6) where
+  gate := highTierEntropyChromaBitDepthGate
+  sound := by
+    intro ⟨c, s, by0, bc0⟩ hg
+    unfold highTierEntropyChromaBitDepthGate at hg
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq] at hg
+    exact ⟨hg.1.1.1, hg.1.1.2, hg.1.2, hg.2⟩
+  complete := by
+    intro ⟨c, s, by0, bc0⟩ ⟨hc, hs, hby, hbc⟩
+    unfold highTierEntropyChromaBitDepthGate
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq]
+    exact ⟨⟨⟨hc, hs⟩, hby⟩, hbc⟩
+  posWitness := (3, 1, 4, 4)
+  negWitness := (2, 1, 2, 2)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem pcmByteCount_422_444_and_separate_plane_exact (sps : SpsFull) :
+    (sps.chromaFormatIdc = 2 → sps.bitDepthLumaMinus8 = 2 → sps.bitDepthChromaMinus8 = 2 →
+      pcmByteCount sps = 640) ∧
+    (sps.chromaFormatIdc = 3 → sps.separateColourPlaneFlag = 0 →
+      sps.bitDepthLumaMinus8 = 4 → sps.bitDepthChromaMinus8 = 4 →
+      pcmByteCount sps = 1152) ∧
+    (sps.chromaFormatIdc = 3 → sps.separateColourPlaneFlag = 1 →
+      sps.bitDepthLumaMinus8 = 2 → pcmByteCount sps = 320) := by
+  unfold pcmByteCount
+  refine ⟨?_, ?_, ?_⟩
+  · intro hc hy hcb; simp [hc, hy, hcb]
+  · intro hc hs hy hcb; simp [hc, hs, hy, hcb]
+  · intro hc hs hy; simp [hc, hs, hy]
+
+set_option maxRecDepth 400000 in
+theorem cavlcChroma2x4_tables_and_roundtrip_exact :
+    let testEntry (tab : Array UInt32) (base count sym : Nat) : Bool :=
+      let packed := tab.getD (base + sym) 0
+      let len := (packed >>> 16).toNat
+      if len == 0 then true
+      else
+        let code := (packed &&& 0xFFFF).toUInt64
+        let w := (BitWriter.empty.writeBitsMSB code len).writeBitsMSB 0 16
+        let outBa := w.toByteArray
+        let r0 : BitReader := { slice := { ba := outBa, off := 0, len := outBa.data.size }, bitOffset := 0 }
+        match readPackedVlc r0 tab base count with
+        | some (decSym, rEnd) => decSym == sym && rEnd.bitOffset == len
+        | none => false
+    cavlcCtChromaDc2x4Enc.size = 36 ∧
+    cavlcTz8Enc.size = 56 ∧
+    ([0, 4, 9, 17, 35].all fun s => testEntry cavlcCtChromaDc2x4Enc 0 36 s) = true ∧
+    ([0, 3, 7].all fun z => testEntry cavlcTz8Enc 0 8 z && testEntry cavlcTz8Enc (6 * 8) 2 (z % 2)) = true := by
+  decide
+
+set_option maxRecDepth 400000 in
+theorem cabacHigh444_ctxTables_and_init1024_valid :
+    cabacCbfBaseTable.size = 14 ∧
+    cabacSigBase.size = 14 ∧
+    cabacLastBase.size = 14 ∧
+    cabacLevelBase.size = 14 ∧
+    cabacLvlGt1CtxChromaDc.size = 8 ∧
+    cabacLvlGt1CtxChromaDc.getD 7 0 = 8 ∧
+    cabacCbfBaseTable.getD 5 0 = 1012 ∧
+    cabacCbfBaseTable.getD 9 0 = 1016 ∧
+    cabacCbfBaseTable.getD 13 0 = 1020 ∧
+    cabacInitI1012.size = 12 ∧
+    cabacInitPB1012_0.size = 12 ∧
+    cabacInitPB1012_1.size = 12 ∧
+    cabacInitPB1012_2.size = 12 ∧
+    mapCabacHighCtxToBase 460 = 85 ∧
+    mapCabacHighCtxToBase 472 = 85 ∧
+    mapCabacHighCtxToBase 660 = 402 ∧
+    mapCabacHighCtxToBase 718 = 402 ∧
+    mapCabacHighCtxToBase 952 = 227 ∧
+    mapCabacHighCtxToBase 982 = 227 ∧
+    ([460, 472, 484, 572, 660, 708, 718, 766, 776, 864, 952, 982, 1011].all fun idx =>
+      mapCabacHighCtxToBase idx < 460) = true := by
+  decide
+
+theorem cabacCbfCtx_8x8_cat5_9_13_non8x8_neighbor_exact :
+    let z16 := Array.replicate 16 0
+    let o16 := Array.replicate 16 1
+    let zc := #[z16, z16]
+    let oc := #[o16, o16]
+    let ipcmZero : MbGridRecord := {
+      inSlice := true, isIntra := true, isIpcm := true, is8x8Dct := false,
+      lumaCbfCabac := z16, chromaCbfCabac := zc
+    }
+    let intra4x4One : MbGridRecord := {
+      inSlice := true, isIntra := true, isIpcm := false, is8x8Dct := false,
+      lumaCbfCabac := o16, chromaCbfCabac := oc
+    }
+    let inter8x8One : MbGridRecord := {
+      inSlice := true, isIntra := false, is8x8Dct := true,
+      lumaCbfCabac := o16, chromaCbfCabac := oc
+    }
+    let g1 := ((MbGrid.init 2 2).setMb 0 1 ipcmZero).setMb 1 0 intra4x4One
+    let g2 := ((MbGrid.init 2 2).setMb 0 1 intra4x4One).setMb 1 0 inter8x8One
+    cabacCbfCtx g1 1 1 true 5 z16 zc 0 = 1013 ∧
+    cabacCbfCtx g1 1 1 true 9 z16 zc 0 = 1017 ∧
+    cabacCbfCtx g1 1 1 true 13 z16 zc 0 = 1021 ∧
+    cabacCbfCtx g2 1 1 false 5 z16 zc 0 = 1014 ∧
+    cabacCbfCtx g2 1 1 false 9 z16 zc 0 = 1018 ∧
+    cabacCbfCtx g2 1 1 false 13 z16 zc 0 = 1022 := by
   decide
 
 end LeanAV.H264EntropyProofs

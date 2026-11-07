@@ -345,6 +345,55 @@ class H264SyntaxDifferentialTests(unittest.TestCase):
                 self.assertEqual(f["data_bit_offset"] % 8, 0)
                 self.assertGreaterEqual(f["data_bit_offset"], 32)
 
+    def test_high10_high422_and_high444_10bit_mp4_and_annexb_match_ffprobe(self):
+        cases = [
+            ("high10", "yuv420p10le", 110, 1, 10, "8x8dct=1:cqm=jvt:bframes=1"),
+            ("high422", "yuv422p10le", 122, 2, 10, "8x8dct=1:cqm=jvt:bframes=1"),
+            ("high444", "yuv444p10le", 244, 3, 10, "8x8dct=1:cqm=jvt:bframes=1"),
+            ("high444", "yuv444p10le", 244, 3, 10, "qp=0"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            for idx, (prof_name, pix_fmt, prof_idc, ch_idc, bd, x264_params) in enumerate(cases):
+                with self.subTest(prof=prof_name, pix_fmt=pix_fmt, params=x264_params):
+                    mp4 = Path(td) / f"case_{idx}_{prof_name}.mp4"
+                    annexb = Path(td) / f"case_{idx}_{prof_name}.h264"
+                    extra = [
+                        "-c:v", "libx264",
+                        "-profile:v", prof_name,
+                        "-pix_fmt", pix_fmt,
+                        "-x264-params", x264_params,
+                    ]
+                    self.encode_sample(mp4, *extra)
+                    subprocess.run(
+                        [
+                            self.ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                            "-i", str(mp4), "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", str(annexb),
+                        ],
+                        check=True,
+                        timeout=30,
+                    )
+                    stream, frames = self.ffprobe_stream_and_frames(mp4)
+                    for p in (mp4, annexb):
+                        res = self.run_probe(p)
+                        self.assertEqual(res.returncode, 0, res.stderr)
+                        got = json.loads(res.stdout)
+                        self.assertTrue(got["ok"])
+                        self.assertEqual(got["profile_idc"], prof_idc)
+                        self.assertEqual(got["chroma_format_idc"], ch_idc)
+                        self.assertEqual(got["bit_depth_luma"], bd)
+                        self.assertEqual(got["bit_depth_chroma"], bd)
+                        self.assertEqual(got["width"], stream["width"])
+                        self.assertEqual(got["height"], stream["height"])
+                        self.assertTrue(got["avcc_roundtrip_ok"])
+                        self.assertTrue(got["framing_roundtrip_ok"])
+                        self.assertTrue(got["slice_header_roundtrip_ok"])
+                        self.assertTrue(got["slice_header_bit_offset_ok"])
+                        self.assertTrue(got["cabac_prefix_rbsp_exact_ok"])
+                        self.assertEqual(len(got["frames"]), len(frames))
+                        if x264_params == "qp=0":
+                            self.assertTrue(got["qpprime_bypass"])
+                            self.assertTrue(all(f["slice_qp_y"] == -12 for f in got["frames"]))
+
     def test_corrupt_or_truncated_streams_fail_closed(self):
         with tempfile.TemporaryDirectory() as td:
             empty = Path(td) / "empty.h264"
