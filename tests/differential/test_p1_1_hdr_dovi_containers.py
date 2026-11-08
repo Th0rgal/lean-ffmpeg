@@ -181,7 +181,7 @@ def main (args : List String) : IO UInt32 := do
     let nal := encodeHevcRpuNal rpuHex
     require (decodeHevcRpuNal nal == some rpuHex) "105B HEVC RPU NAL roundtrip failed"
     let emdf := packDoviEmdf rpuHex
-    require (emdf.length == 112) "EMDF length != 112"
+    require (emdf.length == 113) "EMDF length != 113"
     require (unpackDoviEmdf emdf == some rpuHex) "105B EMDF roundtrip failed"
     let badRpu := rpuHex.take 103 ++ [0x00, 0x80]
     require (!hevcRpuPayloadOk (0x19 :: badRpu)) "corrupted RPU CRC32 accepted"
@@ -332,6 +332,7 @@ class P11HdrDoviContainerTests(unittest.TestCase):
                 FFMPEG, "-v", "error", "-y",
                 "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=0.2",
                 "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000:duration=0.2",
+                "-vf", "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
                 "-c:v", "libaom-av1", "-cpu-used", "8", "-pix_fmt", "yuv420p10le",
                 "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
                 "-c:a", "libopus", "-b:a", "64k", "-strict", "-2",

@@ -11313,6 +11313,38 @@ def p11U32At (ba : ByteArray) (off : Nat) : Nat :=
     ((ba.get! (off + 2)).toNat <<< 8) ||| (ba.get! (off + 3)).toNat
   else 0
 
+def p11ParseAv1CSeqColor (cfg : ByteArray) : Option SequenceColorInfo := do
+  guard (cfg.size ≥ 4 && cfg.get! 0 == 0x81 && (cfg.get! 3 &&& 0xE0) == 0)
+  let mut p := 4
+  let mut found : Option SequenceColorInfo := none
+  for _ in [:cfg.size] do
+    if p < cfg.size then
+      let hdr := (cfg.get! p).toNat
+      p := p + 1
+      guard (hdr / 128 == 0 && hdr % 2 == 0 && hdr / 2 % 2 == 1)
+      let kind := hdr / 8 % 16
+      if hdr / 4 % 2 == 1 then
+        guard (p < cfg.size && (cfg.get! p &&& 7) == 0)
+        if kind == 1 then guard (cfg.get! p == 0)
+        p := p + 1
+      let mut size := 0
+      let mut done := false
+      for j in [:8] do
+        if !done then
+          guard (p < cfg.size)
+          let b := (cfg.get! p).toNat
+          p := p + 1
+          size := size + (b % 128) * 2 ^ (7 * j)
+          done := b < 128
+      guard (done && size ≤ cfg.size - p)
+      if kind == 1 then
+        guard found.isNone
+        let rbsp := cfg.extract p (p + size)
+        let (info, _) ← av1SequenceColors (BitReader.ofSlice (ByteSlice.ofByteArray rbsp))
+        found := some info
+      p := p + size
+  found
+
 def p11ExtractCrossMeta (stsdBox : ByteArray) (codecId : String) :
     Option (ByteArray × Nat × Nat × MkvHdrColour × MasteringDisplaySpec × DoviConfigRecord × Bool) := do
   let tops ← p11Mp4Kids stsdBox 0
@@ -11380,13 +11412,27 @@ def p11ExtractCrossMeta (stsdBox : ByteArray) (codecId : String) :
     matrixCoefficients := 2, transferCharacteristics := 2, primaries := 2
     maxCll := 0, maxFall := 0, hasMastering := false }
   let colrBox? := p11FindChildBody kids "colr"
+  let av1SeqCol? := if codecId == "V_AV1" then p11ParseAv1CSeqColor privBytes else none
   let colour1 :=
     match colrBox?.bind (fun b => decodeColrNclxBoxSpec b.toList) with
-    | some c => { colour0 with
-        matrixCoefficients := c.matrixCoefficients.toNat
-        transferCharacteristics := c.transferCharacteristics.toNat
-        primaries := c.colourPrimaries.toNat }
-    | none => colour0
+    | some c =>
+      let p0 := c.colourPrimaries.toNat
+      let t0 := c.transferCharacteristics.toNat
+      let m0 := c.matrixCoefficients.toNat
+      match av1SeqCol? with
+      | some sc => { colour0 with
+          primaries := if p0 == 0 || p0 == 2 then sc.primaries.toNat else p0
+          transferCharacteristics := if t0 == 0 || t0 == 2 then sc.transfer.toNat else t0
+          matrixCoefficients := if m0 == 0 || m0 == 2 then sc.matrix.toNat else m0 }
+      | none => { colour0 with
+          matrixCoefficients := m0, transferCharacteristics := t0, primaries := p0 }
+    | none =>
+      match av1SeqCol? with
+      | some sc => { colour0 with
+          matrixCoefficients := sc.matrix.toNat
+          transferCharacteristics := sc.transfer.toNat
+          primaries := sc.primaries.toNat }
+      | none => colour0
   let clliBox? := p11FindChildBody kids "clli"
   let colour :=
     match clliBox?.bind (fun b => decodeClliBoxSpec b.toList) with
@@ -11653,10 +11699,12 @@ def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
   let p3 : UInt8 := ((h >>> 8) &&& 0xFF).toUInt8
   let p4 : UInt8 := (h &&& 0xFF).toUInt8
   let rec go (carry : UInt8) : List UInt8 → List UInt8
-    | [] => [(carry <<< 4), 0x00, 0x80]
+    | [] =>
+      let t24 : UInt32 := ((carry.toUInt32 &&& 0x0F) <<< 20) ||| (0x02004 : UInt32)
+      [((t24 >>> 16) &&& 0xFF).toUInt8, ((t24 >>> 8) &&& 0xFF).toUInt8, (t24 &&& 0xFF).toUInt8, 0x80]
     | b :: bs => ((carry <<< 4) ||| (b >>> 4)) :: go (b &&& 0x0F) bs
   match rpu with
-  | [] => [p0, p1, p2, p3, p4, 0x00, 0x80]
+  | [] => [p0, p1, p2, p3, p4 ||| 0x00, 0x20, 0x04, 0x80]
   | b0 :: bs =>
     let p4' : UInt8 := (p4 &&& (0xF0 : UInt8)) ||| (b0 >>> (4 : UInt8))
     p0 :: p1 :: p2 :: p3 :: p4' :: go (b0 &&& (0x0F : UInt8)) bs
@@ -11669,14 +11717,21 @@ def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) :=
     if (top >>> 13) != (0x01BE6841 : UInt64) || ((top >>> 4) &&& 1) != 0 then none
     else
       let n := ((top >>> 5) &&& 0xFF).toNat
-      if emdf.length != n + 7 then none
+      if emdf.length != n + 8 then none
       else
-        let rec pair : Nat → List UInt8 → List UInt8
-          | 0, _ => []
-          | k + 1, x :: y :: rest => (((x &&& 0x0F) <<< 4) ||| (y >>> 4)) :: pair k (y :: rest)
-          | _, _ => []
-        let out := pair n (e4 :: eTail)
-        if out.length == n then some out else none
+        let rec extractBytes : Nat → List UInt8 → List UInt8 × List UInt8
+          | 0, rest => ([], rest)
+          | k + 1, x :: y :: rest =>
+            let (out, rem) := extractBytes k (y :: rest)
+            ((((x &&& 0x0F) <<< 4) ||| (y >>> 4)) :: out, rem)
+          | _, rest => ([], rest)
+        match extractBytes n (e4 :: eTail) with
+        | (out, [t0, t1, t2, 0x80]) =>
+          let t24 := ((t0.toNat &&& 0x0F) <<< 16) ||| (t1.toNat <<< 8) ||| t2.toNat
+          let payloadId := (t24 >>> 15) &&& 0x1F
+          let prot := (t24 >>> 3) &&& 0xFFF
+          if out.length == n && payloadId == 0 && prot == 0x400 then some out else none
+        | _ => none
   | _ => none
 
 theorem p11_hdr_dovi_container_roundtrip :

@@ -2790,7 +2790,7 @@ private def reconstructChromaMbHbd
       let dcRast :=
         if (mb.cbp &&& 0x30) != 0 then
           if chType == 2 then chromaDcScan2x4ToRaster (mb.chromaDc.getD plane #[])
-          else LeanAV.H264Entropy.zigzagToRaster4x4 (mb.chromaDc.getD plane #[])
+          else (mb.chromaDc.getD plane #[]).extract 0 4
         else Array.replicate blocks 0
       let acRast :=
         if (mb.cbp &&& 0x20) != 0 then
@@ -2807,7 +2807,7 @@ private def reconstructChromaMbHbd
           pred.getD (((y / 4) * 4 + k.val / 4) * w + ((x / 4) * 4 + k.val % 4)) 0
         (applyDpcmBlock p16 r16 dpcmMode 4 bitDepth).getD sub 0
   else if chType == 1 then
-    let dc4 := if (mb.cbp &&& 0x30) != 0 then LeanAV.H264Entropy.zigzagToRaster4x4 (mb.chromaDc.getD plane #[]) else Array.replicate 4 0
+    let dc4 := if (mb.cbp &&& 0x30) != 0 then (mb.chromaDc.getD plane #[]).extract 0 4 else Array.replicate 4 0
     let ac4 := if (mb.cbp &&& 0x20) != 0 then Array.ofFn fun b : Fin 4 => ac15ToRaster16 (mb.chromaAc.getD (plane * 4 + b.val) #[])
                else Array.replicate 4 (Array.replicate 16 0)
     reconstructChroma420Hbd pred dc4 ac4 qpC bitDepth w4
@@ -3913,12 +3913,12 @@ private def encodeChromaPlane420Or422
       if k.val == 0 then 0 else quantCoeff4x4 (coeff16.getD k.val 0) qpC (k.val / 4) (k.val % 4) true 16
     acRasters := acRasters.set! blk q16
   let dcScan :=
-    if chType == 1 then LeanAV.H264Entropy.rasterToZigzag4x4 (chromaDcQuant420Hbd rawDc qpC true 16)
+    if chType == 1 then chromaDcQuant420Hbd rawDc qpC true 16
     else chromaDcRasterToScan2x4 (chromaDcQuant422 rawDc qpC true 16)
   let acScans := Array.ofFn fun b : Fin nBlks => raster16ToAc15Scan (acRasters.getD b.val #[])
   let recSamples :=
     if chType == 1 then
-      reconstructChroma420Hbd pred (LeanAV.H264Entropy.zigzagToRaster4x4 dcScan) acRasters qpC bitC
+      reconstructChroma420Hbd pred dcScan acRasters qpC bitC
     else
       reconstructChroma422Hbd pred (chromaDcScan2x4ToRaster dcScan) acRasters qpC bitC
   return (dcScan, acScans, writeMbRect recP cX cY cW recSamples)
