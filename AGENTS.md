@@ -4,8 +4,8 @@
 
 `lean-ffmpeg` (`LeanAV`) is a formally verified Lean 4 (`v4.35.0`) multimedia pipeline and `ffmpeg`-compatible CLI (`lffmpeg`). The binary is standalone: every accepted route runs in-process, and anything outside that set fails closed. There is no child process and no external `ffmpeg` / `ffprobe` override environment variable.
 
-1. **38 Formal Lean 4 Modules (`LeanAV/*.lean`, `100,211` LOC)**:
-   - **`25,029` declarations** (verified under `v4.35.0`) with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
+1. **38 Formal Lean 4 Modules (`LeanAV/*.lean`, `100,423` LOC)**:
+   - **`25,053` declarations** (verified under `v4.35.0`) with **`0 sorryAx`** and **`0` custom axioms** (`scripts/check_axioms.lean`).
    - **`892 / 892` `non_vacuous_and_tight` specifications** audited by `turbo-lean --json audit-spec` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, v2.1; `0 vacuous`, `0 trivial`, `0 shadowed`): `AacLcProofs` (84), `H264IntraTransformProofs` (82), `H264InterDeblockDpbProofs` (79), `Format` (70), `Ffv1Proofs` (60), `NativeKernels` (59), `Video` (47), `LavfiGraphProofs` (40), `Encoder` (37), `Audio` (35), `H264EntropyProofs` (35), `Scale` (34), `Av1MainProofs` (33), `H264SyntaxProofs` (32), `HevcMainProofs` (31), `Bitstream` (27), `Spec` (23), `PlanIR` (22), `Core` (14), `Domain` (9), `InprocTranscode` (8), `Cli` (7), `Filter` (7), `Md5` (7), `LavfiGraph` (6), `UnifiedPipeline` (4) (plus the 12 implementation/orchestration modules `AacLc`, `Av1Main`, `Ffv1`, `Ffv1Container`, `Ffv1Pipeline`, `H264Entropy`, `H264InterDeblockDpb`, `H264IntraTransform`, `H264Syntax`, `HevcMain`, `IO`, and `Main`).
    - Native routes, all with zero subprocesses: unified multi-stream `-i ... -c:v/-c:a` demux -> `LavfiGraph` -> encode -> mux pipeline (`unified_media_pipeline` in `LeanAV/UnifiedPipeline.lean`), FFV1 v3, PNG + Zlib/DEFLATE, FLAC, H.264/AVC syntax + CAVLC/CABAC + intra/inter/deblock/DPB (including High / High 10 / High 4:2:2 / High 4:4:4 Predictive 8/10/12-bit, custom 4x4/8x8 scaling matrices, and `qp=0` lossless), AAC-LC, Opus (`Ogg/Opus` and `MP4/MOV`, RFC 6716 CELT FB silence `0xFF 0xFE` with fail-closed rejection of compressed non-silent packets pending P1.2), Apple ProRes 422 (`apcn` in `MP4/MOV`), MPEG-TS (`PAT/PMT/PES`), HEVC Main / Main 10 / RExt 8/10/12-bit 4:2:0/4:2:2/4:4:4 (`-i` / `-c:v hevc` and `hevc-probe`, plus HDR10 `mdcv`/`clli` SEI & Dolby Vision `UNSPEC62` RPU passthrough), AV1 Main / High / Professional 8/10/12-bit 4:2:0/4:2:2/4:4:4 with film-grain synthesis (`-i` / `-c:v av1` and `av1-probe`, plus ITU-T T.35 Dolby Vision EMDF RPU passthrough), lavfi DAG (`color`, `testsrc`, `nullsrc`, `overlay`, `split`, `hstack`, `vstack`, `sine`, `anullsrc`, `amix`, `amerge`, `asplit`, `md5`, `framemd5`), and stream copy for MP4/MOV/MKV/WebM/WAV/FLAC/IVF. High-bit-depth pixel formats (`yuv420p10le`, `p010le`, `yuv422p10le`, `yuv444p10le`, `yuv420p12le`, `yuv422p12le`, `yuv444p12le`, `gbrp10le`, `rgba64le`), Bayer/Floyd-Steinberg dithering, scale, and BT.2020 PQ/HLG `colorspace=bt709` / tonemap stay in-process. Out-of-scope codecs, profiles, GPU, network protocols, and rejected filter graphs are `BackendTier.unsupported` (`delegatedContainer := false`, `fallbackAllowed := false`) and exit non-zero with no output file. CLI classification lives in `LeanAV/PlanIR.lean`, `LeanAV/UnifiedPipeline.lean`, and `LeanAV/Main.lean`.
 2. **21 Direct Lean 4 `@[export]` C-ABI Entrypoints (`leanav_lean_*`)**:
@@ -41,7 +41,7 @@ python3 scripts/build_turbo.py
 ./.lake/build/bin/lffmpeg verify-ffi
 ./.lake/build/bin/lffmpeg verify-kernels
 
-# 3. Verify 0 sorryAx and 0 custom axioms across all 25,029 LeanAV.* declarations
+# 3. Verify 0 sorryAx and 0 custom axioms across all 25,053 LeanAV.* declarations
 lean scripts/check_axioms.lean
 
 # 4. Audit all 38 formal modules with turbo-lean (892/892 non_vacuous_and_tight)
@@ -65,5 +65,5 @@ The MPEG options audit on 2026-10-27 under Lean v4.35.0 counted 8,897 declaratio
 with zero sorryAx/custom axioms; all 264 specifications remained tight.
 The M3-D post-deletion measurement counted 22,820 declarations and 807/807 tight specs;
 the P1.0 unified-pipeline measurement counted 23,201 declarations and 812/812 tight specs;
-the current P1.1 HDR/high-bit-depth measurement is 25,029 declarations and 892/892 tight specs
+the current P1.1 HDR/high-bit-depth measurement is 25,053 declarations and 892/892 tight specs
 (see `docs/VERIFICATION_APPENDIX.md`).

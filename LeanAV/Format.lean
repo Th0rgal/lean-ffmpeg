@@ -11213,6 +11213,13 @@ def p11RemuxHdrBoxes (inFmt outFmt : ContainerFormat) (boxes : List (List UInt8)
   if p11CrossContainerRemux inFmt outFmt then some boxes else none
 
 /-- Real MP4↔MKV/WebM HDR10/HLG/DoVi + AAC/Opus cross-container remux (distinct from `nativeRemuxBytes`). -/
+structure P11CrossSample where
+  data    : ByteArray
+  dur     : Nat
+  cttsOff : Int := 0
+  isSync  : Bool := true
+  deriving Inhabited
+
 structure P11CrossRemuxTrack where
   kind : NativeStreamKind
   codecId : String
@@ -11226,7 +11233,8 @@ structure P11CrossRemuxTrack where
   mastering : MasteringDisplaySpec
   dovi : DoviConfigRecord
   hasDovi : Bool
-  samples : Array (ByteArray × Nat × Bool)
+  preRoll : Int := 0
+  samples : Array P11CrossSample
   deriving Inhabited
 
 def p11CrossRemuxTrackSafe (t : P11CrossRemuxTrack) : Bool :=
@@ -11332,18 +11340,110 @@ def p11BuildCrossStsd (t : P11CrossRemuxTrack) : ByteArray :=
       return a ++ esds
     buildMp4aStsdBoxFromEntry (wrapMp4Box 'm' 'p' '4' 'a' ase)
 
+def p11BuildElstEdtsBox (segDurMs preRollTicks : Nat) : ByteArray :=
+  if preRollTicks == 0 then ByteArray.empty
+  else if segDurMs ≥ 4294967296 || preRollTicks ≥ 4294967296 then
+    let elst0 := pushU32BE (pushU32BE ByteArray.empty 0x01000000) 1
+    let elst1 := pushU64BE (pushU64BE elst0 segDurMs.toUInt64) preRollTicks.toUInt64
+    let elst := pushU32BE elst1 0x00010000
+    wrapMp4Box 'e' 'd' 't' 's' (wrapMp4Box 'e' 'l' 's' 't' elst)
+  else
+    let elst0 := pushU32BE (pushU32BE ByteArray.empty 0) 1
+    let elst1 := pushU32BE (pushU32BE elst0 segDurMs.toUInt32) preRollTicks.toUInt32
+    let elst := pushU32BE elst1 0x00010000
+    wrapMp4Box 'e' 'd' 't' 's' (wrapMp4Box 'e' 'l' 's' 't' elst)
+
 def p11MuxMp4FromCrossTracks (tracks : Array P11CrossRemuxTrack) : Option ByteArray := Id.run do
   if tracks.isEmpty || tracks.any (fun t => !p11CrossRemuxTrackSafe t) then return none
-  let synth : Array SynthMp4Track := tracks.map fun t => {
-    kind := t.kind
-    timescale := if t.timescale == 0 then 1000 else t.timescale
-    width := t.width
-    height := t.height
-    stsdBox := p11BuildCrossStsd t
-    samples := t.samples.map fun (data, dur, sync) =>
-      { data := data, dur := if dur == 0 then 1 else dur, cttsOff := 0, isSync := sync }
-  }
-  muxSynthMp4Container synth
+  let mut synth : Array SynthMp4Track := Array.mkEmpty tracks.size
+  let mut natives : Array NativeMp4Track := Array.mkEmpty tracks.size
+  for t in tracks do
+    if t.preRoll < 0 then return none
+    let ts := if t.timescale == 0 then 1000 else t.timescale
+    let st : SynthMp4Track := {
+      kind := t.kind
+      timescale := ts
+      width := t.width
+      height := t.height
+      stsdBox := p11BuildCrossStsd t
+      samples := t.samples.map fun s =>
+        { data := s.data, dur := if s.dur == 0 then 1 else s.dur, cttsOff := s.cttsOff, isSync := s.isSync }
+    }
+    if !synthMp4TrackGateSpec.gate st then return none
+    let preTicks := t.preRoll.toNat
+    let (_, maxCompEnd) := st.samples.foldl
+      (fun (dts, mx) s =>
+        let ce := dts + s.cttsOff + Int.ofNat s.dur
+        (dts + Int.ofNat s.dur, if ce > mx then ce else mx))
+      ((0 : Int), (0 : Int))
+    let endTicks := maxCompEnd.toNat
+    let visTicks := if endTicks > preTicks then endTicks - preTicks else Nat.max 1 endTicks
+    let segDurMs := Nat.max 1 ((visTicks * 1000 + ts - 1) / ts)
+    let edts? :=
+      if preTicks == 0 then none
+      else some (p11BuildElstEdtsBox segDurMs preTicks)
+    let nt0 := synthTrackToNative st
+    synth := synth.push st
+    natives := natives.push { nt0 with origEdtsBox? := edts?, origPreRoll := t.preRoll }
+  let ftyp := Id.run do
+    let mut b := ByteArray.emptyWithCapacity 28
+    b := pushU32BE b 28
+    b := pushFourCC b 'f' 't' 'y' 'p'
+    b := pushFourCC b 'i' 's' 'o' 'm'
+    b := pushU32BE b 512
+    b := pushFourCC b 'i' 's' 'o' '2'
+    b := pushFourCC b 'a' 'v' 'c' '1'
+    b := pushFourCC b 'm' 'p' '4' '1'
+    return b
+  let mut prepared : Array NativePreparedMp4Track := #[]
+  let mut maxMovieDurMs : Nat := 0
+  let mut totalMdatPayload : Nat := 0
+  for trk in natives do
+    let some prep := prepareNativeMp4Track trk 1000 false 0 0 0 | return none
+    if prep.movieDurMs > maxMovieDurMs then maxMovieDurMs := prep.movieDurMs
+    totalMdatPayload := totalMdatPayload + prep.payloadBytes
+    prepared := prepared.push prep
+  if maxMovieDurMs == 0 then maxMovieDurMs := 1
+  let mvhdBox := Id.run do
+    let mut b := ByteArray.emptyWithCapacity 100
+    b := pushU32BE b 0
+    b := pushU32BE b 0
+    b := pushU32BE b 0
+    b := pushU32BE b 1000
+    b := pushU32BE b maxMovieDurMs.toUInt32
+    b := pushU32BE b 0x00010000
+    b := pushU16BE b 0x0100
+    b := pushZeros b 10
+    b := pushU32BE b 0x00010000
+    b := pushZeros b 12
+    b := pushU32BE b 0x00010000
+    b := pushZeros b 12
+    b := pushU32BE b 0x40000000
+    b := pushZeros b 24
+    b := pushU32BE b (prepared.size + 1).toUInt32
+    return wrapMp4Box 'm' 'v' 'h' 'd' b
+  let dummyTraksSize : Nat := Id.run do
+    let mut sum := 0
+    for i in [:prepared.size] do
+      sum := sum + (assembleNativeMp4Trak prepared[i]! (i + 1) 0 false).size
+    return sum
+  let moovSize32 := 8 + mvhdBox.size + dummyTraksSize
+  let mdatHeaderLen := 8
+  let mut dataCursor := ftyp.size + moovSize32 + mdatHeaderLen
+  let mut traksBytes := ByteArray.emptyWithCapacity dummyTraksSize
+  for i in [:prepared.size] do
+    let prep := prepared[i]!
+    traksBytes := traksBytes ++ assembleNativeMp4Trak prep (i + 1) dataCursor false
+    dataCursor := dataCursor + prep.payloadBytes
+  let moovBox := wrapMp4Box 'm' 'o' 'o' 'v' (mvhdBox ++ traksBytes)
+  let mut out := ByteArray.emptyWithCapacity (ftyp.size + moovBox.size + mdatHeaderLen + totalMdatPayload)
+  out := out ++ ftyp ++ moovBox
+  out := pushU32BE out (8 + totalMdatPayload).toUInt32
+  out := pushFourCC out 'm' 'd' 'a' 't'
+  for trk in synth do
+    for smp in trk.samples do
+      out := out ++ smp.data
+  return some out
 
 def p11Mp4Kids (box : ByteArray) (skip : Nat) : Option (Array Mp4BoxView) := do
   if box.size < skip then none
@@ -11461,57 +11561,99 @@ def p11ExtractCrossMeta (stsdBox : ByteArray) (codecId : String) :
     maxCll := 0, maxFall := 0, hasMastering := false }
   let colrBox? := p11FindChildBody kids "colr"
   let av1SeqCol? := if codecId == "V_AV1" then p11ParseAv1CSeqColor privBytes else none
-  let colour1 :=
-    match colrBox?.bind (fun b => decodeColrNclxBoxSpec b.toList) with
-    | some c =>
-      let p0 := c.colourPrimaries.toNat
-      let t0 := c.transferCharacteristics.toNat
-      let m0 := c.matrixCoefficients.toNat
-      match av1SeqCol? with
-      | some sc => { colour0 with
-          primaries := if p0 == 0 || p0 == 2 then sc.primaries.toNat else p0
-          transferCharacteristics := if t0 == 0 || t0 == 2 then sc.transfer.toNat else t0
-          matrixCoefficients := if m0 == 0 || m0 == 2 then sc.matrix.toNat else m0 }
-      | none => { colour0 with
-          matrixCoefficients := m0, transferCharacteristics := t0, primaries := p0 }
+  let colour1 ←
+    match colrBox? with
+    | some b =>
+      match decodeColrNclxBoxSpec b.toList with
+      | some c =>
+        let p0 := c.colourPrimaries.toNat
+        let t0 := c.transferCharacteristics.toNat
+        let m0 := c.matrixCoefficients.toNat
+        some <| match av1SeqCol? with
+          | some sc => { colour0 with
+              primaries := if p0 == 0 || p0 == 2 then sc.primaries.toNat else p0
+              transferCharacteristics := if t0 == 0 || t0 == 2 then sc.transfer.toNat else t0
+              matrixCoefficients := if m0 == 0 || m0 == 2 then sc.matrix.toNat else m0 }
+          | none => { colour0 with
+              matrixCoefficients := m0, transferCharacteristics := t0, primaries := p0 }
+      | none => none
     | none =>
-      match av1SeqCol? with
-      | some sc => { colour0 with
-          matrixCoefficients := sc.matrix.toNat
-          transferCharacteristics := sc.transfer.toNat
-          primaries := sc.primaries.toNat }
-      | none => colour0
+      some <| match av1SeqCol? with
+        | some sc => { colour0 with
+            matrixCoefficients := sc.matrix.toNat
+            transferCharacteristics := sc.transfer.toNat
+            primaries := sc.primaries.toNat }
+        | none => colour0
   let clliBox? := p11FindChildBody kids "clli"
-  let colour :=
-    match clliBox?.bind (fun b => decodeClliBoxSpec b.toList) with
-    | some c => { colour1 with
-        maxCll := c.maxContentLightLevel.toNat
-        maxFall := c.maxPicAverageLightLevel.toNat }
-    | none => colour1
+  let colour ←
+    match clliBox? with
+    | none => some colour1
+    | some b =>
+      match decodeClliBoxSpec b.toList with
+      | some c => some { colour1 with
+          maxCll := c.maxContentLightLevel.toNat
+          maxFall := c.maxPicAverageLightLevel.toNat }
+      | none => none
   let mdcvBox? := p11FindChildBody kids "mdcv"
-  let mastering :=
-    match mdcvBox?.bind (fun b => decodeMdcvBoxFull b.toList) with
-    | some m => m
-    | none => dciP3D65Mastering
+  let mastering ←
+    match mdcvBox? with
+    | none => some dciP3D65Mastering
+    | some b => decodeMdcvBoxFull b.toList
   let colourM := { colour with hasMastering := mdcvBox?.isSome == true }
-  let doviBox? := kids.find? (fun b => b.fourcc == "dvcC" || b.fourcc == "dvvC")
-  let dovi :=
-    match doviBox?.bind (fun b => decodeDoviConfigBody b.bodySlice.toByteArray.toList) with
-    | some r => r
-    | none => doviProfile8
+  let doviBox? := kids.find? (fun b => b.fourcc == "dvcC" || b.fourcc == "dvvC" || b.fourcc == "dvwC")
+  let dovi ←
+    match doviBox? with
+    | none => some doviProfile8
+    | some b =>
+      match decodeDoviConfigBody b.bodySlice.toByteArray.toList with
+      | some r => if doviConfigGateSpec.gate r then some r else none
+      | none => none
   let ch := if codecId == "A_AAC" || codecId == "A_OPUS" then p11U16At entry.bodySlice.toByteArray 16 else 0
   let rate16 := if codecId == "A_AAC" || codecId == "A_OPUS" then p11U32At entry.bodySlice.toByteArray 24 >>> 16 else 0
   some (privBytes, ch, rate16, colourM, mastering, dovi, doviBox?.isSome == true)
+
+def p11ValidMp4Edts (edtsBox? : Option ByteArray) : Bool :=
+  match edtsBox? with
+  | none => true
+  | some edtsBox => Id.run do
+    let some topArr := mp4SubBoxesExact (ByteSlice.ofByteArray edtsBox) | return false
+    if topArr.size != 1 || (topArr[0]!).fourcc != "edts" then return false
+    let some kids := mp4SubBoxesExact (topArr[0]!).bodySlice | return false
+    let mut elstCnt := 0
+    for b in kids do
+      if b.fourcc == "elst" then
+        elstCnt := elstCnt + 1
+        if b.bodySlice.len < 8 then return false
+        let ver := b.bodySlice.getByteD 0 0
+        let cnt := (readU32BE b.bodySlice 4).toNat
+        let entrySz := if ver == 1 then 20 else 12
+        if ver > 1 || cnt != 1 || b.bodySlice.len != 8 + entrySz then return false
+        let (mt, rate) : Int × UInt32 :=
+          if ver == 1 then
+            let mtRaw := (readU64BE b.bodySlice 16).toNat
+            (if mtRaw ≥ 0x8000000000000000 then -1 else Int.ofNat mtRaw, readU32BE b.bodySlice 24)
+          else
+            let mtRaw := (readU32BE b.bodySlice 12).toNat
+            let mt0 : Int := if mtRaw ≥ 0x80000000 then (mtRaw : Int) - 4294967296 else Int.ofNat mtRaw
+            (mt0, readU32BE b.bodySlice 16)
+        if mt < 0 || rate != 0x00010000 then return false
+    return elstCnt == 1
 
 def p11DemuxMp4ToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTrack) := Id.run do
   let some parsed := demuxNativeMp4ContainerTracks (ByteSlice.ofByteArray bytes) | return none
   let mut out : Array P11CrossRemuxTrack := #[]
   for trk in parsed do
     if trk.kind == .video || trk.kind == .audio then
-      let mut samples : Array (ByteArray × Nat × Bool) := #[]
+      if trk.hasEncrypted || trk.multiStsd || !p11ValidMp4Edts trk.origEdtsBox? || trk.origPreRoll < 0 then
+        return none
+      let mut samples : Array P11CrossSample := #[]
       for smp in trk.samples do
         if smp.fileOff + smp.byteLen > bytes.size then return none
-        samples := samples.push (bytes.extract smp.fileOff (smp.fileOff + smp.byteLen), smp.dur, smp.isSync)
+        samples := samples.push {
+          data := bytes.extract smp.fileOff (smp.fileOff + smp.byteLen)
+          dur := smp.dur
+          cttsOff := smp.cttsOff
+          isSync := smp.isSync }
       let codecId :=
         if trk.stsdFourcc == "hvc1" || trk.stsdFourcc == "hev1" then "V_MPEGH/ISO/HEVC"
         else if trk.stsdFourcc == "av01" then "V_AV1"
@@ -11533,6 +11675,7 @@ def p11DemuxMp4ToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
         mastering := mastering
         dovi := dovi
         hasDovi := hasDovi
+        preRoll := if trk.origPreRoll > 0 then trk.origPreRoll else 0
         samples := samples
       }
   return if out.isEmpty then none else some out
@@ -11552,9 +11695,11 @@ def p11MuxMkvFromCrossTracks (docType : String) (tracks : Array P11CrossRemuxTra
     ⟨#[0x42, 0x87, 0x81, 0x04, 0x42, 0x85, 0x81, 0x02]⟩
   let infoBody := wrapEbmlElement 0x2AD7B1 ⟨#[0x0F, 0x42, 0x40]⟩
   let mut tracksBody := ByteArray.empty
-  let mut allPkts : Array (Nat × Nat × Bool × ByteArray) := #[]
+  let mut allPkts : Array (Int × Int × Nat × Bool × ByteArray) := #[]
   for idx in [:tracks.size] do
     let t := tracks[idx]!
+    if t.preRoll < 0 then return none
+    let tScale := if t.timescale == 0 then 1000 else t.timescale
     let tn := idx + 1
     let mut entry := ByteArray.empty
     entry := entry ++ wrapEbmlElement 0xD7 (p11EbmlUintBA tn)
@@ -11577,36 +11722,52 @@ def p11MuxMkvFromCrossTracks (docType : String) (tracks : Array P11CrossRemuxTra
           if t.codecPrivate.size >= 12 then
             ((t.codecPrivate.get! 11).toNat <<< 8) ||| (t.codecPrivate.get! 10).toNat
           else 312
-        let delayNs := preSkip * 1000000000 / 48000
+        let delayNs :=
+          if t.preRoll > 0 then t.preRoll.toNat * 1000000000 / tScale
+          else preSkip * 1000000000 / 48000
         entry := entry ++ wrapEbmlElement 0x56AA (p11EbmlUintBA delayNs) ++
           wrapEbmlElement 0x56BB (p11EbmlUintBA 80000000)
+      else if t.preRoll > 0 then
+        let delayNs := t.preRoll.toNat * 1000000000 / tScale
+        entry := entry ++ wrapEbmlElement 0x56AA (p11EbmlUintBA delayNs)
     entry := entry ++ wrapEbmlElement 0x63A2 t.codecPrivate
     if t.hasDovi then
       entry := entry ++ encodeMkvDoviBlockAdditionMapping (encodeDoviConfigBody t.dovi) (doviBoxFourcc t.dovi)
     tracksBody := tracksBody ++ wrapEbmlElement 0xAE entry
-    let tScale := if t.timescale == 0 then 1000 else t.timescale
-    let mut ticks : Nat := 0
-    for (data, dur, sync) in t.samples do
-      let tsMs := ticks * 1000 / tScale
-      allPkts := allPkts.push (tsMs, tn, sync, data)
-      ticks := ticks + (if dur == 0 then 1 else dur)
+    let mut ticks : Int := 0
+    let mut trkPkts : Array (Int × Int × Nat × Bool × ByteArray) := Array.mkEmpty t.samples.size
+    for s in t.samples do
+      let dtsMs : Int := ticks * 1000 / Int.ofNat tScale
+      let ptsTicks := if t.kind == .audio then ticks + s.cttsOff else ticks + s.cttsOff - t.preRoll
+      let tsMs : Int := ptsTicks * 1000 / Int.ofNat tScale
+      trkPkts := trkPkts.push (dtsMs, tsMs, tn, s.isSync, s.data)
+      ticks := ticks + Int.ofNat (if s.dur == 0 then 1 else s.dur)
+    allPkts := allPkts ++ trkPkts
   if allPkts.isEmpty then return none
-  let sortedPkts := allPkts.qsort (fun a b => if a.1 == b.1 then a.2.1 < b.2.1 else a.1 < b.1)
+  let sortedPkts := allPkts.qsort fun a b =>
+    if a.1 == b.1 then a.2.2.1 < b.2.2.1 else a.1 < b.1
   let mut clustersOut := ByteArray.empty
-  let mut curBase := (sortedPkts[0]!).1
+  let mut curBase : Int := 0
   let mut curBlocks := ByteArray.empty
-  for (tsMs, tn, sync, data) in sortedPkts do
-    if tsMs - curBase > 0x7FFF then
-      let clBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+  let mut started := false
+  for (_, tsMs, tn, sync, data) in sortedPkts do
+    let candBase : Int := if tsMs < 0 then 0 else tsMs
+    if !started then
+      curBase := candBase
+      started := true
+    else if tsMs - curBase > 0x7FFF || tsMs - curBase < -0x8000 then
+      let clBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase.toNat) ++ curBlocks
       clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 clBody
-      curBase := tsMs
+      curBase := candBase
       curBlocks := ByteArray.empty
-    let ts16 := (tsMs - curBase).toUInt16
+    let rel := tsMs - curBase
+    if curBase < 0 || rel > 0x7FFF || rel < -0x8000 then return none
+    let ts16 := (if rel < 0 then (0x10000 + rel).toNat else rel.toNat).toUInt16
     let flags : UInt8 := if sync then 0x80 else 0
     let blk := (ByteArray.empty.push (0x80 ||| tn).toUInt8) ++
       (pushU16BE ByteArray.empty ts16) ++ (ByteArray.empty.push flags) ++ data
     curBlocks := curBlocks ++ wrapEbmlElement 0xA3 blk
-  let finalBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+  let finalBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase.toNat) ++ curBlocks
   clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 finalBody
   let seg := wrapEbmlElement 0x1549A966 infoBody ++ wrapEbmlElement 0x1654AE6B tracksBody ++ clustersOut
   return some (wrapEbmlElement 0x1A45DFA3 ebmlBody ++ wrapEbmlElement 0x18538067 seg)
@@ -11632,6 +11793,7 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
       let mut mastering := dciP3D65Mastering
       let mut dovi := doviProfile8
       let mut hasDovi := false
+      let mut codecDelayNs : Nat := 0
       while pos < te.entryEnd && fuel > 0 do
         fuel := fuel - 1
         let some (fid, iw) := readEbmlElementId s pos | return none
@@ -11641,10 +11803,15 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
         let fEnd := fBody + fsz
         if fid == 0x63A2 then
           priv := bytes.extract fBody fEnd
+        else if fid == 0x56AA then
+          codecDelayNs := (readEbmlUintBE s fBody fsz).getD 0
         else if fid == 0x41E4 then
-          if let some r := decodeMkvDoviBlockAddList (bytes.extract pos fEnd).toList then
+          match decodeMkvDoviBlockAddList (bytes.extract pos fEnd).toList with
+          | some r =>
+            if !doviConfigGateSpec.gate r then return none
             dovi := r
             hasDovi := true
+          | none => return none
         else if fid == 0xE0 then
           let mut vp := fBody
           let mut vFuel := 64
@@ -11658,20 +11825,31 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
             if vid == 0xB0 then width := (readEbmlUintBE s vBody vsz).getD 0
             else if vid == 0xBA then height := (readEbmlUintBE s vBody vsz).getD 0
             else if vid == 0x55B0 then
-              if let some c := decodeMkvHdrColourList (bytes.extract vp vEnd).toList then
+              match decodeMkvHdrColourList (bytes.extract vp vEnd).toList with
+              | some c =>
+                if c.maxCll > 0 && c.maxFall > c.maxCll then return none
                 colour := c
+              | none => return none
               let mut cp := vBody
               let mut cFuel := 32
+              let mut sawMst := false
+              let mut mstOk := false
               while cp < vEnd && cFuel > 0 do
                 cFuel := cFuel - 1
-                let some (cid, ciw) := readEbmlElementId s cp | break
-                let some (csz, csw, cunk) := readEbmlElementSize s (cp + ciw) | break
-                if cunk || cp + ciw + csw + csz > vEnd then break
+                let some (cid, ciw) := readEbmlElementId s cp | return none
+                let some (csz, csw, cunk) := readEbmlElementSize s (cp + ciw) | return none
+                if cunk || cp + ciw + csw + csz > vEnd then return none
                 let cEnd := cp + ciw + csw + csz
                 if cid == 0x55D0 then
-                  if let some m := decodeMkvMasteringBodyList (bytes.extract (cp + ciw + csw) cEnd).toList then
+                  sawMst := true
+                  match decodeMkvMasteringBodyList (bytes.extract (cp + ciw + csw) cEnd).toList with
+                  | some m =>
                     mastering := m
+                    mstOk := true
+                  | none => return none
                 cp := cEnd
+              if cp != vEnd then return none
+              if colour.hasMastering && !(sawMst && mstOk) then return none
             vp := vEnd
         else if fid == 0xE1 then
           let mut ap := fBody
@@ -11697,20 +11875,50 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
               let flags := s.getByteD (it.blockOff + it.trackVintLen + 2) 0
               if (flags &&& 0x06) == 0 then
                 rawItems := rawItems.push (it.absTs, it.isKeyframe, bytes.extract (it.blockOff + hdrSkip) it.blockEnd)
-      let mut samples : Array (ByteArray × Nat × Bool) := #[]
-      for i in [:rawItems.size] do
-        let (ts0, sync, payload) := rawItems[i]!
-        let durMs : Nat :=
-          if i + 1 < rawItems.size then
-            let (ts1, _, _) := rawItems[i + 1]!
-            let d := ts1 - ts0
-            if d > 0 then (d.toNat * tsScale) / 1000000 else 40
-          else if rawItems.size >= 2 then
-            let (tsPrev, _, _) := rawItems[rawItems.size - 2]!
-            let d := ts0 - tsPrev
-            if d > 0 then (d.toNat * tsScale) / 1000000 else (if te.kind == .audio then 20 else 40)
-          else if te.kind == .audio then 20 else 40
-        samples := samples.push (payload, if durMs == 0 then 1 else durMs, sync)
+      if rawItems.isEmpty then continue
+      let ptsMsArr : Array Int := rawItems.map fun (ts0, _, _) =>
+        ts0 * Int.ofNat tsScale / 1000000
+      let minPtsMs := ptsMsArr.foldl (fun acc v => if v < acc then v else acc) (ptsMsArr[0]!)
+      if minPtsMs < -0x8000 then return none
+      let nRaw := rawItems.size
+      let stepDurMs : Nat := Id.run do
+        if nRaw >= 2 then
+          let sortedPts := ptsMsArr.qsort (fun a b => a < b)
+          let mut minPos : Nat := 0
+          for k in [:nRaw - 1] do
+            let d := sortedPts[k + 1]! - sortedPts[k]!
+            if d > 0 && (minPos == 0 || d.toNat < minPos) then minPos := d.toNat
+          if minPos > 0 then return minPos
+          let span := sortedPts[nRaw - 1]! - sortedPts[0]!
+          if span > 0 then return Nat.max 1 (span.toNat / (nRaw - 1))
+          return if te.kind == .audio then 20 else 40
+        else return if te.kind == .audio then 20 else 40
+      let mut dtsCur : Int := 0
+      let mut preRollTicks : Nat := 0
+      for i in [:nRaw] do
+        let relPts := ptsMsArr[i]!
+        let off0 := relPts - dtsCur
+        if off0 < -Int.ofNat preRollTicks then preRollTicks := (-off0).toNat
+        let dCur : Nat :=
+          if te.kind == .audio && i + 1 < nRaw && ptsMsArr[i + 1]! > relPts then
+            Nat.max 1 (ptsMsArr[i + 1]! - relPts).toNat
+          else Nat.max 1 stepDurMs
+        dtsCur := dtsCur + Int.ofNat dCur
+      let mut samples : Array P11CrossSample := Array.mkEmpty nRaw
+      let mut dtsOut : Int := 0
+      for i in [:nRaw] do
+        let (_, sync, payload) := rawItems[i]!
+        let relPts := ptsMsArr[i]!
+        let dCur : Nat :=
+          if te.kind == .audio && i + 1 < nRaw && ptsMsArr[i + 1]! > relPts then
+            Nat.max 1 (ptsMsArr[i + 1]! - relPts).toNat
+          else Nat.max 1 stepDurMs
+        samples := samples.push {
+          data := payload
+          dur := dCur
+          cttsOff := relPts + Int.ofNat preRollTicks - dtsOut
+          isSync := sync }
+        dtsOut := dtsOut + Int.ofNat dCur
       let trk : P11CrossRemuxTrack := {
         kind := te.kind
         codecId := te.codecId
@@ -11724,6 +11932,7 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
         mastering := mastering
         dovi := dovi
         hasDovi := hasDovi
+        preRoll := Int.ofNat (preRollTicks + (if te.kind == .audio then (codecDelayNs + 500000) / 1000000 else 0))
         samples := samples
       }
       if p11CrossRemuxTrackSafe trk then out := out.push trk

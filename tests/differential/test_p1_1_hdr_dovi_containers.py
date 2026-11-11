@@ -155,10 +155,10 @@ def patchFirstMp4SamplePayload (mp4 : ByteArray) (f : ByteArray → Option ByteA
   let mut patched := false
   for t in tracks do
     if t.kind == .video && !patched && t.samples.size > 0 then
-      let mut smps : Array (ByteArray × Nat × Bool) := #[]
-      for (pay, dur, sync) in t.samples do
-        let some pay' := f pay | return none
-        smps := smps.push (pay', dur, sync)
+      let mut smps : Array P11CrossSample := #[]
+      for s in t.samples do
+        let some pay' := f s.data | return none
+        smps := smps.push { s with data := pay' }
       outTracks := outTracks.push { t with samples := smps }
       patched := true
     else
@@ -230,7 +230,7 @@ def main (args : List String) : IO UInt32 := do
     let mp4 ← IO.FS.readBinFile inMp4
     let some tracks := p11DemuxMp4ToCrossTracks mp4 | return 4
     let some vt := tracks.find? (fun t => t.kind == .video && t.samples.size > 0) | return 4
-    let (au, _, _) := vt.samples[0]!
+    let au := (vt.samples[0]!).data
     let got := leanavLeanP11HevcRpuOp 0 au ByteArray.empty
     if got.isEmpty then return 5
     IO.FS.writeBinFile outBin got
@@ -247,7 +247,7 @@ def main (args : List String) : IO UInt32 := do
     let mp4 ← IO.FS.readBinFile inMp4
     let some tracks := p11DemuxMp4ToCrossTracks mp4 | return 7
     let some vt := tracks.find? (fun t => t.kind == .video && t.samples.size > 0) | return 7
-    let (tu, _, _) := vt.samples[0]!
+    let tu := (vt.samples[0]!).data
     let got := leanavLeanP11Av1RpuOp 0 tu ByteArray.empty
     if got.isEmpty then return 8
     IO.FS.writeBinFile outBin got
@@ -674,6 +674,129 @@ class P11HdrDoviContainerTests(unittest.TestCase):
         # Same-family rejection in cross-remux helper
         bad = self._run_harness("cross-remux", "mp4", "mp4", str(self.hevc_hdr_dovi_mp4), str(self.work / "no.mp4"))
         self.assertNotEqual(bad.returncode, 0)
+
+    def test_bframe_hevc_hdr_cross_container_cli_preserves_decode_and_pts_order(self):
+        bframe_raw = self.work / "hevc_bframe_raw.mp4"
+        subprocess.run(
+            [
+                FFMPEG, "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=64x48:rate=25:duration=0.4",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.4",
+                "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+                "-x265-params", "log-level=error:keyint=10:bframes=3:b-adapt=0:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
+                "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                "-c:a", "aac", "-b:a", "96k",
+                str(bframe_raw),
+            ],
+            check=True, capture_output=True, timeout=120,
+        )
+        bframe_mp4 = self.work / "hevc_bframe_hdr.mp4"
+        bframe_mp4.write_bytes(
+            _patch_mp4_sample_entry_extra(
+                bframe_raw.read_bytes(),
+                b"hvc1",
+                _make_mdcv_dci_p3() + _make_clli(1000, 400) + _make_dvvc(8, 1, 1),
+            )
+        )
+        out_mkv = self.work / "hevc_bframe_hdr.mkv"
+        out_mp4 = self.work / "hevc_bframe_hdr_rt.mp4"
+        r1 = subprocess.run(
+            [str(BINARY), "-y", "-i", str(bframe_mp4), "-c", "copy", str(out_mkv)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+        r2 = subprocess.run(
+            [str(BINARY), "-y", "-i", str(out_mkv), "-c", "copy", str(out_mp4)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+
+        def _video_pkt_hashes_and_pts_order(path: Path) -> tuple[list[bytes], list[str]]:
+            pkts = json.loads(
+                subprocess.run(
+                    [FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_packets", "-show_data_hash", "MD5", "-of", "json", str(path)],
+                    check=True, capture_output=True, text=True, timeout=30,
+                ).stdout
+            )["packets"]
+            hashes = [p["data_hash"].encode() for p in pkts]
+            # Confirm stream genuinely contains out-of-order B-frame presentation timestamps
+            pts_list = [float(p["pts_time"]) for p in pkts]
+            self.assertNotEqual(pts_list, sorted(pts_list), f"Expected B-frame reordering in {path}")
+            raw_yuv = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"],
+                check=True, capture_output=True, timeout=30,
+            ).stdout
+            fbytes = 64 * 48 * 3
+            self.assertEqual(len(raw_yuv), 10 * fbytes)
+            import hashlib
+            frame_md5s = [hashlib.md5(raw_yuv[i * fbytes:(i + 1) * fbytes]).hexdigest() for i in range(10)]
+            return hashes, frame_md5s
+
+        orig_hashes, orig_frames = _video_pkt_hashes_and_pts_order(bframe_mp4)
+        mkv_hashes, mkv_frames = _video_pkt_hashes_and_pts_order(out_mkv)
+        rt_hashes, rt_frames = _video_pkt_hashes_and_pts_order(out_mp4)
+        self.assertEqual(mkv_hashes, orig_hashes)
+        self.assertEqual(rt_hashes, orig_hashes)
+        self.assertEqual(mkv_frames, orig_frames)
+        self.assertEqual(rt_frames, orig_frames)
+
+    def test_malformed_mp4_and_mkv_hdr_dovi_boxes_fail_closed(self):
+        base_bytes = self.hevc_hdr_dovi_mp4.read_bytes()
+        # 1. Truncated mdcv box (size 16 instead of 32)
+        bad_mdcv = self.work / "bad_mdcv.mp4"
+        bad_mdcv.write_bytes(
+            _patch_mp4_sample_entry_extra(
+                (self.work / "hevc_base.mp4").read_bytes(),
+                b"hvc1",
+                struct.pack(">I4s8s", 16, b"mdcv", b"\x00" * 8),
+            )
+        )
+        # 2. Invalid clli box (maxFALL > maxCLL when maxCLL > 0)
+        bad_clli = self.work / "bad_clli.mp4"
+        bad_clli.write_bytes(
+            _patch_mp4_sample_entry_extra(
+                (self.work / "hevc_base.mp4").read_bytes(),
+                b"hvc1",
+                _make_clli(400, 900),
+            )
+        )
+        # 3. Malformed dvvC box (version_major=99 fails doviConfigGateSpec)
+        bad_dvvc = self.work / "bad_dvvc.mp4"
+        bad_dvvc.write_bytes(
+            _patch_mp4_sample_entry_extra(
+                (self.work / "hevc_base.mp4").read_bytes(),
+                b"hvc1",
+                struct.pack(">I4sBBBB20s", 32, b"dvvC", 99, 0, (8 << 1) | 1, 1 << 3, b"\x00" * 20),
+            )
+        )
+        for idx, bad_src in enumerate((bad_mdcv, bad_clli, bad_dvvc)):
+            bad_out = self.work / f"bad_out_{idx}.mkv"
+            proc = subprocess.run(
+                [str(BINARY), "-y", "-i", str(bad_src), "-c", "copy", str(bad_out)],
+                cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(proc.returncode, 0, f"Expected fail-closed for {bad_src.name}")
+            self.assertFalse(bad_out.exists(), f"Output file created on malformed {bad_src.name}")
+
+        # 4. Valid MKV mutated with invalid MaxFALL > MaxCLL inside Colour (0x55BC / 0x55BD)
+        good_mkv = self.work / "good_for_tamper.mkv"
+        r_good = subprocess.run(
+            [str(BINARY), "-y", "-i", str(self.hevc_hdr_dovi_mp4), "-c", "copy", str(good_mkv)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(r_good.returncode, 0, r_good.stdout + r_good.stderr)
+        mkv_raw = good_mkv.read_bytes()
+        cll_pat = bytes([0x55, 0xBC, 0x82, 0x03, 0xE8, 0x55, 0xBD, 0x82, 0x01, 0x90])
+        self.assertIn(cll_pat, mkv_raw)
+        bad_mkv = self.work / "bad_clli.mkv"
+        bad_mkv.write_bytes(mkv_raw.replace(cll_pat, bytes([0x55, 0xBC, 0x82, 0x01, 0x90, 0x55, 0xBD, 0x82, 0x03, 0xE8]), 1))
+        bad_mkv_out = self.work / "bad_mkv_out.mp4"
+        proc_mkv = subprocess.run(
+            [str(BINARY), "-y", "-i", str(bad_mkv), "-c", "copy", str(bad_mkv_out)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(proc_mkv.returncode, 0, "Expected fail-closed on MKV MaxFALL > MaxCLL")
+        self.assertFalse(bad_mkv_out.exists())
 
 
 if __name__ == "__main__":

@@ -564,14 +564,17 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
       let fpsEst (cnt : Nat) : Nat :=
         let (rn, rd) := rRate cnt
         Nat.max 1 (rn / rd)
-      let codecId :=
-        if tr.stsdFourcc == "hvc1" || tr.stsdFourcc == "hev1" then "V_MPEGH/ISO/HEVC"
-        else if tr.stsdFourcc == "av01" then "V_AV1"
-        else "V_MPEG4/ISO/AVC"
-      let meta? := p11ExtractCrossMeta tr.stsdBox codecId
-      let (colour, mastering, dovi, hasDovi) := match meta? with
-        | some (_, _, _, c, m, d, hd) => (c, m, d, hd)
-        | none => (media.colour, media.mastering, media.dovi, false)
+      let (colour, mastering, dovi, hasDovi) ←
+        if tr.stsdFourcc == "apcn" then
+          some (media.colour, media.mastering, media.dovi, media.hasDovi)
+        else
+          let codecId :=
+            if tr.stsdFourcc == "hvc1" || tr.stsdFourcc == "hev1" then "V_MPEGH/ISO/HEVC"
+            else if tr.stsdFourcc == "av01" then "V_AV1"
+            else "V_MPEG4/ISO/AVC"
+          do
+            let (_, _, _, c, m, d, hd) ← p11ExtractCrossMeta tr.stsdBox codecId
+            some (c, m, d, hd)
       let vMedia ←
         if tr.stsdFourcc == "avc1" || tr.stsdFourcc == "avc3" then
           let avccBody? := extractMp4StsdAvcCBody tr.stsdBox
@@ -782,7 +785,7 @@ def decodeMkv (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
     else some none
   let normalizedTracks := tracks.map fun t =>
     if t.kind == .video then
-      { t with samples := t.samples.map fun (p, _, sync) => (p, 40, sync) }
+      { t with samples := t.samples.map fun s => { s with dur := 40, cttsOff := 0 }, preRoll := 0 }
     else t
   let mp4Bytes ← p11MuxMp4FromCrossTracks normalizedTracks
   let decoded0 ← decodeMp4 mp4Bytes noAudio
@@ -1486,11 +1489,11 @@ def encodeMkvAacTrack (media : Media) (af : AudioFrame) : Option P11CrossRemuxTr
   let encAdts ← LeanAV.AacLc.aacEncodeAdtsStream pcmChans af.sampleRate 16 128000 true
   let (_, rawSlices) ← LeanAV.AacLc.demuxAdtsStream (ByteSlice.ofByteArray encAdts) false
   if rawSlices.isEmpty then none
-  let mut outSamples : Array (ByteArray × Nat × Bool) := Array.mkEmpty rawSlices.size
+  let mut outSamples : Array P11CrossSample := Array.mkEmpty rawSlices.size
   for sl in rawSlices do
     let b := sl.toByteArray
     if b.size == 0 then none
-    outSamples := outSamples.push (b, 1024, true)
+    outSamples := outSamples.push { data := b, dur := 1024, cttsOff := 0, isSync := true }
   let outAsc : LeanAV.AacLc.AacLcAsc := {
     audioObjectType := 2
     samplingFrequencyIndex := srIdx
@@ -1540,7 +1543,7 @@ def copyMkvAudioTrack (media : Media) (docType : String) : Option P11CrossRemuxT
     mastering := media.mastering
     dovi := media.dovi
     hasDovi := false
-    samples := copied.samples.map (fun s => (s.data, s.dur, s.isSync))
+    samples := copied.samples.map (fun s => { data := s.data, dur := s.dur, cttsOff := s.cttsOff, isSync := s.isSync })
   }
 
 def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray := do
@@ -1583,7 +1586,7 @@ def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray :=
       mastering := media.mastering
       dovi := media.dovi
       hasDovi := media.hasDovi
-      samples := packets.map (fun (p, sync) => (p, 1, sync))
+      samples := packets.map (fun (p, sync) => { data := p, dur := 1, cttsOff := 0, isSync := sync })
     }
   if let some af := media.audio then
     if options.audioCodec == "opus" || (docType == "webm" && options.audioCodec == "") then
@@ -1603,7 +1606,7 @@ def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray :=
         mastering := media.mastering
         dovi := media.dovi
         hasDovi := false
-        samples := opPkts.map (fun (p, _) => (p, 20, true))
+        samples := opPkts.map (fun (p, _) => { data := p, dur := 20, cttsOff := 0, isSync := true })
       }
     else if docType != "webm" && (options.audioCodec == "aac" || options.audioCodec == "") then
       let aTrack ← encodeMkvAacTrack media af
