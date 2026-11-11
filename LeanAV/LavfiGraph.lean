@@ -1702,16 +1702,19 @@ def packVideoFramesGray8Raw (frames : Array VideoFrame) : ByteArray := Id.run do
   return out
 
 /-- Direct RGB24 emission when a graph is a single `testsrc` node, avoiding 4:2:0 subsampling loss. -/
-def packDirectTestsrcRgb24? (tg : TypedFilterGraph) (maxFrames? : Option Nat := none) : Option ByteArray :=
+def packDirectTestsrcRgb24? (tg : TypedFilterGraph) (srcIndices? : Option (Array Nat) := none) : Option ByteArray :=
   if tg.nodes.size != 1 then none
   else
     match tg.nodes[0]!.op with
     | .srcTestsrc w h fps durMs =>
       let n0 := lavfiVideoFrameCount fps durMs
-      let n := match maxFrames? with | some m => Nat.min n0 (Nat.max 1 m) | none => n0
+      let indices : Array Nat :=
+        match srcIndices? with
+        | some idxs => if n0 == 0 then #[] else idxs.map (fun idx => Nat.min (n0 - 1) idx)
+        | none => Array.range n0
       some <| Id.run do
-        let mut out := ByteArray.emptyWithCapacity (n * w * h * 3)
-        for idx in [:n] do
+        let mut out := ByteArray.emptyWithCapacity (indices.size * w * h * 3)
+        for idx in indices do
           let rgb := genTestsrcRgbPlane w h fps idx
           for r in [:h] do
             for c in [:w * 3] do

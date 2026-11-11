@@ -911,6 +911,44 @@ class TestP11E2EPipeline(unittest.TestCase):
         self.assertEqual(int(probe_sdr_fc["streams"][0]["nb_frames"]), 2)
         self.assertEqual(probe_sdr_fc["streams"][0]["r_frame_rate"], "5/1")
 
+        # Direct RGB24 standalone lavfi testsrc output-rate resampling (duplication & dropping):
+        rgb_base = self.work / "testsrc_10fps.rgb"
+        rgb_dup = self.work / "testsrc_20fps.rgb"
+        rgb_drop = self.work / "testsrc_5fps.rgb"
+        for out_p, extra in [
+            (rgb_base, []),
+            (rgb_dup, ["-r", "20"]),
+            (rgb_drop, ["-r", "5"]),
+        ]:
+            res = _run_lffmpeg(
+                [
+                    "-lavfi",
+                    "testsrc=size=32x32:rate=10:duration=1",
+                    *extra,
+                    "-pix_fmt",
+                    "rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-y",
+                    str(out_p),
+                ]
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        frame_bytes = 32 * 32 * 3
+        b_base = rgb_base.read_bytes()
+        b_dup = rgb_dup.read_bytes()
+        b_drop = rgb_drop.read_bytes()
+        self.assertEqual(len(b_base), 10 * frame_bytes)
+        self.assertEqual(len(b_dup), 20 * frame_bytes)
+        self.assertEqual(len(b_drop), 5 * frame_bytes)
+        for i in range(10):
+            src_frame = b_base[i * frame_bytes : (i + 1) * frame_bytes]
+            self.assertEqual(b_dup[(2 * i) * frame_bytes : (2 * i + 1) * frame_bytes], src_frame)
+            self.assertEqual(b_dup[(2 * i + 1) * frame_bytes : (2 * i + 2) * frame_bytes], src_frame)
+        for j in range(5):
+            src_frame = b_base[(2 * j) * frame_bytes : (2 * j + 1) * frame_bytes]
+            self.assertEqual(b_drop[j * frame_bytes : (j + 1) * frame_bytes], src_frame)
+
 
 if __name__ == "__main__":
     unittest.main()

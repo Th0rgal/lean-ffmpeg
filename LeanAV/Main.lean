@@ -2082,9 +2082,9 @@ def runInprocLavfiDagCli
       "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"unsupported lavfi codec, pixel format, or stream selection\"}"
       "Unsupported lavfi codec, pixel format, or stream selection"
   let limN? := raw.maxFrames
-  let vFrames? : Option (Array VideoFrame × Nat) :=
+  let (vFrames?, vSrcIndices?) : Option (Array VideoFrame × Nat) × Option (Array Nat) :=
     match vSel with
-    | none => none
+    | none => (none, none)
     | some (_, fmt, q) =>
       let all := drainVideoQueue q
       let srcFps := Nat.max 1 fmt.fpsNum
@@ -2092,20 +2092,23 @@ def runInprocLavfiDagCli
         | some dMs => lavfiVideoFrameCount srcFps dMs
         | none => all.size
       let preResample := all.extract 0 (Nat.min all.size durLim)
-      let (resampled, effFps) :=
+      let (resampled, effFps, resampledIdxs) :=
         match raw.outRate.bind parseLavfiRate with
         | some targetFps =>
-          if targetFps == 0 || preResample.isEmpty || targetFps == srcFps then (preResample, srcFps)
+          if targetFps == 0 || preResample.isEmpty || targetFps == srcFps then
+            (preResample, srcFps, Array.range preResample.size)
           else
             let outCount := Nat.max 1 ((preResample.size * targetFps) / srcFps)
+            let idxs := (Array.range outCount).map fun i =>
+              Nat.min (preResample.size - 1) ((i * srcFps) / targetFps)
             let arr := (Array.range outCount).map fun i =>
-              let srcIdx := Nat.min (preResample.size - 1) ((i * srcFps) / targetFps)
+              let srcIdx := idxs.getD i 0
               let base := preResample.getD srcIdx default
               { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
-            (arr, targetFps)
-        | none => (preResample, srcFps)
+            (arr, targetFps, idxs)
+        | none => (preResample, srcFps, Array.range preResample.size)
       let lim := match limN? with | some n => Nat.min resampled.size (Nat.max 1 n) | none => resampled.size
-      some (resampled.extract 0 lim, effFps)
+      (some (resampled.extract 0 lim, effFps), some (resampledIdxs.extract 0 lim))
   let aFrame? : Option AudioFrame :=
     match aSel with
     | none => none
@@ -2149,7 +2152,10 @@ def runInprocLavfiDagCli
         else if isFrameMd5 then muxLavfiFrameMd5Bytes vfs fps
         else if isPng then
           let first := (vfs.extract 0 1)
-          let rawRgb := packVideoFramesRgb24Raw first
+          let rawRgb :=
+            match vSrcIndices?.bind (fun idxs => packDirectTestsrcRgb24? tg (some (idxs.extract 0 1))) with
+            | some direct => direct
+            | none => packVideoFramesRgb24Raw first
           match vfs[0]? with
           | some vf0 =>
             match pngImageFromRaw rawRgb vf0.width vf0.height "rgb24" with
@@ -2159,7 +2165,7 @@ def runInprocLavfiDagCli
         else
           let rawVid :=
             if isRgb then
-              match packDirectTestsrcRgb24? tg (some vfs.size) with
+              match packDirectTestsrcRgb24? tg vSrcIndices? with
               | some direct => direct
               | none => packVideoFramesRgb24Raw vfs
             else if isGray then
