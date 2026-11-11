@@ -11552,7 +11552,7 @@ def p11MuxMkvFromCrossTracks (docType : String) (tracks : Array P11CrossRemuxTra
     ⟨#[0x42, 0x87, 0x81, 0x04, 0x42, 0x85, 0x81, 0x02]⟩
   let infoBody := wrapEbmlElement 0x2AD7B1 ⟨#[0x0F, 0x42, 0x40]⟩
   let mut tracksBody := ByteArray.empty
-  let mut clusterBody := wrapEbmlElement 0xE7 ⟨#[0]⟩
+  let mut allPkts : Array (Nat × Nat × Bool × ByteArray) := #[]
   for idx in [:tracks.size] do
     let t := tracks[idx]!
     let tn := idx + 1
@@ -11588,14 +11588,27 @@ def p11MuxMkvFromCrossTracks (docType : String) (tracks : Array P11CrossRemuxTra
     let mut ticks : Nat := 0
     for (data, dur, sync) in t.samples do
       let tsMs := ticks * 1000 / tScale
-      let ts16 := (if tsMs > 0x7FFF then 0x7FFF else tsMs).toUInt16
-      let flags : UInt8 := if sync then 0x80 else 0
-      let blk := (ByteArray.empty.push (0x80 ||| tn).toUInt8) ++
-        (pushU16BE ByteArray.empty ts16) ++ (ByteArray.empty.push flags) ++ data
-      clusterBody := clusterBody ++ wrapEbmlElement 0xA3 blk
+      allPkts := allPkts.push (tsMs, tn, sync, data)
       ticks := ticks + (if dur == 0 then 1 else dur)
-  let seg := wrapEbmlElement 0x1549A966 infoBody ++ wrapEbmlElement 0x1654AE6B tracksBody ++
-    wrapEbmlElement 0x1F43B675 clusterBody
+  if allPkts.isEmpty then return none
+  let sortedPkts := allPkts.qsort (fun a b => if a.1 == b.1 then a.2.1 < b.2.1 else a.1 < b.1)
+  let mut clustersOut := ByteArray.empty
+  let mut curBase := (sortedPkts[0]!).1
+  let mut curBlocks := ByteArray.empty
+  for (tsMs, tn, sync, data) in sortedPkts do
+    if tsMs - curBase > 0x7FFF then
+      let clBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+      clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 clBody
+      curBase := tsMs
+      curBlocks := ByteArray.empty
+    let ts16 := (tsMs - curBase).toUInt16
+    let flags : UInt8 := if sync then 0x80 else 0
+    let blk := (ByteArray.empty.push (0x80 ||| tn).toUInt8) ++
+      (pushU16BE ByteArray.empty ts16) ++ (ByteArray.empty.push flags) ++ data
+    curBlocks := curBlocks ++ wrapEbmlElement 0xA3 blk
+  let finalBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+  clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 finalBody
+  let seg := wrapEbmlElement 0x1549A966 infoBody ++ wrapEbmlElement 0x1654AE6B tracksBody ++ clustersOut
   return some (wrapEbmlElement 0x1A45DFA3 ebmlBody ++ wrapEbmlElement 0x18538067 seg)
 
 def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTrack) := Id.run do

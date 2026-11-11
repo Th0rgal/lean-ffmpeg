@@ -52,6 +52,7 @@ structure Options where
   colorspace : Option UInt16 := none
   filmGrain : Nat := 0
   ditherMode : String := "bayer"
+  outFps : Option Nat := none
   deriving Inhabited
 
 def P11UnifiedHdrSafe (x : Nat × Nat × Nat × Nat) : Prop :=
@@ -554,7 +555,8 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
           else do
             let sps ← sps?
             if sps.profileIdc == 135 then none
-            let rawBytes ← LeanAV.H264IntraTransform.decodeMp4ToCanonicalRaw raw
+            let singleMp4 ← isolateSingleVideoTrackMp4 raw tr
+            let rawBytes ← LeanAV.H264IntraTransform.decodeMp4ToCanonicalRaw singleMp4
             let pf ←
               if sps.chromaFormatIdc == 1 && sps.bitDepthLumaMinus8 == 0 then some "yuv420p"
               else if sps.chromaFormatIdc == 1 && sps.bitDepthLumaMinus8 == 2 then some "yuv420p10le"
@@ -714,7 +716,8 @@ def decodeMpegTs (raw : ByteArray) : Option Media := do
 
 def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
     (sampleRate : UInt32 := 48000) (channels : Nat := 2) (noAudio : Bool := false)
-    (pixFmt : String := "yuv420p") : Option Media := do
+    (pixFmt : String := "yuv420p") (inputFps : Nat := 25) : Option Media := do
+  let rFps := Nat.max 1 inputFps
   if raw.isEmpty then none
   else if format == "rawvideo" then
     let pf := if pixFmt == "" then "yuv420p" else pixFmt
@@ -722,10 +725,10 @@ def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
     let pfC := fmt.toString
     if pfC == "yuv420p" then
       let frames ← unpackYuv420p width height raw
-      some (syncMediaFromVideoFrames { video := frames, videoCodecSrc := "rawvideo" })
+      some (syncMediaFromVideoFrames { video := frames, fps := rFps, videoCodecSrc := "rawvideo" })
     else
       let cnt ← validateHbdRawBuffer pfC width height raw
-      syncMediaFromRaw { videoCodecSrc := "rawvideo" } width height cnt pfC raw 25
+      syncMediaFromRaw { videoCodecSrc := "rawvideo" } width height cnt pfC raw rFps
   else if format == "s16le" || format == "s24le" || format == "s32le" then
     let bps := if format == "s32le" then 32 else if format == "s24le" then 24 else 16
     let pcm ← pcmRawLEToChannels (ByteSlice.ofByteArray raw) channels bps
@@ -1022,6 +1025,22 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
       let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight cur.videoFrames dstC conv cur.fps
         | return none
       cur := nextM
+  if let some targetFps := options.outFps then
+    if targetFps > 0 && cur.videoFrames > 0 && targetFps != cur.fps then
+      let srcFps := Nat.max 1 cur.fps
+      let outCount := Nat.max 1 ((cur.videoFrames * targetFps) / srcFps)
+      let some fmt := PixelFormat.parse cur.videoPixFmt | return none
+      let some fb := fmt.frameByteSize cur.videoWidth cur.videoHeight | return none
+      if cur.rawVideo.size != cur.videoFrames * fb then return none
+      let mut outRaw := ByteArray.emptyWithCapacity (outCount * fb)
+      let mut outRpus : Array ByteArray := #[]
+      for i in [:outCount] do
+        let srcIdx := Nat.min (cur.videoFrames - 1) ((i * srcFps) / targetFps)
+        outRaw := outRaw ++ cur.rawVideo.extract (srcIdx * fb) ((srcIdx + 1) * fb)
+        if srcIdx < cur.rpus.size then outRpus := outRpus.push cur.rpus[srcIdx]!
+      let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight outCount cur.videoPixFmt outRaw targetFps
+        | return none
+      cur := { nextM with rpus := if cur.rpus.isEmpty then #[] else outRpus }
   if let some n := options.maxFrames then
     if n < cur.videoFrames then
       let some fmt := PixelFormat.parse cur.videoPixFmt | return none
@@ -1081,10 +1100,23 @@ def filter (media : Media) (options : Options) : Except String Media := do
       audioBits := audioBits
       audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
   else
-    let (frames, outFps) ← runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
+    let (frames0, outFps0) ← runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
+    let (frames1, outFps) :=
+      match options.outFps with
+      | some targetFps =>
+        if targetFps == 0 || frames0.isEmpty || targetFps == outFps0 then (frames0, outFps0)
+        else
+          let srcFps := Nat.max 1 outFps0
+          let outCount := Nat.max 1 ((frames0.size * targetFps) / srcFps)
+          let resampled := (Array.range outCount).map fun i =>
+            let srcIdx := Nat.min (frames0.size - 1) ((i * srcFps) / targetFps)
+            let base := frames0.getD srcIdx default
+            { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
+          (resampled, targetFps)
+      | none => (frames0, outFps0)
     let frames := match options.maxFrames with
-      | some n => frames.extract 0 n
-      | none => frames
+      | some n => frames1.extract 0 n
+      | none => frames1
     let outMedia := { media with
       video := if options.noVideo then #[] else frames
       fps := outFps
@@ -1641,6 +1673,7 @@ structure Input where
   sampleRate : UInt32 := 48000
   channels : Nat := 2
   pixFmt : String := "yuv420p"
+  fps : Nat := 25
   deriving Inhabited
 
 structure Invocation where
@@ -1797,12 +1830,22 @@ def scan (args : List String) : Option Invocation := do
       job := { job with options := { job.options with audioFilter := value } }
       rest := xs
     | "-r" :: value :: xs =>
-      let n ← value.toNat?
+      let n ← parseLavfiRate value
       if n == 0 || n > 1000 then none
+      if job.inputs.isEmpty || pendingInputOptions then
+        pending := { pending with fps := n }
+        pendingInputOptions := true
+      else
+        job := { job with options := { job.options with outFps := some n } }
       rest := xs
     | "-framerate" :: value :: xs =>
-      let n ← value.toNat?
+      let n ← parseLavfiRate value
       if n == 0 || n > 1000 then none
+      if job.inputs.isEmpty || pendingInputOptions then
+        pending := { pending with fps := n }
+        pendingInputOptions := true
+      else
+        job := { job with options := { job.options with outFps := some n } }
       rest := xs
     | "-frames:v" :: value :: xs =>
       let n ← value.toNat?

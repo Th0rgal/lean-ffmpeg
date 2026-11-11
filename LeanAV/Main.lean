@@ -1936,7 +1936,7 @@ def prepareUnifiedMediaPipeline (args : List String) : IO (Option (LeanAV.Unifie
     for inp in job.inputs do
       let bytes ← IO.FS.readBinFile inp.path
       let skipAud := job.options.noAudio && job.options.filterComplex == "" && job.options.audioFilter == ""
-      let some media := LeanAV.UnifiedPipeline.decode bytes inp.format inp.width inp.height inp.sampleRate inp.channels skipAud inp.pixFmt
+      let some media := LeanAV.UnifiedPipeline.decode bytes inp.format inp.width inp.height inp.sampleRate inp.channels skipAud inp.pixFmt inp.fps
         | return none
       inputs := inputs.push media
     return some (job, inputs)

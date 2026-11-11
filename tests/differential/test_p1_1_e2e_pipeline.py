@@ -722,6 +722,58 @@ class TestP11E2EPipeline(unittest.TestCase):
         self.assertEqual(probe_cs10["streams"][0]["pix_fmt"], "yuv420p10le")
         self.assertEqual(probe_cs10["streams"][0].get("color_space"), "bt709")
 
+        raw_40s = self.work / "in_40s_1fps.yuv"
+        raw_40s.write_bytes(_make_raw_10bit_yuv420p(16, 16, frames=1) * 40)
+        mkv_40s = self.work / "hdr_40s_multicluster.mkv"
+        r_40s = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-r",
+                "1",
+                "-i",
+                str(raw_40s),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-y",
+                str(mkv_40s),
+            ]
+        )
+        self.assertEqual(r_40s.returncode, 0, r_40s.stdout + r_40s.stderr)
+        pkt_res = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "json",
+                str(mkv_40s),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        pkts = json.loads(pkt_res.stdout)["packets"]
+        self.assertEqual(len(pkts), 40)
+        pts_ms = [round(float(p["pts_time"]) * 1000) for p in pkts]
+        self.assertEqual(pts_ms[32], 32000)
+        self.assertEqual(pts_ms[33], 33000)
+        self.assertEqual(pts_ms[39], 39000)
+
 
 if __name__ == "__main__":
     unittest.main()
