@@ -11757,15 +11757,18 @@ def doviPackChunks (acc width : Nat) (chunks : List (Nat × Nat)) (out : List UI
     doviPackChunks acc2 width2 rest out2
 
 def doviVarBitsSizeChunks (n : Nat) : List (Nat × Nat) :=
-  if n < 255 then [(n, 8), (0, 1)]
-  else
-    let rec more (fuel rem : Nat) : List (Nat × Nat) :=
-      match fuel with
-      | 0 => []
-      | f + 1 =>
-        if rem < 255 then [(1, 1), (rem, 8), (0, 1)]
-        else (1, 1) :: (255, 8) :: more f (rem - 255)
-    (255, 8) :: more (n / 255 + 2) (n - 255)
+  let rec peel (fuel v : Nat) (acc : List Nat) : List Nat :=
+    match fuel with
+    | 0 => acc
+    | f + 1 =>
+      let c := v &&& 0xFF
+      if v < 256 then c :: acc
+      else peel f ((v >>> 8) - 1) (c :: acc)
+  let rec emit : List Nat → List (Nat × Nat)
+    | [] => [(0, 8), (0, 1)]
+    | [c] => [(c, 8), (0, 1)]
+    | c :: rest => (c, 8) :: (1, 1) :: emit rest
+  emit (peel 8 n [])
 
 def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
   let hdr := (0x01BE6841, 27) :: doviVarBitsSizeChunks rpu.length
@@ -11779,9 +11782,9 @@ def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
       let outByte : UInt8 := ((a1 >>> sh) &&& 0xFF).toUInt8
       feedRpu (a1 &&& ((1 <<< sh) - 1)) wd bs (outByte :: out)
   let (a1, w1, o1) := feedRpu a0 w0 rpu o0
-  let (a2, w2, o2) := doviPackChunks a1 w1 [(0x02004, 20), (1, 1)] o1
-  let oFinal := if w2 == 0 then o2 else (((a2 <<< (8 - w2)) &&& 0xFF).toUInt8 :: o2)
-  oFinal.reverse
+  let (a2, w2, o2) := doviPackChunks a1 w1 [(0x0400, 17), (1, 1)] o1
+  let oAligned := if w2 == 0 then o2 else (((a2 <<< (8 - w2)) &&& 0xFF).toUInt8 :: o2)
+  (0x80 :: oAligned).reverse
 
 def doviTakeBits (acc width need : Nat) (rest : List UInt8) : Option (Nat × Nat × Nat × List UInt8) :=
   let rec fill (fuel a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × List UInt8) :=
@@ -11801,26 +11804,17 @@ def doviTakeBits (acc width need : Nat) (rest : List UInt8) : Option (Nat × Nat
 def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) := do
   let (hdr, a0, w0, r0) ← doviTakeBits 0 0 27 emdf
   if hdr != 0x01BE6841 then none
-  let (n0, a1, w1, r1) ← doviTakeBits a0 w0 8 r0
-  let (n, a2, w2, r2) ←
-    if n0 < 255 then do
-      let (z, ax, wx, rx) ← doviTakeBits a1 w1 1 r1
-      if z != 0 then none else some (n0, ax, wx, rx)
-    else
-      let rec readVar (fuel total a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × Nat × List UInt8) := do
-        match fuel with
-        | 0 => none
-        | f + 1 =>
-          let (m, am, wm, xm) ← doviTakeBits a wd 1 xs
-          if m == 0 then some (total, am, wm, xm)
-          else do
-            let (add, aa, wa, xa) ← doviTakeBits am wm 8 xm
-            let total' := total + add
-            if add < 255 then
-              let (z, az, wz, xz) ← doviTakeBits aa wa 1 xa
-              if z != 0 then none else some (total', az, wz, xz)
-            else readVar f total' aa wa xa
-      readVar (emdf.length + 1) 255 a1 w1 r1
+  let rec readVar (fuel val a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × Nat × List UInt8) := do
+    match fuel with
+    | 0 => none
+    | f + 1 =>
+      let (chunk, a1, w1, xs1) ← doviTakeBits a wd 8 xs
+      let (more, a2, w2, xs2) ← doviTakeBits a1 w1 1 xs1
+      let val1 := val + chunk
+      if more == 0 then some (val1, a2, w2, xs2)
+      else readVar f ((val1 + 1) <<< 8) a2 w2 xs2
+  let (n, a2, w2, r2) ← readVar 4 0 a0 w0 r0
+  if n > emdf.length then none
   let rec readRpu (rem a wd : Nat) (xs acc : List UInt8) : Option (List UInt8 × Nat × Nat × List UInt8) :=
     match rem with
     | 0 => some (acc.reverse, a, wd, xs)
@@ -11829,10 +11823,10 @@ def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) := do
       | none => none
       | some (v, a', wd', xs') => readRpu k a' wd' xs' (v.toUInt8 :: acc)
   let (rpuRev, a3, w3, r3) ← readRpu n a2 w2 r2 []
-  let (tail20, a4, w4, r4) ← doviTakeBits a3 w3 20 r3
-  if tail20 != 0x02004 then none
-  let (stopBit, a5, w5, r5) ← doviTakeBits a4 w4 1 r4
-  if stopBit != 1 || !r5.isEmpty || w5 ≥ 8 || a5 != 0 then none
+  let (prot17, a4, w4, r4) ← doviTakeBits a3 w3 17 r3
+  if prot17 != 0x0400 then none
+  let (emdfStop, a5, w5, r5) ← doviTakeBits a4 w4 1 r4
+  if emdfStop != 1 || w5 ≥ 8 || a5 != 0 || (r5 != [0x80] && !r5.isEmpty) then none
   some rpuRev
 
 theorem p11_hdr_dovi_container_roundtrip :
@@ -11870,9 +11864,11 @@ theorem p11_rpu_and_obu_roundtrip :
     av1Leb128ReadList (av1Leb128Write 300) = some (300, []) ∧
     av1Leb128ReadList (av1Leb128Write 70000) = some (70000, []) ∧
     doviVarBitsSizeChunks 254 = [(254, 8), (0, 1)] ∧
-    doviVarBitsSizeChunks 255 = [(255, 8), (1, 1), (0, 8), (0, 1)] ∧
-    doviVarBitsSizeChunks 260 = [(255, 8), (1, 1), (5, 8), (0, 1)] ∧
-    doviVarBitsSizeChunks 520 = [(255, 8), (1, 1), (255, 8), (1, 1), (10, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 255 = [(255, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 256 = [(0, 8), (1, 1), (0, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 265 = [(0, 8), (1, 1), (9, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 512 = [(1, 8), (1, 1), (0, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 65792 = [(0, 8), (1, 1), (0, 8), (1, 1), (0, 8), (0, 1)] ∧
     decodeAv1T35DoviObu (encodeAv1T35DoviObu [0x19, 0x02]) = some [0x19, 0x02] ∧
     unpackDoviEmdf (packDoviEmdf [0x08, 0x09, 0x80]) = some [0x08, 0x09, 0x80] := by
   decide

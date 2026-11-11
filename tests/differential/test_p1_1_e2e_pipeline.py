@@ -375,7 +375,7 @@ class TestP11E2EPipeline(unittest.TestCase):
         self.assertEqual(len(u8_out.read_bytes()), 16 * 16 * 3 // 2)
 
     def test_06_peak_white_10bit_clamping_and_multi_obu_av1_dovi_rpu_e2e(self) -> None:
-        w, h = 16, 16
+        w, h = 64, 64
         # Include 1022 and 1023 peak-white codes with neutral chroma (512) to ensure 10-bit -> 8-bit frame unpacking clamps to 255 (never wraps to 0)
         peak_y = [1022 if (i % 2 == 0) else 1023 for i in range(w * h)]
         peak_uv = [512 for _ in range((w // 2) * (h // 2))]
@@ -409,7 +409,7 @@ class TestP11E2EPipeline(unittest.TestCase):
         self.assertEqual(len(y_plane), w * h)
         self.assertGreaterEqual(min(y_plane), 200, f"1022/1023 peak-white wrapped around: min={min(y_plane)}")
 
-        # Multi-OBU AV1 MP4 (produced by ffmpeg with TD/Sequence Header + Metadata + Frame OBUs) -> lffmpeg AV1 WebM & MP4
+        # Multi-OBU AV1 MP4 (produced by ffmpeg libaom-av1 with TD + Sequence Header + Frame OBUs) -> lffmpeg AV1 MP4
         av1_src = self.work / "ff_av1_hdr10.mp4"
         subprocess.run(
             [
@@ -428,9 +428,9 @@ class TestP11E2EPipeline(unittest.TestCase):
                 "-i",
                 str(peak_in),
                 "-c:v",
-                "libsvtav1",
-                "-crf",
-                "20",
+                "libaom-av1",
+                "-cpu-used",
+                "8",
                 "-y",
                 str(av1_src),
             ],

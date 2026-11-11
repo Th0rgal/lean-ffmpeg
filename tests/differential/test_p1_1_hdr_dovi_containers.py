@@ -186,7 +186,11 @@ def main (args : List String) : IO UInt32 := do
     let bigBody := List.replicate 260 (0x42 : UInt8)
     let bigRpu := bigBody ++ u32beToList (mpeg2Crc32List bigBody) ++ [0x80]
     require (hevcRpuPayloadOk (0x19 :: bigRpu)) "265B RPU CRC32 check failed"
-    require (unpackDoviEmdf (packDoviEmdf bigRpu) == some bigRpu) "265B EMDF (>=255 variable_bits) roundtrip failed"
+    require (doviVarBitsSizeChunks 255 == [(255, 8), (0, 1)]) "255 variable_bits(8) mismatch"
+    require (doviVarBitsSizeChunks 256 == [(0, 8), (1, 1), (0, 8), (0, 1)]) "256 variable_bits(8) mismatch"
+    require (doviVarBitsSizeChunks 265 == [(0, 8), (1, 1), (9, 8), (0, 1)]) "265 variable_bits(8) mismatch"
+    require (doviVarBitsSizeChunks 512 == [(1, 8), (1, 1), (0, 8), (0, 1)]) "512 variable_bits(8) mismatch"
+    require (unpackDoviEmdf (packDoviEmdf bigRpu) == some bigRpu) "265B EMDF (>=256 variable_bits) roundtrip failed"
     let bigObu := encodeAv1T35DoviObu bigRpu
     require (decodeAv1T35DoviObu bigObu == some bigRpu) "265B AV1 T.35 OBU multi-byte LEB128 roundtrip failed"
     let tdAndSeq := ByteArray.mk #[0x12, 0x00, 0x0A, 0x04, 0x00, 0x00, 0x00, 0x42, 0x32, 0x04, 0x01, 0x02, 0x03, 0x04]
@@ -247,6 +251,16 @@ def main (args : List String) : IO UInt32 := do
     let got := leanavLeanP11Av1RpuOp 0 tu ByteArray.empty
     if got.isEmpty then return 8
     IO.FS.writeBinFile outBin got
+    return 0
+  | ["emdf-pack", inBin, outBin] =>
+    let raw ← IO.FS.readBinFile inBin
+    let packed := packDoviEmdf raw.toList
+    IO.FS.writeBinFile outBin (ByteArray.mk packed.toArray)
+    return 0
+  | ["emdf-unpack", inBin, outBin] =>
+    let raw ← IO.FS.readBinFile inBin
+    let some unpacked := unpackDoviEmdf raw.toList | return 10
+    IO.FS.writeBinFile outBin (ByteArray.mk unpacked.toArray)
     return 0
   | _ => return 9
 """
@@ -543,6 +557,105 @@ class P11HdrDoviContainerTests(unittest.TestCase):
         vframes_reenc = [f for f in probe_reenc["frames"] if f.get("media_type") == "video"]
         f_sd_reenc = {sd["side_data_type"] for sd in vframes_reenc[0].get("side_data_list", [])}
         self.assertIn("Dolby Vision Metadata", f_sd_reenc)
+
+    def test_av1_itu_t35_dovi_emdf_multi_chunk_variable_bits_and_ffprobe(self):
+        def ref_pack_emdf(rpu: bytes) -> bytes:
+            # Independent ETSI TS 103 190-1 §4.2.3 variable_bits(8) + AV1 OBU trailing_bits() reference
+            n = len(rpu)
+            chunks = []
+            v = n
+            while True:
+                chunks.append(v & 0xFF)
+                if v < 256:
+                    break
+                v = (v >> 8) - 1
+            chunks.reverse()
+            bits = []
+            def push(val: int, width: int) -> None:
+                for shift in range(width - 1, -1, -1):
+                    bits.append((val >> shift) & 1)
+            push(0x01BE6841, 27)
+            for idx, ch in enumerate(chunks):
+                push(ch, 8)
+                push(1 if idx + 1 < len(chunks) else 0, 1)
+            for b in rpu:
+                push(b, 8)
+            push(0x0400, 17)
+            push(1, 1)
+            while len(bits) % 8 != 0:
+                bits.append(0)
+            out = bytearray(sum(bits[i + j] << (7 - j) for j in range(8)) for i in range(0, len(bits), 8))
+            out.append(0x80)
+            return bytes(out)
+
+        for sz in (1, 105, 254, 255, 256, 284, 511, 512, 770):
+            payload = bytes(((i * 37 + 13) & 0xFF) for i in range(sz))
+            in_p = self.work / f"emdf_in_{sz}.bin"
+            pk_p = self.work / f"emdf_pk_{sz}.bin"
+            un_p = self.work / f"emdf_un_{sz}.bin"
+            in_p.write_bytes(payload)
+            r_pk = self._run_harness("emdf-pack", str(in_p), str(pk_p))
+            self.assertEqual(r_pk.returncode, 0, r_pk.stdout + r_pk.stderr)
+            self.assertEqual(pk_p.read_bytes(), ref_pack_emdf(payload), f"EMDF mismatch at size={sz}")
+            r_un = self._run_harness("emdf-unpack", str(pk_p), str(un_p))
+            self.assertEqual(r_un.returncode, 0, r_un.stdout + r_un.stderr)
+            self.assertEqual(un_p.read_bytes(), payload, f"EMDF unpack mismatch at size={sz}")
+
+        def mpeg2_crc32(data: bytes) -> int:
+            crc = 0xFFFFFFFF
+            for b in data:
+                crc ^= b << 24
+                for _ in range(8):
+                    crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if (crc & 0x80000000) else (crc << 1) & 0xFFFFFFFF
+            return crc
+
+        # Construct a valid 284-byte (>=256B, 2-chunk variable_bits(8) + 2-byte AV1 LEB128) Dolby Vision RPU
+        bs = "".join(f"{b:08b}" for b in RPU_105[:-5])[:-1] + "000010101"
+        while len(bs) % 8 != 0:
+            bs += "0"
+        bs += ("0001000" + "00000101" + ("0" * 56)) * 20
+        while len(bs) % 8 != 0:
+            bs += "0"
+        body_284 = bytes(int(bs[i : i + 8], 2) for i in range(0, len(bs), 8))
+        rpu_284 = body_284 + mpeg2_crc32(body_284).to_bytes(4, "big") + b"\x80"
+        self.assertEqual(len(rpu_284), 284)
+
+        rpu_284_path = self.work / "dovi_284.rpu"
+        rpu_284_path.write_bytes(rpu_284)
+        inj_284_mp4 = self.work / "av1_injected_284.mp4"
+        ext_284_rpu = self.work / "av1_extracted_284.rpu"
+        reenc_284_mp4 = self.work / "av1_reencoded_284.mp4"
+        reenc_284_rpu = self.work / "av1_reencoded_284.rpu"
+
+        inj = self._run_harness("av1-rpu-inject", str(self.av1_dovi_mp4), str(rpu_284_path), str(inj_284_mp4))
+        self.assertEqual(inj.returncode, 0, inj.stdout + inj.stderr)
+        ext = self._run_harness("av1-rpu-extract", str(inj_284_mp4), str(ext_284_rpu))
+        self.assertEqual(ext.returncode, 0, ext.stdout + ext.stderr)
+        self.assertEqual(ext_284_rpu.read_bytes(), rpu_284)
+
+        pr_inj = subprocess.run(
+            [FFPROBE, "-v", "warning", "-show_frames", "-of", "json", str(inj_284_mp4)],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(pr_inj.stderr, "", f"libdav1d emitted warning on >=256B EMDF: {pr_inj.stderr}")
+        vf_inj = [f for f in json.loads(pr_inj.stdout)["frames"] if f.get("media_type") == "video"]
+        self.assertIn("Dolby Vision Metadata", {sd["side_data_type"] for sd in vf_inj[0].get("side_data_list", [])})
+
+        proc_reenc = subprocess.run(
+            [str(BINARY), "-y", "-i", str(inj_284_mp4), "-an", "-c:v", "av1", "-pix_fmt", "yuv420p10le", str(reenc_284_mp4)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc_reenc.returncode, 0, proc_reenc.stdout + proc_reenc.stderr)
+        ext2 = self._run_harness("av1-rpu-extract", str(reenc_284_mp4), str(reenc_284_rpu))
+        self.assertEqual(ext2.returncode, 0, ext2.stdout + ext2.stderr)
+        self.assertEqual(reenc_284_rpu.read_bytes(), rpu_284)
+        pr_reenc = subprocess.run(
+            [FFPROBE, "-v", "warning", "-show_frames", "-of", "json", str(reenc_284_mp4)],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(pr_reenc.stderr, "", f"libdav1d emitted warning after re-encode: {pr_reenc.stderr}")
+        vf_reenc = [f for f in json.loads(pr_reenc.stdout)["frames"] if f.get("media_type") == "video"]
+        self.assertIn("Dolby Vision Metadata", {sd["side_data_type"] for sd in vf_reenc[0].get("side_data_list", [])})
 
     def test_native_same_family_remux_preserves_hdr_dovi_and_rejects_cross_container_cli(self):
         same_out = self.work / "native_same_hdr.mp4"
