@@ -489,6 +489,25 @@ def extractMp4SampleRpus (raw : ByteArray) (samples : Array NativeMp4Sample) (is
           out := out.push r
   return out
 
+def isolateSingleVideoTrackMp4 (raw : ByteArray) (tr : NativeMp4Track) : Option ByteArray := do
+  let mut synthSamples : Array SynthMp4Sample := Array.mkEmpty tr.samples.size
+  for s in tr.samples do
+    if s.fileOff + s.byteLen > raw.size then none
+    synthSamples := synthSamples.push {
+      data := raw.extract s.fileOff (s.fileOff + s.byteLen)
+      dur := Nat.max 1 s.dur
+      cttsOff := s.cttsOff
+      isSync := s.isSync
+    }
+  muxSynthMp4Container #[{
+    kind := .video
+    timescale := tr.timescale
+    width := Nat.max 2 (tr.tkhdWidth16.toNat >>> 16)
+    height := Nat.max 2 (tr.tkhdHeight16.toNat >>> 16)
+    stsdBox := tr.stsdBox
+    samples := synthSamples
+  }]
+
 def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
   let tracks ← demuxNativeMp4ContainerTracks (ByteSlice.ofByteArray raw)
   let mut media : Media := {}
@@ -557,7 +576,8 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
                 hasDovi := hasDovi }
             syncMediaFromRaw baseM sps.widthPx.toNat sps.heightPx.toNat cnt pf rawBytes (fpsEst cnt)
         else if tr.stsdFourcc == "hvc1" || tr.stsdFourcc == "hev1" then do
-          let (w, h, cnt, pf, rawBytes, vp, vt, vm) ← LeanAV.HevcMain.decodeHevcGenWithColor raw
+          let videoOnlyMp4 ← isolateSingleVideoTrackMp4 raw tr
+          let (w, h, cnt, pf, rawBytes, vp, vt, vm) ← LeanAV.HevcMain.decodeHevcGenWithColor videoOnlyMp4
           let rpus := extractMp4SampleRpus raw tr.samples false
           let mergedColour : MkvHdrColour := { colour with
             primaries := if colour.primaries == 0 || colour.primaries == 2 then vp else colour.primaries
@@ -573,7 +593,8 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
               rpus := rpus }
           syncMediaFromRaw baseM w h cnt pf rawBytes (fpsEst cnt)
         else if tr.stsdFourcc == "av01" then do
-          let (w, h, cnt, _, pf, rawBytes) ← LeanAV.Av1Main.decodeAv1ToRaw raw
+          let videoOnlyMp4 ← isolateSingleVideoTrackMp4 raw tr
+          let (w, h, cnt, _, pf, rawBytes) ← LeanAV.Av1Main.decodeAv1ToRaw videoOnlyMp4
           let rpus := extractMp4SampleRpus raw tr.samples true
           let baseM : Media :=
             { media with
@@ -614,11 +635,22 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
         let outCh := dops.get! 1
         let preSkip := ((dops.get! 2).toNat <<< 8) ||| (dops.get! 3).toNat
         let mut opusPackets := #[]
+        let mut copySamples : Array SynthMp4Sample := #[]
         for s in tr.samples do
           if s.fileOff + s.byteLen > raw.size then none
-          opusPackets := opusPackets.push (ByteSlice.ofByteArray (raw.extract s.fileOff (s.fileOff + s.byteLen)))
+          let pktBytes := raw.extract s.fileOff (s.fileOff + s.byteLen)
+          opusPackets := opusPackets.push (ByteSlice.ofByteArray pktBytes)
+          copySamples := copySamples.push { data := pktBytes, dur := s.dur, cttsOff := s.cttsOff, isSync := s.isSync }
         let af ← LeanAV.Audio.decodeOpusPacketsToAudioFrame opusPackets outCh preSkip
-        media := { media with audio := some af }
+        let copied : SynthMp4Track := {
+          kind := .audio
+          timescale := tr.timescale
+          width := 0
+          height := 0
+          stsdBox := tr.stsdBox
+          samples := copySamples
+        }
+        media := { media with audio := some af, audioCopy := if copySamples.isEmpty then none else some copied }
       else none
     else none
   if media.video.isEmpty && media.audio.isNone then none else some media
@@ -730,28 +762,124 @@ def filterAllowsPixFmtChange (vfSpec fcSpec : String) : Bool :=
   (s.splitOn "tonemap").length > 1 ||
   (s.splitOn "dither").length > 1
 
+def validateHbdLinearGraph (g : FilterGraph) : Bool :=
+  !g.nodes.isEmpty &&
+  g.openInputs.length == 1 &&
+  g.openOutputs.length == 1 &&
+  match g.openInputs, g.openOutputs with
+  | [inLbl], [outLbl] =>
+    (inLbl == "0:v" || inLbl == "0:v:0" || inLbl == "_in0") &&
+    Id.run do
+      let mut prev := inLbl
+      for node in g.nodes do
+        if node.inputs != [prev] || node.outputs.length != 1 then
+          return false
+        prev := node.outputs.headD ""
+      return prev == outLbl
+  | _, _ => false
+
+def parseHbdDitherMode (s : String) : Option String :=
+  let m := s.trimAscii.toString.toLower
+  if m == "bayer" || m == "ordered" then some "bayer"
+  else if m == "floyd_steinberg" || m == "fs" || m == "ed" then some "floyd_steinberg"
+  else if m == "none" then some "bayer"
+  else none
+
+def convertRawVideoColorspaceMatrix (raw : ByteArray) (pf : String) (w h nFrames : Nat)
+    (srcCm dstCm : ColorMatrix) (ditherMode : String) : Option ByteArray := do
+  if srcCm == dstCm then some raw
+  else
+    let fmt ← PixelFormat.parse pf
+    let pfC := fmt.toString
+    mapFramesRaw raw nFrames (fun f => do
+      let f444 ← convertFrameToYuv444p10le f pfC w h srcCm
+      let gbr := LeanAV.Scale.yuv444p10leToGbrp10leBytes f444 w h srcCm
+      let n := w * h
+      let bBase := 2 * n
+      let rBase := 4 * n
+      let gbrMapped : ByteArray :=
+        if (srcCm == .bt2020 || srcCm == .bt2020ncl) && dstCm == .bt709 then Id.run do
+          let mut gO := ByteArray.emptyWithCapacity (2 * n)
+          let mut bO := ByteArray.emptyWithCapacity (2 * n)
+          let mut rO := ByteArray.emptyWithCapacity (2 * n)
+          for i in [:n] do
+            let g10 := hbdReadLe16 gbr (2 * i)
+            let b10 := hbdReadLe16 gbr (bBase + 2 * i)
+            let r10 := hbdReadLe16 gbr (rBase + 2 * i)
+            let (rl, gl, bl) := LeanAV.Scale.gamutBt2020ToBt709LinearQ16 (r10 * 64) (g10 * 64) (b10 * 64)
+            gO := hbdPushLe16 gO (Nat.min 1023 ((gl + 32) / 64))
+            bO := hbdPushLe16 bO (Nat.min 1023 ((bl + 32) / 64))
+            rO := hbdPushLe16 rO (Nat.min 1023 ((rl + 32) / 64))
+          return gO ++ bO ++ rO
+        else if srcCm == .bt709 && (dstCm == .bt2020 || dstCm == .bt2020ncl) then Id.run do
+          let mut gO := ByteArray.emptyWithCapacity (2 * n)
+          let mut bO := ByteArray.emptyWithCapacity (2 * n)
+          let mut rO := ByteArray.emptyWithCapacity (2 * n)
+          for i in [:n] do
+            let g10 := hbdReadLe16 gbr (2 * i)
+            let b10 := hbdReadLe16 gbr (bBase + 2 * i)
+            let r10 := hbdReadLe16 gbr (rBase + 2 * i)
+            let (rl, gl, bl) := LeanAV.Scale.gamutBt709ToBt2020LinearQ16 (r10 * 64) (g10 * 64) (b10 * 64)
+            gO := hbdPushLe16 gO (Nat.min 1023 ((gl + 32) / 64))
+            bO := hbdPushLe16 bO (Nat.min 1023 ((bl + 32) / 64))
+            rO := hbdPushLe16 rO (Nat.min 1023 ((rl + 32) / 64))
+          return gO ++ bO ++ rO
+        else gbr
+      let y444Dst := LeanAV.Scale.gbrp10leToYuv444p10leBytes gbrMapped w h dstCm
+      convertYuv444p10leToTarget y444Dst pfC w h dstCm ditherMode)
+
 def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media := Id.run do
   let mut cur := media
   let mut ditherMode := options.ditherMode
   let vfSpec := if options.videoFilter != "" then options.videoFilter else options.filterComplex
-  let g? :=
-    if options.videoFilter != "" then
-      match parseFilterGraph ("[0:v]" ++ options.videoFilter ++ "[vout]") with
-      | .ok g => some g
-      | .error _ => none
-    else if options.filterComplex != "" then
-      match parseFilterGraph options.filterComplex with
-      | .ok g => some g
-      | .error _ => none
-    else none
-  if let some g := g? then
+  if options.videoFilter != "" || options.filterComplex != "" then
+    let g? :=
+      if options.videoFilter != "" then
+        match parseFilterGraph ("[0:v]" ++ options.videoFilter ++ "[vout]") with
+        | .ok g => some g
+        | .error _ => none
+      else
+        match parseFilterGraph options.filterComplex with
+        | .ok g => some g
+        | .error _ => none
+    let some g := g? | return none
+    if !validateHbdLinearGraph g then return none
     for node in g.nodes do
       let nm := node.name.toLower
-      if nm == "scale" || nm == "zscale" then
-        let wArg := (FilterArg.lookupNat node.args "w" 0 cur.videoWidth).getD cur.videoWidth
-        let hArg := (FilterArg.lookupNat node.args "h" 1 cur.videoHeight).getD cur.videoHeight
-        if let some dStr := FilterArg.lookup node.args "dither" 2 then
-          ditherMode := dStr.toLower
+      if nm == "null" then
+        if !node.args.isEmpty then return none
+      else if nm == "scale" || nm == "zscale" then
+        let wOpt ←
+          match (FilterArg.lookup node.args "w" 0).orElse (fun _ => FilterArg.lookup node.args "width" 0) with
+          | none => pure none
+          | some ws =>
+            match FilterArg.lookupInt [.positional ws] "" 0 0 with
+            | some v => pure (some v)
+            | none => return none
+        let hOpt ←
+          match (FilterArg.lookup node.args "h" 1).orElse (fun _ => FilterArg.lookup node.args "height" 1) with
+          | none => pure none
+          | some hs =>
+            match FilterArg.lookupInt [.positional hs] "" 0 0 with
+            | some v => pure (some v)
+            | none => return none
+        let some (wArg, hArg) := resolveLavfiScaleDims cur.videoWidth cur.videoHeight wOpt hOpt
+          | return none
+        let mut dmOpt : Option String := none
+        for a in node.args do
+          match a with
+          | .keyed k v =>
+            let kl := k.toLower
+            if kl == "dither" || kl == "sws_dither" then dmOpt := some v
+            else if kl != "w" && kl != "width" && kl != "h" && kl != "height" && kl != "flags" then
+              return none
+          | .positional _ => pure ()
+        if dmOpt.isNone then
+          if let some dStr := FilterArg.lookup node.args "dither" 2 then
+            dmOpt := some dStr
+        if let some dStr := dmOpt then
+          let some dm := parseHbdDitherMode dStr | return none
+          ditherMode := dm
         if wArg > 0 && hArg > 0 && (wArg != cur.videoWidth || hArg != cur.videoHeight) then
           let some scaled := scaleRawVideoFrames cur.rawVideo cur.videoPixFmt cur.videoWidth cur.videoHeight wArg hArg cur.videoFrames
             | return none
@@ -759,19 +887,20 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
             | return none
           cur := nextM
       else if nm == "format" then
-        if let some pfArg := FilterArg.lookup node.args "pix_fmts" 0 then
-          let targetPf := (pfArg.splitOn "|").headD pfArg
-          if let some fmt := PixelFormat.parse targetPf then
-            let dstC := fmt.toString
-            if dstC != cur.videoPixFmt then
-              let some conv := convertRawVideoPixFmt cur.rawVideo cur.videoPixFmt dstC cur.videoWidth cur.videoHeight cur.videoFrames .bt2020ncl ditherMode
-                | return none
-              let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight cur.videoFrames dstC conv cur.fps
-                | return none
-              cur := nextM
+        let some pfArg := FilterArg.lookup node.args "pix_fmts" 0 | return none
+        let targetPf := (pfArg.splitOn "|").headD pfArg
+        let some fmt := PixelFormat.parse targetPf | return none
+        let dstC := fmt.toString
+        if dstC != cur.videoPixFmt then
+          let some conv := convertRawVideoPixFmt cur.rawVideo cur.videoPixFmt dstC cur.videoWidth cur.videoHeight cur.videoFrames .bt2020ncl ditherMode
+            | return none
+          let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight cur.videoFrames dstC conv cur.fps
+            | return none
+          cur := nextM
       else if nm == "dither" then
         let mStr := (FilterArg.lookup node.args "mode" 0).getD (FilterArg.lookup node.args "dither" 0 |>.getD "bayer")
-        ditherMode := mStr.toLower
+        let some dm := parseHbdDitherMode mStr | return none
+        ditherMode := dm
         let targetPf :=
           if options.pixFmt != "" then options.pixFmt
           else if cur.videoPixFmt == "yuv420p12le" then "yuv420p10le"
@@ -780,16 +909,36 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
           else if cur.videoPixFmt == "yuv422p10le" then "yuv422p"
           else if cur.videoPixFmt == "yuv444p10le" then "yuv444p"
           else "yuv420p"
-        if let some fmt := PixelFormat.parse targetPf then
-          let dstC := fmt.toString
-          if dstC != cur.videoPixFmt then
-            let some conv := convertRawVideoPixFmt cur.rawVideo cur.videoPixFmt dstC cur.videoWidth cur.videoHeight cur.videoFrames .bt2020ncl ditherMode
-              | return none
-            let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight cur.videoFrames dstC conv cur.fps
-              | return none
-            cur := nextM
+        let some fmt := PixelFormat.parse targetPf | return none
+        let dstC := fmt.toString
+        if dstC != cur.videoPixFmt then
+          let some conv := convertRawVideoPixFmt cur.rawVideo cur.videoPixFmt dstC cur.videoWidth cur.videoHeight cur.videoFrames .bt2020ncl ditherMode
+            | return none
+          let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight cur.videoFrames dstC conv cur.fps
+            | return none
+          cur := nextM
+      else if nm == "fps" then
+        let rStr := (FilterArg.lookup node.args "fps" 0).getD "25"
+        let some targetFps := parseLavfiRate rStr | return none
+        if targetFps == 0 || cur.videoFrames == 0 then return none
+        let srcFps := Nat.max 1 cur.fps
+        let outCount := Nat.max 1 ((cur.videoFrames * targetFps) / srcFps)
+        let some fmt := PixelFormat.parse cur.videoPixFmt | return none
+        let some fb := fmt.frameByteSize cur.videoWidth cur.videoHeight | return none
+        if cur.rawVideo.size != cur.videoFrames * fb then return none
+        let mut outRaw := ByteArray.emptyWithCapacity (outCount * fb)
+        let mut outRpus : Array ByteArray := #[]
+        for i in [:outCount] do
+          let srcIdx := Nat.min (cur.videoFrames - 1) ((i * srcFps) / targetFps)
+          outRaw := outRaw ++ cur.rawVideo.extract (srcIdx * fb) ((srcIdx + 1) * fb)
+          if srcIdx < cur.rpus.size then outRpus := outRpus.push cur.rpus[srcIdx]!
+        let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight outCount cur.videoPixFmt outRaw targetFps
+          | return none
+        cur := { nextM with rpus := if cur.rpus.isEmpty then #[] else outRpus }
       else if nm == "tonemap" then
         let mode := ((FilterArg.lookup node.args "tonemap" 0).getD (FilterArg.lookup node.args "mode" 0 |>.getD "hable")).toLower
+        if mode != "reinhard" && mode != "hable" && mode != "mobius" && mode != "clip" && mode != "linear" then
+          return none
         let trc := if cur.colour.transferCharacteristics == 18 then 18 else 16
         let srcCm : ColorMatrix :=
           if cur.colour.matrixCoefficients == 1 then .bt709
@@ -808,23 +957,58 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
             pure (Array.ofFn fun i : Fin cur.videoFrames =>
               let slice := y10.extract (i.val * fb10) ((i.val + 1) * fb10)
               LeanAV.Scale.tonemapYuv420p10FrameToSdrVideoFrame slice cur.videoWidth cur.videoHeight srcCm mode trc i.val.toUInt64)
-          else
+          else if cur.videoPixFmt == "yuv420p" && !cur.video.isEmpty then
             pure (cur.video.map (fun vf => LeanAV.Scale.tonemapVideoFrameHdrToSdrWithTransfer vf mode trc))
+          else
+            return none
         cur := syncMediaFromVideoFrames { cur with
           video := mapped
           colour := { cur.colour with primaries := 1, transferCharacteristics := 1, matrixCoefficients := 1, hasMastering := false, maxCll := 0, maxFall := 0 }
           hasDovi := false
           rpus := #[] }
-      else if nm == "colorspace" then
-        let allArg := (FilterArg.lookup node.args "all" 0).getD "bt709"
-        let dstM : ColorMatrix := if allArg.toLower == "bt2020" || allArg.toLower == "bt2020nc" || allArg.toLower == "bt2020ncl" then .bt2020ncl else if allArg.toLower == "bt601" then .bt601 else .bt709
-        if dstM == .bt709 && (options.pixFmt == "" || options.pixFmt == "yuv420p") then
-          let mapped := cur.video.map (fun vf => LeanAV.Scale.convertVideoFrameColorspace vf .bt709)
+      else if nm == "colorspace" || nm == "bt2020_to_bt709" then
+        let allArg :=
+          if nm == "bt2020_to_bt709" then "bt709"
+          else ((FilterArg.lookup node.args "all" 0).orElse (fun _ => FilterArg.lookup node.args "space" 0) |>.getD "bt709").toLower
+        let dstM : ColorMatrix ←
+          if allArg == "bt2020" || allArg == "bt2020nc" || allArg == "bt2020ncl" then pure .bt2020ncl
+          else if allArg == "bt601" then pure .bt601
+          else if allArg == "bt709" then pure .bt709
+          else return none
+        let srcCm : ColorMatrix :=
+          if cur.colour.matrixCoefficients == 1 then .bt709
+          else if cur.colour.matrixCoefficients == 5 || cur.colour.matrixCoefficients == 6 then .bt601
+          else .bt2020ncl
+        let dstCicp : (Nat × Nat × Nat) :=
+          if dstM == .bt2020ncl then (9, cur.colour.transferCharacteristics, 9)
+          else if dstM == .bt601 then (5, 6, 5)
+          else (1, if cur.colour.transferCharacteristics == 16 || cur.colour.transferCharacteristics == 18 then cur.colour.transferCharacteristics else 1, 1)
+        if cur.videoPixFmt == "yuv420p" then
+          let mapped := cur.video.map (fun vf => LeanAV.Scale.convertVideoFrameColorspace { vf with colorMatrix := srcCm } dstM)
           cur := syncMediaFromVideoFrames { cur with
             video := mapped
-            colour := { cur.colour with primaries := 1, transferCharacteristics := 1, matrixCoefficients := 1 } }
-        else if dstM == .bt2020ncl then
-          cur := { cur with colour := { cur.colour with primaries := 9, matrixCoefficients := 9 } }
+            colour := { cur.colour with primaries := dstCicp.1, transferCharacteristics := dstCicp.2.1, matrixCoefficients := dstCicp.2.2 } }
+        else
+          let some conv := convertRawVideoColorspaceMatrix cur.rawVideo cur.videoPixFmt cur.videoWidth cur.videoHeight cur.videoFrames srcCm dstM ditherMode
+            | return none
+          let some nextM := syncMediaFromRaw { cur with colour := { cur.colour with primaries := dstCicp.1, transferCharacteristics := dstCicp.2.1, matrixCoefficients := dstCicp.2.2 } }
+            cur.videoWidth cur.videoHeight cur.videoFrames cur.videoPixFmt conv cur.fps
+            | return none
+          cur := nextM
+      else if cur.videoPixFmt == "yuv420p" then
+        let mut seg := node.name
+        if !node.args.isEmpty then
+          let rendered := node.args.map fun a =>
+            match a with
+            | .positional v => v
+            | .keyed k v => s!"{k}={v}"
+          seg := seg ++ "=" ++ String.intercalate ":" rendered
+        match runSingleStreamVideoFilterGraph seg cur.video cur.fps with
+        | .ok (frames8, fps8) =>
+          cur := syncMediaFromVideoFrames { cur with video := frames8, fps := fps8 }
+        | .error _ => return none
+      else
+        return none
   if options.pixFmt != "" then
     let some dstFmt := PixelFormat.parse options.pixFmt | return none
     let dstC := dstFmt.toString
@@ -887,11 +1071,8 @@ def filter (media : Media) (options : Options) : Except String Media := do
   let fg? : Option LeanAV.Av1Main.Av1FilmGrainParams :=
     if options.filmGrain > 0 then some (canonicalFilmGrain options.filmGrain) else media.filmGrain?
   if isHbdFlow then
-    let (_, outFps) ←
-      if options.videoFilter != "" then runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
-      else pure (media.video, media.fps)
-    let some hbdMedia := applyHbdVideoFilterChain { media with fps := outFps, colour := baseColour, filmGrain? := fg? } options
-      | throw "unsupported high-bit-depth pixel format conversion without explicit filter stage (fail-closed)"
+    let some hbdMedia := applyHbdVideoFilterChain { media with colour := baseColour, filmGrain? := fg? } options
+      | throw "unsupported high-bit-depth video filter or pixel format conversion (fail-closed)"
     return { hbdMedia with
       video := if options.noVideo then #[] else hbdMedia.video
       rawVideo := if options.noVideo then ByteArray.empty else hbdMedia.rawVideo
@@ -1086,48 +1267,112 @@ def encodeVideoTrack (media : Media) (options : Options) : Option SynthMp4Track 
     samples := packets.map fun p => { data := p.1, dur := 1000, cttsOff := 0, isSync := p.2 }
   }
 
-def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray := do
-  if media.video.isEmpty then none
-  let w := if media.videoWidth > 0 then media.videoWidth else (media.video[0]?.map (·.width)).getD 0
-  let h := if media.videoHeight > 0 then media.videoHeight else (media.video[0]?.map (·.height)).getD 0
-  if w == 0 || h == 0 then none
-  let docType := if options.format == "webm" then "webm" else "matroska"
-  let mut codecId := ""
-  let mut codecPrivate := ByteArray.empty
-  let mut packets : Array (ByteArray × Bool) := #[]
-  if options.videoCodec == "hevc" && docType != "webm" then
-    let (hvcc, mp4Pkts, _) ← encodeHevcStreamForMedia media options
-    codecId := "V_MPEGH/ISO/HEVC"
-    codecPrivate := hvcc
-    packets := mp4Pkts
-  else if options.videoCodec == "av1" then
-    let (av1c, mp4Pkts, _) ← encodeAv1StreamForMedia media options "mp4"
-    codecId := "V_AV1"
-    codecPrivate := av1c
-    packets := mp4Pkts
-  else if options.videoCodec == "h264" && docType != "webm" then
-    let (avcc, lenPrefixed, _) ← encodeH264StreamForMedia media options
-    codecId := "V_MPEG4/ISO/AVC"
-    codecPrivate := avcc
-    packets := lenPrefixed.map (fun p => (p, true))
-  else none
-  let stepMs := Nat.max 1 (1000 / Nat.max 1 media.fps)
-  let vTrack : P11CrossRemuxTrack := {
-    kind := .video
-    codecId := codecId
-    width := w
-    height := h
-    channels := 0
-    sampleRate := 0
-    timescale := 1000
-    codecPrivate := codecPrivate
+def encodeMkvAacTrack (media : Media) (af : AudioFrame) : Option P11CrossRemuxTrack := do
+  let pcmChans := audioChannels16 media af
+  if pcmChans.isEmpty || pcmChans.size > 2 then none
+  let srIdx ← LeanAV.AacLc.aacSampleRateToIndex af.sampleRate
+  let encAdts ← LeanAV.AacLc.aacEncodeAdtsStream pcmChans af.sampleRate 16 128000 true
+  let (_, rawSlices) ← LeanAV.AacLc.demuxAdtsStream (ByteSlice.ofByteArray encAdts) false
+  if rawSlices.isEmpty then none
+  let mut outSamples : Array (ByteArray × Nat × Bool) := Array.mkEmpty rawSlices.size
+  for sl in rawSlices do
+    let b := sl.toByteArray
+    if b.size == 0 then none
+    outSamples := outSamples.push (b, 1024, true)
+  let outAsc : LeanAV.AacLc.AacLcAsc := {
+    audioObjectType := 2
+    samplingFrequencyIndex := srIdx
+    channelConfiguration := pcmChans.size.toUInt8
+    frameLengthFlag := false
+    dependsOnCoreCoder := false
+    extensionFlag := false
+  }
+  some {
+    kind := .audio
+    codecId := "A_AAC"
+    width := 0
+    height := 0
+    channels := pcmChans.size
+    sampleRate := af.sampleRate.toNat
+    timescale := af.sampleRate.toNat
+    codecPrivate := LeanAV.AacLc.encodeAacLcAsc outAsc
     colour := media.colour
     mastering := media.mastering
     dovi := media.dovi
-    hasDovi := media.hasDovi
-    samples := packets.map (fun (p, sync) => (p, stepMs, sync))
+    hasDovi := false
+    samples := outSamples
   }
-  let mut tracks : Array P11CrossRemuxTrack := #[vTrack]
+
+def copyMkvAudioTrack (media : Media) (docType : String) : Option P11CrossRemuxTrack := do
+  let copied ← media.audioCopy
+  let tops ← p11Mp4Kids copied.stsdBox 0
+  let stsd ← tops.find? (fun b => b.fourcc == "stsd")
+  let entries ← p11Mp4Kids stsd.boxSlice.toByteArray (stsd.headerBytes + 8)
+  let entry ← entries[0]?
+  let codecId ←
+    if entry.fourcc == "Opus" then some "A_OPUS"
+    else if entry.fourcc == "mp4a" && docType != "webm" then some "A_AAC"
+    else none
+  let (priv, ch, rate, _, _, _, _) ← p11ExtractCrossMeta copied.stsdBox codecId
+  if copied.samples.isEmpty || copied.timescale == 0 then none
+  some {
+    kind := .audio
+    codecId := codecId
+    width := 0
+    height := 0
+    channels := if ch == 0 then 2 else ch
+    sampleRate := if rate == 0 then 48000 else rate
+    timescale := copied.timescale
+    codecPrivate := priv
+    colour := media.colour
+    mastering := media.mastering
+    dovi := media.dovi
+    hasDovi := false
+    samples := copied.samples.map (fun s => (s.data, s.dur, s.isSync))
+  }
+
+def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray := do
+  let docType := if options.format == "webm" then "webm" else "matroska"
+  let mut tracks : Array P11CrossRemuxTrack := #[]
+  if !media.video.isEmpty then
+    let w := if media.videoWidth > 0 then media.videoWidth else (media.video[0]?.map (·.width)).getD 0
+    let h := if media.videoHeight > 0 then media.videoHeight else (media.video[0]?.map (·.height)).getD 0
+    if w == 0 || h == 0 then none
+    let mut codecId := ""
+    let mut codecPrivate := ByteArray.empty
+    let mut packets : Array (ByteArray × Bool) := #[]
+    if options.videoCodec == "hevc" && docType != "webm" then
+      let (hvcc, mp4Pkts, _) ← encodeHevcStreamForMedia media options
+      codecId := "V_MPEGH/ISO/HEVC"
+      codecPrivate := hvcc
+      packets := mp4Pkts
+    else if options.videoCodec == "av1" then
+      let (av1c, mp4Pkts, _) ← encodeAv1StreamForMedia media options "mp4"
+      codecId := "V_AV1"
+      codecPrivate := av1c
+      packets := mp4Pkts
+    else if options.videoCodec == "h264" && docType != "webm" then
+      let (avcc, lenPrefixed, _) ← encodeH264StreamForMedia media options
+      codecId := "V_MPEG4/ISO/AVC"
+      codecPrivate := avcc
+      packets := lenPrefixed.map (fun p => (p, true))
+    else none
+    let stepMs := Nat.max 1 (1000 / Nat.max 1 media.fps)
+    tracks := tracks.push {
+      kind := .video
+      codecId := codecId
+      width := w
+      height := h
+      channels := 0
+      sampleRate := 0
+      timescale := 1000
+      codecPrivate := codecPrivate
+      colour := media.colour
+      mastering := media.mastering
+      dovi := media.dovi
+      hasDovi := media.hasDovi
+      samples := packets.map (fun (p, sync) => (p, stepMs, sync))
+    }
   if let some af := media.audio then
     if options.audioCodec == "opus" || (docType == "webm" && options.audioCodec == "") then
       let af16 := if media.audioBits == 16 && af.sampleFmt == .s16p then af
@@ -1148,7 +1393,15 @@ def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray :=
         hasDovi := false
         samples := opPkts.map (fun (p, _) => (p, 20, true))
       }
-  p11MuxMkvFromCrossTracks docType tracks
+    else if docType != "webm" && (options.audioCodec == "aac" || options.audioCodec == "") then
+      let aTrack ← encodeMkvAacTrack media af
+      tracks := tracks.push aTrack
+    else if options.audioCodec == "copy" then
+      let aTrack ← copyMkvAudioTrack media docType
+      tracks := tracks.push aTrack
+    else none
+  if tracks.isEmpty then none
+  else p11MuxMkvFromCrossTracks docType tracks
 
 def encodeAudioTrack (media : Media) (options : Options) : Option SynthMp4Track := do
   let af ← media.audio
@@ -1293,13 +1546,39 @@ def filterStreams (inputs : Array Media) (options : Options) : Except String Med
       throw "cannot combine -filter_complex with -vf or -af"
     if options.audioCodec == "copy" then
       throw "cannot combine -filter_complex with -c:a copy"
-    if inputs.size == 1 &&
-       (inputs[0]!.videoPixFmt != "yuv420p" || (options.pixFmt != "" && options.pixFmt != "yuv420p")) then
+    let anyHbdInput := inputs.any (fun m =>
+      !m.video.isEmpty &&
+      (m.videoPixFmt != "yuv420p" || m.hasDovi || m.colour.hasMastering ||
+       m.colour.primaries == 9 || m.colour.transferCharacteristics == 16 ||
+       m.colour.transferCharacteristics == 18))
+    let wantsHbdOut :=
+      (options.pixFmt != "" && options.pixFmt != "yuv420p") ||
+      options.colorPrimaries.isSome || options.colorTrc.isSome || options.colorspace.isSome ||
+      options.filmGrain > 0
+    if anyHbdInput || wantsHbdOut then
+      if inputs.size != 1 || inputs[0]!.video.isEmpty || (inputs[0]!.audio.isSome && !options.noAudio) then
+        throw "multi-input or audio-bearing high-bit-depth filter_complex is unsupported (fail-closed)"
       let m0 := inputs[0]!
-      let (_, outFps) ← runSingleStreamVideoFilterGraph options.filterComplex m0.video m0.fps
-      let some hbdM := applyHbdVideoFilterChain { m0 with fps := outFps } options
+      let baseColour : MkvHdrColour := {
+        m0.colour with
+        primaries := (options.colorPrimaries.map UInt16.toNat).getD m0.colour.primaries
+        transferCharacteristics := (options.colorTrc.map UInt16.toNat).getD m0.colour.transferCharacteristics
+        matrixCoefficients := (options.colorspace.map UInt16.toNat).getD m0.colour.matrixCoefficients
+      }
+      let fg? : Option LeanAV.Av1Main.Av1FilmGrainParams :=
+        if options.filmGrain > 0 then some (canonicalFilmGrain options.filmGrain) else m0.filmGrain?
+      let g ← parseFilterGraph options.filterComplex
+      if !options.maps.isEmpty then
+        if options.maps.size != 1 || g.openOutputs != [normalizePadLabel options.maps[0]!] then
+          throw "unmapped high-bit-depth filter_complex output pad (fail-closed)"
+      let some hbdM := applyHbdVideoFilterChain { m0 with colour := baseColour, filmGrain? := fg? } options
         | throw "unsupported high-bit-depth filter_complex conversion (fail-closed)"
-      return hbdM
+      return { hbdM with
+        video := if options.noVideo then #[] else hbdM.video
+        rawVideo := if options.noVideo then ByteArray.empty else hbdM.rawVideo
+        videoFrames := if options.noVideo then 0 else hbdM.videoFrames
+        audio := none
+        audioCopy := none }
     let graph ← parseFilterGraph options.filterComplex
     let inputLabels := graph.nodes.toList.flatMap (·.inputs)
     let mut videoIn : List (String × Array VideoFrame × Nat) := []

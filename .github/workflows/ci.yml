@@ -79,7 +79,7 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 24968 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 24984 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           ! command -v ffmpeg
@@ -192,7 +192,7 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 24968 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 24984 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           python3 - <<'PY'

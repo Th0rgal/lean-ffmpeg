@@ -475,6 +475,253 @@ class TestP11E2EPipeline(unittest.TestCase):
         self.assertEqual(r_hlg.returncode, 0, r_hlg.stdout + r_hlg.stderr)
         self.assertGreaterEqual(min(hlg_sdr.read_bytes()[: w * h]), 180)
 
+    def test_07_hbd_unsupported_vf_fails_closed_and_mkv_aac_audio_preserved(self) -> None:
+        raw_10b = _make_raw_10bit_yuv420p(16, 16, frames=2)
+        raw_in = self.work / "in_hbd_negate.yuv"
+        raw_in.write_bytes(raw_10b)
+        bad_out = self.work / "out_hbd_negate.yuv"
+
+        r_neg = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-i",
+                str(raw_in),
+                "-vf",
+                "negate",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-y",
+                str(bad_out),
+            ]
+        )
+        self.assertNotEqual(r_neg.returncode, 0)
+        self.assertFalse(bad_out.exists())
+
+        post_tm_out = self.work / "out_tonemap_negate.yuv"
+        r_tm_neg = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-i",
+                str(raw_in),
+                "-vf",
+                "tonemap=reinhard,negate",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(post_tm_out),
+            ]
+        )
+        self.assertEqual(r_tm_neg.returncode, 0, r_tm_neg.stdout + r_tm_neg.stderr)
+        r_tm_only_out = self.work / "out_tonemap_only.yuv"
+        r_tm_only = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-i",
+                str(raw_in),
+                "-vf",
+                "tonemap=reinhard",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(r_tm_only_out),
+            ]
+        )
+        self.assertEqual(r_tm_only.returncode, 0, r_tm_only.stdout + r_tm_only.stderr)
+        b_tm = r_tm_only_out.read_bytes()
+        b_tm_neg = post_tm_out.read_bytes()
+        self.assertEqual(len(b_tm), len(b_tm_neg))
+        self.assertNotEqual(b_tm[: 16 * 16], b_tm_neg[: 16 * 16])
+
+        hdr_video_mp4 = self.work / "hdr_video_only.mp4"
+        r_hdr_v = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-r",
+                "25",
+                "-i",
+                str(raw_in),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-y",
+                str(hdr_video_mp4),
+            ]
+        )
+        self.assertEqual(r_hdr_v.returncode, 0, r_hdr_v.stdout + r_hdr_v.stderr)
+
+        hdr_av_mp4 = self.work / "hdr_with_aac.mp4"
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(hdr_video_mp4),
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.08",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-y",
+                str(hdr_av_mp4),
+            ],
+            check=True,
+        )
+
+        mkv_aac_out = self.work / "hdr_with_aac.mkv"
+        r_mkv_aac = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_av_mp4),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:a",
+                "aac",
+                "-y",
+                str(mkv_aac_out),
+            ]
+        )
+        self.assertEqual(r_mkv_aac.returncode, 0, r_mkv_aac.stdout + r_mkv_aac.stderr)
+        probe_mkv = _ffprobe_json(mkv_aac_out)
+        codecs = [s["codec_name"] for s in probe_mkv["streams"]]
+        self.assertEqual(codecs, ["hevc", "aac"])
+
+        mkv_copy_out = self.work / "hdr_with_aac_copy.mkv"
+        r_mkv_copy = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_av_mp4),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:a",
+                "copy",
+                "-y",
+                str(mkv_copy_out),
+            ]
+        )
+        self.assertEqual(r_mkv_copy.returncode, 0, r_mkv_copy.stdout + r_mkv_copy.stderr)
+        probe_copy = _ffprobe_json(mkv_copy_out)
+        self.assertEqual([s["codec_name"] for s in probe_copy["streams"]], ["hevc", "aac"])
+
+        webm_bad_aac = self.work / "bad_webm_aac.webm"
+        r_webm_bad = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_av_mp4),
+                "-c:v",
+                "av1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:a",
+                "aac",
+                "-y",
+                str(webm_bad_aac),
+            ]
+        )
+        self.assertNotEqual(r_webm_bad.returncode, 0)
+        self.assertFalse(webm_bad_aac.exists())
+
+        mkv_bad_pcm = self.work / "bad_mkv_pcm.mkv"
+        r_mkv_pcm = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_av_mp4),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+                str(mkv_bad_pcm),
+            ]
+        )
+        self.assertNotEqual(r_mkv_pcm.returncode, 0)
+        self.assertFalse(mkv_bad_pcm.exists())
+
+        fc_bad_out = self.work / "bad_hbd_fc.mp4"
+        r_fc_bad = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_video_mp4),
+                "-filter_complex",
+                "[0:v]negate[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-y",
+                str(fc_bad_out),
+            ]
+        )
+        self.assertNotEqual(r_fc_bad.returncode, 0)
+        self.assertFalse(fc_bad_out.exists())
+
+        cs10_out = self.work / "hdr_cs_bt709_10b.mp4"
+        r_cs10 = _run_lffmpeg(
+            [
+                "-i",
+                str(hdr_video_mp4),
+                "-vf",
+                "colorspace=all=bt709",
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-y",
+                str(cs10_out),
+            ]
+        )
+        self.assertEqual(r_cs10.returncode, 0, r_cs10.stdout + r_cs10.stderr)
+        probe_cs10 = _ffprobe_json(cs10_out)
+        self.assertEqual(probe_cs10["streams"][0]["pix_fmt"], "yuv420p10le")
+        self.assertEqual(probe_cs10["streams"][0].get("color_space"), "bt709")
+
 
 if __name__ == "__main__":
     unittest.main()
