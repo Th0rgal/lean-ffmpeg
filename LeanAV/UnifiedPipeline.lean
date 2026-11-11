@@ -201,13 +201,13 @@ def unpackYuv420p10ToVideoFrames (w h : Nat) (raw10 : ByteArray) (cm : ColorMatr
     for r in [:h] do
       for c in [:w] do
         let v10 := Nat.min 1023 (hbdReadLe16 raw10 (base + 2 * (r * w + c)))
-        pY := pY.setPixel r c ((v10 + 2) / 4).toUInt8
+        pY := pY.setPixel r c (Nat.min 255 ((v10 + 2) / 4)).toUInt8
     for r in [:ch] do
       for c in [:cw] do
         let u10 := Nat.min 1023 (hbdReadLe16 raw10 (base + yBytes + 2 * (r * cw + c)))
         let v10 := Nat.min 1023 (hbdReadLe16 raw10 (base + yBytes + uvBytes + 2 * (r * cw + c)))
-        pU := pU.setPixel r c ((u10 + 2) / 4).toUInt8
-        pV := pV.setPixel r c ((v10 + 2) / 4).toUInt8
+        pU := pU.setPixel r c (Nat.min 255 ((u10 + 2) / 4)).toUInt8
+        pV := pV.setPixel r c (Nat.min 255 ((v10 + 2) / 4)).toUInt8
     let vf0 := VideoFrame.allocYuv420p w h f.toUInt64
     out := out.push { vf0 with colorMatrix := cm, planes := #[pY, pU, pV] }
   return some out
@@ -422,12 +422,21 @@ def decodedVideo (decoded : Option (Nat × Nat × Nat × ByteArray)) (fps : Nat 
   if count != frames.size then none else some (syncMediaFromVideoFrames { video := frames, fps := fps })
 
 def decodeHevcStreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media := do
-  let (w, h, count, pf, rawBytes) ← LeanAV.HevcMain.decodeHevcGen raw
-  syncMediaFromRaw { videoCodecSrc := "hevc" } w h count pf rawBytes fps
+  let (w, h, count, pf, rawBytes, vp, vt, vm) ← LeanAV.HevcMain.decodeHevcGenWithColor raw
+  let base : Media := {
+    videoCodecSrc := "hevc"
+    colour := { primaries := vp, transferCharacteristics := vt, matrixCoefficients := vm, maxCll := 0, maxFall := 0, hasMastering := false } }
+  syncMediaFromRaw base w h count pf rawBytes fps
 
 def decodeAv1StreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media := do
+  let (_, _, pkts) ← LeanAV.Av1Main.av1ExtractContainerPackets raw
+  let mut rpus : Array ByteArray := #[]
+  for pkt in pkts do
+    if let some rpu := extractAv1RpuFromTu pkt then
+      rpus := rpus.push rpu
   let (w, h, count, _, pf, rawBytes) ← LeanAV.Av1Main.decodeAv1ToRaw raw
-  syncMediaFromRaw { videoCodecSrc := "av1" } w h count pf rawBytes fps
+  let base : Media := { videoCodecSrc := "av1", hasDovi := !rpus.isEmpty, rpus := rpus }
+  syncMediaFromRaw base w h count pf rawBytes fps
 
 def decodeH264StreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media :=
   if let some pics := LeanAV.H264IntraTransform.decodeAnnexBToPicturesHbd raw then
@@ -463,8 +472,8 @@ def extractMp4SampleRpus (raw : ByteArray) (samples : Array NativeMp4Sample) (is
       let slice := ByteSlice.ofByteArray au
       if isAv1 then
         if au.size > 0 then
-          if let some rpu := decodeAv1T35DoviObu au.toList then
-            out := out.push (ByteArray.mk rpu.toArray)
+          if let some rpu := extractAv1RpuFromTu au then
+            out := out.push rpu
       else
         let mut p := 0
         let mut found : Option ByteArray := none
@@ -548,12 +557,16 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
                 hasDovi := hasDovi }
             syncMediaFromRaw baseM sps.widthPx.toNat sps.heightPx.toNat cnt pf rawBytes (fpsEst cnt)
         else if tr.stsdFourcc == "hvc1" || tr.stsdFourcc == "hev1" then do
-          let (w, h, cnt, pf, rawBytes) ← LeanAV.HevcMain.decodeHevcGen raw
+          let (w, h, cnt, pf, rawBytes, vp, vt, vm) ← LeanAV.HevcMain.decodeHevcGenWithColor raw
           let rpus := extractMp4SampleRpus raw tr.samples false
+          let mergedColour : MkvHdrColour := { colour with
+            primaries := if colour.primaries == 0 || colour.primaries == 2 then vp else colour.primaries
+            transferCharacteristics := if colour.transferCharacteristics == 0 || colour.transferCharacteristics == 2 then vt else colour.transferCharacteristics
+            matrixCoefficients := if colour.matrixCoefficients == 0 || colour.matrixCoefficients == 2 then vm else colour.matrixCoefficients }
           let baseM : Media :=
             { media with
               videoCodecSrc := "hevc"
-              colour := colour
+              colour := mergedColour
               mastering := mastering
               dovi := dovi
               hasDovi := hasDovi || !rpus.isEmpty
@@ -776,8 +789,27 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
               | return none
             cur := nextM
       else if nm == "tonemap" then
-        let mode := (FilterArg.lookup node.args "tonemap" 0).getD (FilterArg.lookup node.args "mode" 0 |>.getD "hable")
-        let mapped := cur.video.map (fun vf => LeanAV.Scale.tonemapVideoFrameHdrToSdr vf mode.toLower)
+        let mode := ((FilterArg.lookup node.args "tonemap" 0).getD (FilterArg.lookup node.args "mode" 0 |>.getD "hable")).toLower
+        let trc := if cur.colour.transferCharacteristics == 18 then 18 else 16
+        let srcCm : ColorMatrix :=
+          if cur.colour.matrixCoefficients == 1 then .bt709
+          else if cur.colour.matrixCoefficients == 5 || cur.colour.matrixCoefficients == 6 then .bt601
+          else .bt2020ncl
+        let mapped ←
+          if cur.videoPixFmt != "yuv420p" && cur.rawVideo.size > 0 &&
+             cur.videoWidth > 0 && cur.videoHeight > 0 &&
+             cur.videoWidth % 2 == 0 && cur.videoHeight % 2 == 0 && cur.videoFrames > 0 then
+            let some y10 :=
+              if cur.videoPixFmt == "yuv420p10le" then some cur.rawVideo
+              else convertRawVideoPixFmt cur.rawVideo cur.videoPixFmt "yuv420p10le" cur.videoWidth cur.videoHeight cur.videoFrames srcCm ditherMode
+              | return none
+            let fb10 := 3 * cur.videoWidth * cur.videoHeight
+            if y10.size != cur.videoFrames * fb10 then return none
+            pure (Array.ofFn fun i : Fin cur.videoFrames =>
+              let slice := y10.extract (i.val * fb10) ((i.val + 1) * fb10)
+              LeanAV.Scale.tonemapYuv420p10FrameToSdrVideoFrame slice cur.videoWidth cur.videoHeight srcCm mode trc i.val.toUInt64)
+          else
+            pure (cur.video.map (fun vf => LeanAV.Scale.tonemapVideoFrameHdrToSdrWithTransfer vf mode trc))
         cur := syncMediaFromVideoFrames { cur with
           video := mapped
           colour := { cur.colour with primaries := 1, transferCharacteristics := 1, matrixCoefficients := 1, hasMastering := false, maxCll := 0, maxFall := 0 }
@@ -837,6 +869,7 @@ def filter (media : Media) (options : Options) : Except String Media := do
     !media.video.isEmpty &&
     (media.videoPixFmt != "yuv420p" || (options.pixFmt != "" && options.pixFmt != "yuv420p") ||
      media.hasDovi || media.colour.hasMastering || media.colour.primaries == 9 ||
+     media.colour.transferCharacteristics == 16 || media.colour.transferCharacteristics == 18 ||
      options.colorPrimaries.isSome || options.colorTrc.isSome || options.colorspace.isSome ||
      options.filmGrain > 0)
   let audio ← match media.audio with
@@ -976,11 +1009,23 @@ def encodeAv1StreamForMedia (media : Media) (options : Options) (outFmt : String
     let (av1cBase, mp4Base) ← LeanAV.Av1Main.encodeAv1Mp4TrackPayloadsRaw w h pf raw options.qp options.av1TileColumns options.av1TileRows fg?
     let mp4Pkts := mp4Base.mapIdx fun i (pkt, sync) =>
       if i < media.rpus.size then
-        let rpuObu := ByteArray.mk (encodeAv1T35DoviObu media.rpus[i]!.toList).toArray
-        (pkt ++ rpuObu, sync)
+        match injectAv1RpuIntoTu pkt media.rpus[i]! with
+        | some injected => (injected, sync)
+        | none =>
+          let rpuObu := ByteArray.mk (encodeAv1DoviEmdfObu media.rpus[i]!.toList).toArray
+          (pkt ++ rpuObu, sync)
       else (pkt, sync)
-    let streamFmt := if outFmt == "ivf" then "ivf" else "obu"
-    let rawStream ← LeanAV.Av1Main.encodeAv1FromRaw w h pf raw options.qp streamFmt options.av1TileColumns options.av1TileRows fg?
+    let rawStream ←
+      if outFmt == "ivf" then
+        let ivfFrames := mp4Pkts.map fun (pkt, _) => LeanAV.Av1Main.av1WrapObu LeanAV.Av1Main.av1ObuTd ByteArray.empty true ++ pkt
+        pure (LeanAV.Av1Main.av1MuxIvf w h ivfFrames (Nat.max 1 media.fps) 1)
+      else if outFmt == "obu" || outFmt == "av1" then
+        let mut cat := ByteArray.empty
+        for (pkt, _) in mp4Pkts do
+          cat := cat ++ LeanAV.Av1Main.av1WrapObu LeanAV.Av1Main.av1ObuTd ByteArray.empty true ++ pkt
+        pure cat
+      else
+        LeanAV.Av1Main.encodeAv1FromRaw w h pf raw options.qp "obu" options.av1TileColumns options.av1TileRows fg?
     some (av1cBase, mp4Pkts, rawStream)
 
 def encodeVideoTrack (media : Media) (options : Options) : Option SynthMp4Track := do

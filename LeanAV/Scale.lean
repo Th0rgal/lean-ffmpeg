@@ -2188,27 +2188,39 @@ def gamutBt709ToBt2020LinearQ16 (r709 g709 b709 : Nat) : Nat × Nat × Nat :=
   let b2020 := (67 * r + 360 * g + 3669 * b + 2048) / 4096
   (clipIntMax r2020 65536, clipIntMax g2020 65536, clipIntMax b2020 65536)
 
-/-- BT.709 OETF mapping SDR linear `[0, 65536]` (`1.0 = 100 cd/m²`) to studio 8-bit `[0, 255]`. -/
+/-- BT.709 OETF mapping SDR linear `[0, 65536]` (`1.0 = 100 cd/m²`) to full-scale 8-bit `[0, 255]`. -/
 def bt709OetfLinearQ16ToU8 (linQ16 : Nat) : UInt8 := Id.run do
   let x := clampNatMax linQ16 65536
   if x == 0 then return 0
   if x >= 65536 then return 255
-  -- Integer sqrt approximation on `[0, 65536]` blended with linear toe `< 0.018` (`1180` in Q16)
   if x ≤ 1180 then
-    return (clampNatMax ((x * 4500 * 255) / (1000 * 65536)) 255).toUInt8
-  let mut s : Nat := 256
-  for _ in [:8] do
-    s := (s + (x * 256) / Nat.max 1 s) / 2
-  let out := (1099 * s - 99 * 256) / 1000
-  return (clampNatMax ((out * 255 + 128) / 256) 255).toUInt8
+    return (clampNatMax ((x * 4500 * 255 + 500 * 65536) / (1000 * 65536)) 255).toUInt8
+  let knots : Array Nat :=
+    #[5308, 9086, 11982, 14408, 16531, 18438, 20182, 21796,
+      23305, 24726, 26072, 27353, 28578, 29752, 30882, 31971,
+      33024, 34044, 35033, 35995, 36930, 37842, 38731, 39599,
+      40448, 41278, 42091, 42888, 43670, 44436, 45189, 45929,
+      46657, 47372, 48076, 48769, 49451, 50124, 50786, 51440,
+      52085, 52721, 53349, 53969, 54581, 55186, 55784, 56374,
+      56959, 57536, 58107, 58673, 59232, 59785, 60333, 60876,
+      61413, 61945, 62472, 62994, 63512, 64024, 64533, 65036, 65536]
+  let u := x - 1180
+  let span := 65536 - 1180
+  let seg := Nat.min 63 ((u * 64) / span)
+  let u0 := (seg * span) / 64
+  let u1 := Nat.max (u0 + 1) (((seg + 1) * span) / 64)
+  let y0 := knots[seg]!
+  let y1 := knots[seg + 1]!
+  let y := clampNatMax (y0 + ((y1 - y0) * (u - u0)) / (u1 - u0)) 65536
+  return (clampNatMax ((y * 255 + 32768) / 65536) 255).toUInt8
 
-/-- Parametric HDR-to-SDR tonemap curve on Q16 linear light (`10000 nits = 65536`, `100 nits SDR white = 655`). -/
-def tonemapCurveQ16 (mode : String) (linHdrQ16 : Nat) : Nat :=
-  -- Normalize relative to 203-nit diffuse white (`1330` in Q16) so `[0..65536]` maps smoothly into `[0..65536]`.
-  let x := (linHdrQ16 * 4096) / 1330
+/-- Parametric HDR-to-SDR tonemap curve on Q16 linear light (`trcCicp = 18` for HLG `1000 cd/m²`, else PQ `10000 cd/m²`). -/
+def tonemapCurveQ16 (mode : String) (linHdrQ16 : Nat) (trcCicp : Nat := 16) : Nat :=
+  let refWhiteQ16 := if trcCicp == 18 then 13304 else 1330
+  let x := (linHdrQ16 * 4096) / refWhiteQ16
   match mode with
-  | "clip" => clampNatMax ( x * 16 ) 65536
-  | "linear" => clampNatMax linHdrQ16 65536
+  | "clip" => clampNatMax (x * 16) 65536
+  | "linear" => clampNatMax ((x * 16) / 4) 65536
   | "mobius" =>
     if x ≤ 3072 then clampNatMax (x * 16) 65536
     else clampNatMax (49152 + ((x - 3072) * 16384) / (x + 4096)) 65536
@@ -2261,7 +2273,7 @@ def convertVideoFrameColorspace (vf : VideoFrame) (dstMatrix : ColorMatrix) : Vi
     { vf with colorMatrix := dstMatrix, planes := #[dstY, dstU, dstV] }
 
 /-- Real HDR-to-SDR tonemap execution on a `VideoFrame` (PQ EOTF -> BT.2020->BT.709 gamut -> `reinhard`/`hable`/`mobius`/`clip`/`linear` -> BT.709 OETF). -/
-def tonemapVideoFrameHdrToSdr (vf : VideoFrame) (mode : String) : VideoFrame :=
+def tonemapVideoFrameHdrToSdrWithTransfer (vf : VideoFrame) (mode : String) (trcCicp : Nat := 16) : VideoFrame :=
   if vf.planes.size < 3 then vf
   else
     let (dstY, dstU, dstV) := Id.run do
@@ -2276,20 +2288,24 @@ def tonemapVideoFrameHdrToSdr (vf : VideoFrame) (mode : String) : VideoFrame :=
       let mut outU := Plane2D.alloc cw ch cw 128
       let mut outV := Plane2D.alloc cw ch cw 128
       let is2020 := vf.colorMatrix == .bt2020 || vf.colorMatrix == .bt2020ncl
+      let isHlg := trcCicp == 18
       for r in [:h] do
         for c in [:w] do
           let y8 := srcY.getPixel r c
           let u8 := srcU.getPixel (r / 2) (c / 2)
           let v8 := srcV.getPixel (r / 2) (c / 2)
           let (rr, gg, bb) := yuvPixelToRgb vf.colorMatrix y8 u8 v8
-          let rLin := pqEotf10ToLinearQ16 ((rr.toNat * 1023 + 127) / 255)
-          let gLin := pqEotf10ToLinearQ16 ((gg.toNat * 1023 + 127) / 255)
-          let bLin := pqEotf10ToLinearQ16 ((bb.toNat * 1023 + 127) / 255)
+          let r10 := (rr.toNat * 1023 + 127) / 255
+          let g10 := (gg.toNat * 1023 + 127) / 255
+          let b10 := (bb.toNat * 1023 + 127) / 255
+          let (rLin, gLin, bLin) :=
+            if isHlg then hlgEotf10ToDisplayLinearQ16 r10 g10 b10
+            else (pqEotf10ToLinearQ16 r10, pqEotf10ToLinearQ16 g10, pqEotf10ToLinearQ16 b10)
           let (rGam, gGam, bGam) :=
             if is2020 then gamutBt2020ToBt709LinearQ16 rLin gLin bLin else (rLin, gLin, bLin)
-          let rTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode rGam)
-          let gTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode gGam)
-          let bTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode bGam)
+          let rTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode rGam trcCicp)
+          let gTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode gGam trcCicp)
+          let bTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode bGam trcCicp)
           let (yOut, uOut, vOut) := rgbPixelToYuv .bt709 rTm gTm bTm
           outY := outY.setPixel r c yOut
           if r % 2 == 0 && c % 2 == 0 then
@@ -2297,6 +2313,43 @@ def tonemapVideoFrameHdrToSdr (vf : VideoFrame) (mode : String) : VideoFrame :=
             outV := outV.setPixel (r / 2) (c / 2) vOut
       return (outY, outU, outV)
     { vf with colorMatrix := .bt709, planes := #[dstY, dstU, dstV] }
+
+def tonemapVideoFrameHdrToSdr (vf : VideoFrame) (mode : String) : VideoFrame :=
+  tonemapVideoFrameHdrToSdrWithTransfer vf mode 16
+
+/-- Direct 10-bit `yuv420p10le` HDR-to-SDR tonemap (`PQ` `trc=16` vs `HLG` `trc=18`) avoiding 8-bit intermediate loss. -/
+def tonemapYuv420p10FrameToSdrVideoFrame (src : ByteArray) (w h : Nat) (cm : ColorMatrix)
+    (mode : String) (trcCicp : Nat := 16) (pts : UInt64 := 0) : VideoFrame := Id.run do
+  let cw := (w + 1) / 2
+  let ch := (h + 1) / 2
+  let yBytes := 2 * w * h
+  let uvBytes := 2 * cw * ch
+  let mut outY := Plane2D.alloc w h w 16
+  let mut outU := Plane2D.alloc cw ch cw 128
+  let mut outV := Plane2D.alloc cw ch cw 128
+  let is2020 := cm == .bt2020 || cm == .bt2020ncl
+  let isHlg := trcCicp == 18
+  for r in [:h] do
+    for c in [:w] do
+      let y10 := clampNatMax (readLe16At src (2 * (r * w + c))) 1023
+      let u10 := clampNatMax (readLe16At src (yBytes + 2 * ((r / 2) * cw + (c / 2)))) 1023
+      let v10 := clampNatMax (readLe16At src (yBytes + uvBytes + 2 * ((r / 2) * cw + (c / 2)))) 1023
+      let (g10, b10, r10) := yuv10PixelToGbr10 cm y10 u10 v10
+      let (rLin, gLin, bLin) :=
+        if isHlg then hlgEotf10ToDisplayLinearQ16 r10 g10 b10
+        else (pqEotf10ToLinearQ16 r10, pqEotf10ToLinearQ16 g10, pqEotf10ToLinearQ16 b10)
+      let (rGam, gGam, bGam) :=
+        if is2020 then gamutBt2020ToBt709LinearQ16 rLin gLin bLin else (rLin, gLin, bLin)
+      let rTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode rGam trcCicp)
+      let gTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode gGam trcCicp)
+      let bTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode bGam trcCicp)
+      let (yOut, uOut, vOut) := rgbPixelToYuv .bt709 rTm gTm bTm
+      outY := outY.setPixel r c yOut
+      if r % 2 == 0 && c % 2 == 0 then
+        outU := outU.setPixel (r / 2) (c / 2) uOut
+        outV := outV.setPixel (r / 2) (c / 2) vOut
+  let vf0 := VideoFrame.allocYuv420p w h pts AVRational.tb90kHz .bt709
+  return { vf0 with colorMatrix := .bt709, planes := #[outY, outU, outV] }
 
 /-- Tight gate for PQ/HLG Q16 linear-light outputs (`[0, 65536]`) and 10-bit code bounds (`[0, 1023]`). -/
 def HdrTransferSampleSafe (a : Nat × Nat) : Prop :=
@@ -2322,6 +2375,10 @@ theorem pq_and_hlg_endpoints_and_gamut_achromatic :
     pqOetfLinearQ16To10 65536 = 1023 ∧
     hlgInverseOetf10ToLinearQ16 0 = 0 ∧
     hlgInverseOetf10ToLinearQ16 1023 = 65536 ∧
+    bt709OetfLinearQ16ToU8 0 = 0 ∧
+    bt709OetfLinearQ16ToU8 1180 = 21 ∧
+    bt709OetfLinearQ16ToU8 1181 = 21 ∧
+    bt709OetfLinearQ16ToU8 65536 = 255 ∧
     gamutBt2020ToBt709LinearQ16 32768 32768 32768 = (32768, 32768, 32768) ∧
     gamutBt709ToBt2020LinearQ16 32768 32768 32768 = (32768, 32768, 32768) := by
   decide

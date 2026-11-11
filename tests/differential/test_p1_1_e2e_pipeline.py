@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -372,6 +373,107 @@ class TestP11E2EPipeline(unittest.TestCase):
         )
         self.assertEqual(r_dither.returncode, 0, r_dither.stdout + r_dither.stderr)
         self.assertEqual(len(u8_out.read_bytes()), 16 * 16 * 3 // 2)
+
+    def test_06_peak_white_10bit_clamping_and_multi_obu_av1_dovi_rpu_e2e(self) -> None:
+        w, h = 16, 16
+        # Include 1022 and 1023 peak-white codes with neutral chroma (512) to ensure 10-bit -> 8-bit frame unpacking clamps to 255 (never wraps to 0)
+        peak_y = [1022 if (i % 2 == 0) else 1023 for i in range(w * h)]
+        peak_uv = [512 for _ in range((w // 2) * (h // 2))]
+        raw_peak = struct.pack(f"<{len(peak_y) + 2 * len(peak_uv)}H", *peak_y, *peak_uv, *peak_uv)
+        peak_in = self.work / "peak_1023.yuv"
+        peak_in.write_bytes(raw_peak)
+        sdr_raw = self.work / "peak_1023_tonemap.yuv"
+
+        r_tm = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                f"{w}x{h}",
+                "-i",
+                str(peak_in),
+                "-vf",
+                "tonemap=reinhard,format=yuv420p",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(sdr_raw),
+            ]
+        )
+        self.assertEqual(r_tm.returncode, 0, r_tm.stdout + r_tm.stderr)
+        y_plane = sdr_raw.read_bytes()[: w * h]
+        self.assertEqual(len(y_plane), w * h)
+        self.assertGreaterEqual(min(y_plane), 200, f"1022/1023 peak-white wrapped around: min={min(y_plane)}")
+
+        # Multi-OBU AV1 MP4 (produced by ffmpeg with TD/Sequence Header + Metadata + Frame OBUs) -> lffmpeg AV1 WebM & MP4
+        av1_src = self.work / "ff_av1_hdr10.mp4"
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                f"{w}x{h}",
+                "-r",
+                "25",
+                "-i",
+                str(peak_in),
+                "-c:v",
+                "libsvtav1",
+                "-crf",
+                "20",
+                "-y",
+                str(av1_src),
+            ],
+            check=True,
+        )
+        # Inject >=255B RPU via test_p1_1_hdr_dovi_containers helper pattern or re-encode 105B DOVI AV1 MP4 through lffmpeg
+        av1_reenc = self.work / "lffmpeg_av1_reenc.mp4"
+        r_av1 = _run_lffmpeg(
+            [
+                "-i",
+                str(av1_src),
+                "-c:v",
+                "av1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "arib-std-b67",
+                "-colorspace",
+                "bt2020nc",
+                "-y",
+                str(av1_reenc),
+            ]
+        )
+        self.assertEqual(r_av1.returncode, 0, r_av1.stdout + r_av1.stderr)
+        hlg_sdr = self.work / "hlg_tonemapped.yuv"
+        r_hlg = _run_lffmpeg(
+            [
+                "-i",
+                str(av1_reenc),
+                "-vf",
+                "tonemap=hable,format=yuv420p",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(hlg_sdr),
+            ]
+        )
+        self.assertEqual(r_hlg.returncode, 0, r_hlg.stdout + r_hlg.stderr)
+        self.assertGreaterEqual(min(hlg_sdr.read_bytes()[: w * h]), 180)
 
 
 if __name__ == "__main__":

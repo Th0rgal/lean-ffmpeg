@@ -800,7 +800,7 @@ theorem filterVideoTonemap_is_bt709 (vf : VideoFrame) (mode : String)
     let dst := filterVideoTonemap vf mode
     dst.width = vf.width ∧ dst.height = vf.height ∧ dst.planes.size = 3 ∧
       dst.colorMatrix = .bt709 := by
-  unfold filterVideoTonemap tonemapVideoFrameHdrToSdr
+  unfold filterVideoTonemap tonemapVideoFrameHdrToSdr tonemapVideoFrameHdrToSdrWithTransfer
   have hNotLt : ¬ vf.planes.size < 3 := by omega
   simp [hNotLt]
 

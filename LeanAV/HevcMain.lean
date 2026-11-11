@@ -1191,8 +1191,11 @@ def skipHrdParameters (gb0 : HevcBitReader) (cprmsPresent maxSubLayers : Nat) :
           gb := g5
   return some gb
 
-def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader := Id.run do
+def parseVuiColour (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option (HevcBitReader × Nat × Nat × Nat) := Id.run do
   let mut gb := gb0
+  let mut prim : Nat := 2
+  let mut trc : Nat := 2
+  let mut mat : Nat := 2
   let some (arFlag, g1) := gb.getBit | return none
   gb := g1
   if arFlag == 1 then
@@ -1213,8 +1216,13 @@ def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
     let some (cdFlag, g5) := g4.getBit | return none
     gb := g5
     if cdFlag == 1 then
-      let some g6 := gb.skipBits 24 | return none
-      gb := g6
+      let some (cp, g6a) := gb.getBits 8 | return none
+      let some (tc, g6b) := g6a.getBits 8 | return none
+      let some (mc, g6c) := g6b.getBits 8 | return none
+      prim := cp
+      trc := tc
+      mat := mc
+      gb := g6c
   let some (clFlag, g4) := gb.getBit | return none
   gb := g4
   if clFlag == 1 then
@@ -1250,7 +1258,10 @@ def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
     for _ in [:5] do
       let some (_, gn) := gb.getUe | return none
       gb := gn
-  return some gb
+  return some (gb, prim, trc, mat)
+
+def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
+  (parseVuiColour gb0 maxSubLayers).map (·.1)
 
 structure HevcPcmInfo where
   bitDepth              : Nat
@@ -1321,6 +1332,9 @@ structure HevcSps where
   minPuWidth                        : Nat := 4
   minPuHeight                       : Nat := 4
   tbMask                            : Nat := 3
+  vuiPrimaries                      : Nat := 2
+  vuiTransfer                       : Nat := 2
+  vuiMatrix                         : Nat := 2
   deriving Repr, DecidableEq, Inhabited
 
 def isMain8Bit420Sps (sps : HevcSps) : Bool :=
@@ -1499,8 +1513,14 @@ def parseSpsRaw (rbsp : ByteArray) : Option HevcSps := Id.run do
   let some (sis, g27) := g26.getBit | return none
   let some (vuiPres, g28) := g27.getBit | return none
   gb := g28
+  let mut vuiPrim : Nat := 2
+  let mut vuiTrc : Nat := 2
+  let mut vuiMat : Nat := 2
   if vuiPres == 1 then
-    let some gv := skipVui gb maxSubLayers | return none
+    let some (gv, vp, vt, vm) := parseVuiColour gb maxSubLayers | return none
+    vuiPrim := vp
+    vuiTrc := vt
+    vuiMat := vm
     gb := gv
   let some (spsExt, g29) := gb.getBit | return none
   gb := g29
@@ -1609,6 +1629,9 @@ def parseSpsRaw (rbsp : ByteArray) : Option HevcSps := Id.run do
     minPuWidth := width >>> (log2MinCbSize - 1)
     minPuHeight := height >>> (log2MinCbSize - 1)
     tbMask := (1 <<< (log2CtbSize - log2MinTbSize)) - 1
+    vuiPrimaries := vuiPrim
+    vuiTransfer := vuiTrc
+    vuiMatrix := vuiMat
   }
   return some sps
 
@@ -8903,7 +8926,7 @@ def cropFrameGen (f : HevcDecodedFrame) (sps : HevcSps) : ByteArray :=
             out := (out.push (v &&& 0xFF).toUInt8).push ((v >>> 8) &&& 0xFF).toUInt8
     return out
 
-def decodeHevcGen (data : ByteArray) : Option (Nat × Nat × Nat × String × ByteArray) := do
+def decodeHevcGenWithColor (data : ByteArray) : Option (Nat × Nat × Nat × String × ByteArray × Nat × Nat × Nat) := do
   let (st, _) ← decodeHevcStreamStateExt data
   if st.output.isEmpty then none
   let f0 := st.output[0]!
@@ -8916,7 +8939,11 @@ def decodeHevcGen (data : ByteArray) : Option (Nat × Nat × Nat × String × By
     if pf != pixFmt0 || sps.croppedWidth != sps0.croppedWidth || sps.croppedHeight != sps0.croppedHeight then
       none
     out := out ++ cropFrameGen f sps
-  some (sps0.croppedWidth, sps0.croppedHeight, st.output.size, pixFmt0, out)
+  some (sps0.croppedWidth, sps0.croppedHeight, st.output.size, pixFmt0, out, sps0.vuiPrimaries, sps0.vuiTransfer, sps0.vuiMatrix)
+
+def decodeHevcGen (data : ByteArray) : Option (Nat × Nat × Nat × String × ByteArray) := do
+  let (w, h, cnt, pf, out, _, _, _) ← decodeHevcGenWithColor data
+  some (w, h, cnt, pf, out)
 
 def probeHevcStreamJson (data : ByteArray) : Option String := do
   let (nals, container) ← extractHevcNals data

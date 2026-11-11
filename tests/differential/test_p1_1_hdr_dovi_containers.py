@@ -183,6 +183,18 @@ def main (args : List String) : IO UInt32 := do
     let emdf := packDoviEmdf rpuHex
     require (emdf.length == 113) "EMDF length != 113"
     require (unpackDoviEmdf emdf == some rpuHex) "105B EMDF roundtrip failed"
+    let bigBody := List.replicate 260 (0x42 : UInt8)
+    let bigRpu := bigBody ++ u32beToList (mpeg2Crc32List bigBody) ++ [0x80]
+    require (hevcRpuPayloadOk (0x19 :: bigRpu)) "265B RPU CRC32 check failed"
+    require (unpackDoviEmdf (packDoviEmdf bigRpu) == some bigRpu) "265B EMDF (>=255 variable_bits) roundtrip failed"
+    let bigObu := encodeAv1T35DoviObu bigRpu
+    require (decodeAv1T35DoviObu bigObu == some bigRpu) "265B AV1 T.35 OBU multi-byte LEB128 roundtrip failed"
+    let tdAndSeq := ByteArray.mk #[0x12, 0x00, 0x0A, 0x04, 0x00, 0x00, 0x00, 0x42, 0x32, 0x04, 0x01, 0x02, 0x03, 0x04]
+    let some injectedTd := injectAv1RpuIntoTu tdAndSeq (ByteArray.mk bigRpu.toArray)
+      | throw (IO.userError "injectAv1RpuIntoTu failed on TD+Seq+Frame TU")
+    require (extractAv1RpuFromTu injectedTd == some (ByteArray.mk bigRpu.toArray)) "extractAv1RpuFromTu failed on TD+Seq+Meta+Frame TU"
+    let tdNoSize := ByteArray.mk (#[0x10] ++ (encodeAv1DoviEmdfObu bigRpu).toArray ++ #[0x32, 0x02, 0xAA, 0xBB])
+    require (extractAv1RpuFromTu tdNoSize == some (ByteArray.mk bigRpu.toArray)) "extractAv1RpuFromTu failed on size-less TD TU"
     let badRpu := rpuHex.take 103 ++ [0x00, 0x80]
     require (!hevcRpuPayloadOk (0x19 :: badRpu)) "corrupted RPU CRC32 accepted"
     for fcc in ["avc1", "hvc1", "hev1", "av01"] do
@@ -516,6 +528,21 @@ class P11HdrDoviContainerTests(unittest.TestCase):
         vframes_webm = [f for f in probe_webm["frames"] if f.get("media_type") == "video"]
         f_sd_webm = {sd["side_data_type"] for sd in vframes_webm[0].get("side_data_list", [])}
         self.assertIn("Dolby Vision Metadata", f_sd_webm)
+
+        reencoded_mp4 = self.work / "av1_reencoded_with_rpu.mp4"
+        reencoded_rpu = self.work / "av1_reencoded_extracted.rpu"
+        proc_reenc = subprocess.run(
+            [str(BINARY), "-y", "-i", str(injected_mp4), "-an", "-c:v", "av1", "-pix_fmt", "yuv420p10le", str(reencoded_mp4)],
+            cwd=ROOT, env={"PATH": "/nonexistent"}, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc_reenc.returncode, 0, proc_reenc.stdout + proc_reenc.stderr)
+        ext_reenc = self._run_harness("av1-rpu-extract", str(reencoded_mp4), str(reencoded_rpu))
+        self.assertEqual(ext_reenc.returncode, 0, ext_reenc.stdout + ext_reenc.stderr)
+        self.assertEqual(reencoded_rpu.read_bytes(), RPU_105)
+        probe_reenc = _ffprobe_json(reencoded_mp4)
+        vframes_reenc = [f for f in probe_reenc["frames"] if f.get("media_type") == "video"]
+        f_sd_reenc = {sd["side_data_type"] for sd in vframes_reenc[0].get("side_data_list", [])}
+        self.assertIn("Dolby Vision Metadata", f_sd_reenc)
 
     def test_native_same_family_remux_preserves_hdr_dovi_and_rejects_cross_container_cli(self):
         same_out = self.work / "native_same_hdr.mp4"

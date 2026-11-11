@@ -105,7 +105,15 @@ def runSelfChecks : IO Unit := do
     if code >= 224 then
       require (Nat.max code pqRt - Nat.min code pqRt ≤ 2) s!"pq roundtrip at {code}: got {pqRt}"
     if code >= 64 then
-      require (Nat.max code hlgRt - Nat.min code hlgRt ≤ 2) s!"hlg roundtrip at {code}: got {hlgRt}"
+      require (Nat.max code hlgRt - Nat.min code hlgRt ≤ 2) s!"hlg roundtrip at {code}: got {pqRt}"
+  -- Verify BT.709 OETF continuity across linear toe / curve boundary (1180..1181) and monotonicity across [0..65536]
+  require (bt709OetfLinearQ16ToU8 0 == 0 && bt709OetfLinearQ16ToU8 1180 == 21 &&
+           bt709OetfLinearQ16ToU8 1181 == 21 && bt709OetfLinearQ16ToU8 65536 == 255) "bt709Oetf continuity"
+  let mut prevOetf : UInt8 := 0
+  for q in [:65537] do
+    let curOetf := bt709OetfLinearQ16ToU8 q
+    require (prevOetf.toNat ≤ curOetf.toNat && curOetf.toNat - prevOetf.toNat ≤ 2) s!"bt709Oetf jump at {q}: {prevOetf} -> {curOetf}"
+    prevOetf := curOetf
   -- Verify Filter Plane16 dither wrappers and Lavfi high-bit format nodes
   let dplane := filterPlane16BayerToU8 (Plane16.alloc 8 8 8 1023 513) 10
   let fsplane := filterPlane16FloydSteinbergToU8 (Plane16.alloc 8 8 8 1023 513) 10

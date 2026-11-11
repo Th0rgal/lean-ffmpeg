@@ -11100,16 +11100,58 @@ def mkvHdrColourGateSpec : AVGateSpec MkvHdrColour MkvHdrColourSafe where
   nonVacuous := by decide
   tight := by decide
 
+def av1Leb128ReadList (xs : List UInt8) : Option (Nat × List UInt8) :=
+  let rec go (fuel i val : Nat) (rest : List UInt8) : Option (Nat × List UInt8) :=
+    match fuel, rest with
+    | 0, _ => none
+    | _, [] => none
+    | f + 1, b :: bs =>
+      let val' := val ||| (((b &&& 0x7F).toNat) <<< (7 * i))
+      if (b &&& 0x80) == 0 then
+        if val' ≥ (1 <<< 32) then none else some (val', bs)
+      else go f (i + 1) val' bs
+  go 8 0 0 xs
+
+def av1Leb128Write (n : Nat) : List UInt8 :=
+  if n == 0 then [0]
+  else
+    let rec go (fuel v : Nat) : List UInt8 :=
+      match fuel with
+      | 0 => []
+      | f + 1 =>
+        if v == 0 then []
+        else
+          let b := v &&& 0x7F
+          let v' := v >>> 7
+          let byteVal : UInt8 := (if v' > 0 then b ||| 0x80 else b).toUInt8
+          byteVal :: go f v'
+    go 8 n
+
 /-- AV1 ITU-T T.35 metadata OBU: country 0xB5, Dolby provider 0x003B, oriented code 0x00000800. -/
 def av1T35DoviOk (obu : List UInt8) : Bool :=
   match obu with
-  | typ :: sz :: 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: tail =>
-    if ((typ >>> 3) &&& 0x0F) == 5 && (typ &&& 0x02) != 0 then
-      sz.toNat == 8 + tail.length
-    else false
-  | typ :: 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: _ =>
-    ((typ >>> 3) &&& 0x0F) == 5 && (typ &&& 0x02) == 0
-  | _ => false
+  | typ :: rest =>
+    if (typ &&& 0x81) != 0 || ((typ >>> 3) &&& 0x0F) != 5 then false
+    else
+      let afterExt? : Option (List UInt8) :=
+        if (typ &&& 0x04) != 0 then
+          match rest with
+          | ext :: xs => if (ext &&& 0x07) == 0 then some xs else none
+          | [] => none
+        else some rest
+      match afterExt? with
+      | none => false
+      | some body0 =>
+        if (typ &&& 0x02) != 0 then
+          match av1Leb128ReadList body0 with
+          | some (sz, 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: tail) =>
+            sz == 8 + tail.length
+          | _ => false
+        else
+          match body0 with
+          | 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: _ => true
+          | _ => false
+  | [] => false
 
 /-- Matroska BlockAdditionMapping type used for Dolby Vision (`dvcC` or `dvvC`). -/
 def mkvDoviBlockAddMapping (typ : Nat) : Bool :=
@@ -11139,13 +11181,19 @@ def decodeHevcRpuNal (nal : List UInt8) : Option (List UInt8) :=
 
 def encodeAv1T35DoviObu (rpu : List UInt8) : List UInt8 :=
   let payload := [0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00] ++ rpu
-  [0x2A, payload.length.toUInt8] ++ payload
+  0x2A :: (av1Leb128Write payload.length ++ payload)
 
 def decodeAv1T35DoviObu (obu : List UInt8) : Option (List UInt8) :=
   if !av1T35DoviOk obu then none
   else
     match obu with
-    | typ :: _ => if (typ &&& 0x02) != 0 then some (obu.drop 10) else some (obu.drop 9)
+    | typ :: rest =>
+      let body0 := if (typ &&& 0x04) != 0 then rest.drop 1 else rest
+      if (typ &&& 0x02) != 0 then
+        match av1Leb128ReadList body0 with
+        | some (_, p) => some (p.drop 8)
+        | none => none
+      else some (body0.drop 8)
     | [] => none
 
 /-- Cross-container HDR remux is a distinct helper: it never widens same-family `nativeRemuxBytes`. -/
@@ -11690,49 +11738,102 @@ def p11CrossContainerGateSpec : AVGateSpec (ContainerFormat × ContainerFormat) 
   nonVacuous := by decide
   tight := by decide
 
-def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
-  let n := rpu.length
-  let h : UInt64 := ((0x01BE6841 : UInt64) <<< 13) ||| ((n.toUInt64 &&& 0xFF) <<< 5)
-  let p0 : UInt8 := ((h >>> 32) &&& 0xFF).toUInt8
-  let p1 : UInt8 := ((h >>> 24) &&& 0xFF).toUInt8
-  let p2 : UInt8 := ((h >>> 16) &&& 0xFF).toUInt8
-  let p3 : UInt8 := ((h >>> 8) &&& 0xFF).toUInt8
-  let p4 : UInt8 := (h &&& 0xFF).toUInt8
-  let rec go (carry : UInt8) : List UInt8 → List UInt8
-    | [] =>
-      let t24 : UInt32 := ((carry.toUInt32 &&& 0x0F) <<< 20) ||| (0x02004 : UInt32)
-      [((t24 >>> 16) &&& 0xFF).toUInt8, ((t24 >>> 8) &&& 0xFF).toUInt8, (t24 &&& 0xFF).toUInt8, 0x80]
-    | b :: bs => ((carry <<< 4) ||| (b >>> 4)) :: go (b &&& 0x0F) bs
-  match rpu with
-  | [] => [p0, p1, p2, p3, p4 ||| 0x00, 0x20, 0x04, 0x80]
-  | b0 :: bs =>
-    let p4' : UInt8 := (p4 &&& (0xF0 : UInt8)) ||| (b0 >>> (4 : UInt8))
-    p0 :: p1 :: p2 :: p3 :: p4' :: go (b0 &&& (0x0F : UInt8)) bs
+def doviPackChunks (acc width : Nat) (chunks : List (Nat × Nat)) (out : List UInt8) : (Nat × Nat × List UInt8) :=
+  match chunks with
+  | [] => (acc, width, out)
+  | (v, w) :: rest =>
+    let acc1 := (acc <<< w) ||| (v &&& ((1 <<< w) - 1))
+    let width1 := width + w
+    let rec flush (fuel a wd : Nat) (o : List UInt8) : (Nat × Nat × List UInt8) :=
+      match fuel with
+      | 0 => (a, wd, o)
+      | f + 1 =>
+        if wd < 8 then (a, wd, o)
+        else
+          let sh := wd - 8
+          let b : UInt8 := ((a >>> sh) &&& 0xFF).toUInt8
+          flush f (a &&& ((1 <<< sh) - 1)) sh (b :: o)
+    let (acc2, width2, out2) := flush 8 acc1 width1 out
+    doviPackChunks acc2 width2 rest out2
 
-def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) :=
-  match emdf with
-  | e0 :: e1 :: e2 :: e3 :: e4 :: eTail =>
-    let top := (e0.toUInt64 <<< 32) ||| (e1.toUInt64 <<< 24) |||
-      (e2.toUInt64 <<< 16) ||| (e3.toUInt64 <<< 8) ||| (e4.toUInt64 &&& 0xF0)
-    if (top >>> 13) != (0x01BE6841 : UInt64) || ((top >>> 4) &&& 1) != 0 then none
+def doviVarBitsSizeChunks (n : Nat) : List (Nat × Nat) :=
+  if n < 255 then [(n, 8), (0, 1)]
+  else
+    let rec more (fuel rem : Nat) : List (Nat × Nat) :=
+      match fuel with
+      | 0 => []
+      | f + 1 =>
+        if rem < 255 then [(1, 1), (rem, 8), (0, 1)]
+        else (1, 1) :: (255, 8) :: more f (rem - 255)
+    (255, 8) :: more (n / 255 + 2) (n - 255)
+
+def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
+  let hdr := (0x01BE6841, 27) :: doviVarBitsSizeChunks rpu.length
+  let (a0, w0, o0) := doviPackChunks 0 0 hdr []
+  let rec feedRpu (a wd : Nat) (xs out : List UInt8) : (Nat × Nat × List UInt8) :=
+    match xs with
+    | [] => (a, wd, out)
+    | b :: bs =>
+      let a1 := (a <<< 8) ||| b.toNat
+      let sh := wd
+      let outByte : UInt8 := ((a1 >>> sh) &&& 0xFF).toUInt8
+      feedRpu (a1 &&& ((1 <<< sh) - 1)) wd bs (outByte :: out)
+  let (a1, w1, o1) := feedRpu a0 w0 rpu o0
+  let (a2, w2, o2) := doviPackChunks a1 w1 [(0x02004, 20), (1, 1)] o1
+  let oFinal := if w2 == 0 then o2 else (((a2 <<< (8 - w2)) &&& 0xFF).toUInt8 :: o2)
+  oFinal.reverse
+
+def doviTakeBits (acc width need : Nat) (rest : List UInt8) : Option (Nat × Nat × Nat × List UInt8) :=
+  let rec fill (fuel a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × List UInt8) :=
+    if wd ≥ need then some (a, wd, xs)
     else
-      let n := ((top >>> 5) &&& 0xFF).toNat
-      if emdf.length != n + 8 then none
-      else
-        let rec extractBytes : Nat → List UInt8 → List UInt8 × List UInt8
-          | 0, rest => ([], rest)
-          | k + 1, x :: y :: rest =>
-            let (out, rem) := extractBytes k (y :: rest)
-            ((((x &&& 0x0F) <<< 4) ||| (y >>> 4)) :: out, rem)
-          | _, rest => ([], rest)
-        match extractBytes n (e4 :: eTail) with
-        | (out, [t0, t1, t2, 0x80]) =>
-          let t24 := ((t0.toNat &&& 0x0F) <<< 16) ||| (t1.toNat <<< 8) ||| t2.toNat
-          let payloadId := (t24 >>> 15) &&& 0x1F
-          let prot := (t24 >>> 3) &&& 0xFFF
-          if out.length == n && payloadId == 0 && prot == 0x400 then some out else none
-        | _ => none
-  | _ => none
+      match fuel, xs with
+      | 0, _ => none
+      | _, [] => none
+      | f + 1, b :: bs => fill f ((a <<< 8) ||| b.toNat) (wd + 8) bs
+  match fill 8 acc width rest with
+  | none => none
+  | some (a1, w1, xs1) =>
+    let sh := w1 - need
+    let val := (a1 >>> sh) &&& ((1 <<< need) - 1)
+    some (val, a1 &&& ((1 <<< sh) - 1), sh, xs1)
+
+def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) := do
+  let (hdr, a0, w0, r0) ← doviTakeBits 0 0 27 emdf
+  if hdr != 0x01BE6841 then none
+  let (n0, a1, w1, r1) ← doviTakeBits a0 w0 8 r0
+  let (n, a2, w2, r2) ←
+    if n0 < 255 then do
+      let (z, ax, wx, rx) ← doviTakeBits a1 w1 1 r1
+      if z != 0 then none else some (n0, ax, wx, rx)
+    else
+      let rec readVar (fuel total a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × Nat × List UInt8) := do
+        match fuel with
+        | 0 => none
+        | f + 1 =>
+          let (m, am, wm, xm) ← doviTakeBits a wd 1 xs
+          if m == 0 then some (total, am, wm, xm)
+          else do
+            let (add, aa, wa, xa) ← doviTakeBits am wm 8 xm
+            let total' := total + add
+            if add < 255 then
+              let (z, az, wz, xz) ← doviTakeBits aa wa 1 xa
+              if z != 0 then none else some (total', az, wz, xz)
+            else readVar f total' aa wa xa
+      readVar (emdf.length + 1) 255 a1 w1 r1
+  let rec readRpu (rem a wd : Nat) (xs acc : List UInt8) : Option (List UInt8 × Nat × Nat × List UInt8) :=
+    match rem with
+    | 0 => some (acc.reverse, a, wd, xs)
+    | k + 1 =>
+      match doviTakeBits a wd 8 xs with
+      | none => none
+      | some (v, a', wd', xs') => readRpu k a' wd' xs' (v.toUInt8 :: acc)
+  let (rpuRev, a3, w3, r3) ← readRpu n a2 w2 r2 []
+  let (tail20, a4, w4, r4) ← doviTakeBits a3 w3 20 r3
+  if tail20 != 0x02004 then none
+  let (stopBit, a5, w5, r5) ← doviTakeBits a4 w4 1 r4
+  if stopBit != 1 || !r5.isEmpty || w5 ≥ 8 || a5 != 0 then none
+  some rpuRev
 
 theorem p11_hdr_dovi_container_roundtrip :
     let colr := encodeColrNclxBoxSpec
@@ -11766,6 +11867,12 @@ theorem p11_rpu_and_obu_roundtrip :
       some ([0x02] ++ u32beToList (mpeg2Crc32List [0x02]) ++ [0x80]) ∧
     av1T35DoviOk [0x2A, 9, 0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0x19] = true ∧
     av1T35DoviOk [0x28, 0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0x19] = true ∧
+    av1Leb128ReadList (av1Leb128Write 300) = some (300, []) ∧
+    av1Leb128ReadList (av1Leb128Write 70000) = some (70000, []) ∧
+    doviVarBitsSizeChunks 254 = [(254, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 255 = [(255, 8), (1, 1), (0, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 260 = [(255, 8), (1, 1), (5, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 520 = [(255, 8), (1, 1), (255, 8), (1, 1), (10, 8), (0, 1)] ∧
     decodeAv1T35DoviObu (encodeAv1T35DoviObu [0x19, 0x02]) = some [0x19, 0x02] ∧
     unpackDoviEmdf (packDoviEmdf [0x08, 0x09, 0x80]) = some [0x08, 0x09, 0x80] := by
   decide
@@ -11812,12 +11919,10 @@ def av1Leb128Read (ba : ByteArray) (off : Nat) : Option (Nat × Nat) := Id.run d
     if off + i ≥ ba.size then return none
     let b := ba.get! (off + i)
     v := v ||| (((b &&& 0x7F).toNat) <<< (7 * i))
-    if (b &&& 0x80) == 0 then return some (v, i + 1)
+    if (b &&& 0x80) == 0 then
+      if v ≥ (1 <<< 32) then return none
+      return some (v, i + 1)
   return none
-
-def av1Leb128Write (n : Nat) : List UInt8 :=
-  if n < 128 then [n.toUInt8]
-  else [((n &&& 0x7F) ||| 0x80).toUInt8, (n >>> 7).toUInt8]
 
 def encodeAv1DoviEmdfObu (rpu : List UInt8) : List UInt8 :=
   let payload := [0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00] ++ packDoviEmdf rpu
@@ -11825,24 +11930,34 @@ def encodeAv1DoviEmdfObu (rpu : List UInt8) : List UInt8 :=
 
 def extractAv1RpuFromTu (tu : ByteArray) : Option ByteArray := Id.run do
   let mut pos := 0
-  let mut fuel := 64
+  let mut fuel := tu.size + 1
   while pos < tu.size && fuel > 0 do
     fuel := fuel - 1
     let hdr := tu.get! pos
+    if (hdr &&& 0x81) != 0 then return none
     let obuType := (hdr >>> 3) &&& 0x0F
     let hasExt := (hdr &&& 0x04) != 0
     let hasSize := (hdr &&& 0x02) != 0
     let hLen := if hasExt then 2 else 1
-    if !hasSize || pos + hLen > tu.size then return none
-    let some (sz, lw) := av1Leb128Read tu (pos + hLen) | return none
-    let pStart := pos + hLen + lw
-    if pStart + sz > tu.size then return none
-    if obuType == 5 && sz ≥ 15 then
+    if pos + hLen > tu.size then return none
+    if hasExt && ((tu.get! (pos + 1)) &&& 0x07) != 0 then return none
+    let (pStart, sz) ←
+      if hasSize then
+        let some (szVal, lw) := av1Leb128Read tu (pos + hLen) | return none
+        if pos + hLen + lw + szVal > tu.size then return none
+        pure (pos + hLen + lw, szVal)
+      else if obuType == 2 then
+        pure (pos + hLen, 0)
+      else
+        pure (pos + hLen, tu.size - (pos + hLen))
+    if obuType == 5 && sz ≥ 8 then
       let p := (tu.extract pStart (pStart + sz)).toList
       match p with
-      | 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: emdf =>
-        if let some rpu := unpackDoviEmdf emdf then
+      | 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: tail =>
+        if let some rpu := unpackDoviEmdf tail then
           if hevcRpuPayloadOk (0x19 :: rpu) then return some ⟨rpu.toArray⟩
+        if hevcRpuPayloadOk (0x19 :: tail) then
+          return some ⟨tail.toArray⟩
       | _ => pure ()
     pos := pStart + sz
   return none
@@ -11851,20 +11966,27 @@ def injectAv1RpuIntoTu (tu rpu : ByteArray) : Option ByteArray := Id.run do
   if !hevcRpuPayloadOk (0x19 :: rpu.toList) then return none
   let obu := ⟨(encodeAv1DoviEmdfObu rpu.toList).toArray⟩
   let mut pos := 0
-  let mut fuel := 64
+  let mut fuel := tu.size + 1
   while pos < tu.size && fuel > 0 do
     fuel := fuel - 1
     let hdr := tu.get! pos
+    if (hdr &&& 0x81) != 0 then return none
     let obuType := (hdr >>> 3) &&& 0x0F
     if obuType == 3 || obuType == 6 then
       return some (tu.extract 0 pos ++ obu ++ tu.extract pos tu.size)
     let hasExt := (hdr &&& 0x04) != 0
     let hasSize := (hdr &&& 0x02) != 0
     let hLen := if hasExt then 2 else 1
-    if !hasSize || pos + hLen > tu.size then return none
-    let some (sz, lw) := av1Leb128Read tu (pos + hLen) | return none
-    if pos + hLen + lw + sz > tu.size then return none
-    pos := pos + hLen + lw + sz
+    if pos + hLen > tu.size then return none
+    if hasExt && ((tu.get! (pos + 1)) &&& 0x07) != 0 then return none
+    if hasSize then
+      let some (sz, lw) := av1Leb128Read tu (pos + hLen) | return none
+      if pos + hLen + lw + sz > tu.size then return none
+      pos := pos + hLen + lw + sz
+    else if obuType == 2 then
+      pos := pos + hLen
+    else
+      pos := tu.size
   return some (tu ++ obu)
 
 @[export leanav_lean_p11_cross_remux]
