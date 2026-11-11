@@ -11705,6 +11705,10 @@ def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTr
             let (ts1, _, _) := rawItems[i + 1]!
             let d := ts1 - ts0
             if d > 0 then (d.toNat * tsScale) / 1000000 else 40
+          else if rawItems.size >= 2 then
+            let (tsPrev, _, _) := rawItems[rawItems.size - 2]!
+            let d := ts0 - tsPrev
+            if d > 0 then (d.toNat * tsScale) / 1000000 else (if te.kind == .audio then 20 else 40)
           else if te.kind == .audio then 20 else 40
         samples := samples.push (payload, if durMs == 0 then 1 else durMs, sync)
       let trk : P11CrossRemuxTrack := {

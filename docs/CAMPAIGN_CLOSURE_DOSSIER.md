@@ -13,16 +13,16 @@ matrices and `qp=0` lossless bypass, ISOBMFF (`dvcC`/`dvvC`/`mdcv`/`clli`) &
 Matroska/WebM HDR10/Dolby Vision container demux/mux, and 10/12/16-bit scaling,
 BT.2020 PQ/HLG tonemapping, and Bayer/Floyd-Steinberg dithering across
 `yuv420p10le`, `p010le`, `yuv422p10le`, `yuv444p10le`, `yuv420p12le`,
-`yuv422p12le`, `yuv444p12le`, `gbrp10le`, and `rgba64le`, auditing **24,990
-declarations with zero sorryAx/custom axioms** (`99,922` LOC across 38 formal
-`LeanAV/*.lean` modules) and **890/890 `non_vacuous_and_tight` specifications**
+`yuv422p12le`, `yuv444p12le`, `gbrp10le`, and `rgba64le`, auditing **25,029
+declarations with zero sorryAx/custom axioms** (`100,211` LOC across 38 formal
+`LeanAV/*.lean` modules) and **892/892 `non_vacuous_and_tight` specifications**
 (`AacLcProofs`: 84, `H264IntraTransformProofs`: 82, `H264InterDeblockDpbProofs`:
 79, `Format`: 70, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 47,
 `LavfiGraphProofs`: 40, `Encoder`: 37, `Audio`: 35, `H264EntropyProofs`: 35,
 `Scale`: 34, `Av1MainProofs`: 33, `H264SyntaxProofs`: 32, `HevcMainProofs`: 31,
 `Bitstream`: 27, `Spec`: 23, `PlanIR`: 22, `Core`: 14, `Domain`: 9,
 `InprocTranscode`: 8, `Cli`: 7, `Filter`: 7, `Md5`: 7, `LavfiGraph`: 6,
-`UnifiedPipeline`: 2; `0` vacuous, `0` trivial, `0` shadowed).
+`UnifiedPipeline`: 4; `0` vacuous, `0` trivial, `0` shadowed).
 
 The 2026-11-06 P1.0 unified multi-stream pipeline qualification
 (`campaign/p1-0-unified-pipeline-20261106` over `627b45e1`) under Lean v4.35.0 and

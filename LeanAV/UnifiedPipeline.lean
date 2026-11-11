@@ -13,6 +13,8 @@ structure Media where
   audio : Option AudioFrame := none
   audioBits : Nat := 16
   fps : Nat := 25
+  fpsNum : Nat := 0
+  fpsDen : Nat := 1
   audioCopy : Option SynthMp4Track := none
   rawVideo : ByteArray := ByteArray.empty
   videoPixFmt : String := "yuv420p"
@@ -53,6 +55,8 @@ structure Options where
   filmGrain : Nat := 0
   ditherMode : String := "bayer"
   outFps : Option Nat := none
+  mastering? : Option MasteringDisplaySpec := none
+  maxCll? : Option (Nat × Nat) := none
   deriving Inhabited
 
 def P11UnifiedHdrSafe (x : Nat × Nat × Nat × Nat) : Prop :=
@@ -370,11 +374,25 @@ def scaleRawVideoFrames (raw : ByteArray) (pf : String) (srcW srcH dstW dstH nFr
       some (LeanAV.Scale.scalePlanarHighBitFrameBytes .yuv444p10le f srcW srcH dstW dstH))
     convertRawVideoPixFmt scaled "yuv444p10le" pfC dstW dstH nFrames cm
 
+def mediaRationalFps (m : Media) : Nat × Nat :=
+  if m.fpsNum > 0 && m.fpsDen > 0 then (m.fpsNum, m.fpsDen)
+  else (Nat.max 1 m.fps, 1)
+
+def mediaHasFractionalFps (m : Media) : Bool :=
+  m.fpsNum > 0 && m.fpsDen > 0 && m.fpsNum % m.fpsDen != 0
+
 def syncMediaFromVideoFrames (media : Media) : Media :=
   if media.video.isEmpty then media
   else
     let vf0 := media.video[0]!
+    let effFps := Nat.max 1 media.fps
+    let (rn, rd) :=
+      if media.fpsNum > 0 && media.fpsDen > 0 then (media.fpsNum, media.fpsDen)
+      else (effFps, 1)
     { media with
+      fps := effFps
+      fpsNum := rn
+      fpsDen := rd
       rawVideo := packVideoFramesYuv420pRaw media.video
       videoPixFmt := "yuv420p"
       videoWidth := vf0.width
@@ -408,9 +426,15 @@ def syncMediaFromRaw (media : Media) (w h nFrames : Nat) (pf : String) (raw : By
       unpackYuv420p10ToVideoFrames w h y10
     else
       some (Array.ofFn fun i : Fin count => VideoFrame.allocYuv420p ((w + 1) / 2 * 2) ((h + 1) / 2 * 2) i.val.toUInt64)
+  let effFps := Nat.max 1 fps
+  let (rn, rd) :=
+    if media.fpsNum > 0 && media.fpsDen > 0 then (media.fpsNum, media.fpsDen)
+    else (effFps, 1)
   some { media with
     video := vfs
-    fps := fps
+    fps := effFps
+    fpsNum := rn
+    fpsDen := rd
     rawVideo := raw
     videoPixFmt := pfC
     videoWidth := w
@@ -430,14 +454,25 @@ def decodeHevcStreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media := 
   syncMediaFromRaw base w h count pf rawBytes fps
 
 def decodeAv1StreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media := do
+  let mut effFps := Nat.max 1 fps
+  let mut rNum := effFps
+  let mut rDen := 1
+  if raw.size >= 4 && raw.get! 0 == 'D'.toNat.toUInt8 && raw.get! 1 == 'K'.toNat.toUInt8 &&
+     raw.get! 2 == 'I'.toNat.toUInt8 && raw.get! 3 == 'F'.toNat.toUInt8 then
+    let (info, _) ← LeanAV.Av1Main.av1DemuxIvf raw
+    if info.fpsNum == 0 || info.fpsDen == 0 then none
+    let g := Nat.gcd info.fpsNum info.fpsDen
+    rNum := info.fpsNum / g
+    rDen := info.fpsDen / g
+    effFps := Nat.max 1 (rNum / rDen)
   let (_, _, pkts) ← LeanAV.Av1Main.av1ExtractContainerPackets raw
   let mut rpus : Array ByteArray := #[]
   for pkt in pkts do
     if let some rpu := extractAv1RpuFromTu pkt then
       rpus := rpus.push rpu
   let (w, h, count, _, pf, rawBytes) ← LeanAV.Av1Main.decodeAv1ToRaw raw
-  let base : Media := { videoCodecSrc := "av1", hasDovi := !rpus.isEmpty, rpus := rpus }
-  syncMediaFromRaw base w h count pf rawBytes fps
+  let base : Media := { videoCodecSrc := "av1", fpsNum := rNum, fpsDen := rDen, hasDovi := !rpus.isEmpty, rpus := rpus }
+  syncMediaFromRaw base w h count pf rawBytes effFps
 
 def decodeH264StreamMedia (raw : ByteArray) (fps : Nat := 25) : Option Media :=
   if let some pics := LeanAV.H264IntraTransform.decodeAnnexBToPicturesHbd raw then
@@ -516,8 +551,19 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
     if tr.hasEncrypted || tr.multiStsd || tr.timescale == 0 then none
     else if tr.kind == .video then
       if !media.video.isEmpty then none
+      if tr.samples.isEmpty || tr.samples.any (fun s => s.dur == 0) then none
+      let firstDur := tr.samples[0]!.dur
+      if tr.samples.any (fun s => s.dur != firstDur) then none
       let duration := tr.samples.foldl (fun n s => n + s.dur) 0
-      let fpsEst (cnt : Nat) : Nat := if duration == 0 then 25 else Nat.max 1 (cnt * tr.timescale / duration)
+      let rRate (cnt : Nat) : Nat × Nat :=
+        if duration == 0 || cnt == 0 then (25, 1)
+        else
+          let num := cnt * tr.timescale
+          let g := Nat.gcd num duration
+          (num / g, duration / g)
+      let fpsEst (cnt : Nat) : Nat :=
+        let (rn, rd) := rRate cnt
+        Nat.max 1 (rn / rd)
       let codecId :=
         if tr.stsdFourcc == "hvc1" || tr.stsdFourcc == "hev1" then "V_MPEGH/ISO/HEVC"
         else if tr.stsdFourcc == "av01" then "V_AV1"
@@ -541,10 +587,13 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
             if let some (frames, _, _) := LeanAV.InprocTranscode.decodeMp4AvcTrackToFrames raw tr then
               if frames.isEmpty then none
               else
+                let (rn, rd) := rRate frames.size
                 let baseM : Media :=
                   { media with
                     video := frames
                     fps := fpsEst frames.size
+                    fpsNum := rn
+                    fpsDen := rd
                     videoCodecSrc := "h264"
                     colour := colour
                     mastering := mastering
@@ -569,8 +618,11 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
               else if sps.chromaFormatIdc == 3 && sps.bitDepthLumaMinus8 == 4 then some "yuv444p12le"
               else none
             let cnt ← validateHbdRawBuffer pf sps.widthPx.toNat sps.heightPx.toNat rawBytes
+            let (rn, rd) := rRate cnt
             let baseM : Media :=
               { media with
+                fpsNum := rn
+                fpsDen := rd
                 videoCodecSrc := "h264"
                 colour := colour
                 mastering := mastering
@@ -585,8 +637,11 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
             primaries := if colour.primaries == 0 || colour.primaries == 2 then vp else colour.primaries
             transferCharacteristics := if colour.transferCharacteristics == 0 || colour.transferCharacteristics == 2 then vt else colour.transferCharacteristics
             matrixCoefficients := if colour.matrixCoefficients == 0 || colour.matrixCoefficients == 2 then vm else colour.matrixCoefficients }
+          let (rn, rd) := rRate cnt
           let baseM : Media :=
             { media with
+              fpsNum := rn
+              fpsDen := rd
               videoCodecSrc := "hevc"
               colour := mergedColour
               mastering := mastering
@@ -598,8 +653,11 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
           let videoOnlyMp4 ← isolateSingleVideoTrackMp4 raw tr
           let (w, h, cnt, _, pf, rawBytes) ← LeanAV.Av1Main.decodeAv1ToRaw videoOnlyMp4
           let rpus := extractMp4SampleRpus raw tr.samples true
+          let (rn, rd) := rRate cnt
           let baseM : Media :=
             { media with
+              fpsNum := rn
+              fpsDen := rd
               videoCodecSrc := "av1"
               colour := colour
               mastering := mastering
@@ -616,8 +674,9 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
             frames := frames.push vf
           if frames.isEmpty then none
           else
+            let (rn, rd) := rRate frames.size
             let baseM : Media :=
-              { media with video := frames, fps := fpsEst frames.size, videoCodecSrc := "prores" }
+              { media with video := frames, fps := fpsEst frames.size, fpsNum := rn, fpsDen := rd, videoCodecSrc := "prores" }
             some (syncMediaFromVideoFrames baseM)
         else none
       media := vMedia
@@ -657,10 +716,82 @@ def decodeMp4 (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
     else none
   if media.video.isEmpty && media.audio.isNone then none else some media
 
+def inferMkvVideoRationalFps (raw : ByteArray) : Option (Nat × Nat) := do
+  let s := ByteSlice.ofByteArray raw
+  let parsed ← parseNativeMkvContainer s none
+  let tsScale := if parsed.timestampScale == 0 then 1000000 else parsed.timestampScale
+  let mut vidTrackNum? : Option Nat := none
+  for te in parsed.tracks do
+    if te.kind == .video && vidTrackNum?.isNone then
+      vidTrackNum? := some te.trackNumber
+  let vidTn ← vidTrackNum?
+  let mut tsList : Array Int := #[]
+  for (_, items) in parsed.clusters do
+    for it in items do
+      if it.trackNumber == vidTn then
+        let hdrSkip := it.trackVintLen + 3
+        if it.blockOff + hdrSkip < it.blockEnd && it.blockEnd ≤ raw.size then
+          let flags := s.getByteD (it.blockOff + it.trackVintLen + 2) 0
+          if (flags &&& 0x06) == 0 then
+            tsList := tsList.push it.absTs
+  if tsList.size < 2 then
+    some (25, 1)
+  else
+    let sortedTs := tsList.qsort (· < ·)
+    let mut prev := sortedTs[0]!
+    let mut deltasNs : Array Nat := #[]
+    for i in [1:sortedTs.size] do
+      let cur := sortedTs[i]!
+      if cur <= prev then none
+      let dNs := (cur - prev).toNat * tsScale
+      deltasNs := deltasNs.push dNs
+      prev := cur
+    let totalNs := deltasNs.foldl (· + ·) 0
+    if totalNs == 0 then none
+    let nInt := deltasNs.size
+    let candFps := (nInt * 1000000000 + totalNs / 2) / totalNs
+    let matchesIntFps : Bool :=
+      if candFps == 0 || candFps > 1000 then false
+      else
+        Id.run do
+          let mut ok := true
+          let t0Ns := (sortedTs[0]!).toNat * tsScale
+          for k in [:sortedTs.size] do
+            let obsNs := (sortedTs[k]!).toNat * tsScale - t0Ns
+            let expFloor := (k * 1000000000) / candFps
+            let diff := if obsNs >= expFloor then obsNs - expFloor else expFloor - obsNs
+            if diff > tsScale then ok := false
+          return ok
+    if matchesIntFps then
+      some (candFps, 1)
+    else
+      let minD := deltasNs.foldl Nat.min deltasNs[0]!
+      let maxD := deltasNs.foldl Nat.max deltasNs[0]!
+      if maxD - minD > tsScale then none
+      let rawNum := nInt * 1000000000
+      let g := Nat.gcd rawNum totalNs
+      some (rawNum / g, totalNs / g)
+
 def decodeMkv (raw : ByteArray) (noAudio : Bool := false) : Option Media := do
   let tracks ← p11DemuxMkvToCrossTracks raw
-  let mp4Bytes ← p11MuxMp4FromCrossTracks tracks
-  let decoded ← decodeMp4 mp4Bytes noAudio
+  let hasVid := tracks.any (fun t => t.kind == .video)
+  let mkvRate? ←
+    if hasVid then do
+      let r ← inferMkvVideoRationalFps raw
+      some (some r)
+    else some none
+  let normalizedTracks := tracks.map fun t =>
+    if t.kind == .video then
+      { t with samples := t.samples.map fun (p, _, sync) => (p, 40, sync) }
+    else t
+  let mp4Bytes ← p11MuxMp4FromCrossTracks normalizedTracks
+  let decoded0 ← decodeMp4 mp4Bytes noAudio
+  let decoded :=
+    match mkvRate? with
+    | some (rn, rd) =>
+      let eff := Nat.max 1 (rn / Nat.max 1 rd)
+      { decoded0 with fps := eff, fpsNum := rn, fpsDen := rd }
+    | none => decoded0
   if decoded.videoCodecSrc == "h264" && decoded.videoPixFmt == "yuv420p" &&
      !decoded.hasDovi && !decoded.colour.hasMastering && decoded.colour.primaries != 9 &&
      decoded.colour.transferCharacteristics != 16 && decoded.colour.transferCharacteristics != 18 then
@@ -736,9 +867,9 @@ def decode (raw : ByteArray) (format : String) (width height : Nat := 0)
     some { audio := some (channelArraysToAudioFrame pcm sampleRate bps), audioBits := bps }
   else if format == "mp4" || format == "mov" then decodeMp4 raw noAudio
   else if format == "mkv" || format == "matroska" || format == "webm" then decodeMkv raw noAudio
-  else if format == "hevc" then decodeHevcStreamMedia raw
-  else if format == "av1" || format == "obu" || format == "ivf" then decodeAv1StreamMedia raw
-  else if format == "h264" then decodeH264StreamMedia raw
+  else if format == "hevc" then decodeHevcStreamMedia raw rFps
+  else if format == "av1" || format == "obu" || format == "ivf" then decodeAv1StreamMedia raw rFps
+  else if format == "h264" then decodeH264StreamMedia raw rFps
   else if format == "wav" || format == "adts" then
     let (pcm, sr, bps) ←
       if format == "wav" then demuxWavPcmLE (ByteSlice.ofByteArray raw)
@@ -830,6 +961,41 @@ def convertRawVideoColorspaceMatrix (raw : ByteArray) (pf : String) (w h nFrames
         else gbr
       let y444Dst := LeanAV.Scale.gbrp10leToYuv444p10leBytes gbrMapped w h dstCm
       convertYuv444p10leToTarget y444Dst pfC w h dstCm ditherMode)
+
+def resampleRawMediaRationalFps (cur : Media) (targetFps : Nat) : Option Media := do
+  if targetFps == 0 || cur.videoFrames == 0 then none
+  let (rNum, rDen) := mediaRationalFps cur
+  if rNum == targetFps * rDen then
+    let nextM ← syncMediaFromRaw { cur with fpsNum := targetFps, fpsDen := 1 }
+      cur.videoWidth cur.videoHeight cur.videoFrames cur.videoPixFmt cur.rawVideo targetFps
+    some nextM
+  else
+    let outCount := Nat.max 1 ((cur.videoFrames * targetFps * rDen) / rNum)
+    let fmt ← PixelFormat.parse cur.videoPixFmt
+    let fb ← fmt.frameByteSize cur.videoWidth cur.videoHeight
+    if cur.rawVideo.size != cur.videoFrames * fb then none
+    let mut outRaw := ByteArray.emptyWithCapacity (outCount * fb)
+    let mut outRpus : Array ByteArray := #[]
+    for i in [:outCount] do
+      let srcIdx := Nat.min (cur.videoFrames - 1) ((i * rNum) / (targetFps * rDen))
+      outRaw := outRaw ++ cur.rawVideo.extract (srcIdx * fb) ((srcIdx + 1) * fb)
+      if srcIdx < cur.rpus.size then outRpus := outRpus.push cur.rpus[srcIdx]!
+    let nextM ← syncMediaFromRaw { cur with fpsNum := targetFps, fpsDen := 1 }
+      cur.videoWidth cur.videoHeight outCount cur.videoPixFmt outRaw targetFps
+    some { nextM with rpus := if cur.rpus.isEmpty then #[] else outRpus }
+
+def resampleVideoFramesRationalFps (frames : Array VideoFrame) (rNum rDen targetFps : Nat) : Array VideoFrame × Nat :=
+  if targetFps == 0 || frames.isEmpty || rNum == targetFps * rDen then
+    (frames, targetFps)
+  else
+    let effNum := Nat.max 1 rNum
+    let effDen := Nat.max 1 rDen
+    let outCount := Nat.max 1 ((frames.size * targetFps * effDen) / effNum)
+    let resampled := (Array.range outCount).map fun i =>
+      let srcIdx := Nat.min (frames.size - 1) ((i * effNum) / (targetFps * effDen))
+      let base := frames.getD srcIdx default
+      { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
+    (resampled, targetFps)
 
 def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media := Id.run do
   let mut cur := media
@@ -923,21 +1089,8 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
       else if nm == "fps" then
         let rStr := (FilterArg.lookup node.args "fps" 0).getD "25"
         let some targetFps := parseLavfiRate rStr | return none
-        if targetFps == 0 || cur.videoFrames == 0 then return none
-        let srcFps := Nat.max 1 cur.fps
-        let outCount := Nat.max 1 ((cur.videoFrames * targetFps) / srcFps)
-        let some fmt := PixelFormat.parse cur.videoPixFmt | return none
-        let some fb := fmt.frameByteSize cur.videoWidth cur.videoHeight | return none
-        if cur.rawVideo.size != cur.videoFrames * fb then return none
-        let mut outRaw := ByteArray.emptyWithCapacity (outCount * fb)
-        let mut outRpus : Array ByteArray := #[]
-        for i in [:outCount] do
-          let srcIdx := Nat.min (cur.videoFrames - 1) ((i * srcFps) / targetFps)
-          outRaw := outRaw ++ cur.rawVideo.extract (srcIdx * fb) ((srcIdx + 1) * fb)
-          if srcIdx < cur.rpus.size then outRpus := outRpus.push cur.rpus[srcIdx]!
-        let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight outCount cur.videoPixFmt outRaw targetFps
-          | return none
-        cur := { nextM with rpus := if cur.rpus.isEmpty then #[] else outRpus }
+        let some nextM := resampleRawMediaRationalFps cur targetFps | return none
+        cur := nextM
       else if nm == "tonemap" then
         let mode := ((FilterArg.lookup node.args "tonemap" 0).getD (FilterArg.lookup node.args "mode" 0 |>.getD "hable")).toLower
         if mode != "reinhard" && mode != "hable" && mode != "mobius" && mode != "clip" && mode != "linear" then
@@ -999,6 +1152,7 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
             | return none
           cur := nextM
       else if cur.videoPixFmt == "yuv420p" then
+        if mediaHasFractionalFps cur then return none
         let mut seg := node.name
         if !node.args.isEmpty then
           let rendered := node.args.map fun a =>
@@ -1008,7 +1162,7 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
           seg := seg ++ "=" ++ String.intercalate ":" rendered
         match runSingleStreamVideoFilterGraph seg cur.video cur.fps with
         | .ok (frames8, fps8) =>
-          cur := syncMediaFromVideoFrames { cur with video := frames8, fps := fps8 }
+          cur := syncMediaFromVideoFrames { cur with video := frames8, fps := fps8, fpsNum := fps8, fpsDen := 1 }
         | .error _ => return none
       else
         return none
@@ -1026,21 +1180,11 @@ def applyHbdVideoFilterChain (media : Media) (options : Options) : Option Media 
         | return none
       cur := nextM
   if let some targetFps := options.outFps then
-    if targetFps > 0 && cur.videoFrames > 0 && targetFps != cur.fps then
-      let srcFps := Nat.max 1 cur.fps
-      let outCount := Nat.max 1 ((cur.videoFrames * targetFps) / srcFps)
-      let some fmt := PixelFormat.parse cur.videoPixFmt | return none
-      let some fb := fmt.frameByteSize cur.videoWidth cur.videoHeight | return none
-      if cur.rawVideo.size != cur.videoFrames * fb then return none
-      let mut outRaw := ByteArray.emptyWithCapacity (outCount * fb)
-      let mut outRpus : Array ByteArray := #[]
-      for i in [:outCount] do
-        let srcIdx := Nat.min (cur.videoFrames - 1) ((i * srcFps) / targetFps)
-        outRaw := outRaw ++ cur.rawVideo.extract (srcIdx * fb) ((srcIdx + 1) * fb)
-        if srcIdx < cur.rpus.size then outRpus := outRpus.push cur.rpus[srcIdx]!
-      let some nextM := syncMediaFromRaw cur cur.videoWidth cur.videoHeight outCount cur.videoPixFmt outRaw targetFps
-        | return none
-      cur := { nextM with rpus := if cur.rpus.isEmpty then #[] else outRpus }
+    if targetFps > 0 && cur.videoFrames > 0 then
+      let some nextM := resampleRawMediaRationalFps cur targetFps | return none
+      cur := nextM
+  if !options.noVideo && cur.videoFrames > 0 && mediaHasFractionalFps cur then
+    return none
   if let some n := options.maxFrames then
     if n < cur.videoFrames then
       let some fmt := PixelFormat.parse cur.videoPixFmt | return none
@@ -1074,6 +1218,7 @@ def filter (media : Media) (options : Options) : Except String Media := do
      media.hasDovi || media.colour.hasMastering || media.colour.primaries == 9 ||
      media.colour.transferCharacteristics == 16 || media.colour.transferCharacteristics == 18 ||
      options.colorPrimaries.isSome || options.colorTrc.isSome || options.colorspace.isSome ||
+     options.mastering?.isSome || options.maxCll?.isSome ||
      options.filmGrain > 0)
   let audio ← match media.audio with
     | some af => do
@@ -1081,16 +1226,21 @@ def filter (media : Media) (options : Options) : Except String Media := do
       pure (some filtered)
     | none => pure none
   let audioBits := if options.audioFilter != "" then 16 else media.audioBits
+  let (optCll, optFall) := options.maxCll?.getD (media.colour.maxCll, media.colour.maxFall)
   let baseColour : MkvHdrColour := {
     media.colour with
     primaries := (options.colorPrimaries.map UInt16.toNat).getD media.colour.primaries
     transferCharacteristics := (options.colorTrc.map UInt16.toNat).getD media.colour.transferCharacteristics
     matrixCoefficients := (options.colorspace.map UInt16.toNat).getD media.colour.matrixCoefficients
+    hasMastering := options.mastering?.isSome || media.colour.hasMastering
+    maxCll := optCll
+    maxFall := optFall
   }
+  let baseMastering : MasteringDisplaySpec := options.mastering?.getD media.mastering
   let fg? : Option LeanAV.Av1Main.Av1FilmGrainParams :=
     if options.filmGrain > 0 then some (canonicalFilmGrain options.filmGrain) else media.filmGrain?
   if isHbdFlow then
-    let some hbdMedia := applyHbdVideoFilterChain { media with colour := baseColour, filmGrain? := fg? } options
+    let some hbdMedia := applyHbdVideoFilterChain { media with colour := baseColour, mastering := baseMastering, filmGrain? := fg? } options
       | throw "unsupported high-bit-depth video filter or pixel format conversion (fail-closed)"
     return { hbdMedia with
       video := if options.noVideo then #[] else hbdMedia.video
@@ -1100,19 +1250,45 @@ def filter (media : Media) (options : Options) : Except String Media := do
       audioBits := audioBits
       audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
   else
+    if !options.noVideo && !media.video.isEmpty && mediaHasFractionalFps media then
+      if options.videoFilter.trimAscii.toString == "" then
+        if options.outFps.isNone then
+          throw "fractional container frame rate requires explicit -r or fps filter (fail-closed)"
+        let (rNum, rDen) := mediaRationalFps media
+        let targetFps := options.outFps.getD media.fps
+        let (frames1, outFps) := resampleVideoFramesRationalFps media.video rNum rDen targetFps
+        let frames := match options.maxFrames with
+          | some n => frames1.extract 0 n
+          | none => frames1
+        let outMedia := { media with
+          video := frames
+          fps := outFps
+          fpsNum := outFps
+          fpsDen := 1
+          audio := if options.noAudio then none else audio
+          audioBits := audioBits
+          colour := baseColour
+          mastering := baseMastering
+          filmGrain? := fg?
+          audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
+        return syncMediaFromVideoFrames outMedia
+      else
+        let some hbdMedia := applyHbdVideoFilterChain { media with colour := baseColour, mastering := baseMastering, filmGrain? := fg? } options
+          | throw "fractional container frame rate requires explicit -r or fps filter (fail-closed)"
+        return { hbdMedia with
+          video := if options.noVideo then #[] else hbdMedia.video
+          rawVideo := if options.noVideo then ByteArray.empty else hbdMedia.rawVideo
+          videoFrames := if options.noVideo then 0 else hbdMedia.videoFrames
+          audio := if options.noAudio then none else audio
+          audioBits := audioBits
+          audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
     let (frames0, outFps0) ← runSingleStreamVideoFilterGraph options.videoFilter media.video media.fps
     let (frames1, outFps) :=
       match options.outFps with
       | some targetFps =>
         if targetFps == 0 || frames0.isEmpty || targetFps == outFps0 then (frames0, outFps0)
         else
-          let srcFps := Nat.max 1 outFps0
-          let outCount := Nat.max 1 ((frames0.size * targetFps) / srcFps)
-          let resampled := (Array.range outCount).map fun i =>
-            let srcIdx := Nat.min (frames0.size - 1) ((i * srcFps) / targetFps)
-            let base := frames0.getD srcIdx default
-            { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
-          (resampled, targetFps)
+          resampleVideoFramesRationalFps frames0 (Nat.max 1 outFps0) 1 targetFps
       | none => (frames0, outFps0)
     let frames := match options.maxFrames with
       | some n => frames1.extract 0 n
@@ -1120,9 +1296,12 @@ def filter (media : Media) (options : Options) : Except String Media := do
     let outMedia := { media with
       video := if options.noVideo then #[] else frames
       fps := outFps
+      fpsNum := outFps
+      fpsDen := 1
       audio := if options.noAudio then none else audio
       audioBits := audioBits
       colour := baseColour
+      mastering := baseMastering
       filmGrain? := fg?
       audioCopy := if options.noAudio || options.audioFilter != "" then none else media.audioCopy }
     return syncMediaFromVideoFrames outMedia
@@ -1251,7 +1430,8 @@ def encodeVideoTrack (media : Media) (options : Options) : Option SynthMp4Track 
   let c := media.colour
   let isHdr := c.primaries == 9 || c.transferCharacteristics == 16 || c.transferCharacteristics == 18 ||
                c.hasMastering || c.maxCll > 0 || options.colorPrimaries.isSome ||
-               options.colorTrc.isSome || options.colorspace.isSome
+               options.colorTrc.isSome || options.colorspace.isSome ||
+               options.mastering?.isSome || options.maxCll?.isSome
   let mut stsd := ByteArray.empty
   let mut packets : Array (ByteArray × Bool) := #[]
   if options.videoCodec == "h264" then
@@ -1389,7 +1569,7 @@ def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray :=
       codecPrivate := avcc
       packets := lenPrefixed.map (fun p => (p, true))
     else none
-    let stepMs := Nat.max 1 (1000 / Nat.max 1 media.fps)
+    let effFps := Nat.max 1 media.fps
     tracks := tracks.push {
       kind := .video
       codecId := codecId
@@ -1397,13 +1577,13 @@ def muxMkvHdrContainer (media : Media) (options : Options) : Option ByteArray :=
       height := h
       channels := 0
       sampleRate := 0
-      timescale := 1000
+      timescale := effFps
       codecPrivate := codecPrivate
       colour := media.colour
       mastering := media.mastering
       dovi := media.dovi
       hasDovi := media.hasDovi
-      samples := packets.map (fun (p, sync) => (p, stepMs, sync))
+      samples := packets.map (fun (p, sync) => (p, 1, sync))
     }
   if let some af := media.audio then
     if options.audioCodec == "opus" || (docType == "webm" && options.audioCodec == "") then
@@ -1586,24 +1766,30 @@ def filterStreams (inputs : Array Media) (options : Options) : Except String Med
     let wantsHbdOut :=
       (options.pixFmt != "" && options.pixFmt != "yuv420p") ||
       options.colorPrimaries.isSome || options.colorTrc.isSome || options.colorspace.isSome ||
+      options.mastering?.isSome || options.maxCll?.isSome ||
       options.filmGrain > 0
     if anyHbdInput || wantsHbdOut then
       if inputs.size != 1 || inputs[0]!.video.isEmpty || (inputs[0]!.audio.isSome && !options.noAudio) then
         throw "multi-input or audio-bearing high-bit-depth filter_complex is unsupported (fail-closed)"
       let m0 := inputs[0]!
+      let (optCll, optFall) := options.maxCll?.getD (m0.colour.maxCll, m0.colour.maxFall)
       let baseColour : MkvHdrColour := {
         m0.colour with
         primaries := (options.colorPrimaries.map UInt16.toNat).getD m0.colour.primaries
         transferCharacteristics := (options.colorTrc.map UInt16.toNat).getD m0.colour.transferCharacteristics
         matrixCoefficients := (options.colorspace.map UInt16.toNat).getD m0.colour.matrixCoefficients
+        hasMastering := options.mastering?.isSome || m0.colour.hasMastering
+        maxCll := optCll
+        maxFall := optFall
       }
+      let baseMastering : MasteringDisplaySpec := options.mastering?.getD m0.mastering
       let fg? : Option LeanAV.Av1Main.Av1FilmGrainParams :=
         if options.filmGrain > 0 then some (canonicalFilmGrain options.filmGrain) else m0.filmGrain?
       let g ← parseFilterGraph options.filterComplex
       if !options.maps.isEmpty then
         if options.maps.size != 1 || g.openOutputs != [normalizePadLabel options.maps[0]!] then
           throw "unmapped high-bit-depth filter_complex output pad (fail-closed)"
-      let some hbdM := applyHbdVideoFilterChain { m0 with colour := baseColour, filmGrain? := fg? } options
+      let some hbdM := applyHbdVideoFilterChain { m0 with colour := baseColour, mastering := baseMastering, filmGrain? := fg? } options
         | throw "unsupported high-bit-depth filter_complex conversion (fail-closed)"
       return { hbdM with
         video := if options.noVideo then #[] else hbdM.video
@@ -1611,6 +1797,16 @@ def filterStreams (inputs : Array Media) (options : Options) : Except String Med
         videoFrames := if options.noVideo then 0 else hbdM.videoFrames
         audio := none
         audioCopy := none }
+    if inputs.size == 1 && !inputs[0]!.video.isEmpty && inputs[0]!.audio.isNone &&
+       !options.noVideo && mediaHasFractionalFps inputs[0]! then
+      let m0 := inputs[0]!
+      let g ← parseFilterGraph options.filterComplex
+      if !options.maps.isEmpty then
+        if options.maps.size != 1 || g.openOutputs != [normalizePadLabel options.maps[0]!] then
+          throw "unmapped filter_complex output pad (fail-closed)"
+      let some hbdM := applyHbdVideoFilterChain m0 options
+        | throw "fractional container frame rate in filter_complex requires explicit fps filter or -r (fail-closed)"
+      return { hbdM with audio := none, audioCopy := none }
     let graph ← parseFilterGraph options.filterComplex
     let inputLabels := graph.nodes.toList.flatMap (·.inputs)
     let mut videoIn : List (String × Array VideoFrame × Nat) := []
@@ -1621,6 +1817,9 @@ def filterStreams (inputs : Array Media) (options : Options) : Except String Med
         throw "input stream consumed through multiple aliases without split/asplit (fail-closed)"
       let m := inputs[idx]!
       if !m.video.isEmpty then
+        let consumesVideo := inputLabels.contains s!"{idx}:v" || inputLabels.contains s!"{idx}:v:0" || graph.openInputs.isEmpty
+        if consumesVideo && !options.noVideo && mediaHasFractionalFps m then
+          throw "fractional container frame rate in multi-input filter_complex is unsupported (fail-closed)"
         videoIn := videoIn ++ [(s!"{idx}:v", m.video, m.fps), (s!"{idx}:v:0", m.video, m.fps)]
       if let some af := m.audio then
         audioIn := audioIn ++ [(s!"{idx}:a", af), (s!"{idx}:a:0", af)]
@@ -1714,6 +1913,44 @@ def inferFormat (path : String) : String :=
   else if p.endsWith ".avi" then "avi"
   else "unknown"
 
+def parseParenNatPair (tag s : String) : Option (Nat × Nat × String) := do
+  if !s.startsWith (tag ++ "(") then none
+  let after := String.ofList (s.toList.drop (tag.length + 1))
+  match after.splitOn ")" with
+  | [] | [_] => none
+  | inside :: rest =>
+    let [aStr, bStr] := inside.splitOn "," | none
+    let a ← aStr.toNat?
+    let b ← bStr.toNat?
+    some (a, b, String.intercalate ")" rest)
+
+def parseMasterDisplaySpec (raw : String) : Option MasteringDisplaySpec := do
+  let s0 := raw.trimAscii.toString.toUpper
+  let (gx, gy, s1) ← parseParenNatPair "G" s0
+  let (bx, by_, s2) ← parseParenNatPair "B" s1
+  let (rx, ry, s3) ← parseParenNatPair "R" s2
+  let (wx, wy, s4) ← parseParenNatPair "WP" s3
+  let (maxL, minL, s5) ← parseParenNatPair "L" s4
+  if s5 != "" then none
+  if gx > 50000 || gy > 50000 || bx > 50000 || by_ > 50000 ||
+     rx > 50000 || ry > 50000 || wx > 50000 || wy > 50000 then none
+  if minL == 0 || maxL <= minL || maxL > 0xFFFFFFFF then none
+  some {
+    greenX := gx.toUInt32, greenY := gy.toUInt32
+    blueX := bx.toUInt32, blueY := by_.toUInt32
+    redX := rx.toUInt32, redY := ry.toUInt32
+    whiteX := wx.toUInt32, whiteY := wy.toUInt32
+    maxLum := maxL.toUInt32, minLum := minL.toUInt32
+  }
+
+def parseMaxCllSpec (raw : String) : Option (Option (Nat × Nat)) := do
+  let [cStr, fStr] := raw.trimAscii.toString.splitOn "," | none
+  let cll ← cStr.toNat?
+  let fall ← fStr.toNat?
+  if cll == 0 && fall == 0 then some none
+  else if cll == 0 || fall == 0 || fall > cll || cll > 65535 then none
+  else some (some (cll, fall))
+
 def parseEncoderKVParams (raw : String) (opts : Options) : Option Options := do
   let mut cur := opts
   for item in raw.splitOn ":" do
@@ -1747,11 +1984,16 @@ def parseEncoderKVParams (raw : String) (opts : Options) : Option Options := do
       else if kl == "colormatrix" || kl == "matrix-coefficients" then
         let code ← LeanAV.Cli.parseColorspaceCicp v
         cur := { cur with colorspace := some code }
-      else if kl == "hdr10" || kl == "hdr-opt" || kl == "hdr10-opt" || kl == "repeat-headers" ||
-              kl == "aud" || kl == "profile" || kl == "level-idc" || kl == "high-tier" ||
-              kl == "master-display" || kl == "max-cll" || kl == "dolby-vision-profile" ||
-              kl == "enable-hdr" || kl == "film-grain-denoise" then
-        pure ()
+      else if kl == "master-display" then
+        let md ← parseMasterDisplaySpec v
+        cur := { cur with mastering? := some md }
+      else if kl == "max-cll" then
+        let mc? ← parseMaxCllSpec v
+        cur := { cur with maxCll? := mc? }
+      else if kl == "hdr10" || kl == "hdr-opt" || kl == "hdr10-opt" || kl == "enable-hdr" then
+        if v != "0" && v != "1" then none
+      else if kl == "film-grain-denoise" then
+        if v != "0" then none
       else none
   some cur
 
@@ -1965,6 +2207,49 @@ def scan (args : List String) : Option Invocation := do
       else if outputFormat == "s32le" then "pcm_s32le"
       else if outputFormat == "flac" then "flac" else job.options.audioCodec }
   some { job with options := options }
+
+def P11RationalFpsAdmissible (x : Nat × Nat × Bool) : Prop :=
+  let (fpsNum, fpsDen, hasExplicitRate) := x
+  0 < fpsNum ∧ 0 < fpsDen ∧ (fpsNum % fpsDen = 0 ∨ hasExplicitRate = true)
+
+instance (x : Nat × Nat × Bool) : Decidable (P11RationalFpsAdmissible x) := by
+  unfold P11RationalFpsAdmissible
+  infer_instance
+
+def p11RationalFpsGateSpec : AVGateSpec (Nat × Nat × Bool) P11RationalFpsAdmissible where
+  gate x := decide (P11RationalFpsAdmissible x)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := (30000, 1001, true)
+  negWitness := (30000, 1001, false)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem p11RationalFpsGateSpec_iff (x : Nat × Nat × Bool) :
+    p11RationalFpsGateSpec.gate x = true ↔ P11RationalFpsAdmissible x :=
+  p11RationalFpsGateSpec.iff_safe x
+
+def P11MasteringCllValid (x : Nat × Nat × Nat × Nat) : Prop :=
+  let (minLum, maxLum, maxCll, maxFall) := x
+  0 < minLum ∧ minLum < maxLum ∧ maxLum ≤ 0xFFFFFFFF ∧
+  ((maxCll = 0 ∧ maxFall = 0) ∨ (0 < maxFall ∧ maxFall ≤ maxCll ∧ maxCll ≤ 65535))
+
+instance (x : Nat × Nat × Nat × Nat) : Decidable (P11MasteringCllValid x) := by
+  unfold P11MasteringCllValid
+  infer_instance
+
+def p11MasteringCllGateSpec : AVGateSpec (Nat × Nat × Nat × Nat) P11MasteringCllValid where
+  gate x := decide (P11MasteringCllValid x)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := (50, 10000000, 1000, 400)
+  negWitness := (50, 10000000, 400, 1000)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem p11MasteringCllGateSpec_iff (x : Nat × Nat × Nat × Nat) :
+    p11MasteringCllGateSpec.gate x = true ↔ P11MasteringCllValid x :=
+  p11MasteringCllGateSpec.iff_safe x
 
 example : rawVideoGateSpec.gate (2, 2, 6) = true := by decide
 example : rawVideoGateSpec.gate (2, 2, 7) = false := by decide

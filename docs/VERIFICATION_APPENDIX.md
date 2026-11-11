@@ -7,14 +7,14 @@ Measured on `campaign/p1-1-hdr-highbitdepth-20261106` under Lean `v4.35.0` and `
 `LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean`:
 
 ```
-Verified 24990 LeanAV declarations (0 sorryAx, 0 custom axioms).
+Verified 25029 LeanAV declarations (0 sorryAx, 0 custom axioms).
 ```
 
-38 `LeanAV/*.lean` modules, 99,922 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
+38 `LeanAV/*.lean` modules, 100,211 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
 
 ## Tight specifications
 
-`turbo-lean --json audit-spec` on every `LeanAV/*.lean`: **890/890** `non_vacuous_and_tight`, 0 vacuous, 0 trivial, 0 shadowed.
+`turbo-lean --json audit-spec` on every `LeanAV/*.lean`: **892/892** `non_vacuous_and_tight`, 0 vacuous, 0 trivial, 0 shadowed.
 
 | Module | Specs |
 | :--- | ---: |
@@ -43,7 +43,7 @@ Verified 24990 LeanAV declarations (0 sorryAx, 0 custom axioms).
 | `Filter` | 7 |
 | `Md5` | 7 |
 | `LavfiGraph` | 6 |
-| `UnifiedPipeline` | 2 |
+| `UnifiedPipeline` | 4 |
 
 The other 12 modules (`AacLc`, `Av1Main`, `Ffv1`, `Ffv1Container`, `Ffv1Pipeline`, `H264Entropy`, `H264InterDeblockDpb`, `H264IntraTransform`, `H264Syntax`, `HevcMain`, `IO`, `Main`) audit as zero specs.
 

@@ -949,6 +949,276 @@ class TestP11E2EPipeline(unittest.TestCase):
             src_frame = b_base[(2 * j) * frame_bytes : (2 * j + 1) * frame_bytes]
             self.assertEqual(b_drop[j * frame_bytes : (j + 1) * frame_bytes], src_frame)
 
+    def test_12_master_display_max_cll_side_data_and_fail_closed_kv_params(self) -> None:
+        raw_in = self.work / "in_bt2020_custom_mdcv.yuv"
+        raw_in.write_bytes(_make_raw_10bit_yuv420p(16, 16, frames=2))
+        mp4_hevc = self.work / "custom_mdcv_hevc.mp4"
+        mkv_hevc = self.work / "custom_mdcv_hevc.mkv"
+        mp4_rt = self.work / "custom_mdcv_hevc_rt.mp4"
+        mp4_av1 = self.work / "custom_mdcv_av1.mp4"
+        mkv_av1 = self.work / "custom_mdcv_av1.mkv"
+
+        # Use non-default BT.2020 primaries + 4000/0.001 nits + 4000/1000 CLL/FALL so fallback to DCI-P3 would fail
+        kv_spec = (
+            "qp=0:"
+            "master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(40000000,10):"
+            "max-cll=4000,1000"
+        )
+        r_hevc = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-r",
+                "24",
+                "-i",
+                str(raw_in),
+                "-c:v",
+                "hevc",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-x265-params",
+                kv_spec,
+                "-y",
+                str(mp4_hevc),
+            ]
+        )
+        self.assertEqual(r_hevc.returncode, 0, r_hevc.stdout + r_hevc.stderr)
+
+        def _collect_side_data(probe_obj: dict) -> dict[str, dict]:
+            found: dict[str, dict] = {}
+            for s in probe_obj.get("streams", []):
+                for sd in s.get("side_data_list", []):
+                    found[sd["side_data_type"]] = sd
+            for fr in probe_obj.get("frames", []):
+                for sd in fr.get("side_data_list", []):
+                    found.setdefault(sd["side_data_type"], sd)
+            return found
+
+        for step_cmd, target in [
+            (None, mp4_hevc),
+            (["-i", str(mp4_hevc), "-c", "copy", "-y", str(mkv_hevc)], mkv_hevc),
+            (["-i", str(mkv_hevc), "-c", "copy", "-y", str(mp4_rt)], mp4_rt),
+        ]:
+            if step_cmd is not None:
+                res = _run_lffmpeg(step_cmd)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            probe = _ffprobe_json(target)
+            sd = _collect_side_data(probe)
+            self.assertIn("Mastering display metadata", sd, f"Missing mdcv in {target}: {sd}")
+            self.assertIn("Content light level metadata", sd, f"Missing clli in {target}: {sd}")
+            mdcv = sd["Mastering display metadata"]
+            clli = sd["Content light level metadata"]
+            from fractions import Fraction
+
+            self.assertAlmostEqual(float(Fraction(str(mdcv.get("red_x")))), 35400 / 50000, places=4)
+            self.assertAlmostEqual(float(Fraction(str(mdcv.get("green_x")))), 8500 / 50000, places=4)
+            self.assertAlmostEqual(float(Fraction(str(mdcv.get("blue_x")))), 6550 / 50000, places=4)
+            self.assertAlmostEqual(float(Fraction(str(mdcv.get("max_luminance")))), 4000.0, places=2)
+            self.assertAlmostEqual(float(Fraction(str(mdcv.get("min_luminance")))), 0.001, places=5)
+            self.assertEqual(int(clli["max_content"]), 4000)
+            self.assertEqual(int(clli["max_average"]), 1000)
+
+        r_av1 = _run_lffmpeg(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-s",
+                "16x16",
+                "-r",
+                "24",
+                "-i",
+                str(raw_in),
+                "-c:v",
+                "av1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-svtav1-params",
+                kv_spec,
+                "-y",
+                str(mp4_av1),
+            ]
+        )
+        self.assertEqual(r_av1.returncode, 0, r_av1.stdout + r_av1.stderr)
+        r_av1_mkv = _run_lffmpeg(["-i", str(mp4_av1), "-c", "copy", "-y", str(mkv_av1)])
+        self.assertEqual(r_av1_mkv.returncode, 0, r_av1_mkv.stdout + r_av1_mkv.stderr)
+        for av1_target in (mp4_av1, mkv_av1):
+            sd_av1 = _collect_side_data(_ffprobe_json(av1_target))
+            self.assertIn("Mastering display metadata", sd_av1)
+            self.assertIn("Content light level metadata", sd_av1)
+            self.assertEqual(int(sd_av1["Content light level metadata"]["max_content"]), 4000)
+            self.assertEqual(int(sd_av1["Content light level metadata"]["max_average"]), 1000)
+
+        # Malformed HDR metadata and unsupported stateful encoder KV params must fail closed with no output file
+        bad_kv_cases = [
+            ("fall_gt_cll", "max-cll=500,1000"),
+            ("cll_overflow", "max-cll=70000,400"),
+            ("min_ge_max_lum", "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(100,100)"),
+            ("chrom_gt_50000", "master-display=G(50001,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"),
+            ("dovi_profile", "dolby-vision-profile=8.1"),
+            ("stateful_profile", "profile=main10"),
+            ("film_grain_denoise", "film-grain=8:film-grain-denoise=1"),
+        ]
+        for label, bad_kv in bad_kv_cases:
+            bad_out = self.work / f"bad_kv_{label}.mp4"
+            flag = "-svtav1-params" if "film-grain" in bad_kv else "-x265-params"
+            codec = "av1" if "film-grain" in bad_kv else "hevc"
+            res_bad = _run_lffmpeg(
+                [
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-s",
+                    "16x16",
+                    "-r",
+                    "24",
+                    "-i",
+                    str(raw_in),
+                    "-c:v",
+                    codec,
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    flag,
+                    bad_kv,
+                    "-y",
+                    str(bad_out),
+                ]
+            )
+            self.assertNotEqual(res_bad.returncode, 0, f"Expected fail-closed rejection for {label}: {bad_kv}")
+            self.assertFalse(bad_out.exists(), f"Output file leaked on rejected {label}")
+
+    def test_13_fractional_ntsc_fps_fail_closed_and_exact_rational_resampling(self) -> None:
+        # Oracle FFmpeg generates a 60-frame 30000/1001 (~29.97 fps, ~2.002s) 10-bit HEVC MP4 and AV1 IVF + MKV
+        ntsc_hevc_mp4 = self.work / "ntsc_2997_hevc.mp4"
+        ntsc_av1_ivf = self.work / "ntsc_2997_av1.ivf"
+        ntsc_hevc_mkv = self.work / "ntsc_2997_hevc.mkv"
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=32x32:rate=30000/1001:duration=2",
+                "-frames:v",
+                "60",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error:qp=12",
+                "-y",
+                str(ntsc_hevc_mp4),
+            ],
+            check=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-v",
+                "error",
+                "-i",
+                str(ntsc_hevc_mp4),
+                "-c",
+                "copy",
+                "-y",
+                str(ntsc_hevc_mkv),
+            ],
+            check=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=32x32:rate=30000/1001:duration=2",
+                "-frames:v",
+                "60",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:v",
+                "libsvtav1",
+                "-crf",
+                "20",
+                "-y",
+                str(ntsc_av1_ivf),
+            ],
+            check=True,
+            timeout=60,
+        )
+
+        # 1. Stream copy preserves fractional 30000/1001 timing untouched
+        copy_mp4 = self.work / "ntsc_copy.mp4"
+        r_copy = _run_lffmpeg(["-i", str(ntsc_hevc_mp4), "-c", "copy", "-y", str(copy_mp4)])
+        self.assertEqual(r_copy.returncode, 0, r_copy.stdout + r_copy.stderr)
+        probe_copy = _ffprobe_json(copy_mp4)
+        self.assertEqual(probe_copy["streams"][0]["avg_frame_rate"], "30000/1001")
+
+        # 2. Transcoding fractional-FPS MP4/MKV/IVF without explicit -r / fps= fails closed
+        for label, src_p in [("mp4", ntsc_hevc_mp4), ("mkv", ntsc_hevc_mkv), ("ivf", ntsc_av1_ivf)]:
+            no_r_out = self.work / f"ntsc_no_rate_{label}.mp4"
+            res_fail = _run_lffmpeg(
+                ["-i", str(src_p), "-c:v", "hevc", "-pix_fmt", "yuv420p10le", "-y", str(no_r_out)]
+            )
+            self.assertNotEqual(res_fail.returncode, 0, f"Expected fractional-FPS fail-closed for {label}")
+            self.assertFalse(no_r_out.exists())
+
+        # 3. With explicit -r 24 or -vf fps=24, 60 frames @ 30000/1001 (~2.002s) resamples to 48 frames
+        #    (whereas truncated integer 29 fps would have yielded 49 frames: round(60 * 24 / 29) == 50 / 49!)
+        for mode, extra_args in [
+            ("dash_r", ["-r", "24"]),
+            ("vf_fps", ["-vf", "fps=24"]),
+            ("fc_fps", ["-filter_complex", "[0:v]fps=24,format=yuv420p[v]", "-map", "[v]"]),
+        ]:
+            out_24 = self.work / f"ntsc_to_24_{mode}.mp4"
+            pix_args = ["-pix_fmt", "yuv420p"] if mode == "fc_fps" else ["-pix_fmt", "yuv420p10le"]
+            codec = "h264" if mode == "fc_fps" else "hevc"
+            r_ok = _run_lffmpeg(
+                ["-i", str(ntsc_hevc_mp4), *extra_args, "-c:v", codec, *pix_args, "-y", str(out_24)]
+            )
+            self.assertEqual(r_ok.returncode, 0, f"{mode}: {r_ok.stdout + r_ok.stderr}")
+            probe_24 = _ffprobe_json(out_24)
+            self.assertEqual(int(probe_24["streams"][0]["nb_frames"]), 48, f"Wrong rational frame count for {mode}")
+            self.assertEqual(probe_24["streams"][0]["r_frame_rate"], "24/1")
+
+        # Also verify MKV 29.97 (1ms cluster timestamps) + IVF 30000/1001 with -r 24 -> exact 48 frames
+        for label, src_p in [("mkv", ntsc_hevc_mkv), ("ivf", ntsc_av1_ivf)]:
+            out_p = self.work / f"ntsc_{label}_24.mkv"
+            r_ok2 = _run_lffmpeg(
+                ["-i", str(src_p), "-r", "24", "-c:v", "hevc", "-pix_fmt", "yuv420p10le", "-y", str(out_p)]
+            )
+            self.assertEqual(r_ok2.returncode, 0, f"{label}: {r_ok2.stdout + r_ok2.stderr}")
+            probe_m = _ffprobe_json(out_p)
+            self.assertEqual(len(probe_m["frames"]), 48, f"Wrong MKV frame count for {label}")
+            # Verify exact 24fps MKV timescale (no 1000/24 = 41ms cumulative drift: frame 24 pts_time == 1.000s)
+            pts_24 = float(probe_m["frames"][24]["pts_time"])
+            self.assertAlmostEqual(pts_24, 1.0, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()
