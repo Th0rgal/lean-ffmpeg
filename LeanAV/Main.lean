@@ -1688,7 +1688,10 @@ private def scanRawLavfiCliLoop : List String → Option String → RawLavfiCliS
       | [] => { st with hasBlocking := true }
     else if tok == "-r" || tok == "-framerate" then
       match rest with
-      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with outRate := some v }
+      | v :: tail =>
+        match parseLavfiRate v with
+        | some r => scanRawLavfiCliLoop tail pendingFmt { st with outRate := some (toString r) }
+        | none => { st with hasBlocking := true }
       | [] => { st with hasBlocking := true }
     else if tok == "-ar" then
       match rest with
@@ -1870,9 +1873,32 @@ def promoteLavfiDagPlanArgs (plan : MediaPlanIR) (args : List String) : MediaPla
   else
     plan
 
+def isHdrOrDoviForCrossRemux (inFmt : ContainerFormat) (bytes : ByteArray) : Bool :=
+  let tracks? :=
+    if inFmt == .mp4 then p11DemuxMp4ToCrossTracks bytes
+    else if inFmt == .mkv || inFmt == .webm then p11DemuxMkvToCrossTracks bytes
+    else none
+  match tracks? with
+  | some tracks =>
+    tracks.any fun t =>
+      t.hasDovi || t.colour.primaries == 9 || t.colour.transferCharacteristics == 16 ||
+      t.colour.transferCharacteristics == 18 || t.colour.hasMastering || t.colour.maxCll > 0
+  | none => false
+
 def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
-  if plan.backend.tier != .independentVerified then return plan
-  if !plan.backend.reasons.contains "native_stream_copy" then return plan
+  let isCrossCopyCandidate :=
+    if plan.backend.tier == .unsupported && plan.inputs.length == 1 && plan.outputs.length == 1 &&
+       plan.graphs.videoFilter.isNone && plan.graphs.audioFilter.isNone &&
+       (plan.timeline.startMs.getD 0).toNat == 0 && (plan.timeline.durationMs.getD 0).toNat == 0 then
+      match plan.outputs.head? with
+      | some o =>
+        o.videoCodec == some .copy && (o.audioCodec.isNone || o.audioCodec == some .copy) &&
+        ["mp4", "mov", "matroska", "mkv"].contains o.format
+      | none => false
+    else false
+  if !isCrossCopyCandidate then
+    if plan.backend.tier != .independentVerified then return plan
+    if !plan.backend.reasons.contains "native_stream_copy" then return plan
   let some inp := plan.inputs.head? | return plan
   let some out := plan.outputs.head? | return plan
   let some outFmt := containerFormatOfName out.format | return demoteNativePlan plan
@@ -1890,7 +1916,17 @@ def refinePlanWithInput (plan : MediaPlanIR) : IO MediaPlanIR := do
   match nativeRemuxBytes inFmt outFmt bytes (plan.timeline.startMs.getD 0).toNat
       (plan.timeline.durationMs.getD 0).toNat metadata selectors explicitMaps
       copyVideo copyAudio copySubtitle copyData with
-  | .fallback => return demoteNativePlan plan
+  | .fallback =>
+    if (plan.timeline.startMs.getD 0).toNat == 0 && (plan.timeline.durationMs.getD 0).toNat == 0 &&
+       isHdrOrDoviForCrossRemux inFmt bytes &&
+       (p11CrossRemuxBytes inFmt outFmt bytes).isSome then
+      return { plan with backend := {
+        tier := .independentVerified
+        delegatedContainer := false
+        fallbackAllowed := false
+        reasons := ["native_stream_copy"] } }
+    else
+      return demoteNativePlan plan
   | _ => return plan
 
 /-- Promote a supported lavfi CLI plan after native stream-copy refinement. -/
@@ -1903,7 +1939,7 @@ def prepareUnifiedMediaPipeline (args : List String) : IO (Option (LeanAV.Unifie
     for inp in job.inputs do
       let bytes ← IO.FS.readBinFile inp.path
       let skipAud := job.options.noAudio && job.options.filterComplex == "" && job.options.audioFilter == ""
-      let some media := LeanAV.UnifiedPipeline.decode bytes inp.format inp.width inp.height inp.sampleRate inp.channels skipAud
+      let some media := LeanAV.UnifiedPipeline.decode bytes inp.format inp.width inp.height inp.sampleRate inp.channels skipAud inp.pixFmt inp.fps
         | return none
       inputs := inputs.push media
     return some (job, inputs)
@@ -2046,16 +2082,33 @@ def runInprocLavfiDagCli
       "{\"ok\":false,\"mode\":\"ffmpeg-cli-inproc-lavfi\",\"error\":\"unsupported lavfi codec, pixel format, or stream selection\"}"
       "Unsupported lavfi codec, pixel format, or stream selection"
   let limN? := raw.maxFrames
-  let vFrames? : Option (Array VideoFrame × Nat) :=
+  let (vFrames?, vSrcIndices?) : Option (Array VideoFrame × Nat) × Option (Array Nat) :=
     match vSel with
-    | none => none
+    | none => (none, none)
     | some (_, fmt, q) =>
       let all := drainVideoQueue q
+      let srcFps := Nat.max 1 fmt.fpsNum
       let durLim := match cliDurMs? with
-        | some dMs => lavfiVideoFrameCount fmt.fpsNum dMs
+        | some dMs => lavfiVideoFrameCount srcFps dMs
         | none => all.size
-      let lim := match limN? with | some n => Nat.min durLim (Nat.max 1 n) | none => durLim
-      some (all.extract 0 (Nat.min all.size lim), Nat.max 1 fmt.fpsNum)
+      let preResample := all.extract 0 (Nat.min all.size durLim)
+      let (resampled, effFps, resampledIdxs) :=
+        match raw.outRate.bind parseLavfiRate with
+        | some targetFps =>
+          if targetFps == 0 || preResample.isEmpty || targetFps == srcFps then
+            (preResample, srcFps, Array.range preResample.size)
+          else
+            let outCount := Nat.max 1 ((preResample.size * targetFps) / srcFps)
+            let idxs := (Array.range outCount).map fun i =>
+              Nat.min (preResample.size - 1) ((i * srcFps) / targetFps)
+            let arr := (Array.range outCount).map fun i =>
+              let srcIdx := idxs.getD i 0
+              let base := preResample.getD srcIdx default
+              { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
+            (arr, targetFps, idxs)
+        | none => (preResample, srcFps, Array.range preResample.size)
+      let lim := match limN? with | some n => Nat.min resampled.size (Nat.max 1 n) | none => resampled.size
+      (some (resampled.extract 0 lim, effFps), some (resampledIdxs.extract 0 lim))
   let aFrame? : Option AudioFrame :=
     match aSel with
     | none => none
@@ -2099,7 +2152,10 @@ def runInprocLavfiDagCli
         else if isFrameMd5 then muxLavfiFrameMd5Bytes vfs fps
         else if isPng then
           let first := (vfs.extract 0 1)
-          let rawRgb := packVideoFramesRgb24Raw first
+          let rawRgb :=
+            match vSrcIndices?.bind (fun idxs => packDirectTestsrcRgb24? tg (some (idxs.extract 0 1))) with
+            | some direct => direct
+            | none => packVideoFramesRgb24Raw first
           match vfs[0]? with
           | some vf0 =>
             match pngImageFromRaw rawRgb vf0.width vf0.height "rgb24" with
@@ -2109,7 +2165,7 @@ def runInprocLavfiDagCli
         else
           let rawVid :=
             if isRgb then
-              match packDirectTestsrcRgb24? tg (some vfs.size) with
+              match packDirectTestsrcRgb24? tg vSrcIndices? with
               | some direct => direct
               | none => packVideoFramesRgb24Raw vfs
             else if isGray then
@@ -2201,11 +2257,14 @@ def runUnifiedMediaPipelineCli (cfg : CliConfig) (args : List String) : IO UInt3
       return ← reportCliError cfg
         (s!"\{\"ok\":false,\"mode\":\"ffmpeg-cli-unified-pipeline\",\"error\":\"{jsonEscape (reprStr e)}\"}")
         "Unified media pipeline output write failed"
-  let (outW, outH) := match filtered.video[0]? with
-    | some vf => (vf.width, vf.height)
-    | none => (0, 0)
+  let (outW, outH) :=
+    if filtered.videoWidth > 0 && filtered.videoHeight > 0 then (filtered.videoWidth, filtered.videoHeight)
+    else match filtered.video[0]? with
+      | some vf => (vf.width, vf.height)
+      | none => (0, 0)
+  let outFrames := if filtered.videoFrames > 0 then filtered.videoFrames else filtered.video.size
   if cfg.jsonOutput then
-    IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-unified-pipeline\",\"tier\":\"independent_verified\",\"width\":{outW},\"height\":{outH},\"frames\":{filtered.video.size},\"out_bytes\":{bytes.size}}"
+    IO.println s!"\{\"ok\":true,\"mode\":\"ffmpeg-cli-unified-pipeline\",\"tier\":\"independent_verified\",\"width\":{outW},\"height\":{outH},\"frames\":{outFrames},\"out_bytes\":{bytes.size}}"
   return 0
 
 def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List String) : IO (Option UInt32) := do
@@ -2226,8 +2285,17 @@ def runNativeStreamCopy (cfg : CliConfig) (plan : MediaPlanIR) (args : List Stri
     | some sc => sc == .copy
     | none => out.globalCopy
   let copyData := out.copyData
-  match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps
-      copyVideo copyAudio copySubtitle copyData with
+  let remuxResult : NativeRemuxResult :=
+    match nativeRemuxBytes inFmt outFmt bytes startMs durMs metadata selectors explicitMaps
+        copyVideo copyAudio copySubtitle copyData with
+    | .fallback =>
+      if startMs == 0 && durMs == 0 && isHdrOrDoviForCrossRemux inFmt bytes then
+        match p11CrossRemuxBytes inFmt outFmt bytes with
+        | some outB => NativeRemuxResult.remuxed outB
+        | none => NativeRemuxResult.fallback
+      else NativeRemuxResult.fallback
+    | r => r
+  match remuxResult with
   | .fallback => return none
   | .invalid reason =>
     return some (← reportCliError cfg
@@ -3843,4 +3911,105 @@ def main (args : List String) : IO UInt32 := do
 #print axioms LeanAV.LavfiGraphProofs.lavfiDurationBoundGateSpec
 #print axioms LeanAV.LavfiGraph.edgeBufferQueueGateSpec
 #print axioms LeanAV.LavfiGraph.validTopoPairGateSpec
+#print axioms LeanAV.Av1MainProofs.av1SupportedSeqSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1RawLayoutSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1RawFrameByteSize_hbd_even
+#print axioms LeanAV.Av1MainProofs.av1SampleBoundSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1FilmGrainBoundsSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1CHeaderSupportedSpec_iff
+#print axioms LeanAV.Av1MainProofs.av1Hbd_and_film_grain_invariants_verified
+#print axioms LeanAV.Cli.p11HdrColorCliGateSpec
+#print axioms LeanAV.Cli.p11_hdr_colorimetry_and_high_bitdepth_cli_verified
+#print axioms LeanAV.Core.PixelFormat.pixelFormat_parse_toString_roundtrip
+#print axioms LeanAV.Core.PixelFormat.pixelFormat_bitDepth_pos
+#print axioms LeanAV.Core.pixelFormatByteLayoutGateSpec
+#print axioms LeanAV.Core.pixelFormatByteLayoutGateSpec_iff
+#print axioms LeanAV.Domain.highBitFrameGateSpec
+#print axioms LeanAV.Domain.highBitFrameGateSpec_iff
+#print axioms LeanAV.Filter.tonemapFrameGateSpec
+#print axioms LeanAV.Filter.tonemapFrameGateSpec_iff
+#print axioms LeanAV.Format.p11SampleEntryDepthGateSpec
+#print axioms LeanAV.Format.doviConfigGateSpec
+#print axioms LeanAV.Format.mkvHdrColourGateSpec
+#print axioms LeanAV.Format.p11CrossContainerGateSpec
+#print axioms LeanAV.Format.p11_hdr_dovi_container_roundtrip
+#print axioms LeanAV.Format.p11_rpu_and_obu_roundtrip
+#print axioms LeanAV.Format.p11_mkv_hdr_and_dovi_roundtrip
+#print axioms LeanAV.Format.p11_mkv_mastering_roundtrip
+#print axioms LeanAV.H264EntropyProofs.pcmByteCount_422_444_and_separate_plane_exact
+#print axioms LeanAV.H264EntropyProofs.cavlcChroma2x4_tables_and_roundtrip_exact
+#print axioms LeanAV.H264EntropyProofs.cabacHigh444_ctxTables_and_init1024_valid
+#print axioms LeanAV.H264EntropyProofs.cabacCbfCtx_8x8_cat5_9_13_non8x8_neighbor_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.hbdBitDepthGateSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.hbdChromaArrayTypeGateSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.hbdSampleRangeGateSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.hbdPictureValidGateSpec
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264MaxSample_8_10_12_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.clip1Hbd_bounds
+#print axioms LeanAV.H264InterDeblockDpbProofs.clip1Hbd_id_in_range
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Round5Hbd_dc_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264Round6Hbd_dc_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFracHbd_bounds
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFracHbd_bounds
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264LumaFracHbd_10bit_dc_all_16_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaFracHbd_12bit_dc_all_64_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaMcSampleHbd_444_matches_luma_qpel
+#print axioms LeanAV.H264InterDeblockDpbProofs.h264ChromaMcSampleHbd_monochrome_zero
+#print axioms LeanAV.H264InterDeblockDpbProofs.weightedUniPredPixelHbd_bounds
+#print axioms LeanAV.H264InterDeblockDpbProofs.weightedBiPredPixelHbd_bounds
+#print axioms LeanAV.H264InterDeblockDpbProofs.weightedUniPredPixelHbd_10bit_offset_shift_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaSamples8Hbd_bypass_both_noop
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterChromaSamples4Hbd_bypass_both_noop
+#print axioms LeanAV.H264InterDeblockDpbProofs.filterLumaAndChromaHbd_10bit_unshifted_tc_increment_exact
+#print axioms LeanAV.H264InterDeblockDpbProofs.deblockChromaVertStepHbd_444_uses_strong_4tap
+#print axioms LeanAV.H264IntraTransformProofs.h264HighTierQpPrimeGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264HighTierSampleGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264HighTierChromaGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.isLegalIntraNxNModeHbd_iff
+#print axioms LeanAV.H264IntraTransformProofs.h264IntraNxNHbdLegalityGateSpec
+#print axioms LeanAV.H264IntraTransformProofs.h264Hadamard2x4_involution_8x
+#print axioms LeanAV.H264IntraTransformProofs.h264ChromaDcScan2x4_bijection
+#print axioms LeanAV.H264IntraTransformProofs.h264ChromaDcScan2x4_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264QpcFromQpyHbd_8bit_compat
+#print axioms LeanAV.H264IntraTransformProofs.h264QpcFromQpyHbd_10bit_table8_15_anchors
+#print axioms LeanAV.H264IntraTransformProofs.h264ClipSampleHbd_id_on_valid
+#print axioms LeanAV.H264IntraTransformProofs.h264ClipSampleHbd_in_range
+#print axioms LeanAV.H264IntraTransformProofs.h264LosslessBypass4x4_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264LosslessBypass8x8_roundtrip
+#print axioms LeanAV.H264IntraTransformProofs.h264PredHbd_sizes_exact
+#print axioms LeanAV.H264IntraTransformProofs.h264LosslessChromaDpcmMode_mapping
+#print axioms LeanAV.H264SyntaxProofs.resolveSpsScalingMatrices_absent_flat
+#print axioms LeanAV.H264SyntaxProofs.resolveSpsScalingMatrices_chroma420_limits_8x8
+#print axioms LeanAV.H264SyntaxProofs.resolveSpsScalingMatrices_chroma444_fallback_8x8
+#print axioms LeanAV.H264SyntaxProofs.resolvePpsScalingMatrices_inherit_sps
+#print axioms LeanAV.H264SyntaxProofs.buildAvcDecoderConfigRecordFromSps_high444_ext_roundtrip
+#print axioms LeanAV.H264SyntaxProofs.h264HighTierSpsProfileValidSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcMain10OrRextSpsSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcPixFmtPairSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcSample10BoundSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcSample12BoundSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcExtendedQpSpec_iff
+#print axioms LeanAV.HevcMainProofs.hvccHeaderFieldsSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcChroma422ModeMapSpec_iff
+#print axioms LeanAV.HevcMainProofs.hevcExt_pixFmt_hvcc_sps_and_chroma422_roundtrip_verified
+#print axioms LeanAV.LavfiGraph.lavfiHdrFilterGateSpec
+#print axioms LeanAV.LavfiGraph.lavfiHdrFilterGateSpec_iff
+#print axioms LeanAV.LavfiGraphProofs.colorspaceFrameGateSpec
+#print axioms LeanAV.LavfiGraphProofs.colorspaceFrameGateSpec_iff
+#print axioms LeanAV.LavfiGraphProofs.filterVideoColorspace_conserves
+#print axioms LeanAV.LavfiGraphProofs.filterVideoTonemap_is_bt709
+#print axioms LeanAV.LavfiGraphProofs.colorspace_then_tonemap_conserves
+#print axioms LeanAV.PlanIR.p11HdrPlanGateSpec
+#print axioms LeanAV.PlanIR.p11_hdr_plan_roundtrip_verified
+#print axioms LeanAV.Scale.p010_shift_roundtrip_sample
+#print axioms LeanAV.Scale.promote_demote_10_12_roundtrip
+#print axioms LeanAV.Scale.expand_shrink_10_16_roundtrip
+#print axioms LeanAV.Scale.bayer4x4Threshold_lt16
+#print axioms LeanAV.Scale.ditherOutputGateSpec
+#print axioms LeanAV.Scale.ditherBayerSample_bounded
+#print axioms LeanAV.Scale.hdrTransferGateSpec
+#print axioms LeanAV.Scale.pq_and_hlg_endpoints_and_gamut_achromatic
+#print axioms LeanAV.UnifiedPipeline.p11UnifiedHdrGateSpec
+#print axioms LeanAV.UnifiedPipeline.p11UnifiedHdrGateSpec_iff
+
 

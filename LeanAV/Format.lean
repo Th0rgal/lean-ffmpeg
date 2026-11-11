@@ -6695,6 +6695,8 @@ def patchMp4HdrAndElstBoxesPure (inBuf outBuf : @& ByteArray) (copyElst : Bool) 
   let colrBox := extractChild inVreStart inVreEnd 0x636F6C72 64
   let clliBox := extractChild inVreStart inVreEnd 0x636C6C69 32
   let mdcvBox := extractChild inVreStart inVreEnd 0x6D646376 64
+  let dvccBox := extractChild inVreStart inVreEnd 0x64766343 64
+  let dvvcBox := extractChild inVreStart inVreEnd 0x64767643 64
   let paspBox := extractChild inVreStart inVreEnd 0x70617370 32
   let inTrakBody := mp4BoxPayloadOffset inBuf inLoc.trakPos (inLoc.trakPos + inLoc.trakSz)
   let rawEdtsBox := if copyElst then extractChild inTrakBody (inLoc.trakPos + inLoc.trakSz) 0x65647473 128 else ByteArray.empty
@@ -6710,7 +6712,8 @@ def patchMp4HdrAndElstBoxesPure (inBuf outBuf : @& ByteArray) (copyElst : Bool) 
     return false
   let mut edtsBox := if hasNontrivialEdts then rawEdtsBox else ByteArray.empty
 
-  if colrBox.isEmpty && clliBox.isEmpty && mdcvBox.isEmpty && paspBox.isEmpty && edtsBox.isEmpty then
+  if colrBox.isEmpty && clliBox.isEmpty && mdcvBox.isEmpty &&
+      dvccBox.isEmpty && dvvcBox.isEmpty && paspBox.isEmpty && edtsBox.isEmpty then
     return none
 
   let some outLoc := mp4LocateVideoBoxes outBuf outBuf.size | return none
@@ -6749,6 +6752,10 @@ def patchMp4HdrAndElstBoxesPure (inBuf outBuf : @& ByteArray) (copyElst : Bool) 
     stsdInject := stsdInject ++ clliBox
   if !mdcvBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x6D646376).isNone then
     stsdInject := stsdInject ++ mdcvBox
+  if !dvccBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x64766343).isNone then
+    stsdInject := stsdInject ++ dvccBox
+  if !dvvcBox.isEmpty && (mp4FindChildBox outBuf outVreStart outVreEnd 0x64767643).isNone then
+    stsdInject := stsdInject ++ dvvcBox
 
   let mut cur := outBuf
   let stsdDelta := stsdInject.size
@@ -10436,5 +10443,1577 @@ def mpegTsProgramStreamGateSpec : AVGateSpec MpegTsElementaryStream MpegTsProgra
 theorem mpegTsProgramStreamGateSpec_iff (es : MpegTsElementaryStream) :
     mpegTsProgramStreamGateSpec.gate es = true ↔ MpegTsProgramStreamSafe es :=
   mpegTsProgramStreamGateSpec.iff_safe es
+
+/-! ## P1.1 Track E: high-bit-depth sample entries, HDR10/DoVi parse & passthrough, cross-container remux -/
+
+def p11SampleEntryDepth (fourcc : String) : Option Nat :=
+  if fourcc == "avc1" || fourcc == "hvc1" || fourcc == "hev1" || fourcc == "av01" then some 10
+  else none
+
+/-- ISO/IEC 14496-12 high-bit-depth visual sample entry: `avc1`/`hvc1`/`hev1`/`av01` with depth 24. -/
+def buildP11HighBitDepthStsdBox (fourcc : String) (width height : Nat)
+    (cfgFourcc : String) (cfgBody colrBox mdcvBox clliBox doviBox : List UInt8) : List UInt8 :=
+  let entry :=
+    match fourcc with
+    | "avc1" => ('a', 'v', 'c', '1')
+    | "hvc1" => ('h', 'v', 'c', '1')
+    | "hev1" => ('h', 'e', 'v', '1')
+    | _ => ('a', 'v', '0', '1')
+  let cfg :=
+    match cfgFourcc with
+    | "avcC" => ('a', 'v', 'c', 'C')
+    | "hvcC" => ('h', 'v', 'c', 'C')
+    | _ => ('a', 'v', '1', 'C')
+  let base :=
+    if cfgBody.isEmpty then []
+    else (buildVideoCodecStsdBox entry cfg width height ⟨cfgBody.toArray⟩).toList
+  if base.isEmpty then []
+  else
+    let extra := colrBox ++ mdcvBox ++ clliBox ++ doviBox
+    let grow (n : Nat) : List UInt8 :=
+      let v := n + extra.length
+      [(v >>> 24).toUInt8, (v >>> 16).toUInt8, (v >>> 8).toUInt8, v.toUInt8]
+    match base with
+    | s0 :: s1 :: s2 :: s3 :: rest =>
+      let stsdSz := ((s0.toNat <<< 24) ||| (s1.toNat <<< 16) ||| (s2.toNat <<< 8) ||| s3.toNat)
+      if rest.length < 16 then base
+      else
+        let entrySz := stsdSz - 16
+        grow stsdSz ++ rest.take 12 ++ grow entrySz ++ rest.drop 16 ++ extra
+    | _ => base
+
+structure P11SampleEntryDepth where
+  fourcc : String
+  depth  : Nat
+  deriving DecidableEq, Inhabited
+
+def P11SampleEntryDepthSafe (e : P11SampleEntryDepth) : Prop :=
+  p11SampleEntryDepth e.fourcc = some e.depth
+
+instance (e : P11SampleEntryDepth) : Decidable (P11SampleEntryDepthSafe e) :=
+  inferInstanceAs (Decidable (_ = some _))
+
+def p11SampleEntryDepthGateSpec : AVGateSpec P11SampleEntryDepth P11SampleEntryDepthSafe where
+  gate e := decide (P11SampleEntryDepthSafe e)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := { fourcc := "hvc1", depth := 10 }
+  negWitness := { fourcc := "mp4a", depth := 10 }
+  nonVacuous := by decide
+  tight := by decide
+
+/-- Dolby Vision configuration record (ISO/IEC 14496-12 `dvcC`/`dvvC`, 24-byte body). -/
+structure DoviConfigRecord where
+  major : UInt8
+  minor : UInt8
+  profile : Nat
+  level : Nat
+  rpuPresent : Bool
+  elPresent : Bool
+  blPresent : Bool
+  compatibilityId : Nat
+  deriving DecidableEq, Inhabited
+
+def encodeDoviConfigBody (r : DoviConfigRecord) : List UInt8 :=
+  let flags : UInt16 :=
+    (r.profile.toUInt16 <<< 9) ||| (r.level.toUInt16 <<< 3) |||
+    (if r.rpuPresent then 4 else 0) ||| (if r.elPresent then 2 else 0) ||| (if r.blPresent then 1 else 0)
+  let compat := (r.compatibilityId.toUInt8 &&& 0x0F) <<< 4
+  [r.major, r.minor, (flags >>> 8).toUInt8, flags.toUInt8, compat] ++ List.replicate 19 0
+
+def decodeDoviConfigBody (b : List UInt8) : Option DoviConfigRecord :=
+  if b.length != 24 then none
+  else
+    let major := b[0]!
+    let minor := b[1]!
+    let word := listToU16be b[2]! b[3]!
+    let profile := (word >>> 9).toNat
+    let level := ((word >>> 3) &&& 0x3F).toNat
+    let compat := (b[4]! >>> 4).toNat
+    if (b.drop 5).any (· != 0) || profile > 10 || level > 63 then none
+    else some {
+      major, minor, profile, level
+      rpuPresent := (word &&& 4) != 0
+      elPresent := (word &&& 2) != 0
+      blPresent := (word &&& 1) != 0
+      compatibilityId := compat }
+
+def doviProfile5 : DoviConfigRecord :=
+  { major := 1, minor := 0, profile := 5, level := 1, rpuPresent := true,
+    elPresent := false, blPresent := true, compatibilityId := 0 }
+
+def doviProfile8 : DoviConfigRecord :=
+  { major := 1, minor := 0, profile := 8, level := 1, rpuPresent := true,
+    elPresent := false, blPresent := true, compatibilityId := 1 }
+
+def doviProfile10 : DoviConfigRecord :=
+  { major := 1, minor := 0, profile := 10, level := 1, rpuPresent := true,
+    elPresent := false, blPresent := true, compatibilityId := 1 }
+
+def doviBoxFourcc (r : DoviConfigRecord) : String :=
+  if r.profile > 7 then "dvvC" else "dvcC"
+
+def DoviConfigSafe (r : DoviConfigRecord) : Prop :=
+  r.major = 1 ∧ r.rpuPresent = true ∧ r.blPresent = true ∧ r.profile ≤ 10 ∧ r.level ≤ 63
+
+instance (r : DoviConfigRecord) : Decidable (DoviConfigSafe r) :=
+  inferInstanceAs (Decidable (_ ∧ _ ∧ _ ∧ _ ∧ _))
+
+def doviConfigGateSpec : AVGateSpec DoviConfigRecord DoviConfigSafe where
+  gate r := decide (DoviConfigSafe r)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := doviProfile8
+  negWitness := { doviProfile5 with major := 0, rpuPresent := false, blPresent := false }
+  nonVacuous := by decide
+  tight := by decide
+
+/-- HEVC prefix-SEI NAL (`nal_unit_type = 62`) carrying an unescaped Dolby Vision RPU. -/
+def hevcRpuNalHeaderOk (b0 b1 : UInt8) : Bool :=
+  ((b0 >>> 1) &&& 0x3F) == 62 && (b1 &&& 0x07) != 0
+
+def rbspUnescape (xs : List UInt8) : List UInt8 :=
+  let rec go (prev : Nat) (rest : List UInt8) : List UInt8 :=
+    match rest with
+    | [] => []
+    | 0x03 :: t => if prev ≥ 2 then go 0 t else 0x03 :: go 0 t
+    | h :: t => h :: go (if h == 0 then prev + 1 else 0) t
+  go 0 xs
+
+def mpeg2Crc32List (xs : List UInt8) : UInt32 :=
+  xs.foldl (fun (crc : UInt32) b =>
+    crc32MsbStep 0x04C11DB7 8 (crc ^^^ (b.toUInt32 <<< (24 : UInt32)))) (0xFFFFFFFF : UInt32)
+
+def hevcRpuPayloadOk (rbsp : List UInt8) : Bool :=
+  match rbsp with
+  | 0x19 :: body =>
+    if body.length < 6 then false
+    else
+      let msg := body.take (body.length - 5)
+      let crc := u32beToList (mpeg2Crc32List msg)
+      msg ++ crc ++ [0x80] == body
+  | _ => false
+
+/-- Matroska `Colour` (`0x55B0`) + `MasteringMetadata` (`0x55D0`) + `BlockAdditionMapping` (`0x41E4`) codecs. -/
+structure MkvHdrColour where
+  matrixCoefficients      : Nat
+  transferCharacteristics : Nat
+  primaries               : Nat
+  maxCll                  : Nat
+  maxFall                 : Nat
+  hasMastering            : Bool
+  deriving DecidableEq, Inhabited
+
+def ebmlIdToList (eid : UInt32) : List UInt8 :=
+  if eid ≥ 0x1000000 then u32beToList eid
+  else if eid ≥ 0x10000 then [(eid >>> 16).toUInt8, (eid >>> 8).toUInt8, eid.toUInt8]
+  else if eid ≥ 0x100 then [(eid >>> 8).toUInt8, eid.toUInt8]
+  else [eid.toUInt8]
+
+def ebmlSize8ToList (sz : Nat) : List UInt8 :=
+  let s := sz.toUInt64
+  [0x01, ((s >>> 48) &&& 0xFF).toUInt8, ((s >>> 40) &&& 0xFF).toUInt8,
+   ((s >>> 32) &&& 0xFF).toUInt8, ((s >>> 24) &&& 0xFF).toUInt8,
+   ((s >>> 16) &&& 0xFF).toUInt8, ((s >>> 8) &&& 0xFF).toUInt8, (s &&& 0xFF).toUInt8]
+
+def wrapEbmlList (eid : UInt32) (body : List UInt8) : List UInt8 :=
+  let n := body.length
+  let szBytes := if n < 127 then [(0x80 ||| n.toUInt8)] else ebmlSize8ToList n
+  ebmlIdToList eid ++ szBytes ++ body
+
+def encodeMkvUintList (eid : UInt32) (val : Nat) : List UInt8 :=
+  let v := val.toUInt32
+  let b := if val < 256 then [v.toUInt8] else [(v >>> 8).toUInt8, v.toUInt8]
+  wrapEbmlList eid b
+
+def readEbmlIdList : List UInt8 → Option (UInt32 × List UInt8)
+  | [] => none
+  | b0 :: t0 =>
+    if (b0 &&& 0x80) != 0 then some (b0.toUInt32, t0)
+    else match t0 with
+    | b1 :: t1 =>
+      if (b0 &&& 0x40) != 0 then some ((b0.toUInt32 <<< 8) ||| b1.toUInt32, t1)
+      else match t1 with
+      | b2 :: t2 =>
+        if (b0 &&& 0x20) != 0 then
+          some ((b0.toUInt32 <<< 16) ||| (b1.toUInt32 <<< 8) ||| b2.toUInt32, t2)
+        else match t2 with
+        | b3 :: t3 =>
+          if (b0 &&& 0x10) != 0 then
+            some ((b0.toUInt32 <<< 24) ||| (b1.toUInt32 <<< 16) |||
+                  (b2.toUInt32 <<< 8) ||| b3.toUInt32, t3)
+          else none
+        | [] => none
+      | [] => none
+    | [] => none
+
+def ebmlVintWidth (b0 : UInt8) : Option Nat :=
+  if (b0 &&& 0x80) != 0 then some 1
+  else if (b0 &&& 0x40) != 0 then some 2
+  else if (b0 &&& 0x20) != 0 then some 3
+  else if (b0 &&& 0x10) != 0 then some 4
+  else if (b0 &&& 0x08) != 0 then some 5
+  else if (b0 &&& 0x04) != 0 then some 6
+  else if (b0 &&& 0x02) != 0 then some 7
+  else if (b0 &&& 0x01) != 0 then some 8
+  else none
+
+def readEbmlSizeFast : List UInt8 → Option (Nat × List UInt8)
+  | [] => none
+  | b0 :: rest =>
+    if (b0 &&& 0x80) != 0 then some ((b0 &&& 0x7F).toNat, rest)
+    else match rest with
+    | b1 :: b2 :: b3 :: b4 :: b5 :: b6 :: b7 :: tail =>
+      if b0 == 0x01 then
+        let s := (b1.toUInt64 <<< 48) ||| (b2.toUInt64 <<< 40) ||| (b3.toUInt64 <<< 32) |||
+                 (b4.toUInt64 <<< 24) ||| (b5.toUInt64 <<< 16) ||| (b6.toUInt64 <<< 8) ||| b7.toUInt64
+        some (s.toNat, tail)
+      else
+        match ebmlVintWidth b0 with
+        | none => none
+        | some w =>
+          let mask0 : UInt8 := ((1 : UInt8) <<< (8 - w).toUInt8) - 1
+          let v0 : UInt64 := (b0 &&& mask0).toUInt64
+          let v := (rest.take (w - 1)).foldl (fun (acc : UInt64) b => (acc <<< 8) ||| b.toUInt64) v0
+          some (v.toNat, rest.drop (w - 1))
+    | _ =>
+      match ebmlVintWidth b0 with
+      | none => none
+      | some w =>
+        if rest.length + 1 < w then none
+        else
+          let mask0 : UInt8 := ((1 : UInt8) <<< (8 - w).toUInt8) - 1
+          let v0 : UInt64 := (b0 &&& mask0).toUInt64
+          let v := (rest.take (w - 1)).foldl (fun (acc : UInt64) b => (acc <<< 8) ||| b.toUInt64) v0
+          some (v.toNat, rest.drop (w - 1))
+
+def readEbmlSizeList : List UInt8 → Option (Nat × List UInt8) := readEbmlSizeFast
+
+def takeRest8 : List UInt8 → Option (List UInt8 × List UInt8)
+  | b0 :: b1 :: b2 :: b3 :: b4 :: b5 :: b6 :: b7 :: rest =>
+    some ([b0, b1, b2, b3, b4, b5, b6, b7], rest)
+  | _ => none
+
+def splitAtFast : Nat → List UInt8 → Option (List UInt8 × List UInt8)
+  | 0, xs => some ([], xs)
+  | k + 1, h :: t => do
+    let (pre, suf) ← splitAtFast k t
+    some (h :: pre, suf)
+  | _ + 1, [] => none
+
+def readEbmlChildList (xs : List UInt8) : Option (UInt32 × List UInt8 × List UInt8) :=
+  match xs with
+  | 0x55 :: 0xD0 :: 0xEE :: rest =>
+    match splitAtFast 110 rest with
+    | some (v, next) => some (0x55D0, v, next)
+    | none => none
+  | b0 :: b1 :: 0x88 :: v0 :: v1 :: v2 :: v3 :: v4 :: v5 :: v6 :: v7 :: next =>
+    if (b0 &&& 0xC0) == 0x40 then
+      some ((b0.toUInt32 <<< 8) ||| b1.toUInt32, [v0, v1, v2, v3, v4, v5, v6, v7], next)
+    else do
+      let (eid, r1) ← readEbmlIdList xs
+      let (sz, r2) ← readEbmlSizeFast r1
+      let (valBytes, rest) ← splitAtFast sz r2
+      some (eid, valBytes, rest)
+  | b0 :: b1 :: 0x81 :: v0 :: next =>
+    if (b0 &&& 0xC0) == 0x40 then
+      some ((b0.toUInt32 <<< 8) ||| b1.toUInt32, [v0], next)
+    else do
+      let (eid, r1) ← readEbmlIdList xs
+      let (sz, r2) ← readEbmlSizeFast r1
+      let (valBytes, rest) ← splitAtFast sz r2
+      some (eid, valBytes, rest)
+  | b0 :: b1 :: 0x82 :: v0 :: v1 :: next =>
+    if (b0 &&& 0xC0) == 0x40 then
+      some ((b0.toUInt32 <<< 8) ||| b1.toUInt32, [v0, v1], next)
+    else do
+      let (eid, r1) ← readEbmlIdList xs
+      let (sz, r2) ← readEbmlSizeFast r1
+      let (valBytes, rest) ← splitAtFast sz r2
+      some (eid, valBytes, rest)
+  | _ => do
+    let (eid, r1) ← readEbmlIdList xs
+    let (sz, r2) ← readEbmlSizeFast r1
+    let (valBytes, rest) ← splitAtFast sz r2
+    some (eid, valBytes, rest)
+
+def listUintBE (xs : List UInt8) : Option Nat :=
+  if xs.isEmpty || xs.length > 8 then none
+  else some (xs.foldl (fun (acc : UInt64) b => (acc <<< 8) ||| b.toUInt64) 0).toNat
+
+/-- General SMPTE ST 2086 mastering display metadata (`mdcv` / Matroska `0x55D0`). -/
+structure MasteringDisplaySpec where
+  greenX   : UInt32
+  greenY   : UInt32
+  blueX    : UInt32
+  blueY    : UInt32
+  redX     : UInt32
+  redY     : UInt32
+  whiteX   : UInt32
+  whiteY   : UInt32
+  maxLum   : UInt32
+  minLum   : UInt32
+  deriving DecidableEq, Inhabited
+
+def dciP3D65Mastering : MasteringDisplaySpec := {
+  greenX := 13250, greenY := 34500, blueX := 7500, blueY := 3000
+  redX := 34000, redY := 16000, whiteX := 15635, whiteY := 16450
+  maxLum := 10000000, minLum := 50
+}
+
+def encodeMdcvBoxFull (m : MasteringDisplaySpec) : List UInt8 :=
+  u32beToList 32 ++ [0x6D, 0x64, 0x63, 0x76] ++
+  u16beToList m.greenX.toUInt16 ++ u16beToList m.greenY.toUInt16 ++
+  u16beToList m.blueX.toUInt16 ++ u16beToList m.blueY.toUInt16 ++
+  u16beToList m.redX.toUInt16 ++ u16beToList m.redY.toUInt16 ++
+  u16beToList m.whiteX.toUInt16 ++ u16beToList m.whiteY.toUInt16 ++
+  u32beToList m.maxLum ++ u32beToList m.minLum
+
+def decodeMdcvBoxFull (bytes : List UInt8) : Option MasteringDisplaySpec :=
+  match bytes with
+  | 0 :: 0 :: 0 :: 32 :: 0x6D :: 0x64 :: 0x63 :: 0x76 ::
+    gx0 :: gx1 :: gy0 :: gy1 :: bx0 :: bx1 :: by0 :: by1 ::
+    rx0 :: rx1 :: ry0 :: ry1 :: wx0 :: wx1 :: wy0 :: wy1 ::
+    mx0 :: mx1 :: mx2 :: mx3 :: mn0 :: mn1 :: mn2 :: mn3 :: [] =>
+    let maxL := listToU32be mx0 mx1 mx2 mx3
+    let minL := listToU32be mn0 mn1 mn2 mn3
+    if minL == 0 || maxL ≤ minL then none
+    else some {
+      greenX := (listToU16be gx0 gx1).toUInt32, greenY := (listToU16be gy0 gy1).toUInt32
+      blueX := (listToU16be bx0 bx1).toUInt32, blueY := (listToU16be by0 by1).toUInt32
+      redX := (listToU16be rx0 rx1).toUInt32, redY := (listToU16be ry0 ry1).toUInt32
+      whiteX := (listToU16be wx0 wx1).toUInt32, whiteY := (listToU16be wy0 wy1).toUInt32
+      maxLum := maxL, minLum := minL }
+  | _ => none
+
+def u64ToBeList (bits : UInt64) : List UInt8 :=
+  [(bits >>> 56).toUInt8, (bits >>> 48).toUInt8, (bits >>> 40).toUInt8, (bits >>> 32).toUInt8,
+   (bits >>> 24).toUInt8, (bits >>> 16).toUInt8, (bits >>> 8).toUInt8, bits.toUInt8]
+
+def u64FloorLog2 : Nat → UInt64 → UInt64
+  | 0, _ => 0
+  | k + 1, n => if n ≤ 1 then 0 else (1 : UInt64) + u64FloorLog2 k (n >>> 1)
+
+def u64DivRoundEvenShift (n64 d64 : UInt64) (sh : UInt64) : UInt64 :=
+  let qInit := n64 / d64
+  let rInit := n64 % d64
+  let rec step8 : Nat → UInt64 → UInt64 → UInt64 → UInt64 × UInt64
+    | 0, _, q, r => (q, r)
+    | k + 1, remSh, q, r =>
+      if remSh < 8 then
+        if remSh == 0 then (q, r)
+        else
+          let rs := r <<< remSh
+          ((q <<< remSh) ||| (rs / d64), rs % d64)
+      else
+        let r8 := r <<< 8
+        step8 k (remSh - 8) ((q <<< 8) ||| (r8 / d64)) (r8 % d64)
+  let (q0, r0) := step8 10 sh qInit rInit
+  if r0 * 2 > d64 || (r0 * 2 == d64 && (q0 &&& 1) == 1) then q0 + 1 else q0
+
+/-- Exact IEEE-754 binary64 big-endian representation of `n64 / d64` via pure `UInt64` arithmetic. -/
+def u64RatioToF64BE (n64 d64 : UInt64) : List UInt8 :=
+  if n64 == 0 || d64 == 0 then [0, 0, 0, 0, 0, 0, 0, 0]
+  else
+    let (q1, exp0) : UInt64 × UInt64 :=
+      if n64 ≥ d64 then
+        let e := u64FloorLog2 20 (n64 / d64)
+        let eAdj :=
+          if e + 1 < 64 && n64 ≥ d64 * ((1 : UInt64) <<< (e + 1)) then e + 1 else e
+        if eAdj ≤ 52 then
+          let sh := 52 - eAdj
+          if n64 < ((1 : UInt64) <<< (63 - sh)) then
+            let scaled := n64 <<< sh
+            let q0 := scaled / d64
+            let r0 := scaled % d64
+            let qr := if r0 * 2 > d64 || (r0 * 2 == d64 && (q0 &&& 1) == 1) then q0 + 1 else q0
+            (qr, 1023 + eAdj)
+          else
+            (u64DivRoundEvenShift n64 d64 sh, 1023 + eAdj)
+        else
+          (n64 >>> (eAdj - 52), 1023 + eAdj)
+      else
+        let rec findNeg : Nat → UInt64 → UInt64
+          | 0, cur => cur
+          | j + 1, cur =>
+            if cur < 64 && (n64 <<< cur) ≥ d64 then cur
+            else findNeg j (cur + 1)
+        let e := findNeg 20 1
+        let sh := 52 + e
+        if sh < 63 && n64 < ((1 : UInt64) <<< (63 - sh)) then
+          let scaled := n64 <<< sh
+          let q0 := scaled / d64
+          let r0 := scaled % d64
+          let qr := if r0 * 2 > d64 || (r0 * 2 == d64 && (q0 &&& 1) == 1) then q0 + 1 else q0
+          (qr, 1023 - e)
+        else
+          (u64DivRoundEvenShift n64 d64 sh, 1023 - e)
+    let two53 : UInt64 := (1 : UInt64) <<< 53
+    let mask52 : UInt64 := ((1 : UInt64) <<< 52) - 1
+    let (qFinal, expFinal) := if q1 ≥ two53 then (q1 >>> 1, exp0 + 1) else (q1, exp0)
+    let bits : UInt64 := (expFinal <<< 52) ||| (qFinal &&& mask52)
+    u64ToBeList bits
+
+def natRatioToF64BE (num den : Nat) : List UInt8 :=
+  u64RatioToF64BE num.toUInt64 den.toUInt64
+
+def listU64BE (xs : List UInt8) : Option UInt64 :=
+  match xs with
+  | [b0, b1, b2, b3, b4, b5, b6, b7] =>
+    some ((b0.toUInt64 <<< 56) ||| (b1.toUInt64 <<< 48) ||| (b2.toUInt64 <<< 40) |||
+          (b3.toUInt64 <<< 32) ||| (b4.toUInt64 <<< 24) ||| (b5.toUInt64 <<< 16) |||
+          (b6.toUInt64 <<< 8) ||| b7.toUInt64)
+  | _ =>
+    if xs.isEmpty || xs.length > 8 then none
+    else some (xs.foldl (fun (acc : UInt64) b => (acc <<< 8) ||| b.toUInt64) 0)
+
+def u64MulHiLo (a b : UInt64) : UInt64 × UInt64 :=
+  let hiA := a >>> 32
+  let loA := a &&& 0xFFFFFFFF
+  let hiB := b >>> 32
+  let loB := b &&& 0xFFFFFFFF
+  let p0 := loA * loB
+  let p1 := loA * hiB
+  let p2 := hiA * loB
+  let p3 := hiA * hiB
+  let mid := (p0 >>> 32) + (p1 &&& 0xFFFFFFFF) + (p2 &&& 0xFFFFFFFF)
+  let hi : UInt64 := p3 + (p1 >>> 32) + (p2 >>> 32) + (mid >>> 32)
+  let lo : UInt64 := (mid <<< 32) ||| (p0 &&& 0xFFFFFFFF)
+  (hi, lo)
+
+def f64BEToU64Scaled (bs : List UInt8) (sc64 : UInt64) : Option UInt64 := do
+  if bs.length != 8 then none
+  else
+    let bits ← listU64BE bs
+    if bits == 0 then some 0
+    else
+      let sign := bits >>> 63
+      let eb := (bits >>> 52) &&& 0x7FF
+      if sign != 0 || eb == 0 || eb == 0x7FF then none
+      else
+        let mant : UInt64 := ((1 : UInt64) <<< 52) ||| (bits &&& (((1 : UInt64) <<< 52) - 1))
+        if eb ≥ 1075 then
+          let sh := eb - 1075
+          if sh > 40 then none else some ((mant * sc64) <<< sh)
+        else
+          let sh := 1075 - eb
+          if sh == 0 then some (mant * sc64)
+          else if sh < 64 then
+            let (hi, lo) := u64MulHiLo mant sc64
+            if hi ≥ ((1 : UInt64) <<< sh) then none
+            else
+              let q0 : UInt64 := (hi <<< (64 - sh)) ||| (lo >>> sh)
+              let half : UInt64 := (1 : UInt64) <<< (sh - 1)
+              let rem : UInt64 := lo &&& (((1 : UInt64) <<< sh) - 1)
+              some (if rem > half || (rem == half && (q0 &&& 1) == 1) then q0 + 1 else q0)
+          else if sh < 128 then
+            let (hi, lo) := u64MulHiLo mant sc64
+            let shHi := sh - 64
+            if shHi == 0 then
+              let half : UInt64 := (1 : UInt64) <<< 63
+              some (if lo > half || (lo == half && (hi &&& 1) == 1) then hi + 1 else hi)
+            else
+              let q0 : UInt64 := hi >>> shHi
+              let half : UInt64 := (1 : UInt64) <<< (shHi - 1)
+              let remHi : UInt64 := hi &&& (((1 : UInt64) <<< shHi) - 1)
+              let roundUp :=
+                remHi > half || (remHi == half && (lo != 0 || (q0 &&& 1) == 1))
+              some (if roundUp then q0 + 1 else q0)
+          else some 0
+
+def f64BEToNatScaled (bs : List UInt8) (scale : Nat) : Option Nat :=
+  (f64BEToU64Scaled bs scale.toUInt64).map UInt64.toNat
+
+def wrapEbml8List (eid : UInt16) (b8 : List UInt8) : List UInt8 :=
+  match b8 with
+  | [x0, x1, x2, x3, x4, x5, x6, x7] =>
+    [(eid >>> 8).toUInt8, eid.toUInt8, 0x88, x0, x1, x2, x3, x4, x5, x6, x7]
+  | _ => ebmlIdToList eid.toUInt32 ++ (0x88 :: b8)
+
+def encodeMkvMasteringList (m : MasteringDisplaySpec) : List UInt8 :=
+  let f (eid : UInt16) (n : UInt32) (d : UInt64) := wrapEbml8List eid (u64RatioToF64BE n.toUInt64 d)
+  0x55 :: 0xD0 :: 0xEE ::
+    (f 0x55D1 m.redX 50000 ++ f 0x55D2 m.redY 50000 ++
+     f 0x55D3 m.greenX 50000 ++ f 0x55D4 m.greenY 50000 ++
+     f 0x55D5 m.blueX 50000 ++ f 0x55D6 m.blueY 50000 ++
+     f 0x55D7 m.whiteX 50000 ++ f 0x55D8 m.whiteY 50000 ++
+     f 0x55D9 m.maxLum 10000 ++ f 0x55DA m.minLum 10000)
+
+def decodeMkvMasteringBodyList (body : List UInt8) : Option MasteringDisplaySpec :=
+  let rec loop (fuel : Nat) (rest : List UInt8)
+      (acc : MasteringDisplaySpec) : Option MasteringDisplaySpec :=
+    match fuel, rest with
+    | _, [] =>
+      if acc.minLum == 0 || acc.maxLum ≤ acc.minLum then none else some acc
+    | 0, _ :: _ => none
+    | k + 1, _ => do
+      let (cid, valBytes, next) ← readEbmlChildList rest
+      let sc : UInt64 := if cid == 0x55D9 || cid == 0x55DA then 10000 else 50000
+      let v ← f64BEToU64Scaled valBytes sc
+      let v32 := v.toUInt32
+      let acc' :=
+        if cid == 0x55D1 then { acc with redX := v32 }
+        else if cid == 0x55D2 then { acc with redY := v32 }
+        else if cid == 0x55D3 then { acc with greenX := v32 }
+        else if cid == 0x55D4 then { acc with greenY := v32 }
+        else if cid == 0x55D5 then { acc with blueX := v32 }
+        else if cid == 0x55D6 then { acc with blueY := v32 }
+        else if cid == 0x55D7 then { acc with whiteX := v32 }
+        else if cid == 0x55D8 then { acc with whiteY := v32 }
+        else if cid == 0x55D9 then { acc with maxLum := v32 }
+        else if cid == 0x55DA then { acc with minLum := v32 }
+        else acc
+      loop k next acc'
+  loop 16 body {
+    greenX := 0, greenY := 0, blueX := 0, blueY := 0, redX := 0, redY := 0
+    whiteX := 0, whiteY := 0, maxLum := 0, minLum := 0 }
+
+def decodeMkvMasteringList (elem : List UInt8) : Option MasteringDisplaySpec :=
+  match elem with
+  | 0x55 :: 0xD0 :: 0xEE :: body => decodeMkvMasteringBodyList body
+  | _ => do
+    let (eid, body, tail) ← readEbmlChildList elem
+    if eid != 0x55D0 || !tail.isEmpty then none
+    else decodeMkvMasteringBodyList body
+
+def encodeMkvHdrColourList (c : MkvHdrColour) (masteringBody : List UInt8 := []) : List UInt8 :=
+  let core :=
+    encodeMkvUintList 0x55B1 c.matrixCoefficients ++
+    encodeMkvUintList 0x55BA c.transferCharacteristics ++
+    encodeMkvUintList 0x55BB c.primaries ++
+    encodeMkvUintList 0x55BC c.maxCll ++
+    encodeMkvUintList 0x55BD c.maxFall
+  if !c.hasMastering then
+    wrapEbmlList 0x55B0 core
+  else
+    let mst :=
+      if masteringBody.isEmpty then encodeMkvMasteringList dciP3D65Mastering
+      else wrapEbmlList 0x55D0 masteringBody
+    let totalLen := (core.length.toUInt32 + (if masteringBody.isEmpty then 113 else mst.length.toUInt32))
+    if totalLen < 127 then
+      0x55 :: 0xB0 :: ((0x80 : UInt8) ||| totalLen.toUInt8) :: (core ++ mst)
+    else
+      0x55 :: 0xB0 :: ((0x40 : UInt8) ||| ((totalLen >>> 8).toUInt8 &&& 0x3F)) ::
+        totalLen.toUInt8 :: (core ++ mst)
+
+def skipEbml8Children : Nat → List UInt8 → Option (List UInt8)
+  | 0, xs => some xs
+  | k + 1, _ :: _ :: 0x88 :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: rest =>
+    skipEbml8Children k rest
+  | _ + 1, _ => none
+
+def decodeMkvHdrColourList (elem : List UInt8) : Option MkvHdrColour := do
+  let (eid, body, tail) ←
+    match elem with
+    | 0x55 :: 0xB0 :: b0 :: b1 :: rest =>
+      if (b0 &&& 0xC0) == 0x40 then some (0x55B0, rest, [])
+      else if (b0 &&& 0x80) != 0 then some (0x55B0, b1 :: rest, [])
+      else readEbmlChildList elem
+    | _ => readEbmlChildList elem
+  if eid != 0x55B0 || !tail.isEmpty then none
+  else
+    let rec loop (fuel : Nat) (rest : List UInt8) (acc : MkvHdrColour) : Option MkvHdrColour :=
+      match fuel, rest with
+      | _, [] => some acc
+      | 0, _ :: _ => none
+      | k + 1, 0x55 :: 0xD0 :: 0xEE :: sub => do
+        let after10 ← skipEbml8Children 10 sub
+        loop k after10 { acc with hasMastering := true }
+      | k + 1, _ => do
+        let (cid, valBytes, next) ← readEbmlChildList rest
+        if cid == 0x55D0 then
+          loop k next { acc with hasMastering := true }
+        else do
+          let v ← listUintBE valBytes
+          let acc' :=
+            if cid == 0x55B1 then { acc with matrixCoefficients := v }
+            else if cid == 0x55BA then { acc with transferCharacteristics := v }
+            else if cid == 0x55BB then { acc with primaries := v }
+            else if cid == 0x55BC then { acc with maxCll := v }
+            else if cid == 0x55BD then { acc with maxFall := v }
+            else acc
+          loop k next acc'
+    loop 16 body {
+      matrixCoefficients := 2, transferCharacteristics := 2, primaries := 2
+      maxCll := 0, maxFall := 0, hasMastering := false }
+
+def encodeMkvHdrColour (c : MkvHdrColour) (masteringBody : ByteArray := ByteArray.empty) : ByteArray :=
+  ⟨(encodeMkvHdrColourList c masteringBody.toList).toArray⟩
+
+def decodeMkvHdrColour (elem : ByteArray) : Option MkvHdrColour :=
+  decodeMkvHdrColourList elem.toList
+
+def encodeMkvDoviBlockAddList (doviCfg : List UInt8) (fourcc : String := "dvcC") : List UInt8 :=
+  let typBody : List UInt8 :=
+    if fourcc == "dvvC" then [0x64, 0x76, 0x76, 0x43] else [0x64, 0x76, 0x63, 0x43]
+  let body :=
+    encodeMkvUintList 0x41F0 4 ++
+    wrapEbmlList 0x41E7 typBody ++
+    wrapEbmlList 0x41ED doviCfg
+  wrapEbmlList 0x41E4 body
+
+def decodeMkvDoviBlockAddList (elem : List UInt8) : Option DoviConfigRecord := do
+  let (eid, body, tail) ← readEbmlChildList elem
+  if eid != 0x41E4 || !tail.isEmpty then none
+  else
+    let rec loop (fuel : Nat) (rest : List UInt8) (sawType : Bool)
+        (extra? : Option (List UInt8)) : Option DoviConfigRecord :=
+      match fuel, rest with
+      | _, [] =>
+        if !sawType then none
+        else match extra? with | some ex => decodeDoviConfigBody ex | none => none
+      | 0, _ :: _ => none
+      | k + 1, _ => do
+        let (cid, valBytes, next) ← readEbmlChildList rest
+        if cid == 0x41E7 then do
+          let t ← listUintBE valBytes
+          loop k next (t == 0x64766343 || t == 0x64767643) extra?
+        else if cid == 0x41ED then
+          loop k next sawType (some valBytes)
+        else
+          loop k next sawType extra?
+    loop 16 body false none
+
+def encodeMkvDoviBlockAdditionMapping (doviCfg : List UInt8) (fourcc : String := "dvcC") : ByteArray :=
+  ⟨(encodeMkvDoviBlockAddList doviCfg fourcc).toArray⟩
+
+def decodeMkvDoviBlockAdditionMapping (elem : ByteArray) : Option DoviConfigRecord :=
+  decodeMkvDoviBlockAddList elem.toList
+
+def MkvHdrColourSafe (c : MkvHdrColour) : Prop :=
+  c.primaries = 9 ∧ (c.transferCharacteristics = 16 ∨ c.transferCharacteristics = 18) ∧
+  c.matrixCoefficients = 9 ∧ c.maxFall ≤ c.maxCll
+
+instance (c : MkvHdrColour) : Decidable (MkvHdrColourSafe c) :=
+  inferInstanceAs (Decidable (_ ∧ (_ ∨ _) ∧ _ ∧ _))
+
+def mkvHdrColourGateSpec : AVGateSpec MkvHdrColour MkvHdrColourSafe where
+  gate c := decide (MkvHdrColourSafe c)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := {
+    matrixCoefficients := 9, transferCharacteristics := 16, primaries := 9
+    maxCll := 1000, maxFall := 400, hasMastering := true }
+  negWitness := {
+    matrixCoefficients := 1, transferCharacteristics := 1, primaries := 1
+    maxCll := 400, maxFall := 1000, hasMastering := false }
+  nonVacuous := by decide
+  tight := by decide
+
+def av1Leb128ReadList (xs : List UInt8) : Option (Nat × List UInt8) :=
+  let rec go (fuel i val : Nat) (rest : List UInt8) : Option (Nat × List UInt8) :=
+    match fuel, rest with
+    | 0, _ => none
+    | _, [] => none
+    | f + 1, b :: bs =>
+      let val' := val ||| (((b &&& 0x7F).toNat) <<< (7 * i))
+      if (b &&& 0x80) == 0 then
+        if val' ≥ (1 <<< 32) then none else some (val', bs)
+      else go f (i + 1) val' bs
+  go 8 0 0 xs
+
+def av1Leb128Write (n : Nat) : List UInt8 :=
+  if n == 0 then [0]
+  else
+    let rec go (fuel v : Nat) : List UInt8 :=
+      match fuel with
+      | 0 => []
+      | f + 1 =>
+        if v == 0 then []
+        else
+          let b := v &&& 0x7F
+          let v' := v >>> 7
+          let byteVal : UInt8 := (if v' > 0 then b ||| 0x80 else b).toUInt8
+          byteVal :: go f v'
+    go 8 n
+
+/-- AV1 ITU-T T.35 metadata OBU: country 0xB5, Dolby provider 0x003B, oriented code 0x00000800. -/
+def av1T35DoviOk (obu : List UInt8) : Bool :=
+  match obu with
+  | typ :: rest =>
+    if (typ &&& 0x81) != 0 || ((typ >>> 3) &&& 0x0F) != 5 then false
+    else
+      let afterExt? : Option (List UInt8) :=
+        if (typ &&& 0x04) != 0 then
+          match rest with
+          | ext :: xs => if (ext &&& 0x07) == 0 then some xs else none
+          | [] => none
+        else some rest
+      match afterExt? with
+      | none => false
+      | some body0 =>
+        if (typ &&& 0x02) != 0 then
+          match av1Leb128ReadList body0 with
+          | some (sz, 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: tail) =>
+            sz == 8 + tail.length
+          | _ => false
+        else
+          match body0 with
+          | 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: _ => true
+          | _ => false
+  | [] => false
+
+/-- Matroska BlockAdditionMapping type used for Dolby Vision (`dvcC` or `dvvC`). -/
+def mkvDoviBlockAddMapping (typ : Nat) : Bool :=
+  typ == 0x64766343 || typ == 0x64767643
+
+def rbspEscape (xs : List UInt8) : List UInt8 :=
+  let rec go (prev : Nat) (rest : List UInt8) : List UInt8 :=
+    match rest with
+    | [] => []
+    | h :: t =>
+      if prev ≥ 2 && h.toNat ≤ 3 then 0x03 :: h :: go 0 t
+      else h :: go (if h == 0 then prev + 1 else 0) t
+  go 0 xs
+
+def encodeHevcRpuNal (rpu : List UInt8) : List UInt8 :=
+  [0x7C, 0x01] ++ rbspEscape (0x19 :: rpu)
+
+def decodeHevcRpuNal (nal : List UInt8) : Option (List UInt8) :=
+  match nal with
+  | b0 :: b1 :: rest =>
+    if hevcRpuNalHeaderOk b0 b1 then
+      match rbspUnescape rest with
+      | 0x19 :: body => if hevcRpuPayloadOk (0x19 :: body) then some body else none
+      | _ => none
+    else none
+  | _ => none
+
+def encodeAv1T35DoviObu (rpu : List UInt8) : List UInt8 :=
+  let payload := [0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00] ++ rpu
+  0x2A :: (av1Leb128Write payload.length ++ payload)
+
+def decodeAv1T35DoviObu (obu : List UInt8) : Option (List UInt8) :=
+  if !av1T35DoviOk obu then none
+  else
+    match obu with
+    | typ :: rest =>
+      let body0 := if (typ &&& 0x04) != 0 then rest.drop 1 else rest
+      if (typ &&& 0x02) != 0 then
+        match av1Leb128ReadList body0 with
+        | some (_, p) => some (p.drop 8)
+        | none => none
+      else some (body0.drop 8)
+    | [] => none
+
+/-- Cross-container HDR remux is a distinct helper: it never widens same-family `nativeRemuxBytes`. -/
+def p11CrossContainerRemux (inFmt outFmt : ContainerFormat) : Bool :=
+  inFmt != outFmt &&
+  ((inFmt == .mp4 && (outFmt == .mkv || outFmt == .webm)) ||
+   ((inFmt == .mkv || inFmt == .webm) && outFmt == .mp4))
+
+def P11CrossContainerSafe (p : ContainerFormat × ContainerFormat) : Prop :=
+  p11CrossContainerRemux p.1 p.2 = true
+
+instance (p : ContainerFormat × ContainerFormat) : Decidable (P11CrossContainerSafe p) :=
+  inferInstanceAs (Decidable (_ = true))
+
+/-- Lossless HDR/DoVi box transfer used by cross-container remux (distinct from `nativeRemuxBytes`). -/
+def p11RemuxHdrBoxes (inFmt outFmt : ContainerFormat) (boxes : List (List UInt8)) : Option (List (List UInt8)) :=
+  if p11CrossContainerRemux inFmt outFmt then some boxes else none
+
+/-- Real MP4↔MKV/WebM HDR10/HLG/DoVi + AAC/Opus cross-container remux (distinct from `nativeRemuxBytes`). -/
+structure P11CrossRemuxTrack where
+  kind : NativeStreamKind
+  codecId : String
+  width : Nat
+  height : Nat
+  channels : Nat
+  sampleRate : Nat
+  timescale : Nat
+  codecPrivate : ByteArray
+  colour : MkvHdrColour
+  mastering : MasteringDisplaySpec
+  dovi : DoviConfigRecord
+  hasDovi : Bool
+  samples : Array (ByteArray × Nat × Bool)
+  deriving Inhabited
+
+def p11CrossRemuxTrackSafe (t : P11CrossRemuxTrack) : Bool :=
+  t.samples.size > 0 && t.codecPrivate.size > 0 &&
+  ((t.kind == .video && t.width > 0 && t.height > 0 &&
+    (t.codecId == "V_MPEGH/ISO/HEVC" || t.codecId == "V_AV1" || t.codecId == "V_MPEG4/ISO/AVC")) ||
+   (t.kind == .audio && t.channels > 0 && t.sampleRate > 0 && t.timescale > 0 &&
+    (t.codecId == "A_AAC" || t.codecId == "A_OPUS")))
+
+def p11Mp4EntryFourcc (codecId : String) : String :=
+  if codecId == "V_MPEGH/ISO/HEVC" then "hvc1"
+  else if codecId == "V_AV1" then "av01"
+  else if codecId == "V_MPEG4/ISO/AVC" then "avc1"
+  else if codecId == "A_OPUS" then "Opus"
+  else "mp4a"
+
+def p11Mp4CfgFourcc (codecId : String) : String :=
+  if codecId == "V_MPEGH/ISO/HEVC" then "hvcC"
+  else if codecId == "V_AV1" then "av1C"
+  else if codecId == "V_MPEG4/ISO/AVC" then "avcC"
+  else if codecId == "A_OPUS" then "dOps"
+  else "esds"
+
+def p11WrapMp4BoxStr (fcc : String) (body : ByteArray) : ByteArray :=
+  match fcc.toList with
+  | [c0, c1, c2, c3] => wrapMp4Box c0 c1 c2 c3 body
+  | _ => ByteArray.empty
+
+def p11EncodeEsdsBody (asc : ByteArray) : ByteArray := Id.run do
+  let decSpecLen := asc.size.toUInt8
+  let decCfgLen := (13 + 2 + asc.size).toUInt8
+  let esDescrLen := (3 + 2 + decCfgLen.toNat + 3).toUInt8
+  let mut b := ByteArray.emptyWithCapacity (32 + asc.size)
+  b := pushU32BE b 0
+  b := b.push 0x03 |>.push esDescrLen
+  b := pushU16BE b 1
+  b := b.push 0x00 |>.push 0x04 |>.push decCfgLen |>.push 0x40 |>.push 0x15
+  b := b.push 0x00 |>.push 0x18 |>.push 0x00
+  b := pushU32BE b 128000
+  b := pushU32BE b 128000
+  b := b.push 0x05 |>.push decSpecLen
+  b := b ++ asc
+  b := b.push 0x06 |>.push 0x01 |>.push 0x02
+  return b
+
+def p11BuildCrossStsd (t : P11CrossRemuxTrack) : ByteArray :=
+  if t.kind == .video then
+    let base := buildVideoCodecStsdBox
+      (match t.codecId with
+       | "V_MPEGH/ISO/HEVC" => ('h', 'v', 'c', '1')
+       | "V_AV1" => ('a', 'v', '0', '1')
+       | _ => ('a', 'v', 'c', '1'))
+      (match t.codecId with
+       | "V_MPEGH/ISO/HEVC" => ('h', 'v', 'c', 'C')
+       | "V_AV1" => ('a', 'v', '1', 'C')
+       | _ => ('a', 'v', 'c', 'C'))
+      t.width t.height t.codecPrivate
+    let colrB :=
+      if t.colour.primaries == 0 || t.colour.transferCharacteristics == 0 || t.colour.matrixCoefficients == 0 then
+        ByteArray.empty
+      else
+        ⟨(encodeColrNclxBoxSpec {
+          colourPrimaries := t.colour.primaries.toUInt16
+          transferCharacteristics := t.colour.transferCharacteristics.toUInt16
+          matrixCoefficients := t.colour.matrixCoefficients.toUInt16
+          fullRangeFlag := false }).toArray⟩
+    let mdcvB :=
+      if t.colour.hasMastering then ⟨(encodeMdcvBoxFull t.mastering).toArray⟩ else ByteArray.empty
+    let clliB :=
+      if t.colour.maxCll > 0 || t.colour.maxFall > 0 then
+        ⟨(encodeClliBoxSpec {
+          maxContentLightLevel := t.colour.maxCll.toUInt16
+          maxPicAverageLightLevel := t.colour.maxFall.toUInt16 }).toArray⟩
+      else ByteArray.empty
+    let doviB :=
+      if t.hasDovi then
+        p11WrapMp4BoxStr (doviBoxFourcc t.dovi) ⟨(encodeDoviConfigBody t.dovi).toArray⟩
+      else ByteArray.empty
+    let extra := colrB ++ mdcvB ++ clliB ++ doviB
+    if extra.isEmpty then base
+    else
+      let stsdSz := base.size + extra.size
+      let entrySz := base.size - 16 + extra.size
+      (baWrU32BE (baWrU32BE base 0 stsdSz.toUInt32) 16 entrySz.toUInt32) ++ extra
+  else if t.codecId == "A_OPUS" then
+    let preSkip :=
+      if t.codecPrivate.size >= 12 then
+        ((t.codecPrivate.get! 11).toNat <<< 8) ||| (t.codecPrivate.get! 10).toNat
+      else 312
+    buildOpusMp4StsdBox t.channels t.sampleRate preSkip
+  else
+    let esds := p11WrapMp4BoxStr "esds" (p11EncodeEsdsBody t.codecPrivate)
+    let ase := Id.run do
+      let mut a := ByteArray.emptyWithCapacity (28 + esds.size)
+      a := pushZeros a 6
+      a := pushU16BE a 1
+      a := pushZeros a 8
+      a := pushU16BE a t.channels.toUInt16
+      a := pushU16BE a 16
+      a := pushU16BE a 0
+      a := pushU16BE a 0
+      a := pushU32BE a ((t.sampleRate &&& 0xFFFF) <<< 16).toUInt32
+      return a ++ esds
+    buildMp4aStsdBoxFromEntry (wrapMp4Box 'm' 'p' '4' 'a' ase)
+
+def p11MuxMp4FromCrossTracks (tracks : Array P11CrossRemuxTrack) : Option ByteArray := Id.run do
+  if tracks.isEmpty || tracks.any (fun t => !p11CrossRemuxTrackSafe t) then return none
+  let synth : Array SynthMp4Track := tracks.map fun t => {
+    kind := t.kind
+    timescale := if t.timescale == 0 then 1000 else t.timescale
+    width := t.width
+    height := t.height
+    stsdBox := p11BuildCrossStsd t
+    samples := t.samples.map fun (data, dur, sync) =>
+      { data := data, dur := if dur == 0 then 1 else dur, cttsOff := 0, isSync := sync }
+  }
+  muxSynthMp4Container synth
+
+def p11Mp4Kids (box : ByteArray) (skip : Nat) : Option (Array Mp4BoxView) := do
+  if box.size < skip then none
+  else mp4SubBoxesExact { ba := box, off := skip, len := box.size - skip }
+
+def p11FindChildBody (kids : Array Mp4BoxView) (fcc : String) : Option ByteArray :=
+  (kids.find? (fun b => b.fourcc == fcc)).map (fun b => b.boxSlice.toByteArray)
+
+def p11U16At (ba : ByteArray) (off : Nat) : Nat :=
+  if off + 1 < ba.size then ((ba.get! off).toNat <<< 8) ||| (ba.get! (off + 1)).toNat else 0
+
+def p11U32At (ba : ByteArray) (off : Nat) : Nat :=
+  if off + 3 < ba.size then
+    ((ba.get! off).toNat <<< 24) ||| ((ba.get! (off + 1)).toNat <<< 16) |||
+    ((ba.get! (off + 2)).toNat <<< 8) ||| (ba.get! (off + 3)).toNat
+  else 0
+
+def p11ParseAv1CSeqColor (cfg : ByteArray) : Option SequenceColorInfo := do
+  guard (cfg.size ≥ 4 && cfg.get! 0 == 0x81 && (cfg.get! 3 &&& 0xE0) == 0)
+  let mut p := 4
+  let mut found : Option SequenceColorInfo := none
+  for _ in [:cfg.size] do
+    if p < cfg.size then
+      let hdr := (cfg.get! p).toNat
+      p := p + 1
+      guard (hdr / 128 == 0 && hdr % 2 == 0 && hdr / 2 % 2 == 1)
+      let kind := hdr / 8 % 16
+      if hdr / 4 % 2 == 1 then
+        guard (p < cfg.size && (cfg.get! p &&& 7) == 0)
+        if kind == 1 then guard (cfg.get! p == 0)
+        p := p + 1
+      let mut size := 0
+      let mut done := false
+      for j in [:8] do
+        if !done then
+          guard (p < cfg.size)
+          let b := (cfg.get! p).toNat
+          p := p + 1
+          size := size + (b % 128) * 2 ^ (7 * j)
+          done := b < 128
+      guard (done && size ≤ cfg.size - p)
+      if kind == 1 then
+        guard found.isNone
+        let rbsp := cfg.extract p (p + size)
+        let (info, _) ← av1SequenceColors (BitReader.ofSlice (ByteSlice.ofByteArray rbsp))
+        found := some info
+      p := p + size
+  found
+
+def p11ExtractCrossMeta (stsdBox : ByteArray) (codecId : String) :
+    Option (ByteArray × Nat × Nat × MkvHdrColour × MasteringDisplaySpec × DoviConfigRecord × Bool) := do
+  let tops ← p11Mp4Kids stsdBox 0
+  let stsd ← tops.find? (fun b => b.fourcc == "stsd")
+  let entries ← p11Mp4Kids stsd.boxSlice.toByteArray (stsd.headerBytes + 8)
+  let entry ← entries[0]?
+  let hdrSkip := if codecId == "A_AAC" || codecId == "A_OPUS" then 28 else 78
+  let kids ← p11Mp4Kids entry.boxSlice.toByteArray (entry.headerBytes + hdrSkip)
+  let cfgFcc := p11Mp4CfgFourcc codecId
+  let cfgBox ← kids.find? (fun b => b.fourcc == cfgFcc)
+  let priv :=
+    if codecId == "A_AAC" then
+      let body := cfgBox.bodySlice.toByteArray
+      Id.run do
+        let mut idx := 4
+        let mut fuel := 32
+        while idx + 2 ≤ body.size && fuel > 0 do
+          fuel := fuel - 1
+          let tag := body.get! idx
+          idx := idx + 1
+          let mut lenVal : Nat := 0
+          let mut k := 0
+          while k < 4 && idx < body.size do
+            let lb := body.get! idx
+            idx := idx + 1
+            lenVal := (lenVal <<< 7) + (lb &&& 0x7F).toNat
+            if (lb &&& 0x80) == 0 then k := 4 else k := k + 1
+          if tag == 0x03 then
+            if idx + 3 > body.size then return none
+            let fl := body.get! (idx + 2)
+            let mut skip := 3
+            if (fl &&& 0x80) != 0 then skip := skip + 2
+            if (fl &&& 0x40) != 0 && idx + skip < body.size then
+              skip := skip + 1 + (body.get! (idx + skip)).toNat
+            if (fl &&& 0x20) != 0 then skip := skip + 2
+            idx := idx + skip
+          else if tag == 0x04 then
+            idx := idx + 13
+          else if tag == 0x05 then
+            if lenVal > 0 && idx + lenVal ≤ body.size then
+              return some (body.extract idx (idx + lenVal))
+            else return none
+          else
+            idx := idx + lenVal
+        return none
+    else if codecId == "A_OPUS" then
+      let d := cfgBox.bodySlice.toByteArray
+      if d.size < 11 then none
+      else
+        let ch := d.get! 1
+        let pre0 := d.get! 2
+        let pre1 := d.get! 3
+        let sr0 := d.get! 4
+        let sr1 := d.get! 5
+        let sr2 := d.get! 6
+        let sr3 := d.get! 7
+        let gn0 := d.get! 8
+        let gn1 := d.get! 9
+        let mf := d.get! 10
+        some ⟨#[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, ch, pre1, pre0,
+               sr3, sr2, sr1, sr0, gn1, gn0, mf]⟩
+    else some cfgBox.bodySlice.toByteArray
+  let some privBytes := priv | none
+  let colour0 : MkvHdrColour := {
+    matrixCoefficients := 2, transferCharacteristics := 2, primaries := 2
+    maxCll := 0, maxFall := 0, hasMastering := false }
+  let colrBox? := p11FindChildBody kids "colr"
+  let av1SeqCol? := if codecId == "V_AV1" then p11ParseAv1CSeqColor privBytes else none
+  let colour1 :=
+    match colrBox?.bind (fun b => decodeColrNclxBoxSpec b.toList) with
+    | some c =>
+      let p0 := c.colourPrimaries.toNat
+      let t0 := c.transferCharacteristics.toNat
+      let m0 := c.matrixCoefficients.toNat
+      match av1SeqCol? with
+      | some sc => { colour0 with
+          primaries := if p0 == 0 || p0 == 2 then sc.primaries.toNat else p0
+          transferCharacteristics := if t0 == 0 || t0 == 2 then sc.transfer.toNat else t0
+          matrixCoefficients := if m0 == 0 || m0 == 2 then sc.matrix.toNat else m0 }
+      | none => { colour0 with
+          matrixCoefficients := m0, transferCharacteristics := t0, primaries := p0 }
+    | none =>
+      match av1SeqCol? with
+      | some sc => { colour0 with
+          matrixCoefficients := sc.matrix.toNat
+          transferCharacteristics := sc.transfer.toNat
+          primaries := sc.primaries.toNat }
+      | none => colour0
+  let clliBox? := p11FindChildBody kids "clli"
+  let colour :=
+    match clliBox?.bind (fun b => decodeClliBoxSpec b.toList) with
+    | some c => { colour1 with
+        maxCll := c.maxContentLightLevel.toNat
+        maxFall := c.maxPicAverageLightLevel.toNat }
+    | none => colour1
+  let mdcvBox? := p11FindChildBody kids "mdcv"
+  let mastering :=
+    match mdcvBox?.bind (fun b => decodeMdcvBoxFull b.toList) with
+    | some m => m
+    | none => dciP3D65Mastering
+  let colourM := { colour with hasMastering := mdcvBox?.isSome == true }
+  let doviBox? := kids.find? (fun b => b.fourcc == "dvcC" || b.fourcc == "dvvC")
+  let dovi :=
+    match doviBox?.bind (fun b => decodeDoviConfigBody b.bodySlice.toByteArray.toList) with
+    | some r => r
+    | none => doviProfile8
+  let ch := if codecId == "A_AAC" || codecId == "A_OPUS" then p11U16At entry.bodySlice.toByteArray 16 else 0
+  let rate16 := if codecId == "A_AAC" || codecId == "A_OPUS" then p11U32At entry.bodySlice.toByteArray 24 >>> 16 else 0
+  some (privBytes, ch, rate16, colourM, mastering, dovi, doviBox?.isSome == true)
+
+def p11DemuxMp4ToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTrack) := Id.run do
+  let some parsed := demuxNativeMp4ContainerTracks (ByteSlice.ofByteArray bytes) | return none
+  let mut out : Array P11CrossRemuxTrack := #[]
+  for trk in parsed do
+    if trk.kind == .video || trk.kind == .audio then
+      let mut samples : Array (ByteArray × Nat × Bool) := #[]
+      for smp in trk.samples do
+        if smp.fileOff + smp.byteLen > bytes.size then return none
+        samples := samples.push (bytes.extract smp.fileOff (smp.fileOff + smp.byteLen), smp.dur, smp.isSync)
+      let codecId :=
+        if trk.stsdFourcc == "hvc1" || trk.stsdFourcc == "hev1" then "V_MPEGH/ISO/HEVC"
+        else if trk.stsdFourcc == "av01" then "V_AV1"
+        else if trk.stsdFourcc == "avc1" || trk.stsdFourcc == "avc3" then "V_MPEG4/ISO/AVC"
+        else if trk.stsdFourcc == "Opus" then "A_OPUS"
+        else "A_AAC"
+      let some (priv, ch, rate, colour, mastering, dovi, hasDovi) :=
+        p11ExtractCrossMeta trk.stsdBox codecId | return none
+      out := out.push {
+        kind := trk.kind
+        codecId := codecId
+        width := (trk.tkhdWidth16 >>> 16).toNat
+        height := (trk.tkhdHeight16 >>> 16).toNat
+        channels := if ch == 0 then 2 else ch
+        sampleRate := if rate == 0 then 48000 else rate
+        timescale := trk.timescale
+        codecPrivate := priv
+        colour := colour
+        mastering := mastering
+        dovi := dovi
+        hasDovi := hasDovi
+        samples := samples
+      }
+  return if out.isEmpty then none else some out
+
+def p11EbmlUintBA (val : Nat) : ByteArray :=
+  if val < 0x100 then ByteArray.empty.push val.toUInt8
+  else if val < 0x10000 then pushU16BE ByteArray.empty val.toUInt16
+  else if val < 0x100000000 then pushU32BE ByteArray.empty val.toUInt32
+  else pushU64BE ByteArray.empty val.toUInt64
+
+def p11MuxMkvFromCrossTracks (docType : String) (tracks : Array P11CrossRemuxTrack) : Option ByteArray := Id.run do
+  if tracks.isEmpty || tracks.any (fun t => !p11CrossRemuxTrackSafe t) then return none
+  if docType != "matroska" && docType != "webm" then return none
+  let ebmlBody :=
+    ⟨#[0x42, 0x86, 0x81, 0x01, 0x42, 0xF7, 0x81, 0x01, 0x42, 0xF2, 0x81, 0x04, 0x42, 0xF3, 0x81, 0x08]⟩ ++
+    wrapEbmlElement 0x4282 docType.toUTF8 ++
+    ⟨#[0x42, 0x87, 0x81, 0x04, 0x42, 0x85, 0x81, 0x02]⟩
+  let infoBody := wrapEbmlElement 0x2AD7B1 ⟨#[0x0F, 0x42, 0x40]⟩
+  let mut tracksBody := ByteArray.empty
+  let mut allPkts : Array (Nat × Nat × Bool × ByteArray) := #[]
+  for idx in [:tracks.size] do
+    let t := tracks[idx]!
+    let tn := idx + 1
+    let mut entry := ByteArray.empty
+    entry := entry ++ wrapEbmlElement 0xD7 (p11EbmlUintBA tn)
+    entry := entry ++ wrapEbmlElement 0x73C5 (p11EbmlUintBA tn)
+    entry := entry ++ wrapEbmlElement 0x86 t.codecId.toUTF8
+    entry := entry ++ wrapEbmlElement 0x83 (ByteArray.empty.push (if t.kind == .video then 1 else 2))
+    if t.kind == .video then
+      let mstElem := encodeMkvMasteringList t.mastering
+      let mstBody := ⟨(mstElem.drop 3).toArray⟩
+      let colour := encodeMkvHdrColour t.colour mstBody
+      let video := wrapEbmlElement 0xB0 (p11EbmlUintBA t.width) ++
+        wrapEbmlElement 0xBA (p11EbmlUintBA t.height) ++ colour
+      entry := entry ++ wrapEbmlElement 0xE0 video
+    else
+      let rate := ⟨(natRatioToF64BE t.sampleRate 1).toArray⟩
+      let audio := wrapEbmlElement 0x9F (p11EbmlUintBA t.channels) ++ wrapEbmlElement 0xB5 rate
+      entry := entry ++ wrapEbmlElement 0xE1 audio
+      if t.codecId == "A_OPUS" then
+        let preSkip :=
+          if t.codecPrivate.size >= 12 then
+            ((t.codecPrivate.get! 11).toNat <<< 8) ||| (t.codecPrivate.get! 10).toNat
+          else 312
+        let delayNs := preSkip * 1000000000 / 48000
+        entry := entry ++ wrapEbmlElement 0x56AA (p11EbmlUintBA delayNs) ++
+          wrapEbmlElement 0x56BB (p11EbmlUintBA 80000000)
+    entry := entry ++ wrapEbmlElement 0x63A2 t.codecPrivate
+    if t.hasDovi then
+      entry := entry ++ encodeMkvDoviBlockAdditionMapping (encodeDoviConfigBody t.dovi) (doviBoxFourcc t.dovi)
+    tracksBody := tracksBody ++ wrapEbmlElement 0xAE entry
+    let tScale := if t.timescale == 0 then 1000 else t.timescale
+    let mut ticks : Nat := 0
+    for (data, dur, sync) in t.samples do
+      let tsMs := ticks * 1000 / tScale
+      allPkts := allPkts.push (tsMs, tn, sync, data)
+      ticks := ticks + (if dur == 0 then 1 else dur)
+  if allPkts.isEmpty then return none
+  let sortedPkts := allPkts.qsort (fun a b => if a.1 == b.1 then a.2.1 < b.2.1 else a.1 < b.1)
+  let mut clustersOut := ByteArray.empty
+  let mut curBase := (sortedPkts[0]!).1
+  let mut curBlocks := ByteArray.empty
+  for (tsMs, tn, sync, data) in sortedPkts do
+    if tsMs - curBase > 0x7FFF then
+      let clBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+      clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 clBody
+      curBase := tsMs
+      curBlocks := ByteArray.empty
+    let ts16 := (tsMs - curBase).toUInt16
+    let flags : UInt8 := if sync then 0x80 else 0
+    let blk := (ByteArray.empty.push (0x80 ||| tn).toUInt8) ++
+      (pushU16BE ByteArray.empty ts16) ++ (ByteArray.empty.push flags) ++ data
+    curBlocks := curBlocks ++ wrapEbmlElement 0xA3 blk
+  let finalBody := wrapEbmlElement 0xE7 (p11EbmlUintBA curBase) ++ curBlocks
+  clustersOut := clustersOut ++ wrapEbmlElement 0x1F43B675 finalBody
+  let seg := wrapEbmlElement 0x1549A966 infoBody ++ wrapEbmlElement 0x1654AE6B tracksBody ++ clustersOut
+  return some (wrapEbmlElement 0x1A45DFA3 ebmlBody ++ wrapEbmlElement 0x18538067 seg)
+
+def p11DemuxMkvToCrossTracks (bytes : ByteArray) : Option (Array P11CrossRemuxTrack) := Id.run do
+  let s := ByteSlice.ofByteArray bytes
+  let some parsed := parseNativeMkvContainer s none | return none
+  if parsed.hasEncrypted then return none
+  let tsScale := if parsed.timestampScale == 0 then 1000000 else parsed.timestampScale
+  let mut out : Array P11CrossRemuxTrack := #[]
+  for te in parsed.tracks do
+    if te.kind == .video || te.kind == .audio then
+      let mut pos := te.entryStart
+      let mut fuel := 256
+      let mut width := 0
+      let mut height := 0
+      let mut channels := 2
+      let mut sampleRate := 48000
+      let mut priv := ByteArray.empty
+      let mut colour : MkvHdrColour := {
+        matrixCoefficients := 2, transferCharacteristics := 2, primaries := 2
+        maxCll := 0, maxFall := 0, hasMastering := false }
+      let mut mastering := dciP3D65Mastering
+      let mut dovi := doviProfile8
+      let mut hasDovi := false
+      while pos < te.entryEnd && fuel > 0 do
+        fuel := fuel - 1
+        let some (fid, iw) := readEbmlElementId s pos | return none
+        let some (fsz, sw, funk) := readEbmlElementSize s (pos + iw) | return none
+        if funk || pos + iw + sw + fsz > te.entryEnd then return none
+        let fBody := pos + iw + sw
+        let fEnd := fBody + fsz
+        if fid == 0x63A2 then
+          priv := bytes.extract fBody fEnd
+        else if fid == 0x41E4 then
+          if let some r := decodeMkvDoviBlockAddList (bytes.extract pos fEnd).toList then
+            dovi := r
+            hasDovi := true
+        else if fid == 0xE0 then
+          let mut vp := fBody
+          let mut vFuel := 64
+          while vp < fEnd && vFuel > 0 do
+            vFuel := vFuel - 1
+            let some (vid, viw) := readEbmlElementId s vp | return none
+            let some (vsz, vsw, vunk) := readEbmlElementSize s (vp + viw) | return none
+            if vunk || vp + viw + vsw + vsz > fEnd then return none
+            let vBody := vp + viw + vsw
+            let vEnd := vBody + vsz
+            if vid == 0xB0 then width := (readEbmlUintBE s vBody vsz).getD 0
+            else if vid == 0xBA then height := (readEbmlUintBE s vBody vsz).getD 0
+            else if vid == 0x55B0 then
+              if let some c := decodeMkvHdrColourList (bytes.extract vp vEnd).toList then
+                colour := c
+              let mut cp := vBody
+              let mut cFuel := 32
+              while cp < vEnd && cFuel > 0 do
+                cFuel := cFuel - 1
+                let some (cid, ciw) := readEbmlElementId s cp | break
+                let some (csz, csw, cunk) := readEbmlElementSize s (cp + ciw) | break
+                if cunk || cp + ciw + csw + csz > vEnd then break
+                let cEnd := cp + ciw + csw + csz
+                if cid == 0x55D0 then
+                  if let some m := decodeMkvMasteringBodyList (bytes.extract (cp + ciw + csw) cEnd).toList then
+                    mastering := m
+                cp := cEnd
+            vp := vEnd
+        else if fid == 0xE1 then
+          let mut ap := fBody
+          let mut aFuel := 32
+          while ap < fEnd && aFuel > 0 do
+            aFuel := aFuel - 1
+            let some (aid, aiw) := readEbmlElementId s ap | return none
+            let some (asz, asw, aunk) := readEbmlElementSize s (ap + aiw) | return none
+            if aunk || ap + aiw + asw + asz > fEnd then return none
+            let aBody := ap + aiw + asw
+            let aEnd := aBody + asz
+            if aid == 0x9F then channels := (readEbmlUintBE s aBody asz).getD 2
+            else if aid == 0xB5 && asz == 8 then
+              sampleRate := (f64BEToNatScaled (bytes.extract aBody aEnd).toList 1).getD 48000
+            ap := aEnd
+        pos := fEnd
+      let mut rawItems : Array (Int × Bool × ByteArray) := #[]
+      for (_, items) in parsed.clusters do
+        for it in items do
+          if it.trackNumber == te.trackNumber then
+            let hdrSkip := it.trackVintLen + 3
+            if it.blockOff + hdrSkip < it.blockEnd && it.blockEnd ≤ bytes.size then
+              let flags := s.getByteD (it.blockOff + it.trackVintLen + 2) 0
+              if (flags &&& 0x06) == 0 then
+                rawItems := rawItems.push (it.absTs, it.isKeyframe, bytes.extract (it.blockOff + hdrSkip) it.blockEnd)
+      let mut samples : Array (ByteArray × Nat × Bool) := #[]
+      for i in [:rawItems.size] do
+        let (ts0, sync, payload) := rawItems[i]!
+        let durMs : Nat :=
+          if i + 1 < rawItems.size then
+            let (ts1, _, _) := rawItems[i + 1]!
+            let d := ts1 - ts0
+            if d > 0 then (d.toNat * tsScale) / 1000000 else 40
+          else if te.kind == .audio then 20 else 40
+        samples := samples.push (payload, if durMs == 0 then 1 else durMs, sync)
+      let trk : P11CrossRemuxTrack := {
+        kind := te.kind
+        codecId := te.codecId
+        width := width
+        height := height
+        channels := channels
+        sampleRate := sampleRate
+        timescale := 1000
+        codecPrivate := priv
+        colour := colour
+        mastering := mastering
+        dovi := dovi
+        hasDovi := hasDovi
+        samples := samples
+      }
+      if p11CrossRemuxTrackSafe trk then out := out.push trk
+  return if out.isEmpty then none else some out
+
+def p11CrossContainerRoundtrip (inFmt outFmt : ContainerFormat) (tracks : Array P11CrossRemuxTrack) :
+    Option ByteArray := do
+  if !p11CrossContainerRemux inFmt outFmt then none
+  else if inFmt == .mp4 then
+    p11MuxMkvFromCrossTracks (if outFmt == .webm then "webm" else "matroska") tracks
+  else
+    p11MuxMp4FromCrossTracks tracks
+
+def p11CrossRemuxBytes (inFmt outFmt : ContainerFormat) (bytes : ByteArray) : Option ByteArray := do
+  if !p11CrossContainerRemux inFmt outFmt then none
+  else if inFmt == .mp4 then
+    let tracks ← p11DemuxMp4ToCrossTracks bytes
+    p11MuxMkvFromCrossTracks (if outFmt == .webm then "webm" else "matroska") tracks
+  else
+    let tracks ← p11DemuxMkvToCrossTracks bytes
+    p11MuxMp4FromCrossTracks tracks
+
+def p11CrossContainerGateSpec : AVGateSpec (ContainerFormat × ContainerFormat) P11CrossContainerSafe where
+  gate p := decide (P11CrossContainerSafe p)
+  sound _ h := of_decide_eq_true h
+  complete _ h := decide_eq_true h
+  posWitness := (.mp4, .mkv)
+  negWitness := (.mp4, .mp4)
+  nonVacuous := by decide
+  tight := by decide
+
+def doviPackChunks (acc width : Nat) (chunks : List (Nat × Nat)) (out : List UInt8) : (Nat × Nat × List UInt8) :=
+  match chunks with
+  | [] => (acc, width, out)
+  | (v, w) :: rest =>
+    let acc1 := (acc <<< w) ||| (v &&& ((1 <<< w) - 1))
+    let width1 := width + w
+    let rec flush (fuel a wd : Nat) (o : List UInt8) : (Nat × Nat × List UInt8) :=
+      match fuel with
+      | 0 => (a, wd, o)
+      | f + 1 =>
+        if wd < 8 then (a, wd, o)
+        else
+          let sh := wd - 8
+          let b : UInt8 := ((a >>> sh) &&& 0xFF).toUInt8
+          flush f (a &&& ((1 <<< sh) - 1)) sh (b :: o)
+    let (acc2, width2, out2) := flush 8 acc1 width1 out
+    doviPackChunks acc2 width2 rest out2
+
+def doviVarBitsSizeChunks (n : Nat) : List (Nat × Nat) :=
+  let rec peel (fuel v : Nat) (acc : List Nat) : List Nat :=
+    match fuel with
+    | 0 => acc
+    | f + 1 =>
+      let c := v &&& 0xFF
+      if v < 256 then c :: acc
+      else peel f ((v >>> 8) - 1) (c :: acc)
+  let rec emit : List Nat → List (Nat × Nat)
+    | [] => [(0, 8), (0, 1)]
+    | [c] => [(c, 8), (0, 1)]
+    | c :: rest => (c, 8) :: (1, 1) :: emit rest
+  emit (peel 8 n [])
+
+def packDoviEmdf (rpu : List UInt8) : List UInt8 :=
+  let hdr := (0x01BE6841, 27) :: doviVarBitsSizeChunks rpu.length
+  let (a0, w0, o0) := doviPackChunks 0 0 hdr []
+  let rec feedRpu (a wd : Nat) (xs out : List UInt8) : (Nat × Nat × List UInt8) :=
+    match xs with
+    | [] => (a, wd, out)
+    | b :: bs =>
+      let a1 := (a <<< 8) ||| b.toNat
+      let sh := wd
+      let outByte : UInt8 := ((a1 >>> sh) &&& 0xFF).toUInt8
+      feedRpu (a1 &&& ((1 <<< sh) - 1)) wd bs (outByte :: out)
+  let (a1, w1, o1) := feedRpu a0 w0 rpu o0
+  let (a2, w2, o2) := doviPackChunks a1 w1 [(0x0400, 17), (1, 1)] o1
+  let oAligned := if w2 == 0 then o2 else (((a2 <<< (8 - w2)) &&& 0xFF).toUInt8 :: o2)
+  (0x80 :: oAligned).reverse
+
+def doviTakeBits (acc width need : Nat) (rest : List UInt8) : Option (Nat × Nat × Nat × List UInt8) :=
+  let rec fill (fuel a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × List UInt8) :=
+    if wd ≥ need then some (a, wd, xs)
+    else
+      match fuel, xs with
+      | 0, _ => none
+      | _, [] => none
+      | f + 1, b :: bs => fill f ((a <<< 8) ||| b.toNat) (wd + 8) bs
+  match fill 8 acc width rest with
+  | none => none
+  | some (a1, w1, xs1) =>
+    let sh := w1 - need
+    let val := (a1 >>> sh) &&& ((1 <<< need) - 1)
+    some (val, a1 &&& ((1 <<< sh) - 1), sh, xs1)
+
+def unpackDoviEmdf (emdf : List UInt8) : Option (List UInt8) := do
+  let (hdr, a0, w0, r0) ← doviTakeBits 0 0 27 emdf
+  if hdr != 0x01BE6841 then none
+  let rec readVar (fuel val a wd : Nat) (xs : List UInt8) : Option (Nat × Nat × Nat × List UInt8) := do
+    match fuel with
+    | 0 => none
+    | f + 1 =>
+      let (chunk, a1, w1, xs1) ← doviTakeBits a wd 8 xs
+      let (more, a2, w2, xs2) ← doviTakeBits a1 w1 1 xs1
+      let val1 := val + chunk
+      if more == 0 then some (val1, a2, w2, xs2)
+      else readVar f ((val1 + 1) <<< 8) a2 w2 xs2
+  let (n, a2, w2, r2) ← readVar 4 0 a0 w0 r0
+  if n > emdf.length then none
+  let rec readRpu (rem a wd : Nat) (xs acc : List UInt8) : Option (List UInt8 × Nat × Nat × List UInt8) :=
+    match rem with
+    | 0 => some (acc.reverse, a, wd, xs)
+    | k + 1 =>
+      match doviTakeBits a wd 8 xs with
+      | none => none
+      | some (v, a', wd', xs') => readRpu k a' wd' xs' (v.toUInt8 :: acc)
+  let (rpuRev, a3, w3, r3) ← readRpu n a2 w2 r2 []
+  let (prot17, a4, w4, r4) ← doviTakeBits a3 w3 17 r3
+  if prot17 != 0x0400 then none
+  let (emdfStop, a5, w5, r5) ← doviTakeBits a4 w4 1 r4
+  if emdfStop != 1 || w5 ≥ 8 || a5 != 0 || (r5 != [0x80] && !r5.isEmpty) then none
+  some rpuRev
+
+theorem p11_hdr_dovi_container_roundtrip :
+    let colr := encodeColrNclxBoxSpec
+      { colourPrimaries := 9, transferCharacteristics := 16, matrixCoefficients := 9, fullRangeFlag := false }
+    let mdcv := encodeMdcvDciP3BoxSpec
+      { maxDisplayMasteringLuminance := 10000000, minDisplayMasteringLuminance := 50 }
+    let clli := encodeClliBoxSpec { maxContentLightLevel := 1000, maxPicAverageLightLevel := 400 }
+    decodeColrNclxBoxSpec colr = some
+      { colourPrimaries := 9, transferCharacteristics := 16, matrixCoefficients := 9, fullRangeFlag := false } ∧
+    decodeMdcvDciP3BoxSpec mdcv = some
+      { maxDisplayMasteringLuminance := 10000000, minDisplayMasteringLuminance := 50 } ∧
+    decodeClliBoxSpec clli = some { maxContentLightLevel := 1000, maxPicAverageLightLevel := 400 } ∧
+    decodeMdcvBoxFull (encodeMdcvBoxFull dciP3D65Mastering) = some dciP3D65Mastering ∧
+    decodeDoviConfigBody (encodeDoviConfigBody doviProfile8) = some doviProfile8 ∧
+    decodeDoviConfigBody (encodeDoviConfigBody doviProfile5) = some doviProfile5 ∧
+    decodeDoviConfigBody (encodeDoviConfigBody doviProfile10) = some doviProfile10 ∧
+    doviBoxFourcc doviProfile5 = "dvcC" ∧ doviBoxFourcc doviProfile8 = "dvvC" ∧
+    doviBoxFourcc doviProfile10 = "dvvC" ∧
+    p11SampleEntryDepth "avc1" = some 10 ∧ p11SampleEntryDepth "hvc1" = some 10 ∧
+    p11SampleEntryDepth "hev1" = some 10 ∧ p11SampleEntryDepth "av01" = some 10 ∧
+    p11CrossContainerRemux .mp4 .mkv = true ∧ p11CrossContainerRemux .mp4 .mp4 = false ∧
+    p11RemuxHdrBoxes .mp4 .mkv [colr, mdcv, clli] = some [colr, mdcv, clli] ∧
+    p11RemuxHdrBoxes .mp4 .mp4 [colr] = none := by
+  decide
+
+theorem p11_rpu_and_obu_roundtrip :
+    hevcRpuNalHeaderOk 0x7C 0x01 = true ∧
+    rbspUnescape [0x00, 0x00, 0x03, 0x01] = [0x00, 0x00, 0x01] ∧
+    hevcRpuPayloadOk ([0x19, 0x02] ++ u32beToList (mpeg2Crc32List [0x02]) ++ [0x80]) = true ∧
+    decodeHevcRpuNal (encodeHevcRpuNal ([0x02] ++ u32beToList (mpeg2Crc32List [0x02]) ++ [0x80])) =
+      some ([0x02] ++ u32beToList (mpeg2Crc32List [0x02]) ++ [0x80]) ∧
+    av1T35DoviOk [0x2A, 9, 0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0x19] = true ∧
+    av1T35DoviOk [0x28, 0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0x19] = true ∧
+    av1Leb128ReadList (av1Leb128Write 300) = some (300, []) ∧
+    av1Leb128ReadList (av1Leb128Write 70000) = some (70000, []) ∧
+    doviVarBitsSizeChunks 254 = [(254, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 255 = [(255, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 256 = [(0, 8), (1, 1), (0, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 265 = [(0, 8), (1, 1), (9, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 512 = [(1, 8), (1, 1), (0, 8), (0, 1)] ∧
+    doviVarBitsSizeChunks 65792 = [(0, 8), (1, 1), (0, 8), (1, 1), (0, 8), (0, 1)] ∧
+    decodeAv1T35DoviObu (encodeAv1T35DoviObu [0x19, 0x02]) = some [0x19, 0x02] ∧
+    unpackDoviEmdf (packDoviEmdf [0x08, 0x09, 0x80]) = some [0x08, 0x09, 0x80] := by
+  decide
+
+theorem p11_mkv_hdr_and_dovi_roundtrip :
+    decodeMkvHdrColourList (encodeMkvHdrColourList {
+      matrixCoefficients := 9, transferCharacteristics := 16, primaries := 9
+      maxCll := 1000, maxFall := 400, hasMastering := true }) = some {
+      matrixCoefficients := 9, transferCharacteristics := 16, primaries := 9
+      maxCll := 1000, maxFall := 400, hasMastering := true } ∧
+    decodeMkvDoviBlockAddList (encodeMkvDoviBlockAddList (encodeDoviConfigBody doviProfile8) "dvvC") =
+      some doviProfile8 ∧
+    decodeMkvDoviBlockAddList (encodeMkvDoviBlockAddList (encodeDoviConfigBody doviProfile5) "dvcC") =
+      some doviProfile5 ∧
+    mkvDoviBlockAddMapping 0x64766343 = true ∧ mkvDoviBlockAddMapping 0x64767643 = true := by
+  decide
+
+theorem p11_mkv_mastering_roundtrip :
+    decodeMkvMasteringList (encodeMkvMasteringList dciP3D65Mastering) = some dciP3D65Mastering := by
+  decide
+
+def extractHevcRpuFromAu (au : ByteArray) : Option ByteArray := Id.run do
+  let mut pos := 0
+  let mut fuel := 128
+  while pos + 4 ≤ au.size && fuel > 0 do
+    fuel := fuel - 1
+    let n := p11U32At au pos
+    if pos + 4 + n > au.size then return none
+    if n ≥ 2 then
+      if let some rpu := decodeHevcRpuNal (au.extract (pos + 4) (pos + 4 + n)).toList then
+        return some ⟨rpu.toArray⟩
+    pos := pos + 4 + n
+  return none
+
+def injectHevcRpuIntoAu (au rpu : ByteArray) : Option ByteArray :=
+  if !hevcRpuPayloadOk (0x19 :: rpu.toList) then none
+  else
+    let nal := ⟨(encodeHevcRpuNal rpu.toList).toArray⟩
+    some (au ++ (pushU32BE ByteArray.empty nal.size.toUInt32) ++ nal)
+
+def av1Leb128Read (ba : ByteArray) (off : Nat) : Option (Nat × Nat) := Id.run do
+  let mut v : Nat := 0
+  for i in [:8] do
+    if off + i ≥ ba.size then return none
+    let b := ba.get! (off + i)
+    v := v ||| (((b &&& 0x7F).toNat) <<< (7 * i))
+    if (b &&& 0x80) == 0 then
+      if v ≥ (1 <<< 32) then return none
+      return some (v, i + 1)
+  return none
+
+def encodeAv1DoviEmdfObu (rpu : List UInt8) : List UInt8 :=
+  let payload := [0x04, 0xB5, 0x00, 0x3B, 0x00, 0x00, 0x08, 0x00] ++ packDoviEmdf rpu
+  0x2A :: (av1Leb128Write payload.length ++ payload)
+
+def extractAv1RpuFromTu (tu : ByteArray) : Option ByteArray := Id.run do
+  let mut pos := 0
+  let mut fuel := tu.size + 1
+  while pos < tu.size && fuel > 0 do
+    fuel := fuel - 1
+    let hdr := tu.get! pos
+    if (hdr &&& 0x81) != 0 then return none
+    let obuType := (hdr >>> 3) &&& 0x0F
+    let hasExt := (hdr &&& 0x04) != 0
+    let hasSize := (hdr &&& 0x02) != 0
+    let hLen := if hasExt then 2 else 1
+    if pos + hLen > tu.size then return none
+    if hasExt && ((tu.get! (pos + 1)) &&& 0x07) != 0 then return none
+    let (pStart, sz) ←
+      if hasSize then
+        let some (szVal, lw) := av1Leb128Read tu (pos + hLen) | return none
+        if pos + hLen + lw + szVal > tu.size then return none
+        pure (pos + hLen + lw, szVal)
+      else if obuType == 2 then
+        pure (pos + hLen, 0)
+      else
+        pure (pos + hLen, tu.size - (pos + hLen))
+    if obuType == 5 && sz ≥ 8 then
+      let p := (tu.extract pStart (pStart + sz)).toList
+      match p with
+      | 0x04 :: 0xB5 :: 0x00 :: 0x3B :: 0x00 :: 0x00 :: 0x08 :: 0x00 :: tail =>
+        if let some rpu := unpackDoviEmdf tail then
+          if hevcRpuPayloadOk (0x19 :: rpu) then return some ⟨rpu.toArray⟩
+        if hevcRpuPayloadOk (0x19 :: tail) then
+          return some ⟨tail.toArray⟩
+      | _ => pure ()
+    pos := pStart + sz
+  return none
+
+def injectAv1RpuIntoTu (tu rpu : ByteArray) : Option ByteArray := Id.run do
+  if !hevcRpuPayloadOk (0x19 :: rpu.toList) then return none
+  let obu := ⟨(encodeAv1DoviEmdfObu rpu.toList).toArray⟩
+  let mut pos := 0
+  let mut fuel := tu.size + 1
+  while pos < tu.size && fuel > 0 do
+    fuel := fuel - 1
+    let hdr := tu.get! pos
+    if (hdr &&& 0x81) != 0 then return none
+    let obuType := (hdr >>> 3) &&& 0x0F
+    if obuType == 3 || obuType == 6 then
+      return some (tu.extract 0 pos ++ obu ++ tu.extract pos tu.size)
+    let hasExt := (hdr &&& 0x04) != 0
+    let hasSize := (hdr &&& 0x02) != 0
+    let hLen := if hasExt then 2 else 1
+    if pos + hLen > tu.size then return none
+    if hasExt && ((tu.get! (pos + 1)) &&& 0x07) != 0 then return none
+    if hasSize then
+      let some (sz, lw) := av1Leb128Read tu (pos + hLen) | return none
+      if pos + hLen + lw + sz > tu.size then return none
+      pos := pos + hLen + lw + sz
+    else if obuType == 2 then
+      pos := pos + hLen
+    else
+      pos := tu.size
+  return some (tu ++ obu)
+
+@[export leanav_lean_p11_cross_remux]
+def leanavLeanP11CrossRemux (inTag outTag : UInt32) (bytes : ByteArray) : ByteArray :=
+  let fmtOf (t : UInt32) : ContainerFormat :=
+    if t == 1 then .mp4 else if t == 2 then .mkv else if t == 3 then .webm else .wav
+  match p11CrossRemuxBytes (fmtOf inTag) (fmtOf outTag) bytes with
+  | some out => out
+  | none => ByteArray.empty
+
+@[export leanav_lean_p11_hevc_rpu_op]
+def leanavLeanP11HevcRpuOp (mode : UInt32) (au rpu : ByteArray) : ByteArray :=
+  if mode == 0 then (extractHevcRpuFromAu au).getD ByteArray.empty
+  else (injectHevcRpuIntoAu au rpu).getD ByteArray.empty
+
+@[export leanav_lean_p11_av1_rpu_op]
+def leanavLeanP11Av1RpuOp (mode : UInt32) (tu rpu : ByteArray) : ByteArray :=
+  if mode == 0 then (extractAv1RpuFromTu tu).getD ByteArray.empty
+  else (injectAv1RpuIntoTu tu rpu).getD ByteArray.empty
 
 end LeanAV.Format

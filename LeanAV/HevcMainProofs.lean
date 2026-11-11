@@ -536,4 +536,394 @@ theorem hevcDpb_poc_reorder_monotone_and_capacity_checked :
     hevcDpbOccupancyGate (7, 6) = false := by
   decide
 
+def hevcExtSpsPcmSafe (sps : HevcSps) : Prop :=
+  match sps.pcm? with
+  | none => True
+  | some p =>
+    1 ≤ p.bitDepth ∧ p.bitDepth ≤ sps.bitDepth ∧
+    1 ≤ p.bitDepthChroma ∧ p.bitDepthChroma ≤ sps.bitDepthChroma
+
+def hevcAdmittedProfileModeSafe (sps : HevcSps) : Prop :=
+  let isMain := sps.ptl.profileIdc = 1 ∨ sps.ptl.compatFlags.getD 1 0 = 1
+  let isMain10 := sps.ptl.profileIdc = 2 ∨ sps.ptl.compatFlags.getD 2 0 = 1
+  let isRext := sps.ptl.profileIdc = 4 ∨ sps.ptl.compatFlags.getD 4 0 = 1
+  ((isMain ∧ sps.bitDepth = 8 ∧ sps.chromaFormatIdc = 1) ∨
+   (isMain10 ∧ (sps.bitDepth = 8 ∨ sps.bitDepth = 10) ∧ sps.chromaFormatIdc = 1) ∨
+   (isRext ∧ (sps.bitDepth = 8 ∨ sps.bitDepth = 10 ∨ sps.bitDepth = 12) ∧
+    (sps.chromaFormatIdc = 1 ∨ sps.chromaFormatIdc = 2 ∨ sps.chromaFormatIdc = 3))) ∧
+  sps.separateColourPlaneFlag = false ∧
+  sps.bitDepthChroma = sps.bitDepth ∧
+  hevcExtSpsPcmSafe sps
+
+def hevcMain10OrRextSpsGate (sps : HevcSps) : Bool :=
+  isMain10OrRextSps sps
+
+def hevcMain10OrRextSpsSpec :
+    AVGateSpec HevcSps hevcAdmittedProfileModeSafe where
+  gate := hevcMain10OrRextSpsGate
+  sound sps hg := by
+    unfold hevcMain10OrRextSpsGate isMain10OrRextSps isAdmittedExtProfileBitDepthChroma at hg
+    unfold hevcAdmittedProfileModeSafe
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', beq_iff_eq] at hg
+    have hpcm : hevcExtSpsPcmSafe sps := by
+      unfold hevcExtSpsPcmSafe
+      have h2 := hg.2
+      cases hp : sps.pcm? with
+      | none => trivial
+      | some p =>
+        simp only [hp, Bool.and_eq_true, decide_eq_true_eq] at h2
+        exact ⟨h2.1.1.1, h2.1.1.2, h2.1.2, h2.2⟩
+    have hprof :
+        (((sps.ptl.profileIdc = 1 ∨ sps.ptl.compatFlags.getD 1 0 = 1) ∧
+          sps.bitDepth = 8 ∧ sps.chromaFormatIdc = 1) ∨
+         ((sps.ptl.profileIdc = 2 ∨ sps.ptl.compatFlags.getD 2 0 = 1) ∧
+          (sps.bitDepth = 8 ∨ sps.bitDepth = 10) ∧ sps.chromaFormatIdc = 1) ∨
+         ((sps.ptl.profileIdc = 4 ∨ sps.ptl.compatFlags.getD 4 0 = 1) ∧
+          (sps.bitDepth = 8 ∨ sps.bitDepth = 10 ∨ sps.bitDepth = 12) ∧
+          (sps.chromaFormatIdc = 1 ∨ sps.chromaFormatIdc = 2 ∨ sps.chromaFormatIdc = 3))) := by
+      rcases hg.1.1.1 with (hm | hm10) | hrext
+      · exact Or.inl ⟨hm.1.1, hm.1.2, hm.2⟩
+      · exact Or.inr (Or.inl ⟨hm10.1.1, hm10.1.2, hm10.2⟩)
+      · exact Or.inr (Or.inr ⟨hrext.1.1,
+          match hrext.1.2 with
+          | Or.inl (Or.inl h8) => Or.inl h8
+          | Or.inl (Or.inr h10) => Or.inr (Or.inl h10)
+          | Or.inr h12 => Or.inr (Or.inr h12),
+          match hrext.2 with
+          | Or.inl (Or.inl hc1) => Or.inl hc1
+          | Or.inl (Or.inr hc2) => Or.inr (Or.inl hc2)
+          | Or.inr hc3 => Or.inr (Or.inr hc3)⟩)
+    exact ⟨hprof, hg.1.1.2, hg.1.2, hpcm⟩
+  complete sps hs := by
+    rcases hs with ⟨hprof, hsep, hbdc, hpcm⟩
+    unfold hevcMain10OrRextSpsGate isMain10OrRextSps isAdmittedExtProfileBitDepthChroma
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', beq_iff_eq]
+    have hpcmB :
+        (match sps.pcm? with
+         | none => true
+         | some p =>
+           decide (p.bitDepth ≥ 1) && decide (p.bitDepth ≤ sps.bitDepth) &&
+           decide (p.bitDepthChroma ≥ 1) && decide (p.bitDepthChroma ≤ sps.bitDepthChroma)) = true := by
+      unfold hevcExtSpsPcmSafe at hpcm
+      cases hq : sps.pcm? with
+      | none => rfl
+      | some p =>
+        rw [hq] at hpcm
+        simp only [Bool.and_eq_true, decide_eq_true_eq]
+        exact ⟨⟨⟨hpcm.1, hpcm.2.1⟩, hpcm.2.2.1⟩, hpcm.2.2.2⟩
+    have hprofB :
+        ((((sps.ptl.profileIdc = 1 ∨ sps.ptl.compatFlags.getD 1 0 = 1) ∧ sps.bitDepth = 8) ∧
+          sps.chromaFormatIdc = 1) ∨
+         (((sps.ptl.profileIdc = 2 ∨ sps.ptl.compatFlags.getD 2 0 = 1) ∧
+           (sps.bitDepth = 8 ∨ sps.bitDepth = 10)) ∧ sps.chromaFormatIdc = 1)) ∨
+        (((sps.ptl.profileIdc = 4 ∨ sps.ptl.compatFlags.getD 4 0 = 1) ∧
+          ((sps.bitDepth = 8 ∨ sps.bitDepth = 10) ∨ sps.bitDepth = 12)) ∧
+         ((sps.chromaFormatIdc = 1 ∨ sps.chromaFormatIdc = 2) ∨ sps.chromaFormatIdc = 3)) := by
+      rcases hprof with hm | hm10 | hrext
+      · exact Or.inl (Or.inl ⟨⟨hm.1, hm.2.1⟩, hm.2.2⟩)
+      · exact Or.inl (Or.inr ⟨⟨hm10.1, hm10.2.1⟩, hm10.2.2⟩)
+      · exact Or.inr ⟨⟨hrext.1,
+          match hrext.2.1 with
+          | Or.inl h8 => Or.inl (Or.inl h8)
+          | Or.inr (Or.inl h10) => Or.inl (Or.inr h10)
+          | Or.inr (Or.inr h12) => Or.inr h12⟩,
+          match hrext.2.2 with
+          | Or.inl hc1 => Or.inl (Or.inl hc1)
+          | Or.inr (Or.inl hc2) => Or.inl (Or.inr hc2)
+          | Or.inr (Or.inr hc3) => Or.inr hc3⟩
+    exact ⟨⟨⟨hprofB, hsep⟩, hbdc⟩, hpcmB⟩
+  posWitness := {
+    ptl := { profileIdc := 4, compatFlags := (Array.replicate 32 0).set! 4 1, levelIdc := 93 }
+    chromaFormatIdc := 2
+    separateColourPlaneFlag := false
+    bitDepth := 12
+    bitDepthChroma := 12
+    width := 64
+    height := 48
+  }
+  negWitness := {
+    ptl := { profileIdc := 2, compatFlags := (Array.replicate 32 0).set! 2 1, levelIdc := 93 }
+    chromaFormatIdc := 3
+    separateColourPlaneFlag := false
+    bitDepth := 10
+    bitDepthChroma := 10
+    width := 64
+    height := 48
+  }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcMain10OrRextSpsSpec_iff (sps : HevcSps) :
+    hevcMain10OrRextSpsSpec.gate sps = true ↔ hevcAdmittedProfileModeSafe sps :=
+  hevcMain10OrRextSpsSpec.iff_safe sps
+
+def hevcPixFmtPairSafe (p : Nat × Nat) : Prop :=
+  (p.1 = 8 ∨ p.1 = 10 ∨ p.1 = 12) ∧ (p.2 = 1 ∨ p.2 = 2 ∨ p.2 = 3)
+
+def hevcPixFmtPairGate (p : Nat × Nat) : Bool :=
+  (pixFmtForBitDepthChroma p.1 p.2).isSome
+
+def hevcPixFmtPairSpec :
+    AVGateSpec (Nat × Nat) hevcPixFmtPairSafe where
+  gate := hevcPixFmtPairGate
+  sound p hg := by
+    rcases p with ⟨bd, cf⟩
+    unfold hevcPixFmtPairGate pixFmtForBitDepthChroma at hg
+    unfold hevcPixFmtPairSafe
+    by_cases hb8 : bd = 8
+    · by_cases hc1 : cf = 1
+      · exact ⟨Or.inl hb8, Or.inl hc1⟩
+      · by_cases hc2 : cf = 2
+        · exact ⟨Or.inl hb8, Or.inr (Or.inl hc2)⟩
+        · by_cases hc3 : cf = 3
+          · exact ⟨Or.inl hb8, Or.inr (Or.inr hc3)⟩
+          · simp [hb8, hc1, hc2, hc3] at hg
+    · by_cases hb10 : bd = 10
+      · by_cases hc1 : cf = 1
+        · exact ⟨Or.inr (Or.inl hb10), Or.inl hc1⟩
+        · by_cases hc2 : cf = 2
+          · exact ⟨Or.inr (Or.inl hb10), Or.inr (Or.inl hc2)⟩
+          · by_cases hc3 : cf = 3
+            · exact ⟨Or.inr (Or.inl hb10), Or.inr (Or.inr hc3)⟩
+            · simp [hb10, hc1, hc2, hc3] at hg
+      · by_cases hb12 : bd = 12
+        · by_cases hc1 : cf = 1
+          · exact ⟨Or.inr (Or.inr hb12), Or.inl hc1⟩
+          · by_cases hc2 : cf = 2
+            · exact ⟨Or.inr (Or.inr hb12), Or.inr (Or.inl hc2)⟩
+            · by_cases hc3 : cf = 3
+              · exact ⟨Or.inr (Or.inr hb12), Or.inr (Or.inr hc3)⟩
+              · simp [hb12, hc1, hc2, hc3] at hg
+        · simp [hb8, hb10, hb12] at hg
+  complete p hs := by
+    rcases p with ⟨bd, cf⟩
+    rcases hs with ⟨hb, hc⟩
+    change (bd = 8 ∨ bd = 10 ∨ bd = 12) at hb
+    change (cf = 1 ∨ cf = 2 ∨ cf = 3) at hc
+    unfold hevcPixFmtPairGate pixFmtForBitDepthChroma
+    rcases hb with rfl | rfl | rfl <;> rcases hc with rfl | rfl | rfl <;> decide
+  posWitness := (10, 2)
+  negWitness := (10, 0)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcPixFmtPairSpec_iff (p : Nat × Nat) :
+    hevcPixFmtPairSpec.gate p = true ↔ hevcPixFmtPairSafe p :=
+  hevcPixFmtPairSpec.iff_safe p
+
+def hevcSample10BoundGate (v : Int) : Bool :=
+  decide (0 ≤ v) && decide (v ≤ 1023)
+
+def hevcSample10BoundSpec :
+    AVGateSpec Int (fun v => 0 ≤ v ∧ v ≤ 1023) where
+  gate := hevcSample10BoundGate
+  sound _ hg := by
+    unfold hevcSample10BoundGate at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact hg
+  complete _ hs := by
+    unfold hevcSample10BoundGate
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact hs
+  posWitness := 1023
+  negWitness := 1024
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcSample10BoundSpec_iff (v : Int) :
+    hevcSample10BoundSpec.gate v = true ↔ (0 ≤ v ∧ v ≤ 1023) :=
+  hevcSample10BoundSpec.iff_safe v
+
+def hevcSample12BoundGate (v : Int) : Bool :=
+  decide (0 ≤ v) && decide (v ≤ 4095)
+
+def hevcSample12BoundSpec :
+    AVGateSpec Int (fun v => 0 ≤ v ∧ v ≤ 4095) where
+  gate := hevcSample12BoundGate
+  sound _ hg := by
+    unfold hevcSample12BoundGate at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact hg
+  complete _ hs := by
+    unfold hevcSample12BoundGate
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact hs
+  posWitness := 4095
+  negWitness := 4096
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcSample12BoundSpec_iff (v : Int) :
+    hevcSample12BoundSpec.gate v = true ↔ (0 ≤ v ∧ v ≤ 4095) :=
+  hevcSample12BoundSpec.iff_safe v
+
+def hevcExtendedQpGate (p : Int × Nat) : Bool :=
+  (p.2 == 8 || p.2 == 10 || p.2 == 12) &&
+  decide (-Int.ofNat (6 * (p.2 - 8)) ≤ p.1) && decide (p.1 ≤ 51)
+
+def hevcExtendedQpSpec :
+    AVGateSpec (Int × Nat) (fun p =>
+      (p.2 = 8 ∨ p.2 = 10 ∨ p.2 = 12) ∧ -Int.ofNat (6 * (p.2 - 8)) ≤ p.1 ∧ p.1 ≤ 51) where
+  gate := hevcExtendedQpGate
+  sound p hg := by
+    unfold hevcExtendedQpGate at hg
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq] at hg
+    have hbd : p.2 = 8 ∨ p.2 = 10 ∨ p.2 = 12 := by
+      rcases hg.1.1 with (h8 | h10) | h12
+      · exact Or.inl h8
+      · exact Or.inr (Or.inl h10)
+      · exact Or.inr (Or.inr h12)
+    exact ⟨hbd, hg.1.2, hg.2⟩
+  complete p hs := by
+    rcases hs with ⟨hbd, hlo, hhi⟩
+    unfold hevcExtendedQpGate
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq]
+    have hbdB : (p.2 = 8 ∨ p.2 = 10) ∨ p.2 = 12 := by
+      rcases hbd with h8 | h10 | h12
+      · exact Or.inl (Or.inl h8)
+      · exact Or.inl (Or.inr h10)
+      · exact Or.inr h12
+    exact ⟨⟨hbdB, hlo⟩, hhi⟩
+  posWitness := (-12, 10)
+  negWitness := (-13, 10)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcExtendedQpSpec_iff (p : Int × Nat) :
+    hevcExtendedQpSpec.gate p = true ↔
+      ((p.2 = 8 ∨ p.2 = 10 ∨ p.2 = 12) ∧ -Int.ofNat (6 * (p.2 - 8)) ≤ p.1 ∧ p.1 ≤ 51) :=
+  hevcExtendedQpSpec.iff_safe p
+
+structure HvccHeaderFields where
+  configVersion : UInt8 := 1
+  profileSpace : Nat := 0
+  profileIdc : Nat := 1
+  chromaFormatIdc : Nat := 1
+  bitDepthLumaMinus8 : Nat := 0
+  bitDepthChromaMinus8 : Nat := 0
+  lengthSizeMinusOne : Nat := 3
+  deriving Repr, DecidableEq
+
+def hvccHeaderFieldsSafe (h : HvccHeaderFields) : Prop :=
+  h.configVersion = 1 ∧
+  h.profileSpace = 0 ∧
+  h.lengthSizeMinusOne = 3 ∧
+  h.bitDepthLumaMinus8 = h.bitDepthChromaMinus8 ∧
+  isAdmittedExtProfileBitDepthChroma h.profileIdc #[]
+    (h.bitDepthLumaMinus8 + 8) (h.bitDepthChromaMinus8 + 8) h.chromaFormatIdc false = true
+
+def hvccHeaderFieldsGate (h : HvccHeaderFields) : Bool :=
+  (h.configVersion == 1) &&
+  (h.profileSpace == 0) &&
+  (h.lengthSizeMinusOne == 3) &&
+  (h.bitDepthLumaMinus8 == h.bitDepthChromaMinus8) &&
+  isAdmittedExtProfileBitDepthChroma h.profileIdc #[]
+    (h.bitDepthLumaMinus8 + 8) (h.bitDepthChromaMinus8 + 8) h.chromaFormatIdc false
+
+def hvccHeaderFieldsSpec :
+    AVGateSpec HvccHeaderFields hvccHeaderFieldsSafe where
+  gate := hvccHeaderFieldsGate
+  sound h hg := by
+    unfold hvccHeaderFieldsGate hvccHeaderFieldsSafe at *
+    simp only [Bool.and_eq_true, beq_iff_eq] at hg
+    exact ⟨hg.1.1.1.1, hg.1.1.1.2, hg.1.1.2, hg.1.2, hg.2⟩
+  complete h hs := by
+    rcases hs with ⟨hv, hps, hls, hbd, hadm⟩
+    unfold hvccHeaderFieldsGate
+    simp only [Bool.and_eq_true, beq_iff_eq]
+    exact ⟨⟨⟨⟨hv, hps⟩, hls⟩, hbd⟩, hadm⟩
+  posWitness := {
+    configVersion := 1, profileSpace := 0, profileIdc := 4,
+    chromaFormatIdc := 2, bitDepthLumaMinus8 := 2, bitDepthChromaMinus8 := 2, lengthSizeMinusOne := 3
+  }
+  negWitness := {
+    configVersion := 1, profileSpace := 0, profileIdc := 2,
+    chromaFormatIdc := 2, bitDepthLumaMinus8 := 2, bitDepthChromaMinus8 := 2, lengthSizeMinusOne := 3
+  }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hvccHeaderFieldsSpec_iff (h : HvccHeaderFields) :
+    hvccHeaderFieldsSpec.gate h = true ↔ hvccHeaderFieldsSafe h :=
+  hvccHeaderFieldsSpec.iff_safe h
+
+def hevcChroma422ModeMapGate (m : Nat) : Bool :=
+  decide (m ≤ 34) && decide (mapChromaIntraMode 4 m 2 ≤ 34)
+
+def hevcChroma422ModeMapSpec :
+    AVGateSpec Nat (fun m => m ≤ 34 ∧ mapChromaIntraMode 4 m 2 ≤ 34) where
+  gate := hevcChroma422ModeMapGate
+  sound m hg := by
+    unfold hevcChroma422ModeMapGate at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    exact ⟨hg.1, hg.2⟩
+  complete m hs := by
+    rcases hs with ⟨hm, hmap⟩
+    unfold hevcChroma422ModeMapGate
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨hm, hmap⟩
+  posWitness := 26
+  negWitness := 35
+  nonVacuous := by decide
+  tight := by decide
+
+theorem hevcChroma422ModeMapSpec_iff (m : Nat) :
+    hevcChroma422ModeMapSpec.gate m = true ↔ (m ≤ 34 ∧ mapChromaIntraMode 4 m 2 ≤ 34) :=
+  hevcChroma422ModeMapSpec.iff_safe m
+
+def checkHevcExtPixFmtHvccAndSpsRoundtrip : Bool :=
+  let pairs : List (Nat × Nat × String × Nat) := [
+    (8, 1, "yuv420p", 1),
+    (10, 1, "yuv420p10le", 2),
+    (12, 1, "yuv420p12le", 4),
+    (8, 2, "yuv422p", 4),
+    (10, 2, "yuv422p10le", 4),
+    (12, 2, "yuv422p12le", 4),
+    (8, 3, "yuv444p", 4),
+    (10, 3, "yuv444p10le", 4),
+    (12, 3, "yuv444p12le", 4)
+  ]
+  let pixOk := pairs.all fun (bd, cf, pf, _) =>
+    pixFmtForBitDepthChroma bd cf == some pf &&
+    parseHevcPixFmt pf == some (bd, cf)
+  let rawOk :=
+    rawFrameByteSize 16 16 8 1 == 384 &&
+    rawFrameByteSize 16 16 10 1 == 768 &&
+    rawFrameByteSize 16 16 10 2 == 1024 &&
+    rawFrameByteSize 16 16 12 3 == 1536
+  let spsHvccOk :=
+    match writeVpsGen 10 1, writeSpsGen 64 48 6 10 1 (0, 2, 0, 2),
+          writeSpsGen 64 48 6 10 2 (0, 2, 0, 2), writeSpsGen 64 48 6 12 3 (0, 2, 0, 2) with
+    | some vpsNal, some spsMain10, some sps422_10, some sps444_12 =>
+      parseNalHeader vpsNal == some (nalVps, 0, 0) &&
+      parseNalHeader spsMain10 == some (nalSps, 0, 0) &&
+      parseNalHeader sps422_10 == some (nalSps, 0, 0) &&
+      parseNalHeader sps444_12 == some (nalSps, 0, 0) &&
+      (stripRbspWithMap (ByteArray.mk (vpsNal.data.extract 2 vpsNal.data.size))).isSome &&
+      (stripRbspWithMap (ByteArray.mk (spsMain10.data.extract 2 spsMain10.data.size))).isSome &&
+      (stripRbspWithMap (ByteArray.mk (sps422_10.data.extract 2 sps422_10.data.size))).isSome &&
+      (stripRbspWithMap (ByteArray.mk (sps444_12.data.extract 2 sps444_12.data.size))).isSome
+    | _, _, _, _ => false
+  let ptlOk := pairs.all fun (bd, cf, _, prof) =>
+    match ptlParamsForFormat bd cf with
+    | some (p, _, _, _) =>
+      p == prof &&
+      hvccHeaderFieldsGate {
+        configVersion := 1, profileSpace := 0, profileIdc := p,
+        chromaFormatIdc := cf, bitDepthLumaMinus8 := bd - 8,
+        bitDepthChromaMinus8 := bd - 8, lengthSizeMinusOne := 3
+      }
+    | none => false
+  let table84Ok :=
+    mapChromaIntraMode 4 26 2 == 26 &&
+    mapChromaIntraMode 4 10 2 == 10 &&
+    mapChromaIntraMode 4 18 2 == 21 &&
+    mapChromaIntraMode 4 34 2 == 31 &&
+    mapChromaIntraMode 0 26 2 == 0
+  pixOk && rawOk && spsHvccOk && ptlOk && table84Ok
+
+theorem hevcExt_pixFmt_hvcc_sps_and_chroma422_roundtrip_verified :
+    checkHevcExtPixFmtHvccAndSpsRoundtrip = true := by
+  decide
+
 end LeanAV.HevcMainProofs

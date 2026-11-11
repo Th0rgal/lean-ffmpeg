@@ -461,62 +461,86 @@ def writeScalingListSyntax (w0 : BitWriter) (entry : ScalingListSyntax) (size : 
         lastScale := target
     return some w
 
-/-- Resolve the effective 6×16 (`4x4`) and 6×64 (`8x8`) SPS scaling matrices (`ISO/IEC 14496-10` Table 7-2 Rule A). -/
-def resolveSpsScalingMatrices (seqPresent : Bool) (lists4x4 : Array ScalingListSyntax) (lists8x8 : Array ScalingListSyntax)
-    : Array (Array UInt8) × Array (Array UInt8) := Id.run do
-  if !seqPresent then
-    return (Array.replicate 6 flatScalingList4x4, Array.replicate 6 flatScalingList8x8)
-  let mut eff4 : Array (Array UInt8) := #[]
-  for i in [:6] do
-    let defList := if i < 3 then defaultScalingList4x4Intra else defaultScalingList4x4Inter
-    let resolved := match lists4x4.getD i .absent with
-      | .custom w => w
-      | .useDefault => defList
-      | .absent =>
-        if i == 0 then defaultScalingList4x4Intra
-        else if i == 3 then defaultScalingList4x4Inter
-        else eff4.getD (i - 1) defList
-    eff4 := eff4.push resolved
-  let mut eff8 : Array (Array UInt8) := #[]
-  for k in [:6] do
-    let defList := if k % 2 == 0 then defaultScalingList8x8Intra else defaultScalingList8x8Inter
-    let resolved := match lists8x8.getD k .absent with
-      | .custom w => w
-      | .useDefault => defList
-      | .absent =>
-        if k < 2 then defList
-        else eff8.getD (k - 2) defList
-    eff8 := eff8.push resolved
-  return (eff4, eff8)
+/-- Resolve a single SPS 4x4 scaling list slot (`0..5`, `ISO/IEC 14496-10` Table 7-2 Rule A). -/
+def resolveSps4x4Slot (lists4x4 : Array ScalingListSyntax) (eff4 : Array (Array UInt8)) (i : Nat) : Array UInt8 :=
+  let defList := if i < 3 then defaultScalingList4x4Intra else defaultScalingList4x4Inter
+  match lists4x4.getD i .absent with
+  | .custom w => w
+  | .useDefault => defList
+  | .absent =>
+    if i == 0 then defaultScalingList4x4Intra
+    else if i == 3 then defaultScalingList4x4Inter
+    else eff4.getD (i - 1) defList
 
-/-- Resolve the effective PPS scaling matrices on top of SPS (`ISO/IEC 14496-10` Table 7-2 Rule B). -/
+/-- Resolve a single SPS 8x8 scaling list slot (`0..5`, `ISO/IEC 14496-10` Table 7-2 Rule A). -/
+def resolveSps8x8Slot (lists8x8 : Array ScalingListSyntax) (eff8 : Array (Array UInt8))
+    (cnt8 k : Nat) : Array UInt8 :=
+  if k ≥ cnt8 then flatScalingList8x8
+  else
+    let defList := if k % 2 == 0 then defaultScalingList8x8Intra else defaultScalingList8x8Inter
+    match lists8x8.getD k .absent with
+    | .custom w => w
+    | .useDefault => defList
+    | .absent =>
+      if k < 2 then defList
+      else eff8.getD (k - 2) defList
+
+/-- Resolve the effective 6×16 (`4x4`) and 6×64 (`8x8`) SPS scaling matrices (`ISO/IEC 14496-10` Table 7-2 Rule A).
+    When `seqPresent == true` and `chromaFormatIdc != 3`, only `ScalingList8x8[0..1]` are signalled;
+    entries `2..5` remain flat (`16`) unless overridden at the PPS level (`chromaFormatIdc == 3` signals all `0..5`). -/
+def resolveSpsScalingMatrices (seqPresent : Bool) (lists4x4 : Array ScalingListSyntax) (lists8x8 : Array ScalingListSyntax)
+    (chromaFormatIdc : UInt8 := 1) : Array (Array UInt8) × Array (Array UInt8) :=
+  if !seqPresent then
+    (Array.replicate 6 flatScalingList4x4, Array.replicate 6 flatScalingList8x8)
+  else
+    let eff4 := [0, 1, 2, 3, 4, 5].foldl
+      (fun acc i => acc.push (resolveSps4x4Slot lists4x4 acc i)) #[]
+    let cnt8 := if chromaFormatIdc != 3 then 2 else 6
+    let eff8 := [0, 1, 2, 3, 4, 5].foldl
+      (fun acc k => acc.push (resolveSps8x8Slot lists8x8 acc cnt8 k)) #[]
+    (eff4, eff8)
+
+/-- Resolve a single PPS 4x4 scaling list slot (`0..5`, `ISO/IEC 14496-10` Table 7-2 Rule B). -/
+def resolvePps4x4Slot (spsSeqPresent : Bool) (spsEff4 : Array (Array UInt8))
+    (lists4x4 : Array ScalingListSyntax) (eff4 : Array (Array UInt8)) (i : Nat) : Array UInt8 :=
+  let defList := if i < 3 then defaultScalingList4x4Intra else defaultScalingList4x4Inter
+  match lists4x4.getD i .absent with
+  | .custom w => w
+  | .useDefault => defList
+  | .absent =>
+    if i == 0 then (if spsSeqPresent then spsEff4.getD 0 defaultScalingList4x4Intra else defaultScalingList4x4Intra)
+    else if i == 3 then (if spsSeqPresent then spsEff4.getD 3 defaultScalingList4x4Inter else defaultScalingList4x4Inter)
+    else eff4.getD (i - 1) defList
+
+/-- Resolve a single PPS 8x8 scaling list slot (`0..5`, `ISO/IEC 14496-10` Table 7-2 Rule B). -/
+def resolvePps8x8Slot (spsSeqPresent : Bool) (spsEff8 : Array (Array UInt8))
+    (lists8x8 : Array ScalingListSyntax) (eff8 : Array (Array UInt8)) (cnt8 k : Nat) : Array UInt8 :=
+  if k ≥ cnt8 then spsEff8.getD k flatScalingList8x8
+  else
+    let defList := if k % 2 == 0 then defaultScalingList8x8Intra else defaultScalingList8x8Inter
+    match lists8x8.getD k .absent with
+    | .custom w => w
+    | .useDefault => defList
+    | .absent =>
+      if k < 2 then (if spsSeqPresent then spsEff8.getD k defList else defList)
+      else eff8.getD (k - 2) defList
+
+/-- Resolve the effective PPS scaling matrices on top of SPS (`ISO/IEC 14496-10` Table 7-2 Rule B).
+    When `picPresent == true`, `cnt8` (`0` when `!transform8x8ModeFlag`, `2` when `chromaFormatIdc != 3`,
+    `6` when `chromaFormatIdc == 3`) bounds the signalled 8x8 lists; unsignalled slots inherit `spsEff8`. -/
 def resolvePpsScalingMatrices (spsSeqPresent : Bool) (spsEff4 spsEff8 : Array (Array UInt8))
     (picPresent : Bool) (lists4x4 : Array ScalingListSyntax) (lists8x8 : Array ScalingListSyntax)
-    : Array (Array UInt8) × Array (Array UInt8) := Id.run do
+    (transform8x8ModeFlag : Bool := true) (chromaFormatIdc : UInt8 := 1)
+    : Array (Array UInt8) × Array (Array UInt8) :=
   if !picPresent then
-    return (spsEff4, spsEff8)
-  let mut eff4 : Array (Array UInt8) := #[]
-  for i in [:6] do
-    let defList := if i < 3 then defaultScalingList4x4Intra else defaultScalingList4x4Inter
-    let resolved := match lists4x4.getD i .absent with
-      | .custom w => w
-      | .useDefault => defList
-      | .absent =>
-        if i == 0 then (if spsSeqPresent then spsEff4.getD 0 defaultScalingList4x4Intra else defaultScalingList4x4Intra)
-        else if i == 3 then (if spsSeqPresent then spsEff4.getD 3 defaultScalingList4x4Inter else defaultScalingList4x4Inter)
-        else eff4.getD (i - 1) defList
-    eff4 := eff4.push resolved
-  let mut eff8 : Array (Array UInt8) := #[]
-  for k in [:6] do
-    let defList := if k % 2 == 0 then defaultScalingList8x8Intra else defaultScalingList8x8Inter
-    let resolved := match lists8x8.getD k .absent with
-      | .custom w => w
-      | .useDefault => defList
-      | .absent =>
-        if k < 2 then (if spsSeqPresent then spsEff8.getD k defList else defList)
-        else eff8.getD (k - 2) defList
-    eff8 := eff8.push resolved
-  return (eff4, eff8)
+    (spsEff4, spsEff8)
+  else
+    let eff4 := [0, 1, 2, 3, 4, 5].foldl
+      (fun acc i => acc.push (resolvePps4x4Slot spsSeqPresent spsEff4 lists4x4 acc i)) #[]
+    let cnt8 := if transform8x8ModeFlag then (if chromaFormatIdc != 3 then 2 else 6) else 0
+    let eff8 := [0, 1, 2, 3, 4, 5].foldl
+      (fun acc k => acc.push (resolvePps8x8Slot spsSeqPresent spsEff8 lists8x8 acc cnt8 k)) #[]
+    (eff4, eff8)
 
 /-! ## 4. Full Sequence Parameter Set (`SPS`, `nal_unit_type = 7`, `ISO/IEC 14496-10` §7.3.2.1.1 & Annex E VUI) -/
 
@@ -868,6 +892,37 @@ def H264SpsFull.constraintByte (sps : H264SpsFull) : UInt8 :=
   (if sps.constraintSet5Flag then (0x04 : UInt8) else 0) |||
   (sps.reservedZero2Bits &&& 0x03)
 
+/-- Build a canonical `AvcDecoderConfigRecord` (`avcC`, `ISO/IEC 14496-15` §5.3.3.1.2) from SPS/PPS NALUs,
+    automatically populating the 4-byte High-profile extension trailer (`chroma_format`, `bit_depth_luma_minus8`,
+    `bit_depth_chroma_minus8`, `numOfSequenceParameterSetExt`) whenever `isAvccExtProfile sps.profileIdc`. -/
+def buildAvcDecoderConfigRecordFromSps (sps : H264SpsFull) (spsNal ppsNal : ByteArray)
+    (lengthSizeMinusOne : UInt8 := 3) : AvcDecoderConfigRecord :=
+  let hasExt := isAvccExtProfile sps.profileIdc
+  { configurationVersion := 1
+    avcProfileIndication := sps.profileIdc
+    profileCompatibility := sps.constraintByte
+    avcLevelIndication   := sps.levelIdc
+    lengthSizeMinusOne   := lengthSizeMinusOne &&& 0x03
+    spsNalus             := #[spsNal]
+    ppsNalus             := #[ppsNal]
+    hasHighExt           := hasExt
+    chromaFormatIdc      := if hasExt then sps.chromaFormatIdc else 1
+    bitDepthLumaMinus8   := if hasExt then sps.bitDepthLumaMinus8 else 0
+    bitDepthChromaMinus8 := if hasExt then sps.bitDepthChromaMinus8 else 0
+    spsExtNalus          := #[] }
+
+/-- Boolean predicate for High-tier profiles (`100` High, `110` High 10, `122` High 4:2:2,
+    `244` High 4:4:4 Predictive) and ITU-T H.264 Annex A §A.2.4–A.2.7 chroma/bit-depth/bypass constraints. -/
+def isHighTierSpsProfileValid (sps : H264SpsFull) : Bool :=
+  (sps.profileIdc == 100 || sps.profileIdc == 110 || sps.profileIdc == 122 || sps.profileIdc == 244) &&
+  sps.chromaFormatIdc ≤ 3 &&
+  (!sps.separateColourPlaneFlag || sps.chromaFormatIdc == 3) &&
+  sps.bitDepthLumaMinus8 ≤ 4 &&
+  sps.bitDepthChromaMinus8 ≤ 4 &&
+  (sps.profileIdc != 100 || (sps.chromaFormatIdc ≤ 1 && sps.bitDepthLumaMinus8 == 0 && sps.bitDepthChromaMinus8 == 0 && !sps.qpprimeYZeroTransformBypass)) &&
+  (sps.profileIdc != 110 || (sps.chromaFormatIdc ≤ 1 && sps.bitDepthLumaMinus8 ≤ 2 && sps.bitDepthChromaMinus8 ≤ 2 && !sps.qpprimeYZeroTransformBypass)) &&
+  (sps.profileIdc != 122 || (sps.chromaFormatIdc ≤ 2 && sps.bitDepthLumaMinus8 ≤ 2 && sps.bitDepthChromaMinus8 ≤ 2 && !sps.qpprimeYZeroTransformBypass))
+
 /-- Parse a complete H.264 `SPS` NALU (`nal_unit_type = 7`, EBSP input including 1-byte NAL header). -/
 def parseH264SpsFull (nalPayload : ByteSlice) : Option H264SpsFull := Id.run do
   let rbsp := stripRbspEmulationBytesH264 nalPayload true
@@ -928,7 +983,7 @@ def parseH264SpsFull (nalPayload : ByteSlice) : Option H264SpsFull := Id.run do
             r := rNext
       syn4 := s4
       syn8 := s8
-  let (eff4, eff8) := resolveSpsScalingMatrices seqScalePres syn4 syn8
+  let (eff4, eff8) := resolveSpsScalingMatrices seqScalePres syn4 syn8 chromaIdc
   let some (l2FnM4, rFn) := r.readUE | return none
   if l2FnM4 > 12 then return none
   let some (pocT, rPoc) := rFn.readUE | return none
@@ -1238,7 +1293,7 @@ def parseH264PpsFull (nalPayload : ByteSlice) (spsOpt : Option H264SpsFull := no
   let spsSeqPres := match spsOpt with | some s => s.seqScalingMatrixPresentFlag | none => false
   let spsEff4 := match spsOpt with | some s => s.effectiveScaling4x4 | none => Array.replicate 6 flatScalingList4x4
   let spsEff8 := match spsOpt with | some s => s.effectiveScaling8x8 | none => Array.replicate 6 flatScalingList8x8
-  let (eff4, eff8) := resolvePpsScalingMatrices spsSeqPres spsEff4 spsEff8 picScalePres syn4 syn8
+  let (eff4, eff8) := resolvePpsScalingMatrices spsSeqPres spsEff4 spsEff8 picScalePres syn4 syn8 tr8x8 chromaIdc
   return some {
     nalRefIdc, ppsId := ppsId64.toUInt8, spsId := spsId64.toUInt8,
     entropyCodingModeFlag := entBit == 1,
@@ -2018,6 +2073,32 @@ def H264SliceKind.toString : H264SliceKind → String
   | .SP => "SP"
   | .SI => "SI"
 
+/-- Peek `(pps_id, sps_id)` from a PPS NALU EBSP slice without requiring a pre-selected SPS. -/
+def peekH264PpsIds (nalPayload : ByteSlice) : Option (UInt8 × UInt8) := Id.run do
+  let rbsp := stripRbspEmulationBytesH264 nalPayload true
+  if rbsp.data.size < 2 then return none
+  let hdr := byteAtPure rbsp 0
+  if (hdr &&& 0x80) != 0 || (hdr &&& 0x1F) != 8 then return none
+  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.data.size }, bitOffset := 8 }
+  let some (ppsId64, r1) := r0.readUE | return none
+  let some (spsId64, _) := r1.readUE | return none
+  if ppsId64 > 255 || spsId64 > 31 then return none
+  return some (ppsId64.toUInt8, spsId64.toUInt8)
+
+/-- Peek `pic_parameter_set_id` from a coded slice (`nal_unit_type ∈ {1, 5}`) EBSP slice. -/
+def peekH264SlicePpsId (nalPayload : ByteSlice) : Option UInt8 := Id.run do
+  let rbsp := stripRbspEmulationBytesH264 nalPayload true
+  if rbsp.data.size < 2 then return none
+  let hdr := byteAtPure rbsp 0
+  let nt := hdr &&& 0x1F
+  if (hdr &&& 0x80) != 0 || (nt != 1 && nt != 5) then return none
+  let r0 : BitReader := { slice := { ba := rbsp, off := 0, len := rbsp.data.size }, bitOffset := 8 }
+  let some (_, r1) := r0.readUE | return none
+  let some (_, r2) := r1.readUE | return none
+  let some (ppsId64, _) := r2.readUE | return none
+  if ppsId64 > 255 then return none
+  return some ppsId64.toUInt8
+
 /-- Probe an Annex-B `.264` stream OR an ISOBMFF `.mp4` (via `avcC` + `mdat` or raw `avcC` bytes)
     and return a deterministic JSON report covering SPS, PPS, `avcC` round-trip, Annex-B <-> AVCC round-trip,
     and per-slice `(nal_unit_type, slice_type, frame_num, slice_qp_y, poc, slice_data_bit_offset)`. -/
@@ -2038,8 +2119,11 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
       else return none
       spsList := spsList.push sps
     for pNal in avccRec.ppsNalus do
-      let activeSps := spsList[0]?
-      let some pps := parseH264PpsFull (ByteSlice.ofByteArray pNal) activeSps | return none
+      let pSlice := ByteSlice.ofByteArray pNal
+      let activeSps := match peekH264PpsIds pSlice with
+        | some (_, sid) => (spsList.find? (fun s => s.spsId == sid)).orElse (fun _ => spsList[0]?)
+        | none => spsList[0]?
+      let some pps := parseH264PpsFull pSlice activeSps | return none
       let chIdc := match activeSps with | some s => s.chromaFormatIdc | none => 1
       let bdL := match activeSps with | some s => s.bitDepthLumaMinus8 | none => 0
       if let some pRe := serializeH264PpsFull pps chIdc bdL then
@@ -2070,8 +2154,11 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
         else return none
         if spsList.all (fun x => x.spsId != sps.spsId) then spsList := spsList.push sps
       else if nt == 8 then
-        let activeSps := spsList[0]?
-        let some pps := parseH264PpsFull (ByteSlice.ofByteArray nal) activeSps | return none
+        let pSlice := ByteSlice.ofByteArray nal
+        let activeSps := match peekH264PpsIds pSlice with
+          | some (_, sid) => (spsList.find? (fun s => s.spsId == sid)).orElse (fun _ => spsList[0]?)
+          | none => spsList[0]?
+        let some pps := parseH264PpsFull pSlice activeSps | return none
         let chIdc := match activeSps with | some s => s.chromaFormatIdc | none => 1
         let bdL := match activeSps with | some s => s.bitDepthLumaMinus8 | none => 0
         if let some pRe := serializeH264PpsFull pps chIdc bdL then
@@ -2089,43 +2176,49 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
   let mut cabacPrefixRbspExactOk := true
   let mut sliceJsons : Array String := #[]
   for nal in vclNalus do
-    let some sh := parseH264SliceHeaderFull (ByteSlice.ofByteArray nal) sps0 pps0 | return none
-    if let some wHdr := writeH264SliceHeaderBits sh sps0 pps0 then
+    let nalSlice := ByteSlice.ofByteArray nal
+    let ppsCur := match peekH264SlicePpsId nalSlice with
+      | some pid => (ppsList.find? (fun p => p.ppsId == pid)).getD pps0
+      | none => pps0
+    let spsCur := (spsList.find? (fun s => s.spsId == ppsCur.spsId)).getD sps0
+    let some sh := parseH264SliceHeaderFull nalSlice spsCur ppsCur | return none
+    if let some wHdr := writeH264SliceHeaderBits sh spsCur ppsCur then
       if wHdr.totalBitsWritten != sh.sliceDataBitOffset then
         sliceHeaderBitOffsetOk := false
-      if pps0.entropyCodingModeFlag && wHdr.bitsUsed != 0 then
+      if ppsCur.entropyCodingModeFlag && wHdr.bitsUsed != 0 then
         sliceHeaderBitOffsetOk := false
     else
       sliceHeaderBitOffsetOk := false
-    if let some shRe := serializeH264SliceHeaderFull sh sps0 pps0 then
-      if parseH264SliceHeaderFull (ByteSlice.ofByteArray shRe) sps0 pps0 != some sh then
+    if let some shRe := serializeH264SliceHeaderFull sh spsCur ppsCur then
+      if parseH264SliceHeaderFull (ByteSlice.ofByteArray shRe) spsCur ppsCur != some sh then
         sliceHeaderRoundtripOk := false
-      if pps0.entropyCodingModeFlag then
-        let origRbsp := stripRbspEmulationBytesH264 (ByteSlice.ofByteArray nal) true
+      if ppsCur.entropyCodingModeFlag then
+        let origRbsp := stripRbspEmulationBytesH264 nalSlice true
         let reRbsp := stripRbspEmulationBytesH264 (ByteSlice.ofByteArray shRe) true
         let hdrByteLen := sh.sliceDataBitOffset / 8
         if sh.sliceDataBitOffset % 8 != 0 || reRbsp != extractBytesPure origRbsp 0 hdrByteLen then
           cabacPrefixRbspExactOk := false
     else
       sliceHeaderRoundtripOk := false
-      if pps0.entropyCodingModeFlag then cabacPrefixRbspExactOk := false
+      if ppsCur.entropyCodingModeFlag then cabacPrefixRbspExactOk := false
     let hasMmco5 := sh.mmcoOps.any (fun m => m.opcode == 5)
     let isIdr := sh.nalUnitType == 5
+    let isPrimaryPlane := !spsCur.separateColourPlaneFlag || sh.colourPlaneId == 0
     let mut pocVal : Int := 0
-    if sps0.picOrderCntType == 0 then
-      let (_, _, p, stNext) := derivePicOrderCntType0 poc0St sps0.log2MaxPicOrderCntLsbMinus4 isIdr sh.nalRefIdc
-        hasMmco5 sh.fieldPicFlag sh.bottomFieldFlag pps0.bottomFieldPicOrderInFramePresent sh.picOrderCntLsb sh.deltaPicOrderCntBottom
-      if sh.firstMbInSlice == 0 then poc0St := stNext
+    if spsCur.picOrderCntType == 0 then
+      let (_, _, p, stNext) := derivePicOrderCntType0 poc0St spsCur.log2MaxPicOrderCntLsbMinus4 isIdr sh.nalRefIdc
+        hasMmco5 sh.fieldPicFlag sh.bottomFieldFlag ppsCur.bottomFieldPicOrderInFramePresent sh.picOrderCntLsb sh.deltaPicOrderCntBottom
+      if sh.firstMbInSlice == 0 && isPrimaryPlane then poc0St := stNext
       pocVal := p
-    else if sps0.picOrderCntType == 2 then
-      let (_, _, p, stNext) := derivePicOrderCntType2 poc2St sps0.log2MaxFrameNumMinus4 isIdr sh.nalRefIdc hasMmco5 sh.frameNum
-      if sh.firstMbInSlice == 0 then poc2St := stNext
+    else if spsCur.picOrderCntType == 2 then
+      let (_, _, p, stNext) := derivePicOrderCntType2 poc2St spsCur.log2MaxFrameNumMinus4 isIdr sh.nalRefIdc hasMmco5 sh.frameNum
+      if sh.firstMbInSlice == 0 && isPrimaryPlane then poc2St := stNext
       pocVal := p
-    if sh.firstMbInSlice == 0 then
+    if sh.firstMbInSlice == 0 && isPrimaryPlane then
       let jA := s!"\{\"nal_type\":{sh.nalUnitType},\"nal_ref_idc\":{sh.nalRefIdc},\"pict_type\":\"{sh.sliceKind.toString}\","
       let jB := s!"\"slice_type\":{sh.sliceType},\"frame_num\":{sh.frameNum},\"poc\":{pocVal},"
       let jC := s!"\"slice_qp_y\":{sh.sliceQpY},\"cabac_init_idc\":{sh.cabacInitIdc},"
-      let jD := s!"\"data_bit_offset\":{sh.sliceDataBitOffset}}"
+      let jD := s!"\"colour_plane_id\":{sh.colourPlaneId},\"data_bit_offset\":{sh.sliceDataBitOffset}}"
       sliceJsons := sliceJsons.push (jA ++ jB ++ jC ++ jD)
   let slicesStr := String.intercalate "," sliceJsons.toList
   let bdL := sps0.bitDepthLumaMinus8.toNat + 8
@@ -2133,7 +2226,7 @@ def probeH264SyntaxJson (raw : ByteArray) : Option String := Id.run do
   let initQp := pps0.picInitQpMinus26.toInt + 26
   let s0 := s!"\{\"ok\":true,\"profile_idc\":{sps0.profileIdc},\"level_idc\":{sps0.levelIdc},"
   let s0b := s!"\"sps_id\":{sps0.spsId},\"pps_id\":{pps0.ppsId},"
-  let s1 := s!"\"chroma_format_idc\":{sps0.chromaFormatIdc},\"bit_depth_luma\":{bdL},\"bit_depth_chroma\":{bdC},"
+  let s1 := s!"\"chroma_format_idc\":{sps0.chromaFormatIdc},\"separate_colour_plane_flag\":{sps0.separateColourPlaneFlag},\"bit_depth_luma\":{bdL},\"bit_depth_chroma\":{bdC},"
   let s2 := s!"\"qpprime_bypass\":{sps0.qpprimeYZeroTransformBypass},\"seq_scaling_matrix\":{sps0.seqScalingMatrixPresentFlag},"
   let s2b := s!"\"pic_scaling_matrix\":{pps0.picScalingMatrixPresentFlag},\"weighted_pred\":{pps0.weightedPredFlag},"
   let s2c := s!"\"weighted_bipred_idc\":{pps0.weightedBipredIdc},"

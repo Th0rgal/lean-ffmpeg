@@ -1632,4 +1632,755 @@ theorem swar_scale2x2_u8x4_eq_scalar
     swarScale2x2U64 0x281E140A281E140A 0x50463C3250463C32 = 0x0037002300370023 := by
   refine ⟨by omega, by omega, by decide, by decide⟩
 
+/-! ## P1.1 High-Bit-Depth Formats, Dithering, PQ/HLG Transfers, and Gamut Mapping -/
+
+@[inline]
+def readLe16At (ba : ByteArray) (byteOff : Nat) : Nat :=
+  if byteOff + 1 < ba.size then
+    (ba.get! byteOff).toNat ||| (((ba.get! (byteOff + 1)).toNat) <<< 8)
+  else 0
+
+@[inline]
+def pushLe16 (ba : ByteArray) (v : Nat) : ByteArray :=
+  (ba.push (v &&& 0xFF).toUInt8).push ((v >>> 8) &&& 0xFF).toUInt8
+
+@[inline]
+def clampNatMax (v maxCode : Nat) : Nat :=
+  if v ≤ maxCode then v else maxCode
+
+@[inline]
+def clipIntMax (v : Int) (maxCode : Nat) : Nat :=
+  if v ≤ 0 then 0 else Nat.min v.toNat maxCode
+
+/-- Pack a 10-bit planar `yuv420p10le` raw frame into semi-planar `p010le` (`<< 6` with zero low bits). -/
+def yuv420p10leToP010leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let ch := PixelFormat.chromaCeilDiv2 h
+  let yCount := w * h
+  let uvCount := cw * ch
+  let mut out := ByteArray.emptyWithCapacity (2 * yCount + 4 * uvCount)
+  for i in [:yCount] do
+    let s10 := clampNatMax (readLe16At src (2 * i)) 1023
+    out := pushLe16 out (s10 <<< 6)
+  let uBase := 2 * yCount
+  let vBase := uBase + 2 * uvCount
+  for i in [:uvCount] do
+    let u10 := clampNatMax (readLe16At src (uBase + 2 * i)) 1023
+    let v10 := clampNatMax (readLe16At src (vBase + 2 * i)) 1023
+    out := pushLe16 out (u10 <<< 6)
+    out := pushLe16 out (v10 <<< 6)
+  return out
+
+/-- Unpack semi-planar `p010le` into canonical planar `yuv420p10le` (`>> 6`). -/
+def p010leToYuv420p10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let ch := PixelFormat.chromaCeilDiv2 h
+  let yCount := w * h
+  let uvCount := cw * ch
+  let mut yOut := ByteArray.emptyWithCapacity (2 * yCount)
+  for i in [:yCount] do
+    let s16 := readLe16At src (2 * i)
+    yOut := pushLe16 yOut ((s16 >>> 6) &&& 0x3FF)
+  let uvBase := 2 * yCount
+  let mut uOut := ByteArray.emptyWithCapacity (2 * uvCount)
+  let mut vOut := ByteArray.emptyWithCapacity (2 * uvCount)
+  for i in [:uvCount] do
+    let u16 := readLe16At src (uvBase + 4 * i)
+    let v16 := readLe16At src (uvBase + 4 * i + 2)
+    uOut := pushLe16 uOut ((u16 >>> 6) &&& 0x3FF)
+    vOut := pushLe16 vOut ((v16 >>> 6) &&& 0x3FF)
+  return yOut ++ uOut ++ vOut
+
+theorem p010_shift_roundtrip_sample (s : Nat) (hs : s ≤ 1023) :
+    ((s <<< 6) >>> 6) &&& 0x3FF = s := by
+  have h1 : (s <<< 6) >>> 6 = s := by
+    simp [Nat.shiftLeft_eq, Nat.shiftRight_eq_div_pow]
+  have h2 : s &&& 1023 = s := Nat.and_two_pow_sub_one_eq_mod s 10 |>.trans (Nat.mod_eq_of_lt (by omega))
+  simpa [h1] using h2
+
+/-- Upsample `yuv420p10le` vertically to `yuv422p10le` (exact chroma row duplication). -/
+def yuv420p10leToYuv422p10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let ch := PixelFormat.chromaCeilDiv2 h
+  let yBytes := 2 * w * h
+  let uBase := yBytes
+  let vBase := uBase + 2 * cw * ch
+  let mut uOut := ByteArray.emptyWithCapacity (2 * cw * h)
+  let mut vOut := ByteArray.emptyWithCapacity (2 * cw * h)
+  for r in [:h] do
+    let sr := if ch == 0 then 0 else Nat.min (ch - 1) (r / 2)
+    for c in [:cw] do
+      uOut := pushLe16 uOut (clampNatMax (readLe16At src (uBase + 2 * (sr * cw + c))) 1023)
+      vOut := pushLe16 vOut (clampNatMax (readLe16At src (vBase + 2 * (sr * cw + c))) 1023)
+  return (src.extract 0 yBytes) ++ uOut ++ vOut
+
+/-- Downsample `yuv422p10le` vertically to `yuv420p10le` (rounded 2-row box average). -/
+def yuv422p10leToYuv420p10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let ch := PixelFormat.chromaCeilDiv2 h
+  let yBytes := 2 * w * h
+  let uBase := yBytes
+  let vBase := uBase + 2 * cw * h
+  let mut uOut := ByteArray.emptyWithCapacity (2 * cw * ch)
+  let mut vOut := ByteArray.emptyWithCapacity (2 * cw * ch)
+  for r in [:ch] do
+    let r0 := Nat.min (h - 1) (2 * r)
+    let r1 := Nat.min (h - 1) (2 * r + 1)
+    for c in [:cw] do
+      let u0 := clampNatMax (readLe16At src (uBase + 2 * (r0 * cw + c))) 1023
+      let u1 := clampNatMax (readLe16At src (uBase + 2 * (r1 * cw + c))) 1023
+      let v0 := clampNatMax (readLe16At src (vBase + 2 * (r0 * cw + c))) 1023
+      let v1 := clampNatMax (readLe16At src (vBase + 2 * (r1 * cw + c))) 1023
+      uOut := pushLe16 uOut ((u0 + u1 + 1) / 2)
+      vOut := pushLe16 vOut ((v0 + v1 + 1) / 2)
+  return (src.extract 0 yBytes) ++ uOut ++ vOut
+
+/-- Upsample `yuv422p10le` horizontally to `yuv444p10le` (exact chroma column duplication). -/
+def yuv422p10leToYuv444p10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let yBytes := 2 * w * h
+  let uBase := yBytes
+  let vBase := uBase + 2 * cw * h
+  let mut uOut := ByteArray.emptyWithCapacity yBytes
+  let mut vOut := ByteArray.emptyWithCapacity yBytes
+  for r in [:h] do
+    for c in [:w] do
+      let sc := if cw == 0 then 0 else Nat.min (cw - 1) (c / 2)
+      uOut := pushLe16 uOut (clampNatMax (readLe16At src (uBase + 2 * (r * cw + sc))) 1023)
+      vOut := pushLe16 vOut (clampNatMax (readLe16At src (vBase + 2 * (r * cw + sc))) 1023)
+  return (src.extract 0 yBytes) ++ uOut ++ vOut
+
+/-- Downsample `yuv444p10le` horizontally to `yuv422p10le` (rounded 2-column box average). -/
+def yuv444p10leToYuv422p10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let cw := PixelFormat.chromaCeilDiv2 w
+  let yBytes := 2 * w * h
+  let uBase := yBytes
+  let vBase := uBase + yBytes
+  let mut uOut := ByteArray.emptyWithCapacity (2 * cw * h)
+  let mut vOut := ByteArray.emptyWithCapacity (2 * cw * h)
+  for r in [:h] do
+    for c in [:cw] do
+      let c0 := Nat.min (w - 1) (2 * c)
+      let c1 := Nat.min (w - 1) (2 * c + 1)
+      let u0 := clampNatMax (readLe16At src (uBase + 2 * (r * w + c0))) 1023
+      let u1 := clampNatMax (readLe16At src (uBase + 2 * (r * w + c1))) 1023
+      let v0 := clampNatMax (readLe16At src (vBase + 2 * (r * w + c0))) 1023
+      let v1 := clampNatMax (readLe16At src (vBase + 2 * (r * w + c1))) 1023
+      uOut := pushLe16 uOut ((u0 + u1 + 1) / 2)
+      vOut := pushLe16 vOut ((v0 + v1 + 1) / 2)
+  return (src.extract 0 yBytes) ++ uOut ++ vOut
+
+def yuv420p10leToYuv444p10leBytes (src : ByteArray) (w h : Nat) : ByteArray :=
+  yuv422p10leToYuv444p10leBytes (yuv420p10leToYuv422p10leBytes src w h) w h
+
+def yuv444p10leToYuv420p10leBytes (src : ByteArray) (w h : Nat) : ByteArray :=
+  yuv422p10leToYuv420p10leBytes (yuv444p10leToYuv422p10leBytes src w h) w h
+
+/-- Lossless 10-bit -> 12-bit sample promotion (`s10 <<< 2`, matching `swscale` bitexact). -/
+@[inline] def promote10To12Sample (s10 : Nat) : Nat := (clampNatMax s10 1023) <<< 2
+
+/-- Rounded/clamped 12-bit -> 10-bit sample demotion (`(s12 + 2) >>> 2`, clamped to `1023`). -/
+@[inline] def demote12To10Sample (s12 : Nat) : Nat := clampNatMax (((clampNatMax s12 4095) + 2) >>> 2) 1023
+
+theorem promote_demote_10_12_roundtrip (s : Nat) (hs : s ≤ 1023) :
+    demote12To10Sample (promote10To12Sample s) = s := by
+  dsimp [demote12To10Sample, promote10To12Sample, clampNatMax]
+  have h1 : (s <<< 2) ≤ 4095 := by rw [Nat.shiftLeft_eq]; omega
+  have h2 : ((s <<< 2) + 2) >>> 2 = s := by rw [Nat.shiftLeft_eq, Nat.shiftRight_eq_div_pow]; omega
+  simp [hs, h1, h2]
+
+def promoteU16Buffer10To12 (src : ByteArray) (sampleCount : Nat) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity (2 * sampleCount)
+  for i in [:sampleCount] do
+    out := pushLe16 out (promote10To12Sample (readLe16At src (2 * i)))
+  return out
+
+def demoteU16Buffer12To10 (src : ByteArray) (sampleCount : Nat) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity (2 * sampleCount)
+  for i in [:sampleCount] do
+    out := pushLe16 out (demote12To10Sample (readLe16At src (2 * i)))
+  return out
+
+/-- Full-range 10-bit `YUV444P10LE` pixel to 10-bit `(G, B, R)` for `gbrp10le` (`BT.709` / `BT.2020`). -/
+@[inline]
+def yuv10PixelToGbr10 (m : ColorMatrix) (y10 u10 v10 : Nat) : Nat × Nat × Nat :=
+  let c := getCoeffsQ10 m
+  let y : Int := Int.ofNat (clampNatMax y10 1023)
+  let u : Int := Int.ofNat (clampNatMax u10 1023) - 512
+  let v : Int := Int.ofNat (clampNatMax v10 1023) - 512
+  let r := y + (c.cCrR.toInt * v + 512) / 1024
+  let g := y - (c.cCbG.toInt * u + c.cCrG.toInt * v + 512) / 1024
+  let b := y + (c.cCbB.toInt * u + 512) / 1024
+  (clipIntMax g 1023, clipIntMax b 1023, clipIntMax r 1023)
+
+/-- Full-range 10-bit `(G, B, R)` pixel to 10-bit `(Y, U, V)` (`BT.709` vs `BT.2020`). -/
+@[inline]
+def gbr10PixelToYuv10 (m : ColorMatrix) (g10 b10 r10 : Nat) : Nat × Nat × Nat :=
+  let r : Int := Int.ofNat (clampNatMax r10 1023)
+  let g : Int := Int.ofNat (clampNatMax g10 1023)
+  let b : Int := Int.ofNat (clampNatMax b10 1023)
+  match m with
+  | .bt2020 | .bt2020ncl =>
+    let y := (269 * r + 694 * g + 61 * b + 512) / 1024
+    let u := 512 + ((-143) * r - 369 * g + 512 * b + 512) / 1024
+    let v := 512 + (512 * r - 471 * g - 41 * b + 512) / 1024
+    (clipIntMax y 1023, clipIntMax u 1023, clipIntMax v 1023)
+  | .bt601 =>
+    let y := (306 * r + 601 * g + 117 * b + 512) / 1024
+    let u := 512 + ((-173) * r - 339 * g + 512 * b + 512) / 1024
+    let v := 512 + (512 * r - 429 * g - 83 * b + 512) / 1024
+    (clipIntMax y 1023, clipIntMax u 1023, clipIntMax v 1023)
+  | _ =>
+    let y := (218 * r + 732 * g + 74 * b + 512) / 1024
+    let u := 512 + ((-117) * r - 395 * g + 512 * b + 512) / 1024
+    let v := 512 + (512 * r - 465 * g - 47 * b + 512) / 1024
+    (clipIntMax y 1023, clipIntMax u 1023, clipIntMax v 1023)
+
+def yuv444p10leToGbrp10leBytes (src : ByteArray) (w h : Nat) (m : ColorMatrix := .bt709) : ByteArray := Id.run do
+  let n := w * h
+  let uBase := 2 * n
+  let vBase := 4 * n
+  let mut gOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut bOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut rOut := ByteArray.emptyWithCapacity (2 * n)
+  for i in [:n] do
+    let y := readLe16At src (2 * i)
+    let u := readLe16At src (uBase + 2 * i)
+    let v := readLe16At src (vBase + 2 * i)
+    let (g, b, r) := yuv10PixelToGbr10 m y u v
+    gOut := pushLe16 gOut g
+    bOut := pushLe16 bOut b
+    rOut := pushLe16 rOut r
+  return gOut ++ bOut ++ rOut
+
+def gbrp10leToYuv444p10leBytes (src : ByteArray) (w h : Nat) (m : ColorMatrix := .bt709) : ByteArray := Id.run do
+  let n := w * h
+  let bBase := 2 * n
+  let rBase := 4 * n
+  let mut yOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut uOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut vOut := ByteArray.emptyWithCapacity (2 * n)
+  for i in [:n] do
+    let g := readLe16At src (2 * i)
+    let b := readLe16At src (bBase + 2 * i)
+    let r := readLe16At src (rBase + 2 * i)
+    let (y, u, v) := gbr10PixelToYuv10 m g b r
+    yOut := pushLe16 yOut y
+    uOut := pushLe16 uOut u
+    vOut := pushLe16 vOut v
+  return yOut ++ uOut ++ vOut
+
+/-- Bit-replicated 10-bit -> 16-bit promotion (`(x <<< 6) ||| (x >>> 4)` = `64 * x + x / 16`), matching `swscale` `gbrp10le -> rgba64le`. -/
+@[inline]
+def expand10To16Sample (s10 : Nat) : Nat :=
+  let v := clampNatMax s10 1023
+  v * 64 + v / 16
+
+@[inline]
+def shrink16To10Sample (s16 : Nat) : Nat :=
+  (clampNatMax s16 65535) / 64
+
+theorem expand_shrink_10_16_roundtrip (s : Nat) (hs : s ≤ 1023) :
+    shrink16To10Sample (expand10To16Sample s) = s := by
+  dsimp [shrink16To10Sample, expand10To16Sample, clampNatMax]
+  have h1 : s * 64 + s / 16 ≤ 65535 := by omega
+  simp [hs, h1]
+  omega
+
+def gbrp10leToRgba64leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let n := w * h
+  let bBase := 2 * n
+  let rBase := 4 * n
+  let mut out := ByteArray.emptyWithCapacity (8 * n)
+  for i in [:n] do
+    let g := expand10To16Sample (readLe16At src (2 * i))
+    let b := expand10To16Sample (readLe16At src (bBase + 2 * i))
+    let r := expand10To16Sample (readLe16At src (rBase + 2 * i))
+    out := pushLe16 out r
+    out := pushLe16 out g
+    out := pushLe16 out b
+    out := pushLe16 out 65535
+  return out
+
+def rgba64leToGbrp10leBytes (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let n := w * h
+  let mut gOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut bOut := ByteArray.emptyWithCapacity (2 * n)
+  let mut rOut := ByteArray.emptyWithCapacity (2 * n)
+  for i in [:n] do
+    let r := shrink16To10Sample (readLe16At src (8 * i))
+    let g := shrink16To10Sample (readLe16At src (8 * i + 2))
+    let b := shrink16To10Sample (readLe16At src (8 * i + 4))
+    gOut := pushLe16 gOut g
+    bOut := pushLe16 bOut b
+    rOut := pushLe16 rOut r
+  return gOut ++ bOut ++ rOut
+
+/-- Arbitrary 10-bit or 12-bit Q8 bilinear plane scaler parameterized by `maxCode`. -/
+def scalePlaneBilinearHighBitBytes
+    (src : ByteArray) (srcByteOff srcW srcH dstW dstH maxCode : Nat) : ByteArray := Id.run do
+  if dstW == 0 || dstH == 0 then return ByteArray.empty
+  if srcW == 0 || srcH == 0 then
+    return ByteArray.mk (Array.replicate (2 * dstW * dstH) 0)
+  let mut out := ByteArray.emptyWithCapacity (2 * dstW * dstH)
+  for dy in [:dstH] do
+    let syQ8 := (dy * srcH * 256) / dstH
+    let sy0 := Nat.min (srcH - 1) (syQ8 / 256)
+    let sy1 := Nat.min (srcH - 1) (sy0 + 1)
+    let fy := syQ8 % 256
+    let ify := 256 - fy
+    for dx in [:dstW] do
+      let sxQ8 := (dx * srcW * 256) / dstW
+      let sx0 := Nat.min (srcW - 1) (sxQ8 / 256)
+      let sx1 := Nat.min (srcW - 1) (sx0 + 1)
+      let fx := sxQ8 % 256
+      let ifx := 256 - fx
+      let p00 := clampNatMax (readLe16At src (srcByteOff + 2 * (sy0 * srcW + sx0))) maxCode
+      let p01 := clampNatMax (readLe16At src (srcByteOff + 2 * (sy0 * srcW + sx1))) maxCode
+      let p10 := clampNatMax (readLe16At src (srcByteOff + 2 * (sy1 * srcW + sx0))) maxCode
+      let p11 := clampNatMax (readLe16At src (srcByteOff + 2 * (sy1 * srcW + sx1))) maxCode
+      let top := ifx * p00 + fx * p01
+      let bot := ifx * p10 + fx * p11
+      let val := clampNatMax ((ify * top + fy * bot + 32768) / 65536) maxCode
+      out := pushLe16 out val
+  return out
+
+/-- Bilinearly scale any planar 10-bit or 12-bit `4:2:0` / `4:2:2` / `4:4:4` / `gbrp10le` raw buffer. -/
+def scalePlanarHighBitFrameBytes
+    (fmt : PixelFormat) (src : ByteArray) (srcW srcH dstW dstH : Nat) : ByteArray :=
+  let (sx, sy) := fmt.chromaSubsampling
+  let srcCw := if sx == 2 then PixelFormat.chromaCeilDiv2 srcW else srcW
+  let srcCh := if sy == 2 then PixelFormat.chromaCeilDiv2 srcH else srcH
+  let dstCw := if sx == 2 then PixelFormat.chromaCeilDiv2 dstW else dstW
+  let dstCh := if sy == 2 then PixelFormat.chromaCeilDiv2 dstH else dstH
+  let maxCode := if fmt.bitDepth == 12 then 4095 else 1023
+  let yOff := 0
+  let uOff := 2 * srcW * srcH
+  let vOff := uOff + 2 * srcCw * srcCh
+  let yScaled := scalePlaneBilinearHighBitBytes src yOff srcW srcH dstW dstH maxCode
+  let uScaled := scalePlaneBilinearHighBitBytes src uOff srcCw srcCh dstCw dstCh maxCode
+  let vScaled := scalePlaneBilinearHighBitBytes src vOff srcCw srcCh dstCw dstCh maxCode
+  yScaled ++ uScaled ++ vScaled
+
+/-- Canonical 4×4 Bayer threshold matrix (`0..15`). -/
+def bayer4x4Threshold (row col : Nat) : Nat :=
+  let r := row % 4
+  let c := col % 4
+  match r, c with
+  | 0, 0 => 0  | 0, 1 => 8  | 0, 2 => 2  | 0, 3 => 10
+  | 1, 0 => 12 | 1, 1 => 4  | 1, 2 => 14 | 1, 3 => 6
+  | 2, 0 => 3  | 2, 1 => 11 | 2, 2 => 1  | 2, 3 => 9
+  | 3, 0 => 15 | 3, 1 => 7  | 3, 2 => 13 | 3, 3 => 5
+  | _, _ => 0
+
+theorem bayer4x4Threshold_lt16 (row col : Nat) : bayer4x4Threshold row col < 16 := by
+  dsimp [bayer4x4Threshold]
+  split <;> decide
+
+/-- Single-sample ordered 4×4 Bayer dither from `srcBits` (`10` or `12`) down to `dstBits` (`8` or `10`). -/
+@[inline]
+def ditherBayerSample (sample srcBits dstBits row col : Nat) : Nat :=
+  let shift := srcBits - dstBits
+  let dstMax := (1 <<< dstBits) - 1
+  if shift == 0 then clampNatMax sample dstMax
+  else
+    let t := bayer4x4Threshold row col
+    let bias := (t * (1 <<< shift)) / 16
+    clampNatMax ((sample + bias) >>> shift) dstMax
+
+def ditherPlaneBayerToU8 (src : ByteArray) (w h srcBits : Nat) : ByteArray := Id.run do
+  let srcMax := (1 <<< srcBits) - 1
+  let mut out := ByteArray.emptyWithCapacity (w * h)
+  for r in [:h] do
+    for c in [:w] do
+      let s := clampNatMax (readLe16At src (2 * (r * w + c))) srcMax
+      out := out.push (ditherBayerSample s srcBits 8 r c).toUInt8
+  return out
+
+def ditherPlaneBayer12To10 (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let mut out := ByteArray.emptyWithCapacity (2 * w * h)
+  for r in [:h] do
+    for c in [:w] do
+      let s := clampNatMax (readLe16At src (2 * (r * w + c))) 4095
+      out := pushLe16 out (ditherBayerSample s 12 10 r c)
+  return out
+
+/-- Floyd–Steinberg `[7, 3, 5, 1] / 16` error-diffusion dither from `srcBits` down to `dstBits`. -/
+def ditherPlaneFloydSteinberg (src : ByteArray) (w h srcBits dstBits : Nat) : Array Nat := Id.run do
+  let n := w * h
+  if n == 0 then return #[]
+  let shift := srcBits - dstBits
+  let srcMax := (1 <<< srcBits) - 1
+  let dstMax := (1 <<< dstBits) - 1
+  let stepQ4 : Nat := 16 * (1 <<< shift)
+  let mut work : Array Int := Array.emptyWithCapacity n
+  for i in [:n] do
+    work := work.push (Int.ofNat (16 * clampNatMax (readLe16At src (2 * i)) srcMax))
+  let mut out : Array Nat := Array.replicate n 0
+  for r in [:h] do
+    for c in [:w] do
+      let idx := r * w + c
+      let curQ4 := clipIntMax (work.getD idx 0) (16 * srcMax)
+      let q := clampNatMax ((curQ4 + stepQ4 / 2) / stepQ4) dstMax
+      out := out.setIfInBounds idx q
+      let reconQ4 := 16 * Nat.min srcMax (q <<< shift)
+      let errQ4 : Int := (work.getD idx 0) - Int.ofNat reconQ4
+      let d7 := (errQ4 * 7) / 16
+      let d3 := (errQ4 * 3) / 16
+      let d5 := (errQ4 * 5) / 16
+      let d1 := errQ4 - d7 - d3 - d5
+      if c + 1 < w then
+        let j := r * w + (c + 1)
+        work := work.setIfInBounds j (work.getD j 0 + d7)
+      if r + 1 < h then
+        if c > 0 then
+          let j := (r + 1) * w + (c - 1)
+          work := work.setIfInBounds j (work.getD j 0 + d3)
+        let jMid := (r + 1) * w + c
+        work := work.setIfInBounds jMid (work.getD jMid 0 + d5)
+        if c + 1 < w then
+          let jRight := (r + 1) * w + (c + 1)
+          work := work.setIfInBounds jRight (work.getD jRight 0 + d1)
+  return out
+
+def ditherPlaneFloydSteinbergToU8 (src : ByteArray) (w h srcBits : Nat) : ByteArray :=
+  let arr := ditherPlaneFloydSteinberg src w h srcBits 8
+  ByteArray.mk (arr.map fun v => (clampNatMax v 255).toUInt8)
+
+def ditherPlaneFloydSteinberg12To10 (src : ByteArray) (w h : Nat) : ByteArray := Id.run do
+  let arr := ditherPlaneFloydSteinberg src w h 12 10
+  let mut out := ByteArray.emptyWithCapacity (2 * arr.size)
+  for v in arr do
+    out := pushLe16 out (clampNatMax v 1023)
+  return out
+
+/-- Tight admission gate for high-bit-depth dithering (`(srcBits, dstBits, outSample)`). -/
+def DitherOutputSafe (a : Nat × Nat × Nat) : Prop :=
+  let (srcBits, dstBits, outSample) := a
+  ((srcBits = 10 ∧ dstBits = 8) ∨ (srcBits = 12 ∧ dstBits = 8) ∨ (srcBits = 12 ∧ dstBits = 10)) ∧
+    outSample ≤ (1 <<< dstBits) - 1
+
+instance (a : Nat × Nat × Nat) : Decidable (DitherOutputSafe a) := by
+  unfold DitherOutputSafe
+  infer_instance
+
+def ditherOutputGateSpec : AVGateSpec (Nat × Nat × Nat) DitherOutputSafe where
+  gate := fun a => decide (DitherOutputSafe a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := (10, 8, 255)
+  negWitness := (10, 8, 256)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem ditherBayerSample_bounded (sample srcBits dstBits row col : Nat) :
+    ditherBayerSample sample srcBits dstBits row col ≤ (1 <<< dstBits) - 1 := by
+  dsimp [ditherBayerSample, clampNatMax]
+  split <;> split <;> omega
+
+/-- Deterministic integer SMPTE ST 2084 (PQ) EOTF mapping 10-bit code `[0, 1023]` to Q16 linear light `[0, 65536]` (`1.0 = 10000 cd/m²`). -/
+def pqEotf10ToLinearQ16 (code10 : Nat) : Nat :=
+  let x := clampNatMax code10 1023
+  if x == 0 then 0
+  else if x == 1023 then 65536
+  else
+    -- Monotone 33-knot piecewise-linear SMPTE ST 2084 table in Q16 (`65536 = 10000 nits`).
+    let knots : Array Nat :=
+      #[0, 0, 1, 2, 4, 7, 13, 21, 34, 52, 77, 112, 161, 228, 318, 440, 605,
+        824, 1117, 1507, 2025, 2713, 3625, 4836, 6445, 8583, 11430, 15228,
+        20309, 27125, 36301, 48702, 65536]
+    let seg := Nat.min 31 ((x * 32) / 1023)
+    let x0 := (seg * 1023) / 32
+    let x1 := Nat.max (x0 + 1) (((seg + 1) * 1023) / 32)
+    let y0 := knots[seg]!
+    let y1 := knots[seg + 1]!
+    let frac := if x ≤ x0 then 0 else x - x0
+    clampNatMax (y0 + ((y1 - y0) * frac) / (x1 - x0)) 65536
+
+/-- Inverse SMPTE ST 2084 (PQ) OETF mapping Q16 linear light `[0, 65536]` back to 10-bit PQ `[0, 1023]`. -/
+def pqOetfLinearQ16To10 (linQ16 : Nat) : Nat := Id.run do
+  let y := clampNatMax linQ16 65536
+  if y == 0 then return 0
+  if y >= 65536 then return 1023
+  let mut lo : Nat := 0
+  let mut hi : Nat := 1023
+  for _ in [:11] do
+    let mid := (lo + hi) / 2
+    if pqEotf10ToLinearQ16 mid < y then
+      lo := mid + 1
+    else
+      hi := mid
+  return clampNatMax lo 1023
+
+/-- ARIB STD-B67 (HLG) inverse OETF (`E' ∈ [0, 1023]` -> scene-referred linear Q16 `[0, 65536]`). -/
+def hlgInverseOetf10ToLinearQ16 (code10 : Nat) : Nat :=
+  let e := clampNatMax code10 1023
+  if e ≤ 512 then
+    -- `(E')^2 / 3` scaled to Q16 (`512 -> 5461`, i.e., `1/12` of `65536`)
+    (e * e * 65536) / (3 * 1023 * 1023)
+  else
+    let knots : Array Nat :=
+      #[5472, 6219, 7109, 8168, 9430, 10932, 12720, 14850,
+        17386, 20406, 24002, 28283, 33381, 39452, 46680, 55287, 65536]
+    let off := e - 512
+    let seg := Nat.min 15 ((off * 16) / 511)
+    let x0 := (seg * 511) / 16
+    let x1 := Nat.max (x0 + 1) (((seg + 1) * 511) / 16)
+    let y0 := knots[seg]!
+    let y1 := knots[seg + 1]!
+    let frac := if off ≤ x0 then 0 else off - x0
+    clampNatMax (y0 + ((y1 - y0) * frac) / (x1 - x0)) 65536
+
+/-- ARIB STD-B67 (HLG) OETF (linear Q16 `[0, 65536]` -> 10-bit HLG `[0, 1023]`). -/
+def hlgOetfLinearQ16To10 (linQ16 : Nat) : Nat := Id.run do
+  let y := clampNatMax linQ16 65536
+  if y == 0 then return 0
+  if y >= 65536 then return 1023
+  let mut lo : Nat := 0
+  let mut hi : Nat := 1023
+  for _ in [:11] do
+    let mid := (lo + hi) / 2
+    if hlgInverseOetf10ToLinearQ16 mid < y then
+      lo := mid + 1
+    else
+      hi := mid
+  return clampNatMax lo 1023
+
+/-- ARIB STD-B67 / ITU-R BT.2100 HLG OOTF (`γ = 1.2` system gamma on BT.2020 scene luminance). -/
+def hlgOotfQ16 (rQ16 gQ16 bQ16 : Nat) : Nat × Nat × Nat :=
+  let ys := clampNatMax ((269 * rQ16 + 694 * gQ16 + 61 * bQ16) / 1024) 65536
+  let ootfKnots : Array Nat :=
+    #[0, 588, 676, 733, 776, 811, 842, 868, 891, 913, 932, 950, 967, 982, 997, 1011, 1024]
+  let gainQ10 :=
+    if ys == 0 then 0
+    else
+      let seg := Nat.min 15 ((ys * 16) / 65536)
+      let x0 := (seg * 65536) / 16
+      let x1 := Nat.max (x0 + 1) (((seg + 1) * 65536) / 16)
+      let g0 := ootfKnots[seg]!
+      let g1 := ootfKnots[seg + 1]!
+      let frac := if ys ≤ x0 then 0 else ys - x0
+      clampNatMax (g0 + ((g1 - g0) * frac) / (x1 - x0)) 1024
+  (clampNatMax ((rQ16 * gainQ10) / 1024) 65536,
+   clampNatMax ((gQ16 * gainQ10) / 1024) 65536,
+   clampNatMax ((bQ16 * gainQ10) / 1024) 65536)
+
+def hlgEotf10ToDisplayLinearQ16 (r10 g10 b10 : Nat) : Nat × Nat × Nat :=
+  hlgOotfQ16 (hlgInverseOetf10ToLinearQ16 r10) (hlgInverseOetf10ToLinearQ16 g10) (hlgInverseOetf10ToLinearQ16 b10)
+
+/-- ITU-R BT.2087 linear-light gamut matrix `BT.2020 -> BT.709` in Q12 (`4096 = 1.0`, rows sum to `4096`). -/
+def gamutBt2020ToBt709LinearQ16 (r2020 g2020 b2020 : Nat) : Nat × Nat × Nat :=
+  let r : Int := Int.ofNat (clampNatMax r2020 65536)
+  let g : Int := Int.ofNat (clampNatMax g2020 65536)
+  let b : Int := Int.ofNat (clampNatMax b2020 65536)
+  let r709 := (6802 * r - 2407 * g - 299 * b + 2048) / 4096
+  let g709 := ((-510) * r + 4639 * g - 33 * b + 2048) / 4096
+  let b709 := ((-74) * r - 412 * g + 4582 * b + 2048) / 4096
+  (clipIntMax r709 65536, clipIntMax g709 65536, clipIntMax b709 65536)
+
+/-- Inverse linear-light gamut matrix `BT.709 -> BT.2020` in Q12 (`4096 = 1.0`, rows sum to `4096`). -/
+def gamutBt709ToBt2020LinearQ16 (r709 g709 b709 : Nat) : Nat × Nat × Nat :=
+  let r : Int := Int.ofNat (clampNatMax r709 65536)
+  let g : Int := Int.ofNat (clampNatMax g709 65536)
+  let b : Int := Int.ofNat (clampNatMax b709 65536)
+  let r2020 := (2570 * r + 1349 * g + 177 * b + 2048) / 4096
+  let g2020 := (283 * r + 3767 * g + 46 * b + 2048) / 4096
+  let b2020 := (67 * r + 360 * g + 3669 * b + 2048) / 4096
+  (clipIntMax r2020 65536, clipIntMax g2020 65536, clipIntMax b2020 65536)
+
+/-- BT.709 OETF mapping SDR linear `[0, 65536]` (`1.0 = 100 cd/m²`) to full-scale 8-bit `[0, 255]`. -/
+def bt709OetfLinearQ16ToU8 (linQ16 : Nat) : UInt8 := Id.run do
+  let x := clampNatMax linQ16 65536
+  if x == 0 then return 0
+  if x >= 65536 then return 255
+  if x ≤ 1180 then
+    return (clampNatMax ((x * 4500 * 255 + 500 * 65536) / (1000 * 65536)) 255).toUInt8
+  let knots : Array Nat :=
+    #[5308, 9086, 11982, 14408, 16531, 18438, 20182, 21796,
+      23305, 24726, 26072, 27353, 28578, 29752, 30882, 31971,
+      33024, 34044, 35033, 35995, 36930, 37842, 38731, 39599,
+      40448, 41278, 42091, 42888, 43670, 44436, 45189, 45929,
+      46657, 47372, 48076, 48769, 49451, 50124, 50786, 51440,
+      52085, 52721, 53349, 53969, 54581, 55186, 55784, 56374,
+      56959, 57536, 58107, 58673, 59232, 59785, 60333, 60876,
+      61413, 61945, 62472, 62994, 63512, 64024, 64533, 65036, 65536]
+  let u := x - 1180
+  let span := 65536 - 1180
+  let seg := Nat.min 63 ((u * 64) / span)
+  let u0 := (seg * span) / 64
+  let u1 := Nat.max (u0 + 1) (((seg + 1) * span) / 64)
+  let y0 := knots[seg]!
+  let y1 := knots[seg + 1]!
+  let y := clampNatMax (y0 + ((y1 - y0) * (u - u0)) / (u1 - u0)) 65536
+  return (clampNatMax ((y * 255 + 32768) / 65536) 255).toUInt8
+
+/-- Parametric HDR-to-SDR tonemap curve on Q16 linear light (`trcCicp = 18` for HLG `1000 cd/m²`, else PQ `10000 cd/m²`). -/
+def tonemapCurveQ16 (mode : String) (linHdrQ16 : Nat) (trcCicp : Nat := 16) : Nat :=
+  let refWhiteQ16 := if trcCicp == 18 then 13304 else 1330
+  let x := (linHdrQ16 * 4096) / refWhiteQ16
+  match mode with
+  | "clip" => clampNatMax (x * 16) 65536
+  | "linear" => clampNatMax ((x * 16) / 4) 65536
+  | "mobius" =>
+    if x ≤ 3072 then clampNatMax (x * 16) 65536
+    else clampNatMax (49152 + ((x - 3072) * 16384) / (x + 4096)) 65536
+  | "hable" =>
+    let num := x * (x + 2048)
+    let den := x * (x + 1536) + 8388608
+    clampNatMax ((num * 65536) / Nat.max 1 den) 65536
+  | _ => -- `"reinhard"`
+    clampNatMax ((x * 65536) / (x + 4096)) 65536
+
+/-- Real colorspace matrix conversion across a decoded `VideoFrame` (`BT.2020 / BT.709 / BT.601`). -/
+def convertVideoFrameColorspace (vf : VideoFrame) (dstMatrix : ColorMatrix) : VideoFrame :=
+  if vf.planes.size < 3 || vf.colorMatrix == dstMatrix then
+    { vf with colorMatrix := dstMatrix }
+  else
+    let (dstY, dstU, dstV) := Id.run do
+      let w := vf.width
+      let h := vf.height
+      let cw := (w + 1) / 2
+      let ch := (h + 1) / 2
+      let srcY := vf.planes[0]!
+      let srcU := vf.planes[1]!
+      let srcV := vf.planes[2]!
+      let mut outY := Plane2D.alloc w h w 16
+      let mut outU := Plane2D.alloc cw ch cw 128
+      let mut outV := Plane2D.alloc cw ch cw 128
+      let is2020Src := vf.colorMatrix == .bt2020 || vf.colorMatrix == .bt2020ncl
+      let is709Dst := dstMatrix == .bt709
+      for r in [:h] do
+        for c in [:w] do
+          let y0 := srcY.getPixel r c
+          let u0 := srcU.getPixel (r / 2) (c / 2)
+          let v0 := srcV.getPixel (r / 2) (c / 2)
+          let (r8, g8, b8) := yuvPixelToRgb vf.colorMatrix y0 u0 v0
+          let (rMap, gMap, bMap) :=
+            if is2020Src && is709Dst then
+              let (rl, gl, bl) := gamutBt2020ToBt709LinearQ16 (r8.toNat * 257) (g8.toNat * 257) (b8.toNat * 257)
+              (((rl + 128) / 257).toUInt8, ((gl + 128) / 257).toUInt8, ((bl + 128) / 257).toUInt8)
+            else if vf.colorMatrix == .bt709 && (dstMatrix == .bt2020 || dstMatrix == .bt2020ncl) then
+              let (rl, gl, bl) := gamutBt709ToBt2020LinearQ16 (r8.toNat * 257) (g8.toNat * 257) (b8.toNat * 257)
+              (((rl + 128) / 257).toUInt8, ((gl + 128) / 257).toUInt8, ((bl + 128) / 257).toUInt8)
+            else
+              (r8, g8, b8)
+          let (y1, u1, v1) := rgbPixelToYuv dstMatrix rMap gMap bMap
+          outY := outY.setPixel r c y1
+          if r % 2 == 0 && c % 2 == 0 then
+            outU := outU.setPixel (r / 2) (c / 2) u1
+            outV := outV.setPixel (r / 2) (c / 2) v1
+      return (outY, outU, outV)
+    { vf with colorMatrix := dstMatrix, planes := #[dstY, dstU, dstV] }
+
+/-- Real HDR-to-SDR tonemap execution on a `VideoFrame` (PQ EOTF -> BT.2020->BT.709 gamut -> `reinhard`/`hable`/`mobius`/`clip`/`linear` -> BT.709 OETF). -/
+def tonemapVideoFrameHdrToSdrWithTransfer (vf : VideoFrame) (mode : String) (trcCicp : Nat := 16) : VideoFrame :=
+  if vf.planes.size < 3 then vf
+  else
+    let (dstY, dstU, dstV) := Id.run do
+      let w := vf.width
+      let h := vf.height
+      let cw := (w + 1) / 2
+      let ch := (h + 1) / 2
+      let srcY := vf.planes[0]!
+      let srcU := vf.planes[1]!
+      let srcV := vf.planes[2]!
+      let mut outY := Plane2D.alloc w h w 16
+      let mut outU := Plane2D.alloc cw ch cw 128
+      let mut outV := Plane2D.alloc cw ch cw 128
+      let is2020 := vf.colorMatrix == .bt2020 || vf.colorMatrix == .bt2020ncl
+      let isHlg := trcCicp == 18
+      for r in [:h] do
+        for c in [:w] do
+          let y8 := srcY.getPixel r c
+          let u8 := srcU.getPixel (r / 2) (c / 2)
+          let v8 := srcV.getPixel (r / 2) (c / 2)
+          let (rr, gg, bb) := yuvPixelToRgb vf.colorMatrix y8 u8 v8
+          let r10 := (rr.toNat * 1023 + 127) / 255
+          let g10 := (gg.toNat * 1023 + 127) / 255
+          let b10 := (bb.toNat * 1023 + 127) / 255
+          let (rLin, gLin, bLin) :=
+            if isHlg then hlgEotf10ToDisplayLinearQ16 r10 g10 b10
+            else (pqEotf10ToLinearQ16 r10, pqEotf10ToLinearQ16 g10, pqEotf10ToLinearQ16 b10)
+          let (rGam, gGam, bGam) :=
+            if is2020 then gamutBt2020ToBt709LinearQ16 rLin gLin bLin else (rLin, gLin, bLin)
+          let rTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode rGam trcCicp)
+          let gTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode gGam trcCicp)
+          let bTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode bGam trcCicp)
+          let (yOut, uOut, vOut) := rgbPixelToYuv .bt709 rTm gTm bTm
+          outY := outY.setPixel r c yOut
+          if r % 2 == 0 && c % 2 == 0 then
+            outU := outU.setPixel (r / 2) (c / 2) uOut
+            outV := outV.setPixel (r / 2) (c / 2) vOut
+      return (outY, outU, outV)
+    { vf with colorMatrix := .bt709, planes := #[dstY, dstU, dstV] }
+
+def tonemapVideoFrameHdrToSdr (vf : VideoFrame) (mode : String) : VideoFrame :=
+  tonemapVideoFrameHdrToSdrWithTransfer vf mode 16
+
+/-- Direct 10-bit `yuv420p10le` HDR-to-SDR tonemap (`PQ` `trc=16` vs `HLG` `trc=18`) avoiding 8-bit intermediate loss. -/
+def tonemapYuv420p10FrameToSdrVideoFrame (src : ByteArray) (w h : Nat) (cm : ColorMatrix)
+    (mode : String) (trcCicp : Nat := 16) (pts : UInt64 := 0) : VideoFrame := Id.run do
+  let cw := (w + 1) / 2
+  let ch := (h + 1) / 2
+  let yBytes := 2 * w * h
+  let uvBytes := 2 * cw * ch
+  let mut outY := Plane2D.alloc w h w 16
+  let mut outU := Plane2D.alloc cw ch cw 128
+  let mut outV := Plane2D.alloc cw ch cw 128
+  let is2020 := cm == .bt2020 || cm == .bt2020ncl
+  let isHlg := trcCicp == 18
+  for r in [:h] do
+    for c in [:w] do
+      let y10 := clampNatMax (readLe16At src (2 * (r * w + c))) 1023
+      let u10 := clampNatMax (readLe16At src (yBytes + 2 * ((r / 2) * cw + (c / 2)))) 1023
+      let v10 := clampNatMax (readLe16At src (yBytes + uvBytes + 2 * ((r / 2) * cw + (c / 2)))) 1023
+      let (g10, b10, r10) := yuv10PixelToGbr10 cm y10 u10 v10
+      let (rLin, gLin, bLin) :=
+        if isHlg then hlgEotf10ToDisplayLinearQ16 r10 g10 b10
+        else (pqEotf10ToLinearQ16 r10, pqEotf10ToLinearQ16 g10, pqEotf10ToLinearQ16 b10)
+      let (rGam, gGam, bGam) :=
+        if is2020 then gamutBt2020ToBt709LinearQ16 rLin gLin bLin else (rLin, gLin, bLin)
+      let rTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode rGam trcCicp)
+      let gTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode gGam trcCicp)
+      let bTm := bt709OetfLinearQ16ToU8 (tonemapCurveQ16 mode bGam trcCicp)
+      let (yOut, uOut, vOut) := rgbPixelToYuv .bt709 rTm gTm bTm
+      outY := outY.setPixel r c yOut
+      if r % 2 == 0 && c % 2 == 0 then
+        outU := outU.setPixel (r / 2) (c / 2) uOut
+        outV := outV.setPixel (r / 2) (c / 2) vOut
+  let vf0 := VideoFrame.allocYuv420p w h pts AVRational.tb90kHz .bt709
+  return { vf0 with colorMatrix := .bt709, planes := #[outY, outU, outV] }
+
+/-- Tight gate for PQ/HLG Q16 linear-light outputs (`[0, 65536]`) and 10-bit code bounds (`[0, 1023]`). -/
+def HdrTransferSampleSafe (a : Nat × Nat) : Prop :=
+  a.1 ≤ 1023 ∧ a.2 ≤ 65536
+
+instance (a : Nat × Nat) : Decidable (HdrTransferSampleSafe a) := by
+  unfold HdrTransferSampleSafe
+  infer_instance
+
+def hdrTransferGateSpec : AVGateSpec (Nat × Nat) HdrTransferSampleSafe where
+  gate := fun a => decide (HdrTransferSampleSafe a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := (1023, 65536)
+  negWitness := (1024, 65536)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem pq_and_hlg_endpoints_and_gamut_achromatic :
+    pqEotf10ToLinearQ16 0 = 0 ∧
+    pqEotf10ToLinearQ16 1023 = 65536 ∧
+    pqOetfLinearQ16To10 0 = 0 ∧
+    pqOetfLinearQ16To10 65536 = 1023 ∧
+    hlgInverseOetf10ToLinearQ16 0 = 0 ∧
+    hlgInverseOetf10ToLinearQ16 1023 = 65536 ∧
+    bt709OetfLinearQ16ToU8 0 = 0 ∧
+    bt709OetfLinearQ16ToU8 1180 = 21 ∧
+    bt709OetfLinearQ16ToU8 1181 = 21 ∧
+    bt709OetfLinearQ16ToU8 65536 = 255 ∧
+    gamutBt2020ToBt709LinearQ16 32768 32768 32768 = (32768, 32768, 32768) ∧
+    gamutBt709ToBt2020LinearQ16 32768 32768 32768 = (32768, 32768, 32768) := by
+  decide
+
 end LeanAV.Scale

@@ -77,7 +77,147 @@ inductive PixelFormat where
   | rgb24
   | rgba
   | gray8
+  | p010le
+  | yuv422p10le
+  | yuv444p10le
+  | yuv420p12le
+  | yuv422p12le
+  | yuv444p12le
+  | gbrp10le
+  | rgba64le
   deriving Repr, DecidableEq, Inhabited
+
+namespace PixelFormat
+
+/-- Parse an FFmpeg pixel-format name, including the P1.1 high-bit-depth set. -/
+def parse (s : String) : Option PixelFormat :=
+  let low := String.ofList (s.toList.map Char.toLower)
+  if low == "yuv420p" then some .yuv420p
+  else if low == "yuv422p" then some .yuv422p
+  else if low == "yuv444p" then some .yuv444p
+  else if low == "yuv420p10le" || low == "yuv420p10" then some .yuv420p10le
+  else if low == "nv12" then some .nv12
+  else if low == "rgb24" then some .rgb24
+  else if low == "rgba" then some .rgba
+  else if low == "gray" || low == "gray8" then some .gray8
+  else if low == "p010le" || low == "p010" then some .p010le
+  else if low == "yuv422p10le" || low == "yuv422p10" then some .yuv422p10le
+  else if low == "yuv444p10le" || low == "yuv444p10" then some .yuv444p10le
+  else if low == "yuv420p12le" || low == "yuv420p12" then some .yuv420p12le
+  else if low == "yuv422p12le" || low == "yuv422p12" then some .yuv422p12le
+  else if low == "yuv444p12le" || low == "yuv444p12" then some .yuv444p12le
+  else if low == "gbrp10le" || low == "gbrp10" then some .gbrp10le
+  else if low == "rgba64le" || low == "rgba64" then some .rgba64le
+  else none
+
+/-- Canonical little-endian FFmpeg name. -/
+def toString : PixelFormat → String
+  | .yuv420p => "yuv420p"
+  | .yuv422p => "yuv422p"
+  | .yuv444p => "yuv444p"
+  | .yuv420p10le => "yuv420p10le"
+  | .nv12 => "nv12"
+  | .rgb24 => "rgb24"
+  | .rgba => "rgba"
+  | .gray8 => "gray8"
+  | .p010le => "p010le"
+  | .yuv422p10le => "yuv422p10le"
+  | .yuv444p10le => "yuv444p10le"
+  | .yuv420p12le => "yuv420p12le"
+  | .yuv422p12le => "yuv422p12le"
+  | .yuv444p12le => "yuv444p12le"
+  | .gbrp10le => "gbrp10le"
+  | .rgba64le => "rgba64le"
+
+/-- Nominal sample precision. Packed 8-bit RGB stays 8; `rgba64le` is 16. -/
+def bitDepth : PixelFormat → Nat
+  | .yuv420p10le | .p010le | .yuv422p10le | .yuv444p10le | .gbrp10le => 10
+  | .yuv420p12le | .yuv422p12le | .yuv444p12le => 12
+  | .rgba64le => 16
+  | _ => 8
+
+/-- Horizontal and vertical chroma divisors. RGB, gray, and GBR are not subsampled. -/
+def chromaSubsampling : PixelFormat → Nat × Nat
+  | .yuv420p | .yuv420p10le | .yuv420p12le | .nv12 | .p010le => (2, 2)
+  | .yuv422p | .yuv422p10le | .yuv422p12le => (2, 1)
+  | _ => (1, 1)
+
+/-- Ceiling chroma size used by the P1.1 canonical raw layouts. -/
+@[inline] def chromaCeilDiv2 (d : Nat) : Nat := (d + 1) / 2
+
+/-- Exact canonical raw byte size, or `none` when a dimension is zero. -/
+def frameByteSize (fmt : PixelFormat) (w h : Nat) : Option Nat :=
+  if w == 0 || h == 0 then none
+  else
+    let cw := chromaCeilDiv2 w
+    let ch := chromaCeilDiv2 h
+    some <|
+      match fmt with
+      | .yuv420p => w * h + 2 * (cw * ch)
+      | .yuv422p => w * h + 2 * (cw * h)
+      | .yuv444p => 3 * w * h
+      | .nv12 => w * h + 2 * cw * ch
+      | .rgb24 => 3 * w * h
+      | .rgba => 4 * w * h
+      | .gray8 => w * h
+      | .yuv420p10le | .yuv420p12le => 2 * (w * h + 2 * (cw * ch))
+      | .p010le => 2 * w * h + 4 * cw * ch
+      | .yuv422p10le | .yuv422p12le => 2 * (w * h + 2 * (cw * h))
+      | .yuv444p10le | .yuv444p12le | .gbrp10le => 6 * w * h
+      | .rgba64le => 8 * w * h
+
+theorem pixelFormat_parse_toString_roundtrip (fmt : PixelFormat) :
+    PixelFormat.parse fmt.toString = some fmt := by
+  cases fmt <;> decide
+
+theorem pixelFormat_bitDepth_pos (fmt : PixelFormat) : 0 < fmt.bitDepth := by
+  cases fmt <;> decide
+
+end PixelFormat
+
+/-- One validated 16-bit little-endian plane. Values above `maxCode` are not representable. -/
+structure Plane16 where
+  data    : ByteArray
+  width   : Nat
+  height  : Nat
+  stride  : Nat
+  maxCode : Nat
+  deriving Inhabited
+
+namespace Plane16
+
+def alloc (width height stride maxCode : Nat) (fill : Nat := 0) : Plane16 :=
+  let w := if width == 0 then 1 else width
+  let h := if height == 0 then 1 else height
+  let st := if stride < w then w else stride
+  let v := Nat.min fill maxCode
+  let bytes := (List.range (st * h)).flatMap fun _ =>
+    [v.toUInt8, ((v >>> 8) &&& 0xFF).toUInt8]
+  { data := { data := bytes.toArray }, width := w, height := h, stride := st, maxCode := maxCode }
+
+@[inline]
+def getSample (p : Plane16) (row col : Nat) : Nat :=
+  if col < p.width && row < p.height then
+    let off := 2 * (row * p.stride + col)
+    if off + 1 < p.data.size then
+      (p.data.get! off).toNat ||| (((p.data.get! (off + 1)).toNat) <<< 8)
+    else 0
+  else 0
+
+@[inline]
+def setSample (p : Plane16) (row col v : Nat) : Plane16 :=
+  if col < p.width && row < p.height then
+    let off := 2 * (row * p.stride + col)
+    if off + 1 < p.data.size then
+      let clipped := Nat.min v p.maxCode
+      { p with data := (p.data.set! off clipped.toUInt8).set! (off + 1) ((clipped >>> 8).toUInt8) }
+    else p
+  else p
+
+def sampleInRange (p : Plane16) (row col : Nat) : Bool :=
+  getSample p row col ≤ p.maxCode
+
+end Plane16
 
 /-- ITU-R Color matrix coefficients (`AVColorSpace`). -/
 inductive ColorMatrix where
@@ -87,6 +227,35 @@ inductive ColorMatrix where
   | bt2020ncl
   | srgb
   deriving Repr, DecidableEq, Inhabited
+
+/-- Three-plane high-bit-depth picture. RGB uses `(R, G, B)`; GBR uses `(G, B, R)`. -/
+structure HighBitFrame where
+  width       : Nat
+  height      : Nat
+  pixFmt      : PixelFormat
+  colorMatrix : ColorMatrix
+  maxCode     : Nat
+  planes      : Array Plane16
+  deriving Inhabited
+
+namespace HighBitFrame
+
+def alloc (fmt : PixelFormat) (width height : Nat)
+    (colorMatrix : ColorMatrix := .bt709) : HighBitFrame :=
+  let (sx, sy) := fmt.chromaSubsampling
+  let cw := if sx == 2 then PixelFormat.chromaCeilDiv2 width else width
+  let ch := if sy == 2 then PixelFormat.chromaCeilDiv2 height else height
+  let code := match fmt.bitDepth with
+    | 10 => 1023
+    | 12 => 4095
+    | _ => 65535
+  let y := Plane16.alloc width height width code
+  let c0 := Plane16.alloc cw ch cw code
+  let c1 := Plane16.alloc cw ch cw code
+  { width := width, height := height, pixFmt := fmt, colorMatrix := colorMatrix,
+    maxCode := code, planes := #[y, c0, c1] }
+
+end HighBitFrame
 
 /-- Clamp a signed 32-bit integer `v` into the signed 16-bit PCM range `[-32768, 32767]`. -/
 @[inline]
@@ -780,5 +949,28 @@ theorem rescaleTimestampChecked_exact_and_bounded (pts q : Int) (bq cq : PosRati
     subst hEq
     exact ⟨rfl, hBounds⟩
   · contradiction
+
+/-- Exact raw byte-size gate for any supported `PixelFormat` at `(w, h)`. -/
+def PixelFormatByteLayoutSafe (a : PixelFormat × Nat × Nat × Nat) : Prop :=
+  let (fmt, w, h, bytes) := a
+  0 < w ∧ 0 < h ∧ PixelFormat.frameByteSize fmt w h = some bytes
+
+instance (a : PixelFormat × Nat × Nat × Nat) : Decidable (PixelFormatByteLayoutSafe a) := by
+  unfold PixelFormatByteLayoutSafe
+  infer_instance
+
+def pixelFormatByteLayoutGateSpec :
+    AVGateSpec (PixelFormat × Nat × Nat × Nat) PixelFormatByteLayoutSafe where
+  gate := fun a => decide (PixelFormatByteLayoutSafe a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := (.p010le, 4, 4, 48)
+  negWitness := (.p010le, 4, 4, 24)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem pixelFormatByteLayoutGateSpec_iff (a : PixelFormat × Nat × Nat × Nat) :
+    pixelFormatByteLayoutGateSpec.gate a = true ↔ PixelFormatByteLayoutSafe a :=
+  pixelFormatByteLayoutGateSpec.iff_safe a
 
 end LeanAV.Core

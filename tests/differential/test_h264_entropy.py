@@ -55,6 +55,36 @@ def _make_yuv420p10le(w: int, h: int, frames: int) -> bytes:
     return bytes(out)
 
 
+def _make_yuv_planar(w: int, h: int, cw: int, ch: int, bit_depth: int, frames: int) -> bytes:
+    out = bytearray()
+    mask = (1 << bit_depth) - 1
+    mid = 1 << (bit_depth - 1)
+    span = max(31, mid - (mid >> 2))
+    for f in range(frames):
+        for y in range(h):
+            for x in range(w):
+                v = (x * 73 + y * 139 + f * 211 + ((x ^ (y * 3)) * 23)) & mask
+                if bit_depth == 8:
+                    out.append(v)
+                else:
+                    out += v.to_bytes(2, "little")
+        for y in range(ch):
+            for x in range(cw):
+                v = (mid + ((x * 53 - y * 71 + f * 109) % (2 * span + 1)) - span) & mask
+                if bit_depth == 8:
+                    out.append(v)
+                else:
+                    out += v.to_bytes(2, "little")
+        for y in range(ch):
+            for x in range(cw):
+                v = (mid + ((y * 67 - x * 41 - f * 97) % (2 * span + 1)) - span) & mask
+                if bit_depth == 8:
+                    out.append(v)
+                else:
+                    out += v.to_bytes(2, "little")
+    return bytes(out)
+
+
 class H264EntropyDifferentialTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -383,6 +413,166 @@ class H264EntropyDifferentialTests(unittest.TestCase):
                 self.assertEqual(rd.returncode, 0, rd.stderr.decode(errors="replace"))
                 self.assertEqual(rd.stderr, b"")
                 self.assertEqual(hashlib.sha256(rd.stdout).hexdigest(), ref_sha, f"ipcm {mode} mismatch")
+
+    def test_high422_8bit_10bit_cavlc_cabac_pixel_exact(self):
+        if not self.has_libx264:
+            self.skipTest("libx264 encoder unavailable in reference FFmpeg")
+        with tempfile.TemporaryDirectory(prefix="leanav-h264-hi422-") as tmp:
+            root = Path(tmp)
+            w, h, frames = 64, 48, 5
+            raw8 = root / "src_422p.yuv"
+            raw8.write_bytes(_make_yuv_planar(w, h, w // 2, h, 8, frames))
+            raw10 = root / "src_422p10le.yuv"
+            raw10.write_bytes(_make_yuv_planar(w, h, w // 2, h, 10, frames))
+
+            cases = [
+                ("hi422_8_cavlc", raw8, "yuv422p", 16, "cabac=0:8x8dct=1:ref=2:bframes=2:b-pyramid=normal:annexb=1"),
+                ("hi422_8_cabac", raw8, "yuv422p", 16, "cabac=1:8x8dct=1:ref=2:bframes=2:b-pyramid=normal:annexb=1"),
+                ("hi422_10_cavlc", raw10, "yuv422p10le", 6, "cabac=0:8x8dct=1:ref=2:bframes=2:annexb=1"),
+                ("hi422_10_cabac", raw10, "yuv422p10le", 6, "cabac=1:8x8dct=1:ref=2:bframes=2:annexb=1"),
+            ]
+            for tag, raw_path, pix_fmt, qp, params in cases:
+                with self.subTest(case=tag):
+                    src_264 = root / f"{tag}.264"
+                    self.encode_h264(raw_path, src_264, w, h, pix_fmt, pix_fmt, "high422", qp, params)
+                    self.assert_all_modes_pixel_exact(src_264, pix_fmt, root, tag)
+
+    def test_high444_8bit_10bit_and_qp0_lossless_cavlc_cabac_pixel_exact(self):
+        if not self.has_libx264:
+            self.skipTest("libx264 encoder unavailable in reference FFmpeg")
+        with tempfile.TemporaryDirectory(prefix="leanav-h264-hi444-") as tmp:
+            root = Path(tmp)
+            w, h, frames = 64, 48, 5
+            raw8 = root / "src_444p.yuv"
+            raw8_bytes = _make_yuv_planar(w, h, w, h, 8, frames)
+            raw8.write_bytes(raw8_bytes)
+            raw10 = root / "src_444p10le.yuv"
+            raw10_bytes = _make_yuv_planar(w, h, w, h, 10, frames)
+            raw10.write_bytes(raw10_bytes)
+
+            cases = [
+                ("hi444_8_cavlc", raw8, "yuv444p", 18, "cabac=0:8x8dct=1:ref=2:bframes=2:annexb=1", False, b""),
+                ("hi444_8_cabac", raw8, "yuv444p", 18, "cabac=1:8x8dct=1:ref=2:bframes=2:annexb=1", False, b""),
+                ("hi444_10_cavlc", raw10, "yuv444p10le", 10, "cabac=0:8x8dct=1:ref=2:bframes=2:annexb=1", False, b""),
+                ("hi444_10_cabac", raw10, "yuv444p10le", 10, "cabac=1:8x8dct=1:ref=2:bframes=2:annexb=1", False, b""),
+                ("hi444_8_qp0_cavlc", raw8, "yuv444p", 0, "cabac=0:8x8dct=1:ref=2:bframes=0:annexb=1", True, raw8_bytes),
+                ("hi444_8_qp0_cabac", raw8, "yuv444p", 0, "cabac=1:8x8dct=1:ref=2:bframes=0:annexb=1", True, raw8_bytes),
+                ("hi444_10_qp0_cavlc", raw10, "yuv444p10le", 0, "cabac=0:8x8dct=1:ref=2:bframes=0:annexb=1", True, raw10_bytes),
+                ("hi444_10_qp0_cabac", raw10, "yuv444p10le", 0, "cabac=1:8x8dct=1:ref=2:bframes=0:annexb=1", True, raw10_bytes),
+            ]
+            for tag, raw_path, pix_fmt, qp, params, check_lossless, orig_bytes in cases:
+                with self.subTest(case=tag):
+                    src_264 = root / f"{tag}.264"
+                    self.encode_h264(raw_path, src_264, w, h, pix_fmt, pix_fmt, "high444", qp, params)
+                    if check_lossless:
+                        self.assertEqual(self.decode_raw(src_264, pix_fmt), orig_bytes)
+                    self.assert_all_modes_pixel_exact(src_264, pix_fmt, root, tag)
+
+    def test_high422_and_high444_10bit_ipcm_cavlc_cabac_roundtrip(self):
+        def pack_nal(nal_hdr: int, bits: list[int]) -> bytes:
+            padded = list(bits) + [1]
+            while len(padded) % 8 != 0:
+                padded.append(0)
+            rbsp = bytearray()
+            for i in range(0, len(padded), 8):
+                v = 0
+                for b in padded[i : i + 8]:
+                    v = (v << 1) | b
+                rbsp.append(v)
+            out = bytearray([0, 0, 0, 1, nal_hdr])
+            zeros = 0
+            for b in rbsp:
+                if zeros == 2 and b <= 3:
+                    out.append(3)
+                    zeros = 0
+                out.append(b)
+                zeros = zeros + 1 if b == 0 else 0
+            return bytes(out)
+
+        def put_u(bits: list[int], val: int, n: int):
+            for i in range(n - 1, -1, -1):
+                bits.append((val >> i) & 1)
+
+        def put_ue(bits: list[int], val: int):
+            x = val + 1
+            k = x.bit_length() - 1
+            put_u(bits, 0, k)
+            put_u(bits, x, k + 1)
+
+        def put_se(bits: list[int], val: int):
+            put_ue(bits, 0 if val == 0 else (2 * val - 1 if val > 0 else -2 * val))
+
+        def put_pcm_10bit(bits: list[int], samples: list[int]):
+            while len(bits) % 8 != 0:
+                bits.append(0)
+            for s in samples:
+                put_u(bits, s & 0x3FF, 10)
+
+        for tag, profile_idc, chroma_idc, pix_fmt, sample_cnt in (
+            ("ipcm_hi422_10bit", 122, 2, "yuv422p10le", 256 + 2 * 128),
+            ("ipcm_hi444_10bit", 244, 3, "yuv444p10le", 256 + 2 * 256),
+        ):
+            with self.subTest(case=tag), tempfile.TemporaryDirectory(prefix=f"leanav-{tag}-") as tmp:
+                root = Path(tmp)
+                sps: list[int] = []
+                put_u(sps, profile_idc, 8)
+                put_u(sps, 0x00, 8)
+                put_u(sps, 40, 8)
+                put_ue(sps, 0)
+                put_ue(sps, chroma_idc)
+                if chroma_idc == 3:
+                    put_u(sps, 0, 1)  # separate_colour_plane_flag = 0
+                put_ue(sps, 2)  # bit_depth_luma_minus8 = 2 (10-bit)
+                put_ue(sps, 2)  # bit_depth_chroma_minus8 = 2 (10-bit)
+                put_u(sps, 0, 1)  # qpprime_y_zero_transform_bypass_flag = 0
+                put_u(sps, 0, 1)  # seq_scaling_matrix_present_flag = 0
+                put_ue(sps, 0)  # log2_max_frame_num_minus4
+                put_ue(sps, 2)  # pic_order_cnt_type = 2
+                put_ue(sps, 0)  # max_num_ref_frames
+                put_u(sps, 0, 1)  # gaps_in_frame_num_value_allowed_flag
+                put_ue(sps, 1)  # pic_width_in_mbs_minus1 = 1 (32 px)
+                put_ue(sps, 0)  # pic_height_in_map_units_minus1 = 0 (16 px)
+                put_u(sps, 1, 1)  # frame_mbs_only_flag = 1
+                put_u(sps, 1, 1)  # direct_8x8_inference_flag = 1
+                put_u(sps, 0, 1)  # frame_cropping_flag = 0
+                put_u(sps, 0, 1)  # vui_parameters_present_flag = 0
+
+                pps: list[int] = []
+                put_ue(pps, 0)
+                put_ue(pps, 0)
+                put_u(pps, 0, 1)  # entropy_coding_mode_flag = 0 (CAVLC)
+                put_u(pps, 0, 1)
+                put_ue(pps, 0)
+                put_ue(pps, 0)
+                put_ue(pps, 0)
+                put_u(pps, 0, 1)
+                put_u(pps, 0, 2)
+                put_se(pps, 0)
+                put_se(pps, 0)
+                put_se(pps, 0)
+                put_u(pps, 1, 1)  # deblocking_filter_control_present_flag = 1
+                put_u(pps, 0, 1)
+                put_u(pps, 0, 1)
+
+                sl: list[int] = []
+                put_ue(sl, 0)  # first_mb_in_slice
+                put_ue(sl, 7)  # I slice
+                put_ue(sl, 0)  # pps_id
+                put_u(sl, 0, 4)  # frame_num
+                put_ue(sl, 0)  # idr_pic_id
+                put_u(sl, 0, 1)  # no_output_of_prior_pics_flag
+                put_u(sl, 0, 1)  # long_term_reference_flag
+                put_se(sl, 0)  # slice_qp_delta
+                put_ue(sl, 1)  # disable_deblocking_filter_idc = 1
+
+                for mb_idx in range(2):
+                    put_ue(sl, 25)  # I_PCM
+                    samples = [((mb_idx * 197 + i * 73 + (i >> 3) * 29) & 0x3FE) | 1 for i in range(sample_cnt)]
+                    put_pcm_10bit(sl, samples)
+
+                src_264 = root / f"{tag}.264"
+                src_264.write_bytes(pack_nal(0x67, sps) + pack_nal(0x68, pps) + pack_nal(0x65, sl))
+                self.assert_all_modes_pixel_exact(src_264, pix_fmt, root, tag)
 
 
 if __name__ == "__main__":

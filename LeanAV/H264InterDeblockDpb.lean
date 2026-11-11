@@ -1650,5 +1650,588 @@ def h264KernelVectorsJson : String :=
   let v6 := s!"\"subpel_me_mv\":[{meRes.mv.x},{meRes.mv.y},{meRes.sad}]}"
   v0 ++ v1 ++ v2 ++ v3 ++ v4 ++ v5 ++ v6
 
+/-! ## High-Bit-Depth & Multi-Chroma Motion Compensation, Weighted Prediction, Deblocking & DPB -/
+
+@[inline]
+def isValidHbdBitDepth (bitDepth : Nat) : Bool :=
+  bitDepth >= 8 && bitDepth <= 12
+
+@[inline]
+def isValidChromaArrayType (chromaArrayType : Nat) : Bool :=
+  chromaArrayType <= 3
+
+@[inline]
+def h264MaxSample (bitDepth : Nat) : Int :=
+  Int.ofNat ((1 <<< bitDepth) - 1)
+
+@[inline]
+def clip1Hbd (bitDepth : Nat) (x : Int) : Nat :=
+  (clip3 0 (h264MaxSample bitDepth) x).toNat
+
+structure PlaneHbd where
+  width    : Nat
+  height   : Nat
+  stride   : Nat
+  bitDepth : Nat := 8
+  data     : Array Nat
+  deriving Repr, DecidableEq, Inhabited
+
+def PlaneHbd.alloc (w h : Nat) (bitDepth : Nat := 8) (fill : Nat := 0) : PlaneHbd :=
+  let clampedFill := clip1Hbd bitDepth (Int.ofNat fill)
+  { width := w, height := h, stride := w, bitDepth := bitDepth,
+    data := Array.replicate (w * h) clampedFill }
+
+@[inline]
+def PlaneHbd.getPixel (p : PlaneHbd) (r c : Nat) : Nat :=
+  if r < p.height && c < p.width then p.data.getD (r * p.stride + c) 0 else 0
+
+@[inline]
+def PlaneHbd.setPixel (p : PlaneHbd) (r c val : Nat) : PlaneHbd :=
+  if r < p.height && c < p.width then
+    let idx := r * p.stride + c
+    { p with data := p.data.setIfInBounds idx (clip1Hbd p.bitDepth (Int.ofNat val)) }
+  else p
+
+def PlaneHbd.ofPlane2D (p : Plane2D) : PlaneHbd := Id.run do
+  let mut out := Array.mkEmpty (p.width * p.height)
+  for r in [:p.height] do
+    for c in [:p.width] do
+      out := out.push (p.getPixel r c).toNat
+  return { width := p.width, height := p.height, stride := p.width, bitDepth := 8, data := out }
+
+def PlaneHbd.toPlane2D (p : PlaneHbd) : Plane2D := Id.run do
+  let mut out := Plane2D.alloc p.width p.height p.width 0
+  for r in [:p.height] do
+    for c in [:p.width] do
+      out := out.setPixel r c (clip1Y (Int.ofNat (p.getPixel r c)))
+  return out
+
+@[inline]
+def sampleExtHbd (p : PlaneHbd) (x y : Int) : Int :=
+  if p.width == 0 || p.height == 0 then 0
+  else
+    let cx := (clip3 0 (Int.ofNat p.width - 1) x).toNat
+    let cy := (clip3 0 (Int.ofNat p.height - 1) y).toNat
+    Int.ofNat (p.getPixel cy cx)
+
+@[inline]
+def h264Round5Hbd (bitDepth : Nat) (b1 : Int) : Int :=
+  clip3 0 (h264MaxSample bitDepth) ((b1 + 16) / 32)
+
+@[inline]
+def h264Round6Hbd (bitDepth : Nat) (j1 : Int) : Int :=
+  clip3 0 (h264MaxSample bitDepth) ((j1 + 512) / 1024)
+
+@[inline]
+def h264HorizB1Hbd (p : PlaneHbd) (xInt y : Int) : Int :=
+  h264Tap6
+    (sampleExtHbd p (xInt - 2) y) (sampleExtHbd p (xInt - 1) y)
+    (sampleExtHbd p xInt y)       (sampleExtHbd p (xInt + 1) y)
+    (sampleExtHbd p (xInt + 2) y) (sampleExtHbd p (xInt + 3) y)
+
+@[inline]
+def h264VertH1Hbd (p : PlaneHbd) (x yInt : Int) : Int :=
+  h264Tap6
+    (sampleExtHbd p x (yInt - 2)) (sampleExtHbd p x (yInt - 1))
+    (sampleExtHbd p x yInt)       (sampleExtHbd p x (yInt + 1))
+    (sampleExtHbd p x (yInt + 2)) (sampleExtHbd p x (yInt + 3))
+
+@[inline]
+def h264CenterJ1Hbd (p : PlaneHbd) (xInt yInt : Int) : Int :=
+  h264Tap6
+    (h264HorizB1Hbd p xInt (yInt - 2)) (h264HorizB1Hbd p xInt (yInt - 1))
+    (h264HorizB1Hbd p xInt yInt)       (h264HorizB1Hbd p xInt (yInt + 1))
+    (h264HorizB1Hbd p xInt (yInt + 2)) (h264HorizB1Hbd p xInt (yInt + 3))
+
+def h264LumaFracIntHbd (p : PlaneHbd) (xInt yInt : Int) (xFracL yFracL : Nat) : Int :=
+  let bd := p.bitDepth
+  let g  := sampleExtHbd p xInt yInt
+  let m  := sampleExtHbd p (xInt + 1) yInt
+  let s0 := sampleExtHbd p xInt (yInt + 1)
+  let b  := h264Round5Hbd bd (h264HorizB1Hbd p xInt yInt)
+  let s  := h264Round5Hbd bd (h264HorizB1Hbd p xInt (yInt + 1))
+  let h  := h264Round5Hbd bd (h264VertH1Hbd p xInt yInt)
+  let mV := h264Round5Hbd bd (h264VertH1Hbd p (xInt + 1) yInt)
+  let j  := h264Round6Hbd bd (h264CenterJ1Hbd p xInt yInt)
+  match xFracL % 4, yFracL % 4 with
+  | 0, 0 => g
+  | 1, 0 => avgRound g b
+  | 2, 0 => b
+  | 3, 0 => avgRound b m
+  | 0, 1 => avgRound g h
+  | 1, 1 => avgRound b h
+  | 2, 1 => avgRound b j
+  | 3, 1 => avgRound b mV
+  | 0, 2 => h
+  | 1, 2 => avgRound h j
+  | 2, 2 => j
+  | 3, 2 => avgRound j mV
+  | 0, 3 => avgRound h s0
+  | 1, 3 => avgRound h s
+  | 2, 3 => avgRound j s
+  | _, _ => avgRound s mV
+
+@[inline]
+def h264LumaFracHbd (p : PlaneHbd) (xInt yInt : Int) (xFracL yFracL : Nat) : Nat :=
+  clip1Hbd p.bitDepth (h264LumaFracIntHbd p xInt yInt (xFracL % 4) (yFracL % 4))
+
+@[inline]
+def h264LumaQpelHbd (p : PlaneHbd) (xQ yQ : Int) : Nat :=
+  let xInt := xQ / 4
+  let yInt := yQ / 4
+  let xFrac := (xQ - 4 * xInt).toNat
+  let yFrac := (yQ - 4 * yInt).toNat
+  h264LumaFracHbd p xInt yInt xFrac yFrac
+
+@[inline]
+def h264ChromaFracIntHbd (p : PlaneHbd) (xIntC yIntC : Int) (xFracC yFracC : Nat) : Int :=
+  let xf := Int.ofNat (xFracC % 8)
+  let yf := Int.ofNat (yFracC % 8)
+  let a := sampleExtHbd p xIntC yIntC
+  let b := sampleExtHbd p (xIntC + 1) yIntC
+  let c := sampleExtHbd p xIntC (yIntC + 1)
+  let d := sampleExtHbd p (xIntC + 1) (yIntC + 1)
+  ((8 - xf) * (8 - yf) * a + xf * (8 - yf) * b +
+   (8 - xf) * yf * c + xf * yf * d + 32) / 64
+
+@[inline]
+def h264ChromaFracHbd (p : PlaneHbd) (xIntC yIntC : Int) (xFracC yFracC : Nat) : Nat :=
+  clip1Hbd p.bitDepth (h264ChromaFracIntHbd p xIntC yIntC xFracC yFracC)
+
+@[inline]
+def h264ChromaOpel420Hbd (p : PlaneHbd) (xC yC mvX mvY : Int) : Nat :=
+  let posX := 8 * xC + mvX
+  let posY := 8 * yC + mvY
+  let xIntC := posX / 8
+  let yIntC := posY / 8
+  h264ChromaFracHbd p xIntC yIntC (posX - 8 * xIntC).toNat (posY - 8 * yIntC).toNat
+
+@[inline]
+def h264ChromaOpel422Hbd (p : PlaneHbd) (xC yC mvX mvY : Int) : Nat :=
+  let posX := 8 * xC + mvX
+  let posY := 8 * yC + 2 * mvY
+  let xIntC := posX / 8
+  let yIntC := posY / 8
+  h264ChromaFracHbd p xIntC yIntC (posX - 8 * xIntC).toNat (posY - 8 * yIntC).toNat
+
+@[inline]
+def h264ChromaMcSampleHbd (chromaArrayType : Nat) (p : PlaneHbd) (xC yC mvX mvY : Int) : Nat :=
+  if chromaArrayType == 1 then
+    h264ChromaOpel420Hbd p xC yC mvX mvY
+  else if chromaArrayType == 2 then
+    h264ChromaOpel422Hbd p xC yC mvX mvY
+  else if chromaArrayType == 3 then
+    h264LumaQpelHbd p (4 * xC + mvX) (4 * yC + mvY)
+  else
+    0
+
+def chromaPartSize (chromaArrayType : Nat) (shape : H264PartShape) : Nat × Nat :=
+  let (bwL, bhL) := partSize shape
+  if chromaArrayType == 1 then
+    (Nat.max 1 (bwL / 2), Nat.max 1 (bhL / 2))
+  else if chromaArrayType == 2 then
+    (Nat.max 1 (bwL / 2), bhL)
+  else if chromaArrayType == 3 then
+    (bwL, bhL)
+  else
+    (0, 0)
+
+def predL0LumaBlockHbd (refP : PlaneHbd) (x0 y0 : Nat) (shape : H264PartShape) (mvX mvY : Int) : PlaneHbd := Id.run do
+  let (bw, bh) := partSize shape
+  let mut out := PlaneHbd.alloc bw bh refP.bitDepth 0
+  for r in [:bh] do
+    for c in [:bw] do
+      let xQ := 4 * Int.ofNat (x0 + c) + mvX
+      let yQ := 4 * Int.ofNat (y0 + r) + mvY
+      out := out.setPixel r c (h264LumaQpelHbd refP xQ yQ)
+  return out
+
+def predL0ChromaBlockHbd (chromaArrayType : Nat) (refP : PlaneHbd) (x0C y0C : Nat)
+    (shape : H264PartShape) (mvX mvY : Int) : PlaneHbd := Id.run do
+  let (bw, bh) := chromaPartSize chromaArrayType shape
+  let mut out := PlaneHbd.alloc bw bh refP.bitDepth 0
+  for r in [:bh] do
+    for c in [:bw] do
+      out := out.setPixel r c
+        (h264ChromaMcSampleHbd chromaArrayType refP (Int.ofNat (x0C + c)) (Int.ofNat (y0C + r)) mvX mvY)
+  return out
+
+@[inline]
+def biPredSampleHbd (bitDepth : Nat) (pL0 pL1 : Nat) : Nat :=
+  clip1Hbd bitDepth (((Int.ofNat pL0) + (Int.ofNat pL1) + 1) / 2)
+
+def biPredBlockHbd (b0 b1 : PlaneHbd) : PlaneHbd := Id.run do
+  let bw := Nat.min b0.width b1.width
+  let bh := Nat.min b0.height b1.height
+  let bd := b0.bitDepth
+  let mut out := PlaneHbd.alloc bw bh bd 0
+  for r in [:bh] do
+    for c in [:bw] do
+      out := out.setPixel r c (biPredSampleHbd bd (b0.getPixel r c) (b1.getPixel r c))
+  return out
+
+@[inline]
+def wpOffsetScale (bitDepth : Nat) (rawOffset : Int) : Int :=
+  rawOffset * Int.ofNat (1 <<< (bitDepth - 8))
+
+@[inline]
+def weightedUniPredPixelHbd (bitDepth : Nat) (p0 : Nat) (w0 rawO0 : Int) (log2Wd : Nat) : Nat :=
+  let o0 := wpOffsetScale bitDepth rawO0
+  let val :=
+    if log2Wd >= 1 then
+      let round : Int := Int.ofNat (1 <<< (log2Wd - 1))
+      ((Int.ofNat p0 * w0 + round) / Int.ofNat (1 <<< log2Wd)) + o0
+    else
+      Int.ofNat p0 * w0 + o0
+  clip1Hbd bitDepth val
+
+@[inline]
+def weightedBiPredPixelHbd (bitDepth : Nat) (p0 p1 : Nat) (w0 w1 rawO0 rawO1 : Int) (log2Wd : Nat) : Nat :=
+  let o0 := wpOffsetScale bitDepth rawO0
+  let o1 := wpOffsetScale bitDepth rawO1
+  let sh := log2Wd + 1
+  let round : Int := Int.ofNat (1 <<< log2Wd)
+  let weighted := (Int.ofNat p0 * w0 + Int.ofNat p1 * w1 + round) / Int.ofNat (1 <<< sh)
+  let off := (o0 + o1 + 1) / 2
+  clip1Hbd bitDepth (weighted + off)
+
+def implicitWeightedBiPredPixelHbd (bitDepth : Nat) (p0 p1 : Nat) (pocCur poc0 poc1 : Int) : Nat :=
+  match implicitBiWeightScaleFactor pocCur poc0 poc1 with
+  | none => biPredSampleHbd bitDepth p0 p1
+  | some (w0, w1) =>
+    clip1Hbd bitDepth ((Int.ofNat p0 * w0 + Int.ofNat p1 * w1 + 32) / 64)
+
+def qpelBlockSadHbd (src refP : PlaneHbd) (x0 y0 bw bh : Nat) (mvX mvY : Int) : Nat :=
+  (List.range bh).foldl (fun accR r =>
+    (List.range bw).foldl (fun accC c =>
+      let sPx := src.getPixel (y0 + r) (x0 + c)
+      let rPx := h264LumaQpelHbd refP (4 * Int.ofNat (x0 + c) + mvX) (4 * Int.ofNat (y0 + r) + mvY)
+      accC + absDiffNat sPx rPx) accR) 0
+
+def searchFullPelDiamondHbd (src refP : PlaneHbd) (x0 y0 bw bh radius : Nat) : Int × Int × Nat := Id.run do
+  let mut bestDx : Int := 0
+  let mut bestDy : Int := 0
+  let mut bestSad : Nat := qpelBlockSadHbd src refP x0 y0 bw bh 0 0
+  let radI := Int.ofNat radius
+  for _ in [:radius + 1] do
+    let mut improved := false
+    let mut nextDx := bestDx
+    let mut nextDy := bestDy
+    for (ox, oy) in ([(-1, 0), (1, 0), (0, -1), (0, 1), (-2, 0), (2, 0), (0, -2), (0, 2)] : List (Int × Int)) do
+      let cx := bestDx + ox
+      let cy := bestDy + oy
+      if cx >= -radI && cx <= radI && cy >= -radI && cy <= radI then
+        let sad := qpelBlockSadHbd src refP x0 y0 bw bh (4 * cx) (4 * cy)
+        if sad < bestSad then
+          bestSad := sad
+          nextDx := cx
+          nextDy := cy
+          improved := true
+    bestDx := nextDx
+    bestDy := nextDy
+    if !improved then break
+  return (bestDx, bestDy, bestSad)
+
+def refineMotionSubpelHbd (src refP : PlaneHbd) (x0 y0 bw bh : Nat) (intDx intDy : Int)
+    (mvp : MotionVec := ⟨0, 0⟩) (lambda : Nat := 1) : MotionEstResult :=
+  let initMv : MotionVec := ⟨4 * intDx, 4 * intDy⟩
+  let initSad := qpelBlockSadHbd src refP x0 y0 bw bh initMv.x initMv.y
+  let initRes : MotionEstResult := {
+    mv := initMv, sad := initSad,
+    rdCost := rdoSelectModeCost initSad lambda (mvdRateBits initMv mvp)
+  }
+  let halfRes := (subpelNeighborOffsets 2).foldl (fun best (dx, dy) =>
+    let cand : MotionVec := ⟨initRes.mv.x + dx, initRes.mv.y + dy⟩
+    let sad := qpelBlockSadHbd src refP x0 y0 bw bh cand.x cand.y
+    let cost := rdoSelectModeCost sad lambda (mvdRateBits cand mvp)
+    if cost < best.rdCost then { mv := cand, sad := sad, rdCost := cost } else best) initRes
+  (subpelNeighborOffsets 1).foldl (fun best (dx, dy) =>
+    let cand : MotionVec := ⟨halfRes.mv.x + dx, halfRes.mv.y + dy⟩
+    let sad := qpelBlockSadHbd src refP x0 y0 bw bh cand.x cand.y
+    let cost := rdoSelectModeCost sad lambda (mvdRateBits cand mvp)
+    if cost < best.rdCost then { mv := cand, sad := sad, rdCost := cost } else best) halfRes
+
+def estimateMotionSubpelHbd (src refP : PlaneHbd) (x0 y0 bw bh radius : Nat)
+    (mvp : MotionVec := ⟨0, 0⟩) (lambda : Nat := 1) : MotionEstResult :=
+  let (intDx, intDy, _) := searchFullPelDiamondHbd src refP x0 y0 bw bh radius
+  refineMotionSubpelHbd src refP x0 y0 bw bh intDx intDy mvp lambda
+
+@[inline]
+def qpBdOffsetHbd (bitDepth : Nat) : Int :=
+  6 * (Int.ofNat bitDepth - 8)
+
+@[inline]
+def qpYFromQpPrimeHbd (bitDepthY qpPrimeY : Nat) : Int :=
+  Int.ofNat qpPrimeY - qpBdOffsetHbd bitDepthY
+
+@[inline]
+def lookupAlphaHbd (bitDepth idxA : Nat) : Int :=
+  lookupAlpha idxA * Int.ofNat (1 <<< (bitDepth - 8))
+
+@[inline]
+def lookupBetaHbd (bitDepth idxB : Nat) : Int :=
+  lookupBeta idxB * Int.ofNat (1 <<< (bitDepth - 8))
+
+@[inline]
+def lookupTc0Hbd (bitDepth idxA bS : Nat) : Int :=
+  lookupTc0 idxA bS * Int.ofNat (1 <<< (bitDepth - 8))
+
+structure DeblockSamples8Hbd where
+  p3 : Nat
+  p2 : Nat
+  p1 : Nat
+  p0 : Nat
+  q0 : Nat
+  q1 : Nat
+  q2 : Nat
+  q3 : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+def filterLumaSamples8Hbd (bitDepth : Nat) (s : DeblockSamples8Hbd) (bS : Nat)
+    (qPav alphaOffDiv2 betaOffDiv2 : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : DeblockSamples8Hbd :=
+  if bS == 0 || bS > 4 || (bypassP && bypassQ) then s
+  else
+    let idxA := deblockIndexA qPav alphaOffDiv2
+    let idxB := deblockIndexB qPav betaOffDiv2
+    let alpha := lookupAlphaHbd bitDepth idxA
+    let beta  := lookupBetaHbd bitDepth idxB
+    let p3 := Int.ofNat s.p3
+    let p2 := Int.ofNat s.p2
+    let p1 := Int.ofNat s.p1
+    let p0 := Int.ofNat s.p0
+    let q0 := Int.ofNat s.q0
+    let q1 := Int.ofNat s.q1
+    let q2 := Int.ofNat s.q2
+    let q3 := Int.ofNat s.q3
+    let ap := Int.ofNat (p2 - p0).natAbs
+    let aq := Int.ofNat (q2 - q0).natAbs
+    if !(Int.ofNat (p0 - q0).natAbs < alpha &&
+         Int.ofNat (p1 - p0).natAbs < beta &&
+         Int.ofNat (q1 - q0).natAbs < beta) then s
+    else if bS == 4 then
+      let smallGap := Int.ofNat (p0 - q0).natAbs < (alpha / 4) + 2
+      let (np0, np1, np2) :=
+        if ap < beta && smallGap then
+          (clip1Hbd bitDepth ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) / 8),
+           clip1Hbd bitDepth ((p2 + p1 + p0 + q0 + 2) / 4),
+           clip1Hbd bitDepth ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) / 8))
+        else
+          (clip1Hbd bitDepth ((2 * p1 + p0 + q1 + 2) / 4), s.p1, s.p2)
+      let (nq0, nq1, nq2) :=
+        if aq < beta && smallGap then
+          (clip1Hbd bitDepth ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) / 8),
+           clip1Hbd bitDepth ((p0 + q0 + q1 + q2 + 2) / 4),
+           clip1Hbd bitDepth ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) / 8))
+        else
+          (clip1Hbd bitDepth ((2 * q1 + q0 + p1 + 2) / 4), s.q1, s.q2)
+      let (fp2, fp1, fp0) := if bypassP then (s.p2, s.p1, s.p0) else (np2, np1, np0)
+      let (fq0, fq1, fq2) := if bypassQ then (s.q0, s.q1, s.q2) else (nq0, nq1, nq2)
+      { s with p2 := fp2, p1 := fp1, p0 := fp0, q0 := fq0, q1 := fq1, q2 := fq2 }
+    else
+      let tc0 := lookupTc0Hbd bitDepth idxA bS
+      let tc := tc0 + (if ap < beta then 1 else 0) + (if aq < beta then 1 else 0)
+      let delta := clip3 (-tc) tc ((4 * (q0 - p0) + (p1 - q1) + 4) / 8)
+      let np0 := clip1Hbd bitDepth (p0 + delta)
+      let nq0 := clip1Hbd bitDepth (q0 - delta)
+      let np1 :=
+        if ap < beta then
+          let dp1 := clip3 (-tc0) tc0 ((p2 + ((p0 + q0 + 1) / 2) - 2 * p1) / 2)
+          clip1Hbd bitDepth (p1 + dp1)
+        else s.p1
+      let nq1 :=
+        if aq < beta then
+          let dq1 := clip3 (-tc0) tc0 ((q2 + ((p0 + q0 + 1) / 2) - 2 * q1) / 2)
+          clip1Hbd bitDepth (q1 + dq1)
+        else s.q1
+      let (fp1, fp0) := if bypassP then (s.p1, s.p0) else (np1, np0)
+      let (fq0, fq1) := if bypassQ then (s.q0, s.q1) else (nq0, nq1)
+      { s with p1 := fp1, p0 := fp0, q0 := fq0, q1 := fq1 }
+
+def filterChromaSamples4Hbd (bitDepth : Nat) (p1n p0n q0n q1n : Nat) (bS : Nat)
+    (qPav alphaOffDiv2 betaOffDiv2 : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : Nat × Nat :=
+  if bS == 0 || bS > 4 || (bypassP && bypassQ) then (p0n, q0n)
+  else
+    let idxA := deblockIndexA qPav alphaOffDiv2
+    let idxB := deblockIndexB qPav betaOffDiv2
+    let alpha := lookupAlphaHbd bitDepth idxA
+    let beta  := lookupBetaHbd bitDepth idxB
+    let p1 := Int.ofNat p1n
+    let p0 := Int.ofNat p0n
+    let q0 := Int.ofNat q0n
+    let q1 := Int.ofNat q1n
+    if !(Int.ofNat (p0 - q0).natAbs < alpha &&
+         Int.ofNat (p1 - p0).natAbs < beta &&
+         Int.ofNat (q1 - q0).natAbs < beta) then (p0n, q0n)
+    else if bS == 4 then
+      let np0 := clip1Hbd bitDepth ((2 * p1 + p0 + q1 + 2) / 4)
+      let nq0 := clip1Hbd bitDepth ((2 * q1 + q0 + p1 + 2) / 4)
+      (if bypassP then p0n else np0, if bypassQ then q0n else nq0)
+    else
+      let tc := lookupTc0Hbd bitDepth idxA bS + 1
+      let delta := clip3 (-tc) tc ((4 * (q0 - p0) + (p1 - q1) + 4) / 8)
+      let np0 := clip1Hbd bitDepth (p0 + delta)
+      let nq0 := clip1Hbd bitDepth (q0 - delta)
+      (if bypassP then p0n else np0, if bypassQ then q0n else nq0)
+
+def deblockVertEdge4Hbd (p : PlaneHbd) (edgeX yStart count bS : Nat) (qPav aOff bOff : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if edgeX < 4 || edgeX + 4 > p.width || (bypassP && bypassQ) then p
+  else
+    (List.range count).foldl (fun dst i =>
+      let y := yStart + i
+      if y < dst.height then
+        let sIn : DeblockSamples8Hbd := {
+          p3 := dst.getPixel y (edgeX - 4), p2 := dst.getPixel y (edgeX - 3),
+          p1 := dst.getPixel y (edgeX - 2), p0 := dst.getPixel y (edgeX - 1),
+          q0 := dst.getPixel y edgeX,       q1 := dst.getPixel y (edgeX + 1),
+          q2 := dst.getPixel y (edgeX + 2), q3 := dst.getPixel y (edgeX + 3)
+        }
+        let sOut := filterLumaSamples8Hbd dst.bitDepth sIn bS qPav aOff bOff bypassP bypassQ
+        let d1 := dst.setPixel y (edgeX - 3) sOut.p2
+        let d2 := d1.setPixel  y (edgeX - 2) sOut.p1
+        let d3 := d2.setPixel  y (edgeX - 1) sOut.p0
+        let d4 := d3.setPixel  y edgeX       sOut.q0
+        let d5 := d4.setPixel  y (edgeX + 1) sOut.q1
+        d5.setPixel            y (edgeX + 2) sOut.q2
+      else dst) p
+
+def deblockHorizEdge4Hbd (p : PlaneHbd) (xStart edgeY count bS : Nat) (qPav aOff bOff : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if edgeY < 4 || edgeY + 4 > p.height || (bypassP && bypassQ) then p
+  else
+    (List.range count).foldl (fun dst i =>
+      let x := xStart + i
+      if x < dst.width then
+        let sIn : DeblockSamples8Hbd := {
+          p3 := dst.getPixel (edgeY - 4) x, p2 := dst.getPixel (edgeY - 3) x,
+          p1 := dst.getPixel (edgeY - 2) x, p0 := dst.getPixel (edgeY - 1) x,
+          q0 := dst.getPixel edgeY       x, q1 := dst.getPixel (edgeY + 1) x,
+          q2 := dst.getPixel (edgeY + 2) x, q3 := dst.getPixel (edgeY + 3) x
+        }
+        let sOut := filterLumaSamples8Hbd dst.bitDepth sIn bS qPav aOff bOff bypassP bypassQ
+        let d1 := dst.setPixel (edgeY - 3) x sOut.p2
+        let d2 := d1.setPixel  (edgeY - 2) x sOut.p1
+        let d3 := d2.setPixel  (edgeY - 1) x sOut.p0
+        let d4 := d3.setPixel  edgeY       x sOut.q0
+        let d5 := d4.setPixel  (edgeY + 1) x sOut.q1
+        d5.setPixel            (edgeY + 2) x sOut.q2
+      else dst) p
+
+def deblockChromaVertEdge2Hbd (p : PlaneHbd) (edgeXC yStartC count bS : Nat) (qPavC aOff bOff : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if edgeXC < 2 || edgeXC + 2 > p.width || (bypassP && bypassQ) then p
+  else
+    (List.range count).foldl (fun dst i =>
+      let y := yStartC + i
+      if y < dst.height then
+        let p1 := dst.getPixel y (edgeXC - 2)
+        let p0 := dst.getPixel y (edgeXC - 1)
+        let q0 := dst.getPixel y edgeXC
+        let q1 := dst.getPixel y (edgeXC + 1)
+        let (np0, nq0) := filterChromaSamples4Hbd dst.bitDepth p1 p0 q0 q1 bS qPavC aOff bOff bypassP bypassQ
+        let d1 := dst.setPixel y (edgeXC - 1) np0
+        d1.setPixel            y edgeXC       nq0
+      else dst) p
+
+def deblockChromaHorizEdge2Hbd (p : PlaneHbd) (xStartC edgeYC count bS : Nat) (qPavC aOff bOff : Int)
+    (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if edgeYC < 2 || edgeYC + 2 > p.height || (bypassP && bypassQ) then p
+  else
+    (List.range count).foldl (fun dst i =>
+      let x := xStartC + i
+      if x < dst.width then
+        let p1 := dst.getPixel (edgeYC - 2) x
+        let p0 := dst.getPixel (edgeYC - 1) x
+        let q0 := dst.getPixel edgeYC       x
+        let q1 := dst.getPixel (edgeYC + 1) x
+        let (np0, nq0) := filterChromaSamples4Hbd dst.bitDepth p1 p0 q0 q1 bS qPavC aOff bOff bypassP bypassQ
+        let d1 := dst.setPixel (edgeYC - 1) x np0
+        d1.setPixel            edgeYC       x nq0
+      else dst) p
+
+/-- ITU-T H.264 §8.7.2: Chroma vertical edge deblocking for `chromaArrayType ∈ {0,1,2,3}`.
+    - `1` (4:2:0): 2-tap chroma filter at `kx ∈ {0, 8}`, `count = 2` rows per 4-luma-row block
+    - `2` (4:2:2): 2-tap chroma filter at `kx ∈ {0, 8}`, `count = 4` rows per 4-luma-row block
+    - `3` (4:4:4): 4-tap luma-style filter at `kx ∈ {0, 4, 8, 12}` (skipping `4, 12` when `isChroma8x8`), `count = 4` rows
+    - `0` (4:0:0): no-op -/
+def deblockChromaVertStepHbd (chromaArrayType : Nat) (p : PlaneHbd)
+    (mbX mbY kx blkRow bS : Nat) (isChroma8x8 : Bool)
+    (qPavC aOff bOff : Int) (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if chromaArrayType == 1 then
+    if kx == 0 || kx == 8 then
+      deblockChromaVertEdge2Hbd p (mbX * 8 + kx / 2) (mbY * 8 + blkRow * 2) 2 bS qPavC aOff bOff bypassP bypassQ
+    else p
+  else if chromaArrayType == 2 then
+    if kx == 0 || kx == 8 then
+      deblockChromaVertEdge2Hbd p (mbX * 8 + kx / 2) (mbY * 16 + blkRow * 4) 4 bS qPavC aOff bOff bypassP bypassQ
+    else p
+  else if chromaArrayType == 3 then
+    if skipInternalEdge8x8 isChroma8x8 kx then p
+    else deblockVertEdge4Hbd p (mbX * 16 + kx) (mbY * 16 + blkRow * 4) 4 bS qPavC aOff bOff bypassP bypassQ
+  else p
+
+/-- ITU-T H.264 §8.7.2: Chroma horizontal edge deblocking for `chromaArrayType ∈ {0,1,2,3}`.
+    - `1` (4:2:0): 2-tap chroma filter at `ky ∈ {0, 8}`, `count = 2` cols per 4-luma-col block
+    - `2` (4:2:2): 2-tap chroma filter at `ky ∈ {0, 4, 8, 12}`, `count = 2` cols per 4-luma-col block
+    - `3` (4:4:4): 4-tap luma-style filter at `ky ∈ {0, 4, 8, 12}` (skipping `4, 12` when `isChroma8x8`), `count = 4` cols
+    - `0` (4:0:0): no-op -/
+def deblockChromaHorizStepHbd (chromaArrayType : Nat) (p : PlaneHbd)
+    (mbX mbY ky blkCol bS : Nat) (isChroma8x8 : Bool)
+    (qPavC aOff bOff : Int) (bypassP : Bool := false) (bypassQ : Bool := false) : PlaneHbd :=
+  if chromaArrayType == 1 then
+    if ky == 0 || ky == 8 then
+      deblockChromaHorizEdge2Hbd p (mbX * 8 + blkCol * 2) (mbY * 8 + ky / 2) 2 bS qPavC aOff bOff bypassP bypassQ
+    else p
+  else if chromaArrayType == 2 then
+    deblockChromaHorizEdge2Hbd p (mbX * 8 + blkCol * 2) (mbY * 16 + ky) 2 bS qPavC aOff bOff bypassP bypassQ
+  else if chromaArrayType == 3 then
+    if skipInternalEdge8x8 isChroma8x8 ky then p
+    else deblockHorizEdge4Hbd p (mbX * 16 + blkCol * 4) (mbY * 16 + ky) 4 bS qPavC aOff bOff bypassP bypassQ
+  else p
+
+structure H264PictureHbd where
+  width               : Nat
+  height              : Nat
+  chromaFormatIdc     : Nat := 1
+  separateColourPlane : Bool := false
+  bitDepthY           : Nat := 8
+  bitDepthC           : Nat := 8
+  y                   : PlaneHbd
+  u                   : PlaneHbd
+  v                   : PlaneHbd
+  deriving Repr, DecidableEq, Inhabited
+
+def isValidPictureHbd (pic : H264PictureHbd) : Bool :=
+  isValidHbdBitDepth pic.bitDepthY &&
+  isValidHbdBitDepth pic.bitDepthC &&
+  pic.chromaFormatIdc <= 3 &&
+  pic.y.bitDepth == pic.bitDepthY &&
+  pic.y.width == pic.width &&
+  pic.y.height == pic.height &&
+  (if pic.chromaFormatIdc == 0 then
+     pic.u.width == 0 && pic.u.height == 0 && pic.v.width == 0 && pic.v.height == 0
+   else if pic.chromaFormatIdc == 1 then
+     let cw := (pic.width + 1) / 2
+     let ch := (pic.height + 1) / 2
+     pic.u.bitDepth == pic.bitDepthC && pic.v.bitDepth == pic.bitDepthC &&
+     pic.u.width == cw && pic.u.height == ch && pic.v.width == cw && pic.v.height == ch
+   else if pic.chromaFormatIdc == 2 then
+     let cw := (pic.width + 1) / 2
+     pic.u.bitDepth == pic.bitDepthC && pic.v.bitDepth == pic.bitDepthC &&
+     pic.u.width == cw && pic.u.height == pic.height && pic.v.width == cw && pic.v.height == pic.height
+   else
+     pic.u.bitDepth == pic.bitDepthC && pic.v.bitDepth == pic.bitDepthC &&
+     pic.u.width == pic.width && pic.u.height == pic.height &&
+     pic.v.width == pic.width && pic.v.height == pic.height)
+
+structure H264StoredRefHbd where
+  uid        : Nat
+  poc        : Int
+  isLongTerm : Bool := false
+  pic        : H264PictureHbd
+  deriving Repr, DecidableEq, Inhabited
+
 end LeanAV.H264InterDeblockDpb
 
