@@ -724,9 +724,13 @@ class TestP11E2EPipeline(unittest.TestCase):
 
         raw_40s = self.work / "in_40s_1fps.yuv"
         raw_40s.write_bytes(_make_raw_10bit_yuv420p(16, 16, frames=1) * 40)
-        mkv_40s = self.work / "hdr_40s_multicluster.mkv"
-        r_40s = _run_lffmpeg(
+        mp4_40s_src = self.work / "in_40s_hdr_aac.mp4"
+        subprocess.run(
             [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -737,6 +741,36 @@ class TestP11E2EPipeline(unittest.TestCase):
                 "1",
                 "-i",
                 str(raw_40s),
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=2.0",
+                "-c:v",
+                "libx265",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-y",
+                str(mp4_40s_src),
+            ],
+            check=True,
+        )
+        mkv_40s = self.work / "hdr_40s_multicluster.mkv"
+        r_40s = _run_lffmpeg(
+            [
+                "-i",
+                str(mp4_40s_src),
+                "-r",
+                "1",
                 "-c:v",
                 "hevc",
                 "-pix_fmt",
@@ -747,6 +781,8 @@ class TestP11E2EPipeline(unittest.TestCase):
                 "smpte2084",
                 "-colorspace",
                 "bt2020nc",
+                "-c:a",
+                "aac",
                 "-y",
                 str(mkv_40s),
             ]
@@ -758,7 +794,7 @@ class TestP11E2EPipeline(unittest.TestCase):
                 "-v",
                 "error",
                 "-show_entries",
-                "packet=pts_time",
+                "packet=codec_type,pts_time",
                 "-of",
                 "json",
                 str(mkv_40s),
@@ -768,11 +804,112 @@ class TestP11E2EPipeline(unittest.TestCase):
             check=True,
         )
         pkts = json.loads(pkt_res.stdout)["packets"]
-        self.assertEqual(len(pkts), 40)
-        pts_ms = [round(float(p["pts_time"]) * 1000) for p in pkts]
-        self.assertEqual(pts_ms[32], 32000)
-        self.assertEqual(pts_ms[33], 33000)
-        self.assertEqual(pts_ms[39], 39000)
+        all_pts_ms = [round(float(p["pts_time"]) * 1000) for p in pkts]
+        self.assertEqual(all_pts_ms, sorted(all_pts_ms))
+        vid_pts_ms = [round(float(p["pts_time"]) * 1000) for p in pkts if p["codec_type"] == "video"]
+        aud_pts_ms = [round(float(p["pts_time"]) * 1000) for p in pkts if p["codec_type"] == "audio"]
+        self.assertEqual(vid_pts_ms, [i * 1000 for i in range(40)])
+        self.assertGreater(len(aud_pts_ms), 0)
+        mp4_40s = self.work / "hdr_40s_multicluster_rt.mp4"
+        r_40s_rt = _run_lffmpeg(
+            [
+                "-i",
+                str(mkv_40s),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-y",
+                str(mp4_40s),
+            ]
+        )
+        self.assertEqual(r_40s_rt.returncode, 0, r_40s_rt.stdout + r_40s_rt.stderr)
+        rt_pkt_res = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "json",
+                str(mp4_40s),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        rt_vid_pts = [round(float(p["pts_time"]) * 1000) for p in json.loads(rt_pkt_res.stdout)["packets"]]
+        self.assertEqual(rt_vid_pts, [i * 1000 for i in range(40)])
+
+        bad_frac_out = self.work / "bad_frac_fps.mp4"
+        for bad_rate in ("30000/1001", "24000/1001", "ntsc"):
+            r_bad_frac = _run_lffmpeg(
+                [
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-s",
+                    "16x16",
+                    "-r",
+                    bad_rate,
+                    "-i",
+                    str(raw_40s),
+                    "-c:v",
+                    "hevc",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-y",
+                    str(bad_frac_out),
+                ]
+            )
+            self.assertNotEqual(r_bad_frac.returncode, 0, f"rate {bad_rate} must fail closed")
+            self.assertFalse(bad_frac_out.exists())
+
+        sdr_src_mp4 = self.work / "sdr_src_10fps.mp4"
+        subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=32x32:rate=10:duration=0.4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                str(sdr_src_mp4),
+            ],
+            check=True,
+        )
+        sdr_fc_r_mp4 = self.work / "sdr_fc_out_5fps.mp4"
+        r_sdr_fc = _run_lffmpeg(
+            [
+                "-i",
+                str(sdr_src_mp4),
+                "-filter_complex",
+                "[0:v]null[v]",
+                "-map",
+                "[v]",
+                "-r",
+                "5",
+                "-c:v",
+                "h264",
+                "-y",
+                str(sdr_fc_r_mp4),
+            ]
+        )
+        self.assertEqual(r_sdr_fc.returncode, 0, r_sdr_fc.stdout + r_sdr_fc.stderr)
+        probe_sdr_fc = _ffprobe_json(sdr_fc_r_mp4)
+        self.assertEqual(int(probe_sdr_fc["streams"][0]["nb_frames"]), 2)
+        self.assertEqual(probe_sdr_fc["streams"][0]["r_frame_rate"], "5/1")
 
 
 if __name__ == "__main__":

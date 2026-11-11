@@ -1643,8 +1643,21 @@ def filterStreams (inputs : Array Media) (options : Options) : Except String Med
       else match selected.find? (fun (_, fmt, _) => fmt.kind == .video) with
         | some (_, fmt, q) =>
           let all := drainVideoQueue q
-          let capped := match options.maxFrames with | some n => all.extract 0 n | none => all
-          (capped, Nat.max 1 fmt.fpsNum)
+          let outFps0 := Nat.max 1 fmt.fpsNum
+          let (resampled, outFps) :=
+            match options.outFps with
+            | some targetFps =>
+              if targetFps == 0 || all.isEmpty || targetFps == outFps0 then (all, outFps0)
+              else
+                let outCount := Nat.max 1 ((all.size * targetFps) / outFps0)
+                let arr := (Array.range outCount).map fun i =>
+                  let srcIdx := Nat.min (all.size - 1) ((i * outFps0) / targetFps)
+                  let base := all.getD srcIdx default
+                  { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
+                (arr, targetFps)
+            | none => (all, outFps0)
+          let capped := match options.maxFrames with | some n => resampled.extract 0 n | none => resampled
+          (capped, outFps)
         | none => (#[], 25)
     let audio :=
       if options.noAudio then none

@@ -507,11 +507,11 @@ def parseLavfiSize (s : String) : Option (Nat × Nat) :=
       | _, _ => none
     | _ => none
 
-/-- Parse a frame rate token (`"25"`, `"30/1"`, `"ntsc"`, `"pal"`). -/
+/-- Parse an integral frame rate token (`"25"`, `"30/1"`, `"pal"`, `"film"`); non-integral rates fail closed (`none`). -/
 def parseLavfiRate (s : String) : Option Nat :=
   let low := s.trimAscii.toString.toLower
-  if low == "pal" then some 25
-  else if low == "ntsc" || low == "film" then some 24
+  if low == "pal" || low == "qpal" || low == "spal" then some 25
+  else if low == "film" then some 24
   else
     match splitKeep low '/' with
     | [numStr] =>
@@ -520,7 +520,7 @@ def parseLavfiRate (s : String) : Option Nat :=
       | none => none
     | [numStr, denStr] =>
       match numStr.toNat?, denStr.toNat? with
-      | some num, some den => if num > 0 && den > 0 && num >= den then some (num / den) else none
+      | some num, some den => if num > 0 && den > 0 && num % den == 0 then some (num / den) else none
       | _, _ => none
     | _ => none
 

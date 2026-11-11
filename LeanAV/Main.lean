@@ -1688,7 +1688,10 @@ private def scanRawLavfiCliLoop : List String → Option String → RawLavfiCliS
       | [] => { st with hasBlocking := true }
     else if tok == "-r" || tok == "-framerate" then
       match rest with
-      | v :: tail => scanRawLavfiCliLoop tail pendingFmt { st with outRate := some v }
+      | v :: tail =>
+        match parseLavfiRate v with
+        | some r => scanRawLavfiCliLoop tail pendingFmt { st with outRate := some (toString r) }
+        | none => { st with hasBlocking := true }
       | [] => { st with hasBlocking := true }
     else if tok == "-ar" then
       match rest with
@@ -2084,11 +2087,25 @@ def runInprocLavfiDagCli
     | none => none
     | some (_, fmt, q) =>
       let all := drainVideoQueue q
+      let srcFps := Nat.max 1 fmt.fpsNum
       let durLim := match cliDurMs? with
-        | some dMs => lavfiVideoFrameCount fmt.fpsNum dMs
+        | some dMs => lavfiVideoFrameCount srcFps dMs
         | none => all.size
-      let lim := match limN? with | some n => Nat.min durLim (Nat.max 1 n) | none => durLim
-      some (all.extract 0 (Nat.min all.size lim), Nat.max 1 fmt.fpsNum)
+      let preResample := all.extract 0 (Nat.min all.size durLim)
+      let (resampled, effFps) :=
+        match raw.outRate.bind parseLavfiRate with
+        | some targetFps =>
+          if targetFps == 0 || preResample.isEmpty || targetFps == srcFps then (preResample, srcFps)
+          else
+            let outCount := Nat.max 1 ((preResample.size * targetFps) / srcFps)
+            let arr := (Array.range outCount).map fun i =>
+              let srcIdx := Nat.min (preResample.size - 1) ((i * srcFps) / targetFps)
+              let base := preResample.getD srcIdx default
+              { base with pts := i.toUInt64, timeBase := AVRational.mkSafe 1 targetFps.toUInt64 }
+            (arr, targetFps)
+        | none => (preResample, srcFps)
+      let lim := match limN? with | some n => Nat.min resampled.size (Nat.max 1 n) | none => resampled.size
+      some (resampled.extract 0 lim, effFps)
   let aFrame? : Option AudioFrame :=
     match aSel with
     | none => none

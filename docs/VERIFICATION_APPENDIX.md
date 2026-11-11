@@ -10,7 +10,7 @@ Measured on `campaign/p1-1-hdr-highbitdepth-20261106` under Lean `v4.35.0` and `
 Verified 24989 LeanAV declarations (0 sorryAx, 0 custom axioms).
 ```
 
-38 `LeanAV/*.lean` modules, 99,861 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
+38 `LeanAV/*.lean` modules, 99,891 lines. Axiom allowlist: `{propext, Quot.sound, Classical.choice}`.
 
 ## Tight specifications
 

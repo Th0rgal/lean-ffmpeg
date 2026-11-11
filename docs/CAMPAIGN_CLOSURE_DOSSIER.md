@@ -14,7 +14,7 @@ Matroska/WebM HDR10/Dolby Vision container demux/mux, and 10/12/16-bit scaling,
 BT.2020 PQ/HLG tonemapping, and Bayer/Floyd-Steinberg dithering across
 `yuv420p10le`, `p010le`, `yuv422p10le`, `yuv444p10le`, `yuv420p12le`,
 `yuv422p12le`, `yuv444p12le`, `gbrp10le`, and `rgba64le`, auditing **24,989
-declarations with zero sorryAx/custom axioms** (`99,861` LOC across 38 formal
+declarations with zero sorryAx/custom axioms** (`99,891` LOC across 38 formal
 `LeanAV/*.lean` modules) and **890/890 `non_vacuous_and_tight` specifications**
 (`AacLcProofs`: 84, `H264IntraTransformProofs`: 82, `H264InterDeblockDpbProofs`:
 79, `Format`: 70, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 47,
