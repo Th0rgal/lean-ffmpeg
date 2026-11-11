@@ -758,5 +758,60 @@ theorem buildAudioQueue_bounded (cap : Nat) (af : AudioFrame) :
     simp
   exact edgeBufferQueue_push_preserves_bound _ _ hEmpty
 
+/-! ## 4. P1.1 colorspace and tonemap conservation -/
+
+/-- Colorspace conversion changes the matrix and conserves geometry and plane count. -/
+def ColorspaceFrameSafe (a : VideoFrame × String × VideoFrame) : Prop :=
+  let (src, target, dst) := a
+  dst.width = src.width ∧ dst.height = src.height ∧ dst.planes.size = 3 ∧
+    dst.colorMatrix = parseHdrColorMatrix target
+
+instance (a : VideoFrame × String × VideoFrame) : Decidable (ColorspaceFrameSafe a) := by
+  unfold ColorspaceFrameSafe
+  infer_instance
+
+def colorspaceFrameGateSpec : AVGateSpec (VideoFrame × String × VideoFrame) ColorspaceFrameSafe where
+  gate := fun a => decide (ColorspaceFrameSafe a)
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness :=
+    let src := VideoFrame.allocYuv420p 2 2 0 AVRational.tb90kHz .bt2020ncl
+    (src, "bt709", filterVideoColorspace src "bt709")
+  negWitness :=
+    let src := VideoFrame.allocYuv420p 2 2 0 AVRational.tb90kHz .bt2020ncl
+    (src, "bt709", src)
+  nonVacuous := by decide
+  tight := by decide
+
+theorem colorspaceFrameGateSpec_iff (a : VideoFrame × String × VideoFrame) :
+    colorspaceFrameGateSpec.gate a = true ↔ ColorspaceFrameSafe a :=
+  colorspaceFrameGateSpec.iff_safe a
+
+theorem filterVideoColorspace_conserves (vf : VideoFrame) (target : String)
+    (hPlanes : vf.planes.size = 3) :
+    let dst := filterVideoColorspace vf target
+    dst.width = vf.width ∧ dst.height = vf.height ∧ dst.planes.size = 3 ∧
+      dst.colorMatrix = parseHdrColorMatrix target := by
+  unfold filterVideoColorspace convertVideoFrameColorspace
+  split <;> simp [hPlanes]
+
+theorem filterVideoTonemap_is_bt709 (vf : VideoFrame) (mode : String)
+    (hPlanes : vf.planes.size = 3) :
+    let dst := filterVideoTonemap vf mode
+    dst.width = vf.width ∧ dst.height = vf.height ∧ dst.planes.size = 3 ∧
+      dst.colorMatrix = .bt709 := by
+  unfold filterVideoTonemap tonemapVideoFrameHdrToSdr tonemapVideoFrameHdrToSdrWithTransfer
+  have hNotLt : ¬ vf.planes.size < 3 := by omega
+  simp [hNotLt]
+
+theorem colorspace_then_tonemap_conserves (vf : VideoFrame) (target mode : String)
+    (hPlanes : vf.planes.size = 3) :
+    let dst := filterVideoTonemap (filterVideoColorspace vf target) mode
+    dst.width = vf.width ∧ dst.height = vf.height ∧ dst.planes.size = 3 ∧
+      dst.colorMatrix = .bt709 := by
+  have hCs := filterVideoColorspace_conserves vf target hPlanes
+  have hTm := filterVideoTonemap_is_bt709 (filterVideoColorspace vf target) mode hCs.2.2.1
+  exact ⟨hTm.1.trans hCs.1, hTm.2.1.trans hCs.2.1, hTm.2.2.1, hTm.2.2.2⟩
+
 end LeanAV.LavfiGraphProofs
 

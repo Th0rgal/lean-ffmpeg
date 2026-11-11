@@ -675,6 +675,131 @@ theorem h264_cabac_nonidr_prefix_exact_and_offset_roundtrip :
               | none => false)
            | none => false)
         | none => false)
-     | none => false) = true := rfl
+      | none => false) = true := rfl
+
+/-! ## 6. Table 7-2 Scaling-Matrix Fallback & High `avcC` Builder -/
+
+/-- ITU-T H.264 Table 7-2 Rule A: `seq_scaling_matrix_present_flag = 0` yields flat (`16`) 4x4 & 8x8 lists. -/
+theorem resolveSpsScalingMatrices_absent_flat (ch : UInt8) :
+    resolveSpsScalingMatrices false #[] #[] ch =
+      (Array.replicate 6 flatScalingList4x4, Array.replicate 6 flatScalingList8x8) := by
+  unfold resolveSpsScalingMatrices
+  simp
+
+/-- ITU-T H.264 Table 7-2 Rule A: when `chroma_format_idc != 3`, only `ScalingList8x8[0..1]` are signalled;
+    unsignalled entries `2..5` stay flat (`16`). -/
+theorem resolveSpsScalingMatrices_chroma420_limits_8x8 :
+    (match resolveSpsScalingMatrices true (Array.replicate 6 .useDefault) (Array.replicate 6 .useDefault) 1 with
+     | (e4, e8) =>
+       e4.size == 6 && e8.size == 6 && e8.getD 2 #[] == flatScalingList8x8 && e8.getD 5 #[] == flatScalingList8x8) = true :=
+  rfl
+
+/-- ITU-T H.264 Table 7-2 Rule A: `chroma_format_idc == 3` signals all six 8x8 lists;
+    an absent list `k ≥ 2` falls back to `k - 2` (so `useDefault` at index 0 propagates to index 2). -/
+theorem resolveSpsScalingMatrices_chroma444_fallback_8x8 :
+    (match resolveSpsScalingMatrices true (Array.replicate 6 .useDefault) (Array.replicate 6 .useDefault) 3 with
+     | (e4, e8) =>
+       e4.size == 6 && e8.size == 6 && e8.getD 2 #[] == defaultScalingList8x8Intra && e8.getD 3 #[] == defaultScalingList8x8Inter) = true :=
+  rfl
+
+/-- ITU-T H.264 Table 7-2 Rule B: `pic_scaling_matrix_present_flag = 0` inherits the SPS effective matrices verbatim. -/
+theorem resolvePpsScalingMatrices_inherit_sps (sps4 sps8 : Array (Array UInt8)) (seq tr : Bool) (ch : UInt8) :
+    resolvePpsScalingMatrices seq sps4 sps8 false #[] #[] tr ch = (sps4, sps8) := by
+  unfold resolvePpsScalingMatrices
+  simp
+
+/-- `buildAvcDecoderConfigRecordFromSps` emits the High-profile `avcC` extension trailer for profile `244`
+    (`chroma_format_idc = 3`, `bit_depth_*_minus8 = 2`) and a valid record that round-trips through the `avcC` parser. -/
+theorem buildAvcDecoderConfigRecordFromSps_high444_ext_roundtrip :
+    let sps : H264SpsFull := { profileIdc := 244, chromaFormatIdc := 3, bitDepthLumaMinus8 := 2, bitDepthChromaMinus8 := 2 }
+    let cfg := buildAvcDecoderConfigRecordFromSps sps { data := #[0x67] } { data := #[0x68] }
+    (cfg.hasHighExt && cfg.chromaFormatIdc == 3 && cfg.bitDepthLumaMinus8 == 2 && cfg.bitDepthChromaMinus8 == 2 &&
+      cfg.isValid &&
+      ((serializeAvcDecoderConfigRecord cfg).bind parseAvcDecoderConfigRecord == some cfg)) = true :=
+  rfl
+
+/-- Declarative ITU-T H.264 Annex A §A.2.4–A.2.7 specification for High (`100`), High 10 (`110`),
+    High 4:2:2 (`122`), and High 4:4:4 Predictive (`244`) SPS profile/chroma/bit-depth/bypass admissibility. -/
+def HighTierSpsProfileValidProp (sps : H264SpsFull) : Prop :=
+  (sps.profileIdc = 100 ∨ sps.profileIdc = 110 ∨ sps.profileIdc = 122 ∨ sps.profileIdc = 244) ∧
+  sps.chromaFormatIdc ≤ 3 ∧
+  (sps.separateColourPlaneFlag = true → sps.chromaFormatIdc = 3) ∧
+  sps.bitDepthLumaMinus8 ≤ 4 ∧
+  sps.bitDepthChromaMinus8 ≤ 4 ∧
+  (sps.profileIdc = 100 →
+    sps.chromaFormatIdc ≤ 1 ∧ sps.bitDepthLumaMinus8 = 0 ∧ sps.bitDepthChromaMinus8 = 0 ∧ sps.qpprimeYZeroTransformBypass = false) ∧
+  (sps.profileIdc = 110 →
+    sps.chromaFormatIdc ≤ 1 ∧ sps.bitDepthLumaMinus8 ≤ 2 ∧ sps.bitDepthChromaMinus8 ≤ 2 ∧ sps.qpprimeYZeroTransformBypass = false) ∧
+  (sps.profileIdc = 122 →
+    sps.chromaFormatIdc ≤ 2 ∧ sps.bitDepthLumaMinus8 ≤ 2 ∧ sps.bitDepthChromaMinus8 ≤ 2 ∧ sps.qpprimeYZeroTransformBypass = false)
+
+/-- `isHighTierSpsProfileValid` is sound, complete, non-vacuous, and tight for ITU-T H.264 Annex A §A.2.4–A.2.7. -/
+def h264HighTierSpsProfileValidSpec : AVGateSpec H264SpsFull HighTierSpsProfileValidProp where
+  gate := isHighTierSpsProfileValid
+  sound := by
+    intro sps h
+    unfold isHighTierSpsProfileValid at h
+    unfold HighTierSpsProfileValidProp
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', bne_iff_ne, ne_eq,
+      beq_iff_eq, decide_eq_true_eq] at h
+    rcases h with ⟨⟨⟨⟨⟨⟨⟨hp, hch⟩, hsep⟩, hbl⟩, hbc⟩, h100⟩, h110⟩, h122⟩
+    have hp' : sps.profileIdc = 100 ∨ sps.profileIdc = 110 ∨ sps.profileIdc = 122 ∨ sps.profileIdc = 244 := by
+      rcases hp with ((h1 | h2) | h3) | h4
+      · exact Or.inl h1
+      · exact Or.inr (Or.inl h2)
+      · exact Or.inr (Or.inr (Or.inl h3))
+      · exact Or.inr (Or.inr (Or.inr h4))
+    refine ⟨hp', hch, ?_, hbl, hbc, ?_, ?_, ?_⟩
+    · intro hs
+      rcases hsep with hf | hc
+      · rw [hs] at hf; cases hf
+      · exact hc
+    · intro hp100
+      rcases h100 with hne | ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact absurd hp100 hne
+      · exact ⟨a, b, c, d⟩
+    · intro hp110
+      rcases h110 with hne | ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact absurd hp110 hne
+      · exact ⟨a, b, c, d⟩
+    · intro hp122
+      rcases h122 with hne | ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact absurd hp122 hne
+      · exact ⟨a, b, c, d⟩
+  complete := by
+    intro sps h
+    unfold HighTierSpsProfileValidProp at h
+    rcases h with ⟨hp, hch, hsep, hbl, hbc, h100, h110, h122⟩
+    unfold isHighTierSpsProfileValid
+    simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', bne_iff_ne, ne_eq,
+      beq_iff_eq, decide_eq_true_eq]
+    have hp' : ((sps.profileIdc = 100 ∨ sps.profileIdc = 110) ∨ sps.profileIdc = 122) ∨ sps.profileIdc = 244 := by
+      rcases hp with h1 | h2 | h3 | h4
+      · exact Or.inl (Or.inl (Or.inl h1))
+      · exact Or.inl (Or.inl (Or.inr h2))
+      · exact Or.inl (Or.inr h3)
+      · exact Or.inr h4
+    refine ⟨⟨⟨⟨⟨⟨⟨hp', hch⟩, ?_⟩, hbl⟩, hbc⟩, ?_⟩, ?_⟩, ?_⟩
+    · cases hs : sps.separateColourPlaneFlag
+      · exact Or.inl rfl
+      · exact Or.inr (hsep hs)
+    · by_cases hp100 : sps.profileIdc = 100
+      · rcases h100 hp100 with ⟨a, b, c, d⟩; exact Or.inr ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact Or.inl hp100
+    · by_cases hp110 : sps.profileIdc = 110
+      · rcases h110 hp110 with ⟨a, b, c, d⟩; exact Or.inr ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact Or.inl hp110
+    · by_cases hp122 : sps.profileIdc = 122
+      · rcases h122 hp122 with ⟨a, b, c, d⟩; exact Or.inr ⟨⟨⟨a, b⟩, c⟩, d⟩
+      · exact Or.inl hp122
+  posWitness := { profileIdc := 244, chromaFormatIdc := 3, separateColourPlaneFlag := true,
+                  bitDepthLumaMinus8 := 4, bitDepthChromaMinus8 := 4, qpprimeYZeroTransformBypass := true }
+  negWitness := { profileIdc := 100, chromaFormatIdc := 1, bitDepthLumaMinus8 := 2 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem h264HighTierSpsProfileValidSpec_iff (sps : H264SpsFull) :
+    isHighTierSpsProfileValid sps = true ↔ HighTierSpsProfileValidProp sps :=
+  h264HighTierSpsProfileValidSpec.iff_safe sps
 
 end LeanAV.H264SyntaxProofs

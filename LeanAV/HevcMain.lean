@@ -404,7 +404,7 @@ def hevcInvAngle : Array Int := #[
 ]
 @[inline]
 def baGetD (ba : ByteArray) (idx : Nat) (d : UInt8 := 0) : UInt8 :=
-  ba.data.getD idx d
+  if h : idx < ba.size then ba[idx] else d
 
 structure HevcBitReader where
   data : ByteArray
@@ -1191,8 +1191,11 @@ def skipHrdParameters (gb0 : HevcBitReader) (cprmsPresent maxSubLayers : Nat) :
           gb := g5
   return some gb
 
-def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader := Id.run do
+def parseVuiColour (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option (HevcBitReader × Nat × Nat × Nat) := Id.run do
   let mut gb := gb0
+  let mut prim : Nat := 2
+  let mut trc : Nat := 2
+  let mut mat : Nat := 2
   let some (arFlag, g1) := gb.getBit | return none
   gb := g1
   if arFlag == 1 then
@@ -1213,8 +1216,13 @@ def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
     let some (cdFlag, g5) := g4.getBit | return none
     gb := g5
     if cdFlag == 1 then
-      let some g6 := gb.skipBits 24 | return none
-      gb := g6
+      let some (cp, g6a) := gb.getBits 8 | return none
+      let some (tc, g6b) := g6a.getBits 8 | return none
+      let some (mc, g6c) := g6b.getBits 8 | return none
+      prim := cp
+      trc := tc
+      mat := mc
+      gb := g6c
   let some (clFlag, g4) := gb.getBit | return none
   gb := g4
   if clFlag == 1 then
@@ -1250,7 +1258,10 @@ def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
     for _ in [:5] do
       let some (_, gn) := gb.getUe | return none
       gb := gn
-  return some gb
+  return some (gb, prim, trc, mat)
+
+def skipVui (gb0 : HevcBitReader) (maxSubLayers : Nat) : Option HevcBitReader :=
+  (parseVuiColour gb0 maxSubLayers).map (·.1)
 
 structure HevcPcmInfo where
   bitDepth              : Nat
@@ -1302,6 +1313,15 @@ structure HevcSps where
   ltUsed                            : Array Nat := #[]
   spsTemporalMvpEnabledFlag         : Bool := false
   spsStrongIntraSmoothingEnableFlag : Bool := false
+  transformSkipRotationEnabledFlag  : Bool := false
+  transformSkipContextEnabledFlag   : Bool := false
+  implicitRdpcmEnabledFlag          : Bool := false
+  explicitRdpcmEnabledFlag          : Bool := false
+  extendedPrecisionProcessingFlag   : Bool := false
+  intraSmoothingDisabledFlag        : Bool := false
+  highPrecisionOffsetsEnabledFlag   : Bool := false
+  persistentRiceAdaptationEnabledFlag : Bool := false
+  cabacBypassAlignmentEnabledFlag   : Bool := false
   ctbWidth                          : Nat := 1
   ctbHeight                         : Nat := 1
   ctbSize                           : Nat := 1
@@ -1312,6 +1332,9 @@ structure HevcSps where
   minPuWidth                        : Nat := 4
   minPuHeight                       : Nat := 4
   tbMask                            : Nat := 3
+  vuiPrimaries                      : Nat := 2
+  vuiTransfer                       : Nat := 2
+  vuiMatrix                         : Nat := 2
   deriving Repr, DecidableEq, Inhabited
 
 def isMain8Bit420Sps (sps : HevcSps) : Bool :=
@@ -1327,7 +1350,34 @@ def isMain8Bit420Sps (sps : HevcSps) : Bool :=
   sps.bitDepthChroma == 8 &&
   pcmOk
 
-def parseSps (rbsp : ByteArray) : Option HevcSps := Id.run do
+def isAdmittedExtProfileBitDepthChroma
+    (profileIdc : Nat) (compatFlags : Array Nat)
+    (bitDepth bitDepthChroma chromaFormatIdc : Nat) (sepPlane : Bool) : Bool :=
+  let isMain := profileIdc == 1 || compatFlags.getD 1 0 == 1
+  let isMain10 := profileIdc == 2 || compatFlags.getD 2 0 == 1
+  let isRext := profileIdc == 4 || compatFlags.getD 4 0 == 1
+  let mainOk := isMain && bitDepth == 8 && chromaFormatIdc == 1
+  let main10Ok := isMain10 && (bitDepth == 8 || bitDepth == 10) && chromaFormatIdc == 1
+  let rextOk :=
+    isRext &&
+    (bitDepth == 8 || bitDepth == 10 || bitDepth == 12) &&
+    (chromaFormatIdc == 1 || chromaFormatIdc == 2 || chromaFormatIdc == 3)
+  (mainOk || main10Ok || rextOk) &&
+  !sepPlane &&
+  bitDepthChroma == bitDepth
+
+def isMain10OrRextSps (sps : HevcSps) : Bool :=
+  let pcmOk :=
+    match sps.pcm? with
+    | none => true
+    | some p =>
+      p.bitDepth >= 1 && p.bitDepth <= sps.bitDepth &&
+      p.bitDepthChroma >= 1 && p.bitDepthChroma <= sps.bitDepthChroma
+  isAdmittedExtProfileBitDepthChroma sps.ptl.profileIdc sps.ptl.compatFlags
+    sps.bitDepth sps.bitDepthChroma sps.chromaFormatIdc sps.separateColourPlaneFlag &&
+  pcmOk
+
+def parseSpsRaw (rbsp : ByteArray) : Option HevcSps := Id.run do
   let gb0 := HevcBitReader.ofBytes rbsp
   let some (vpsId, g1) := gb0.getBits 4 | return none
   let some (mslM1, g2) := g1.getBits 3 | return none
@@ -1463,11 +1513,26 @@ def parseSps (rbsp : ByteArray) : Option HevcSps := Id.run do
   let some (sis, g27) := g26.getBit | return none
   let some (vuiPres, g28) := g27.getBit | return none
   gb := g28
+  let mut vuiPrim : Nat := 2
+  let mut vuiTrc : Nat := 2
+  let mut vuiMat : Nat := 2
   if vuiPres == 1 then
-    let some gv := skipVui gb maxSubLayers | return none
+    let some (gv, vp, vt, vm) := parseVuiColour gb maxSubLayers | return none
+    vuiPrim := vp
+    vuiTrc := vt
+    vuiMat := vm
     gb := gv
   let some (spsExt, g29) := gb.getBit | return none
   gb := g29
+  let mut tsRot := false
+  let mut tsCtx := false
+  let mut impRdpcm := false
+  let mut expRdpcm := false
+  let mut extPrec := false
+  let mut intraSmoothDis := false
+  let mut hiPrecOff := false
+  let mut persRice := false
+  let mut cabacBypassAlign := false
   if spsExt == 1 then
     let some (rextF, ga) := gb.getBit | return none
     let some (mlF, gb') := ga.getBit | return none
@@ -1475,13 +1540,27 @@ def parseSps (rbsp : ByteArray) : Option HevcSps := Id.run do
     let some (sccF, gd) := gc.getBit | return none
     let some ge := gd.skipBits 4 | return none
     gb := ge
+    if mlF == 1 || d3F == 1 || sccF == 1 then return none
     if rextF == 1 then
-      let some gf := gb.skipBits 9 | return none
-      gb := gf
-    if mlF == 1 then
-      let some gf := gb.skipBits 1 | return none
-      gb := gf
-    if d3F == 1 || sccF == 1 then return none
+      let some (r0, g0) := gb.getBit | return none
+      let some (r1, g1') := g0.getBit | return none
+      let some (r2, g2') := g1'.getBit | return none
+      let some (r3, g3') := g2'.getBit | return none
+      let some (r4, g4') := g3'.getBit | return none
+      let some (r5, g5') := g4'.getBit | return none
+      let some (r6, g6') := g5'.getBit | return none
+      let some (r7, g7') := g6'.getBit | return none
+      let some (r8, g8') := g7'.getBit | return none
+      tsRot := r0 == 1
+      tsCtx := r1 == 1
+      impRdpcm := r2 == 1
+      expRdpcm := r3 == 1
+      extPrec := r4 == 1
+      intraSmoothDis := r5 == 1
+      hiPrecOff := r6 == 1
+      persRice := r7 == 1
+      cabacBypassAlign := r8 == 1
+      gb := g8'
   if confLeft + confRight >= width || confTop + confBottom >= height then
     confLeft := 0
     confRight := 0
@@ -1531,6 +1610,15 @@ def parseSps (rbsp : ByteArray) : Option HevcSps := Id.run do
     ltUsed := ltUsed
     spsTemporalMvpEnabledFlag := tmvp == 1
     spsStrongIntraSmoothingEnableFlag := sis == 1
+    transformSkipRotationEnabledFlag := tsRot
+    transformSkipContextEnabledFlag := tsCtx
+    implicitRdpcmEnabledFlag := impRdpcm
+    explicitRdpcmEnabledFlag := expRdpcm
+    extendedPrecisionProcessingFlag := extPrec
+    intraSmoothingDisabledFlag := intraSmoothDis
+    highPrecisionOffsetsEnabledFlag := hiPrecOff
+    persistentRiceAdaptationEnabledFlag := persRice
+    cabacBypassAlignmentEnabledFlag := cabacBypassAlign
     ctbWidth := ctbWidth
     ctbHeight := ctbHeight
     ctbSize := ctbWidth * ctbHeight
@@ -1541,9 +1629,21 @@ def parseSps (rbsp : ByteArray) : Option HevcSps := Id.run do
     minPuWidth := width >>> (log2MinCbSize - 1)
     minPuHeight := height >>> (log2MinCbSize - 1)
     tbMask := (1 <<< (log2CtbSize - log2MinTbSize)) - 1
+    vuiPrimaries := vuiPrim
+    vuiTransfer := vuiTrc
+    vuiMatrix := vuiMat
   }
-  if !isMain8Bit420Sps sps then return none
   return some sps
+
+def parseSps (rbsp : ByteArray) : Option HevcSps :=
+  match parseSpsRaw rbsp with
+  | some sps => if isMain8Bit420Sps sps then some sps else none
+  | none => none
+
+def parseSpsExt (rbsp : ByteArray) : Option HevcSps :=
+  match parseSpsRaw rbsp with
+  | some sps => if isMain10OrRextSps sps then some sps else none
+  | none => none
 
 structure HevcPps where
   ppsId                                   : Nat := 0
@@ -1599,6 +1699,8 @@ structure HevcPps where
   chromaQpOffsetListLenMinus1             : Nat := 0
   cbQpOffsetList                          : Array Int := Array.replicate 6 0
   crQpOffsetList                          : Array Int := Array.replicate 6 0
+  log2SaoOffsetScaleLuma                  : Nat := 0
+  log2SaoOffsetScaleChroma                : Nat := 0
   deriving Repr, DecidableEq, Inhabited
 
 def buildPpsDerivations (sps : HevcSps) (pps : HevcPps) : Option HevcPps := Id.run do
@@ -1792,6 +1894,8 @@ def parsePps (rbsp : ByteArray) (spsMap : Array (Option HevcSps)) : Option HevcP
   let mut cbQpList := Array.replicate 6 (0 : Int)
   let mut crQpList := Array.replicate 6 (0 : Int)
   let mut log2MaxTskip := 2
+  let mut log2SaoLuma := 0
+  let mut log2SaoChroma := 0
   if ppsExt == 1 then
     let some (rext, ga) := gb.getBit | return none
     let some (mlExt, gb') := ga.getBit | return none
@@ -1799,6 +1903,7 @@ def parsePps (rbsp : ByteArray) (spsMap : Array (Option HevcSps)) : Option HevcP
     let some (sccExt, gd) := gc.getBit | return none
     let some ge := gd.skipBits 4 | return none
     gb := ge
+    if mlExt == 1 || d3Ext == 1 || sccExt == 1 then return none
     if rext == 1 then
       if tskip == 1 then
         let some (v, gn) := gb.getUe | return none
@@ -1823,10 +1928,14 @@ def parsePps (rbsp : ByteArray) (spsMap : Array (Option HevcSps)) : Option HevcP
           cbQpList := cbQpList.set! i cbo
           crQpList := crQpList.set! i cro
           gb := gb''
-      let some (_, ga') := gb.getUe | return none
-      let some (_, gb'') := ga'.getUe | return none
+      let some (saoL, ga') := gb.getUe | return none
+      let some (saoC, gb'') := ga'.getUe | return none
+      let maxSaoL := if sps.bitDepth > 10 then sps.bitDepth - 10 else 0
+      let maxSaoC := if sps.bitDepthChroma > 10 then sps.bitDepthChroma - 10 else 0
+      if saoL > maxSaoL || saoC > maxSaoC then return none
+      log2SaoLuma := saoL
+      log2SaoChroma := saoC
       gb := gb''
-    if mlExt == 1 || d3Ext == 1 || sccExt == 1 then return none
   let pps0 : HevcPps := { ({} : HevcPps) with
     ppsId := ppsId
     spsId := spsId
@@ -1873,6 +1982,8 @@ def parsePps (rbsp : ByteArray) (spsMap : Array (Option HevcSps)) : Option HevcP
     chromaQpOffsetListLenMinus1 := chromaQpListLenM1
     cbQpOffsetList := cbQpList
     crQpOffsetList := crQpList
+    log2SaoOffsetScaleLuma := log2SaoLuma
+    log2SaoOffsetScaleChroma := log2SaoChroma
   }
   buildPpsDerivations sps pps0
 
@@ -1918,12 +2029,19 @@ private def parseWeightList (gb0 : HevcBitReader) (sps : HevcSps) (nb lumaDenom 
     let mut lo := Array.replicate nb (0 : Int)
     let mut cw := Array.replicate nb #[baseC, baseC]
     let mut co := Array.replicate nb #[(0 : Int), 0]
+    let wpShiftY := if sps.highPrecisionOffsetsEnabledFlag then sps.bitDepth - 1 else 7
+    let wpHalfY : Int := Int.ofNat (1 <<< wpShiftY)
+    let wpShiftC := if sps.highPrecisionOffsetsEnabledFlag then sps.bitDepthChroma - 1 else 7
+    let wpHalfC : Int := Int.ofNat (1 <<< wpShiftC)
+    let wpScaleY : Int := if sps.highPrecisionOffsetsEnabledFlag then 1 else Int.ofNat (1 <<< (sps.bitDepth - 8))
+    let wpScaleC : Int := if sps.highPrecisionOffsetsEnabledFlag then 1 else Int.ofNat (1 <<< (sps.bitDepthChroma - 8))
     for i in [:nb] do
       if lumaFlag.getD i 0 == 1 then
         let some (dw, ga) := gb.getSe | return none
         let some (doff, gb') := ga.getSe | return none
+        if doff < -wpHalfY || doff > wpHalfY - 1 then return none
         lw := lw.set! i (baseL + dw)
-        lo := lo.set! i doff
+        lo := lo.set! i (doff * wpScaleY)
         gb := gb'
       if chromaFlag.getD i 0 == 1 then
         let mut cwRow := cw.getD i #[baseC, baseC]
@@ -1932,8 +2050,9 @@ private def parseWeightList (gb0 : HevcBitReader) (sps : HevcSps) (nb lumaDenom 
           let some (dw, ga) := gb.getSe | return none
           let some (doff, gb') := ga.getSe | return none
           let cwj := baseC + dw
-          let pred : Int := 128 - asrInt (128 * cwj) chromaDenom
-          coRow := coRow.set! j (clipInt (pred + doff) (-128) 127)
+          let pred : Int := wpHalfC - asrInt (wpHalfC * cwj) chromaDenom
+          let offRaw := clipInt (pred + doff) (-wpHalfC) (wpHalfC - 1)
+          coRow := coRow.set! j (offRaw * wpScaleC)
           cwRow := cwRow.set! j cwj
           gb := gb'
         cw := cw.set! i cwRow
@@ -2285,8 +2404,9 @@ def parseSliceHeader (ebspPayload : ByteArray) (nalType tid : Nat)
       gb := gb'
     let some (qpDelta, ga) := gb.getSe | return none
     gb := ga
+    let qpBdOffY : Int := Int.ofNat (6 * (sps.bitDepth - 8))
     let sliceQp := 26 + pps.picInitQpMinus26 + qpDelta
-    if sliceQp < 0 || sliceQp > 51 then return none
+    if sliceQp < -qpBdOffY || sliceQp > 51 then return none
     let mut cbOff : Int := 0
     let mut crOff : Int := 0
     if pps.picSliceLevelChromaQpOffsetsPresentFlag then
@@ -2539,6 +2659,171 @@ def buildHvccRecord (vps sps pps : ByteArray) : ByteArray :=
   let body := ByteArray.append (arrayBody 32 vps) (ByteArray.append (arrayBody 33 sps) (arrayBody 34 pps))
   ByteArray.append header body
 
+def ptlParamsForFormat (bitDepth chromaFormatIdc : Nat) :
+    Option (Nat × Nat × Nat × Nat) :=
+  if bitDepth == 8 && chromaFormatIdc == 1 then
+    some (1, 0x60000000, 0x9000, 0x00)
+  else if bitDepth == 10 && chromaFormatIdc == 1 then
+    some (2, 0x20000000, 0x9000, 0x00)
+  else if chromaFormatIdc == 1 && bitDepth == 12 then
+    some (4, 0x08000000, 0x9988, 0x00)
+  else if chromaFormatIdc == 2 && (bitDepth == 8 || bitDepth == 10) then
+    some (4, 0x08000000, 0x9D08, 0x00)
+  else if chromaFormatIdc == 2 && bitDepth == 12 then
+    some (4, 0x08000000, 0x9908, 0x00)
+  else if chromaFormatIdc == 3 && bitDepth == 8 then
+    some (4, 0x08000000, 0x9E08, 0x00)
+  else if chromaFormatIdc == 3 && bitDepth == 10 then
+    some (4, 0x08000000, 0x9C08, 0x00)
+  else if chromaFormatIdc == 3 && bitDepth == 12 then
+    some (4, 0x08000000, 0x9808, 0x00)
+  else
+    none
+
+def writePtlGen (w : HevcBitWriter) (profileIdc compatHi32 cstrHi16 cstrMid8 : Nat)
+    (levelIdc : Nat := 30) : HevcBitWriter :=
+  let cur0 := (((w.putBits 0 2).putBit 0).putBits profileIdc 5).putBits compatHi32 32
+  let cur1 := ((cur0.putBits cstrHi16 16).putBits cstrMid8 8).putBits 0 24
+  cur1.putBits levelIdc 8
+
+def writeVpsGen (bitDepth chromaFormatIdc : Nat) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
+  let mut w := HevcBitWriter.empty
+  w := (w.putBits 0 4).putBits 3 2
+  w := (w.putBits 0 6).putBits 0 3
+  w := (w.putBit 1).putBits 0xFFFF 16
+  w := writePtlGen w prof compat cHi cMid
+  w := w.putBit 1
+  w := ((w.putUe 1).putUe 0).putUe 0
+  w := (w.putBits 0 6).putUe 0
+  w := (w.putBit 0).putBit 0
+  let body ← w.rbspTrailingBits.toBytes
+  some (packHevcNal nalVps 0 1 body)
+
+def writeSpsGen (width height log2Ctb bitDepth chromaFormatIdc : Nat)
+    (conf : Nat × Nat × Nat × Nat)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
+  let subW := hevcSubWidthC.getD chromaFormatIdc 1
+  let subH := hevcSubHeightC.getD chromaFormatIdc 1
+  let mut w := HevcBitWriter.empty
+  w := (w.putBits 0 4).putBits 0 3
+  w := w.putBit 1
+  w := writePtlGen w prof compat cHi cMid
+  w := w.putUe 0
+  w := w.putUe chromaFormatIdc
+  if chromaFormatIdc == 3 then
+    w := w.putBit 0
+  w := (w.putUe width).putUe height
+  if conf.1 != 0 || conf.2.1 != 0 || conf.2.2.1 != 0 || conf.2.2.2 != 0 then
+    w := w.putBit 1
+    w := (w.putUe (conf.1 / subW)).putUe (conf.2.1 / subW)
+    w := (w.putUe (conf.2.2.1 / subH)).putUe (conf.2.2.2 / subH)
+  else
+    w := w.putBit 0
+  w := (w.putUe (bitDepth - 8)).putUe (bitDepth - 8)
+  w := w.putUe 4
+  w := w.putBit 1
+  w := ((w.putUe 1).putUe 0).putUe 0
+  w := w.putUe 0
+  w := w.putUe (log2Ctb - 3)
+  w := w.putUe 0
+  w := w.putUe (Nat.min log2Ctb 5 - 2)
+  w := (w.putUe 1).putUe 1
+  w := (w.putBit 0).putBit 0
+  w := w.putBit 1
+  w := w.putBit 0
+  w := w.putUe 1
+  w := (w.putUe 1).putUe 0
+  w := (w.putUe 0).putBit 1
+  w := w.putBit 0
+  w := (w.putBit 1).putBit 1
+  match vuiColour? with
+  | some (cp, tc, mc) =>
+    w := w.putBit 1
+    w := (w.putBit 0).putBit 0
+    w := w.putBit 1
+    w := (w.putBits 5 3).putBit 0
+    w := w.putBit 1
+    w := ((w.putBits (cp &&& 0xFF) 8).putBits (tc &&& 0xFF) 8).putBits (mc &&& 0xFF) 8
+    w := w.putBit 0
+    w := w.putBits 0 3
+    w := ((w.putBit 0).putBit 0).putBit 0
+  | none =>
+    w := w.putBit 0
+  if prof == 4 then
+    w := w.putBit 1
+    w := (((w.putBit 1).putBit 0).putBit 0).putBit 0
+    w := w.putBits 0 4
+    w := w.putBits 0 9
+  else
+    w := w.putBit 0
+  let body ← w.rbspTrailingBits.toBytes
+  some (packHevcNal nalSps 0 1 body)
+
+def writePpsGen (numTileColumns numTileRows ctbW ctbH : Nat)
+    (lossless : Bool := false) : Option ByteArray := Id.run do
+  let mut w := HevcBitWriter.empty
+  w := (w.putUe 0).putUe 0
+  w := (w.putBit 0).putBit 0
+  w := w.putBits 0 3
+  w := (w.putBit 0).putBit 0
+  w := (w.putUe 0).putUe 0
+  w := w.putSe 0
+  w := (w.putBit 0).putBit 0
+  w := w.putBit 0
+  w := (w.putSe 0).putSe 0
+  w := (w.putBit 0).putBit 0
+  w := (w.putBit 0).putBit (if lossless then 1 else 0)
+  let tiles := numTileColumns > 1 || numTileRows > 1
+  w := w.putBit (if tiles then 1 else 0)
+  w := w.putBit 0
+  if tiles then
+    w := (w.putUe (numTileColumns - 1)).putUe (numTileRows - 1)
+    w := w.putBit 0
+    for i in [:numTileColumns - 1] do
+      w := w.putUe ((((i + 1) * ctbW) / numTileColumns) - ((i * ctbW) / numTileColumns) - 1)
+    for i in [:numTileRows - 1] do
+      w := w.putUe ((((i + 1) * ctbH) / numTileRows) - ((i * ctbH) / numTileRows) - 1)
+    w := w.putBit 1
+  w := w.putBit 1
+  w := w.putBit 0
+  w := w.putBit 0
+  w := w.putBit 0
+  w := w.putUe 0
+  w := (w.putBit 0).putBit 0
+  let some body := w.rbspTrailingBits.toBytes | return none
+  return some (packHevcNal nalPps 0 1 body)
+
+def buildHvccRecordGen (vps sps pps : ByteArray) (bitDepth chromaFormatIdc : Nat) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
+  let arrayBody (nalType : Nat) (nal : ByteArray) : ByteArray :=
+    let b0 : UInt8 := (0x80 ||| nalType).toUInt8
+    let body := (((ByteArray.empty.push b0).push 0).push 1).push ((nal.size >>> 8).toUInt8)
+    ByteArray.append (body.push ((nal.size &&& 0xFF).toUInt8)) nal
+  let bdM8 := bitDepth - 8
+  let header : ByteArray := ByteArray.mk #[
+    1,
+    (prof &&& 0x1F).toUInt8,
+    ((compat >>> 24) &&& 0xFF).toUInt8,
+    ((compat >>> 16) &&& 0xFF).toUInt8,
+    ((compat >>> 8) &&& 0xFF).toUInt8,
+    (compat &&& 0xFF).toUInt8,
+    ((cHi >>> 8) &&& 0xFF).toUInt8,
+    (cHi &&& 0xFF).toUInt8,
+    (cMid &&& 0xFF).toUInt8,
+    0x00, 0x00, 0x00,
+    30,
+    0xF0, 0x00,
+    0xFC,
+    (0xFC ||| (chromaFormatIdc &&& 0x03)).toUInt8,
+    (0xF8 ||| (bdM8 &&& 0x07)).toUInt8,
+    (0xF8 ||| (bdM8 &&& 0x07)).toUInt8,
+    0x00, 0x00, 0x0F, 3
+  ]
+  let body := ByteArray.append (arrayBody 32 vps) (ByteArray.append (arrayBody 33 sps) (arrayBody 34 pps))
+  some (ByteArray.append header body)
+
 def be32 (v : Nat) : ByteArray :=
   ByteArray.mk #[(v >>> 24).toUInt8, ((v >>> 16) &&& 0xFF).toUInt8,
     ((v >>> 8) &&& 0xFF).toUInt8, (v &&& 0xFF).toUInt8]
@@ -2742,6 +3027,8 @@ def elemSplitTransformFlag : Nat := 29
 def elemCbfLuma : Nat := 30
 def elemCbfCbCr : Nat := 31
 def elemTransformSkipFlag : Nat := 32
+def elemExplicitRdpcmFlag : Nat := 33
+def elemExplicitRdpcmDir : Nat := 34
 def elemLastSigXPrefix : Nat := 35
 def elemLastSigYPrefix : Nat := 36
 def elemSigCoeffGroupFlag : Nat := 39
@@ -2913,6 +3200,9 @@ def reinit (c : HevcCabacReader) : Option HevcCabacReader := do
       load k' ((ioff <<< 1) ||| b) cur'
   let (ioff, c1) := load 9 0 c0
   some { c1 with ioffset := ioff }
+
+def alignBypass (c : HevcCabacReader) : HevcCabacReader :=
+  if c.irange >= 256 then c else { c with irange := 256 }
 
 end HevcCabacReader
 
@@ -3275,7 +3565,7 @@ def decCuChromaQpOffset (c : HevcCabacReader) (st : Array Nat) (listLenMinus1 : 
   if b == 0 then (0, c1, st1)
   else if listLenMinus1 == 0 then (1, c1, st1)
   else Id.run do
-    let cMax := if 5 > listLenMinus1 then 5 else listLenMinus1
+    let cMax := if listLenMinus1 > 5 then 5 else listLenMinus1
     let mut i := 0
     let mut c := c1
     let mut st := st1
@@ -3291,6 +3581,14 @@ def decCuChromaQpOffset (c : HevcCabacReader) (st : Array Nat) (listLenMinus1 : 
 def decTransformSkipFlag (c : HevcCabacReader) (st : Array Nat) (cIdx : Nat) :
     Nat × HevcCabacReader × Array Nat :=
   c.decodeDecision st (hevcCabacElemOffset.getD elemTransformSkipFlag 0 + (if cIdx != 0 then 1 else 0))
+
+def decExplicitRdpcm (c : HevcCabacReader) (st : Array Nat) (cIdx : Nat) :
+    Nat × Nat × HevcCabacReader × Array Nat :=
+  let (f, c1, st1) := c.decodeDecision st (hevcCabacElemOffset.getD elemExplicitRdpcmFlag 0 + (if cIdx != 0 then 1 else 0))
+  if f == 0 then (0, 0, c1, st1)
+  else
+    let (d, c2, st2) := c1.decodeDecision st1 (hevcCabacElemOffset.getD elemExplicitRdpcmDir 0 + (if cIdx != 0 then 1 else 0))
+    (1, d, c2, st2)
 
 def sigCoeffCtxInc (log2TrafoSize cIdx scanIdx xCg yCg prevSig xS yS : Nat) : Nat := Id.run do
   if log2TrafoSize == 2 then
@@ -3382,25 +3680,38 @@ def coeffAbsLevelRemainingDecode (c : HevcCabacReader) (rcRiceParam : Nat) :
 structure HevcResidual where
   coeffs : Array Int
   transformSkipFlag : Nat
+  explicitRdpcmFlag : Nat
+  explicitRdpcmDir : Nat
   dcOnly : Bool
   colLimit : Nat
   deriving Inhabited
 
 def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
     (sps : HevcSps) (pps : HevcPps) (log2TrafoSize scanIdx cIdx predMode
-      cuTransquantBypass : Nat) (qpY qpCb qpCr : Int) :
-    Option (HevcResidual × HevcCabacReader × Array Nat) := do
+      cuTransquantBypass : Nat) (qpY qpCb qpCr : Int) (statCoeff : Nat) :
+    Option (HevcResidual × HevcCabacReader × Array Nat × Nat) := do
   let size := 1 <<< log2TrafoSize
   let mut coeffs : Array Int := Array.replicate (size * size) 0
   let mut c := c0
   let mut st := st0
   let mut transformSkipFlag := 0
-  if pps.transformSkipEnabledFlag && cuTransquantBypass == 0 &&
-      log2TrafoSize <= pps.log2MaxTransformSkipBlockSize then
-    let (f, c', st') := decTransformSkipFlag c st cIdx
-    c := c'
-    st := st'
-    transformSkipFlag := f
+  let mut explicitRdpcmFlag := 0
+  let mut explicitRdpcmDir := 0
+  if cuTransquantBypass == 0 && log2TrafoSize <= pps.log2MaxTransformSkipBlockSize then
+    if pps.transformSkipEnabledFlag then
+      let (f, c', st') := decTransformSkipFlag c st cIdx
+      c := c'
+      st := st'
+      transformSkipFlag := f
+    if transformSkipFlag != 0 && sps.explicitRdpcmEnabledFlag then
+      let (f, d, c', st') := decExplicitRdpcm c st cIdx
+      c := c'
+      st := st'
+      explicitRdpcmFlag := f
+      explicitRdpcmDir := d
+  if sps.cabacBypassAlignmentEnabledFlag &&
+      (cuTransquantBypass != 0 || (transformSkipFlag != 0 && explicitRdpcmFlag != 0)) then
+    c := c.alignBypass
   let (lx0, ly0, c1, st1) := lastSigCoeffXY c st log2TrafoSize cIdx
   c := c1
   st := st1
@@ -3419,17 +3730,35 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
     else
       (hevcDiagScan8x8Inv.getD yCgLast #[]).getD xCgLast 0
   let (sxCg, syCg, sxOff, syOff) := getScanTables log2TrafoSize scanIdx
-  let qp := if cIdx == 0 then qpY else if cIdx == 1 then qpCb else qpCr
-  let shiftNat : Nat := 8 + log2TrafoSize - 5
-  let add : Int := Int.ofNat (1 <<< (shiftNat - 1))
+  let singleCtx := sps.transformSkipContextEnabledFlag &&
+    (transformSkipFlag != 0 || cuTransquantBypass != 0)
+  let rotate4x4 := sps.transformSkipRotationEnabledFlag && log2TrafoSize == 2 &&
+    predMode == modeIntra && (transformSkipFlag != 0 || cuTransquantBypass != 0)
+  let bd := if cIdx == 0 then sps.bitDepth else sps.bitDepthChroma
+  let qpBdOff : Int := Int.ofNat (6 * (bd - 8))
+  let qp := if cIdx == 0 then qpY + qpBdOff else if cIdx == 1 then qpCb else qpCr
+  let shiftNat : Nat :=
+    if sps.extendedPrecisionProcessingFlag && transformSkipFlag != 0 && bd + log2TrafoSize < 5 then 0
+    else bd + log2TrafoSize - 5
+  let add : Int := if shiftNat == 0 then 0 else Int.ofNat (1 <<< (shiftNat - 1))
   let scale : Int := (hevcLevelScale.getD (qp.toNat % 6) 40) * Int.ofNat (1 <<< (qp.toNat / 6))
   let useSl := sps.scalingListEnableFlag && !(transformSkipFlag != 0 && log2TrafoSize > 2)
   let slData := if pps.scalingListDataPresentFlag then pps.scalingList else sps.scalingList
-  let matrixId := cIdx + (if predMode != modeIntra then 3 else 0)
-  let scaleMatrix := (slData.sl.getD (log2TrafoSize - 2) #[]).getD matrixId #[]
+  let matrixId :=
+    if log2TrafoSize == 5 && sps.chromaFormatIdc != 3 && cIdx == 0 then
+      if predMode != modeIntra then 3 else 0
+    else
+      cIdx + (if predMode != modeIntra then 3 else 0)
+  let scaleRowIdx :=
+    if log2TrafoSize == 5 && sps.chromaFormatIdc != 3 && cIdx != 0 then 2
+    else log2TrafoSize - 2
+  let scaleMatrix := (slData.sl.getD scaleRowIdx #[]).getD matrixId #[]
   let dcScale : Int :=
     if useSl && log2TrafoSize >= 4 then
-      (slData.slDc.getD (log2TrafoSize - 4) #[]).getD matrixId 16
+      let dcRowIdx :=
+        if log2TrafoSize == 5 && sps.chromaFormatIdc != 3 && cIdx != 0 then 0
+        else log2TrafoSize - 4
+      (slData.slDc.getD dcRowIdx #[]).getD matrixId 16
     else 16
   let cgSide := 1 <<< (log2TrafoSize - 2)
   let mut sigCg : Array (Array Nat) := Array.replicate cgSide (Array.replicate cgSide 0)
@@ -3437,6 +3766,7 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
   let mut greater1Ctx := 1
   let mut dcOnly := true
   let mut maxXC := 0
+  let mut statCoeff' := statCoeff
   let mut i := lastCg
   let mut fuel := lastCg + 1
   while fuel > 0 do
@@ -3483,7 +3813,9 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
         else
           let xS := sxOff.getD n 0
           let yS := syOff.getD n 0
-          let inc := sigCoeffCtxInc log2TrafoSize cIdx scanIdx xCg yCg prevSig xS yS
+          let inc :=
+            if singleCtx then (if cIdx == 0 then 42 else 43)
+            else sigCoeffCtxInc log2TrafoSize cIdx scanIdx xCg yCg prevSig xS yS
           let (f, c', st') := c.decodeDecision st
             (hevcCabacElemOffset.getD elemSigCoeffFlag 0 + inc)
           c := c'
@@ -3497,7 +3829,9 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
       if numNz != 0 then
         let mut ctxSet := if i > 0 && cIdx == 0 then 2 else 0
         if i != lastCg && greater1Ctx == 0 then ctxSet := ctxSet + 1
-        greater1Ctx := 1
+        if singleCtx then
+          ctxSet := if cIdx == 0 then 4 else 2
+        greater1Ctx := if singleCtx then 0 else 1
         let gt1Base := hevcCabacElemOffset.getD elemCoeffAbsLevelGt1 0 + (ctxSet <<< 2) +
           (if cIdx != 0 then 16 else 0)
         let mut gt1Flags : Array Nat := Array.replicate numNz 0
@@ -3512,7 +3846,7 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
           if g1 != 0 then
             greater1Ctx := 0
             if firstGt1Idx == -1 then firstGt1Idx := m
-          else if greater1Ctx > 0 && greater1Ctx < 3 then
+          else if !singleCtx && greater1Ctx > 0 && greater1Ctx < 3 then
             greater1Ctx := greater1Ctx + 1
           m := m + 1
         let mut gt2Flag := 0
@@ -3526,12 +3860,20 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
         let firstNzPosInCg := nzPos.getD (numNz - 1) 0
         let lastNzPosInCg := nzPos.getD 0 0
         let signHidden := pps.signDataHidingFlag && cuTransquantBypass == 0 &&
-          lastNzPosInCg >= firstNzPosInCg + 4
+          explicitRdpcmFlag == 0 && lastNzPosInCg >= firstNzPosInCg + 4
         let numSigns := if signHidden then numNz - 1 else numNz
         let (signs, c') := c.decodeBypassBits numSigns
         c := c'
-        let mut cRice := 0
+        let riceIdx :=
+          if transformSkipFlag == 0 && cuTransquantBypass == 0 then
+            if cIdx == 0 then 2 else 3
+          else
+            if cIdx == 0 then 0 else 1
+        let riceStat := (statCoeff >>> (riceIdx * 8)) &&& 0xFF
+        let riceBase := if sps.persistentRiceAdaptationEnabledFlag then riceStat / 4 else 0
+        let mut cRice := riceBase
         let mut sumAbs : Nat := 0
+        let mut updatedStat := false
         m := 0
         while m < numNz do
           let baseLvl :=
@@ -3546,15 +3888,28 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
               | some (rem, c'') => some (baseLvl + rem, c'')
             else some (baseLvl, c)
           c := cNext
-          if needRem && transLevel > (3 <<< cRice) then cRice := if cRice + 1 < 4 then cRice + 1 else 4
+          if needRem && sps.persistentRiceAdaptationEnabledFlag && !updatedStat then
+            updatedStat := true
+            let remVal := transLevel - baseLvl
+            let newStat :=
+              if remVal >= (3 <<< riceBase) then riceStat + 1
+              else if 2 * remVal < (1 <<< riceBase) && riceStat > 0 then riceStat - 1
+              else riceStat
+            let mask := 0xFFFFFFFF ^^^ (0xFF <<< (riceIdx * 8))
+            statCoeff' := (statCoeff' &&& mask) ||| ((newStat &&& 0xFF) <<< (riceIdx * 8))
+          let riceMax := if sps.extendedPrecisionProcessingFlag then 8 else 4
+          if needRem && transLevel > (3 <<< cRice) then
+            cRice := if cRice + 1 < riceMax then cRice + 1 else riceMax
           sumAbs := sumAbs + transLevel
           let sgn :=
             if signHidden && m == numNz - 1 then sumAbs &&& 1
             else (signs >>> (numSigns - 1 - m)) &&& 1
           let signedLevel : Int := if sgn != 0 then -Int.ofNat transLevel else Int.ofNat transLevel
           let nPos := nzPos.getD m 0
-          let xC := (xCg <<< 2) + sxOff.getD nPos 0
-          let yC := (yCg <<< 2) + syOff.getD nPos 0
+          let xC0 := (xCg <<< 2) + sxOff.getD nPos 0
+          let yC0 := (yCg <<< 2) + syOff.getD nPos 0
+          let xC := if rotate4x4 then size - 1 - xC0 else xC0
+          let yC := if rotate4x4 then size - 1 - yC0 else yC0
           if xC != 0 || yC != 0 then dcOnly := false
           if xC > maxXC then maxXC := xC
           let val : Int :=
@@ -3569,7 +3924,11 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
                   scaleMatrix.getD (((yC >>> 1) <<< 3) + (xC >>> 1)) 16
                 else scaleMatrix.getD (((yC >>> 2) <<< 3) + (xC >>> 2)) 16
               asrInt ((signedLevel * scale * scaleM) + add) shiftNat
-          let clipped := if val < -32768 then (-32768 : Int) else if val > 32767 then 32767 else val
+          let clipLim : Int :=
+            if sps.extendedPrecisionProcessingFlag then
+              Int.ofNat (1 <<< Nat.max 15 (bd + 6))
+            else 32768
+          let clipped := if val < -clipLim then -clipLim else if val > clipLim - 1 then clipLim - 1 else val
           coeffs := coeffs.set! (yC * size + xC) clipped
           m := m + 1
     if i == 0 then break
@@ -3577,9 +3936,11 @@ def decodeResidualCoding (c0 : HevcCabacReader) (st0 : Array Nat)
   some ({
     coeffs := coeffs
     transformSkipFlag := transformSkipFlag
+    explicitRdpcmFlag := explicitRdpcmFlag
+    explicitRdpcmDir := explicitRdpcmDir
     dcOnly := dcOnly
-    colLimit := if lastX > lastY then lastX else lastY
-  }, c, st)
+    colLimit := if rotate4x4 then size - 1 else if lastX > lastY then lastX else lastY
+  }, c, st, if sps.persistentRiceAdaptationEnabledFlag then statCoeff' else statCoeff)
 
 def lastPrefixEncode (pos : Nat) : Nat × Nat × Nat :=
   if pos <= 3 then (pos, 0, 0)
@@ -3883,12 +4244,44 @@ def hevcQuantScale : Array Int := #[26214, 23302, 20560, 18396, 16384, 14564]
 def clipInt16 (v : Int) : Int :=
   clipInt v (-32768) 32767
 
+@[inline]
+def clipSampleU16 (v : Int) (bitDepth : Nat) : UInt16 :=
+  let hi : Int := Int.ofNat ((1 <<< bitDepth) - 1)
+  if v <= 0 then 0 else if v >= hi then hi.toNat.toUInt16 else v.toNat.toUInt16
+
 def mapQpC (qpI : Int) : Int :=
   if qpI < 0 then 0
   else if qpI < 30 then qpI
   else if qpI <= 43 then hevcQpC.getD (qpI - 30).toNat 29
   else if qpI > 57 then 51
   else qpI - 6
+
+def deriveChromaQp (qpI : Int) (chromaFormatIdc bitDepthChroma : Nat) : Int :=
+  let qpBdOffC : Int := Int.ofNat (6 * (bitDepthChroma - 8))
+  let qPiClip := clipInt qpI (-qpBdOffC) 57
+  let qPc :=
+    if chromaFormatIdc == 1 then
+      if qPiClip < 0 then qPiClip else mapQpC qPiClip
+    else
+      if qPiClip > 51 then 51 else qPiClip
+  qPc + qpBdOffC
+
+def hevcChromaMode422Table : Array Nat := #[
+  0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20,
+  21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31
+]
+
+def mapChromaIntraMode (chromaModeRaw lumaMode chromaFormatIdc : Nat) : Nat :=
+  let base :=
+    if chromaModeRaw == 4 then lumaMode
+    else
+      let cand :=
+        if chromaModeRaw == 0 then 0
+        else if chromaModeRaw == 1 then 26
+        else if chromaModeRaw == 2 then 10
+        else 1
+      if cand == lumaMode then 34 else cand
+  if chromaFormatIdc == 2 then hevcChromaMode422Table.getD base base else base
 
 def transformSkip8 (coeffs : Array Int) (log2Size : Nat) : Array Int := Id.run do
   let size := 1 <<< log2Size
@@ -4033,6 +4426,120 @@ def inverseTransformAndAdd (plane0 : ByteArray) (stride dstX dstY : Nat)
       plane := plane.set! (rowOff + x) (clipU8Int (cur + res.getD (rOff + x) 0))
   return plane
 
+@[inline]
+def clipCoeffGen (v : Int) (bitDepth : Nat) (extPrec : Bool) : Int :=
+  let lim : Int := if extPrec then Int.ofNat (1 <<< Nat.max 15 (bitDepth + 6)) else 32768
+  if v < -lim then -lim else if v > lim - 1 then lim - 1 else v
+
+def transformSkipGen (coeffs : Array Int) (log2Size bitDepth : Nat) (extPrec : Bool) : Array Int := Id.run do
+  let size := 1 <<< log2Size
+  let mut out : Array Int := Array.replicate (size * size) 0
+  if 15 > bitDepth + log2Size then
+    let sh := 15 - bitDepth - log2Size
+    let off := Int.ofNat (1 <<< (sh - 1))
+    for i in [:coeffs.size] do
+      out := out.set! i (clipCoeffGen (asrInt (coeffs.getD i 0 + off) sh) bitDepth extPrec)
+  else
+    let sh := bitDepth + log2Size - 15
+    for i in [:coeffs.size] do
+      out := out.set! i (clipCoeffGen (coeffs.getD i 0 * Int.ofNat (1 <<< sh)) bitDepth extPrec)
+  return out
+
+def dst4Pass1DGen (buf0 : Array Int) (base step : Nat) (add : Int) (shift bitDepth : Nat) (extPrec : Bool) : Array Int :=
+  let s0 := buf0.getD base 0
+  let s1 := buf0.getD (base + step) 0
+  let s2 := buf0.getD (base + 2 * step) 0
+  let s3 := buf0.getD (base + 3 * step) 0
+  let c0 := s0 + s2
+  let c1 := s2 + s3
+  let c2 := s0 - s3
+  let c3 := 74 * s1
+  let b1 := buf0.set! (base + 2 * step) (clipCoeffGen (asrInt (74 * (s0 - s2 + s3) + add) shift) bitDepth extPrec)
+  let b2 := b1.set! base (clipCoeffGen (asrInt (29 * c0 + 55 * c1 + c3 + add) shift) bitDepth extPrec)
+  let b3 := b2.set! (base + step) (clipCoeffGen (asrInt (55 * c2 - 29 * c1 + c3 + add) shift) bitDepth extPrec)
+  b3.set! (base + 3 * step) (clipCoeffGen (asrInt (55 * c0 + 29 * c2 - c3 + add) shift) bitDepth extPrec)
+
+def transform4x4LumaGen (coeffs : Array Int) (bitDepth : Nat) (extPrec : Bool) : Array Int := Id.run do
+  let sh2 := 20 - bitDepth
+  let add2 := Int.ofNat (1 <<< (sh2 - 1))
+  let mut buf := coeffs
+  for x in [:4] do
+    buf := dst4Pass1DGen buf x 4 64 7 bitDepth extPrec
+  for y in [:4] do
+    buf := dst4Pass1DGen buf (y * 4) 1 add2 sh2 bitDepth extPrec
+  return buf
+
+def idctDcGen (c0 : Int) (size bitDepth : Nat) (extPrec : Bool) : Array Int :=
+  let sh2 := 14 - bitDepth
+  let add2 := Int.ofNat (1 <<< (sh2 - 1))
+  let v1 := clipCoeffGen (asrInt (c0 + 1) 1) bitDepth extPrec
+  let val := clipCoeffGen (asrInt (v1 + add2) sh2) bitDepth extPrec
+  Array.replicate (size * size) val
+
+def idctBlockGen (coeffs : Array Int) (log2Size bitDepth : Nat) (extPrec : Bool) : Array Int := Id.run do
+  let size := 1 <<< log2Size
+  let sh2 := 20 - bitDepth
+  let add2 := Int.ofNat (1 <<< (sh2 - 1))
+  let mut buf := coeffs
+  let tr1d (b : Array Int) (base step : Nat) : Array Int :=
+    if size == 4 then idctTr4 b base step
+    else if size == 8 then idctTr8 b base step
+    else if size == 16 then idctTr16 b base step
+    else idctTr32 b base step
+  for x in [:size] do
+    let col := tr1d buf x size
+    for y in [:size] do
+      buf := buf.set! (y * size + x) (clipCoeffGen (asrInt (col.getD y 0 + 64) 7) bitDepth extPrec)
+  for y in [:size] do
+    let base := y * size
+    let row := tr1d buf base 1
+    for x in [:size] do
+      buf := buf.set! (base + x) (clipCoeffGen (asrInt (row.getD x 0 + add2) sh2) bitDepth extPrec)
+  return buf
+
+def applyRdpcm (res0 : Array Int) (size rdpcmDir : Nat) : Array Int := Id.run do
+  let mut res := res0
+  if rdpcmDir == 0 then
+    for y in [:size] do
+      let base := y * size
+      for x in [1:size] do
+        res := res.set! (base + x) (res.getD (base + x) 0 + res.getD (base + x - 1) 0)
+  else
+    for y in [1:size] do
+      let base := y * size
+      let prev := (y - 1) * size
+      for x in [:size] do
+        res := res.set! (base + x) (res.getD (base + x) 0 + res.getD (prev + x) 0)
+  return res
+
+def inverseTransformAndAddGen (plane0 : Array UInt16) (stride dstX dstY : Nat)
+    (sps : HevcSps) (coeffs : Array Int) (log2Size cIdx intraMode : Nat) (isIntra : Bool)
+    (transformSkip explicitRdpcmFlag explicitRdpcmDir cuTransquantBypass maxXY : Nat) :
+    Array UInt16 := Id.run do
+  let size := 1 <<< log2Size
+  let bd := if cIdx == 0 then sps.bitDepth else sps.bitDepthChroma
+  let extPrec := sps.extendedPrecisionProcessingFlag
+  let mut res : Array Int :=
+    if cuTransquantBypass != 0 then coeffs
+    else if transformSkip != 0 then transformSkipGen coeffs log2Size bd extPrec
+    else if isIntra && cIdx == 0 && log2Size == 2 then transform4x4LumaGen coeffs bd extPrec
+    else if maxXY == 0 then idctDcGen (coeffs.getD 0 0) size bd extPrec
+    else idctBlockGen coeffs log2Size bd extPrec
+  if !isIntra then
+    if explicitRdpcmFlag != 0 && (transformSkip != 0 || cuTransquantBypass != 0) then
+      res := applyRdpcm res size explicitRdpcmDir
+  else if sps.implicitRdpcmEnabledFlag && (transformSkip != 0 || cuTransquantBypass != 0) &&
+      (intraMode == 10 || intraMode == 26) then
+    res := applyRdpcm res size (if intraMode == 26 then 1 else 0)
+  let mut plane := plane0
+  for y in [:size] do
+    let rowOff := (dstY + y) * stride + dstX
+    let rOff := y * size
+    for x in [:size] do
+      let cur := Int.ofNat (plane.getD (rowOff + x) 0).toNat
+      plane := plane.set! (rowOff + x) (clipSampleU16 (cur + res.getD (rOff + x) 0) bd)
+  return plane
+
 def fdst4Pass1D (src : Array Int) (base step shift : Nat) : Array Int := Id.run do
   let add := if shift == 0 then (0 : Int) else Int.ofNat (1 <<< (shift - 1))
   let mut out : Array Int := Array.replicate 4 0
@@ -4086,6 +4593,42 @@ def quantizeCoeffs (coeffs : Array Int) (log2Size : Nat) (qp : Int) (intra : Boo
 def dequantLevels (levels : Array Int) (log2Size : Nat) (qp : Int) : Array Int := Id.run do
   let shift := log2Size + 3
   let add := Int.ofNat (1 <<< (shift - 1))
+  let scale := (hevcLevelScale.getD (qp.toNat % 6) 40) * Int.ofNat (1 <<< (qp.toNat / 6))
+  let mut out : Array Int := Array.mkEmpty levels.size
+  for lv in levels do
+    out := out.push (clipInt16 (asrInt (lv * scale * 16 + add) shift))
+  return out
+
+def forwardTransformGen (res : Array Int) (log2Size bitDepth : Nat) (isDst : Bool) : Array Int := Id.run do
+  let size := 1 <<< log2Size
+  let sh1 := log2Size + bitDepth - 9
+  let sh2 := log2Size + 6
+  let mut tmp : Array Int := Array.replicate (size * size) 0
+  for x in [:size] do
+    let col := if isDst then fdst4Pass1D res x size sh1 else fdctPass1D res x size size sh1
+    for y in [:size] do
+      tmp := tmp.set! (y * size + x) (col.getD y 0)
+  let mut out : Array Int := Array.replicate (size * size) 0
+  for y in [:size] do
+    let row := if isDst then fdst4Pass1D tmp (y * size) 1 sh2 else fdctPass1D tmp (y * size) 1 size sh2
+    for x in [:size] do
+      out := out.set! (y * size + x) (row.getD x 0)
+  return out
+
+def quantizeCoeffsGen (coeffs : Array Int) (log2Size bitDepth : Nat) (qp : Int) (intra : Bool) : Array Int := Id.run do
+  let qS := hevcQuantScale.getD (qp.toNat % 6) 16384
+  let shift := 29 + (qp.toNat / 6) - log2Size - bitDepth
+  let oneSh := Int.ofNat (1 <<< shift)
+  let offset := if intra then oneSh / 3 else oneSh / 6
+  let mut out : Array Int := Array.mkEmpty coeffs.size
+  for c in coeffs do
+    let mag := asrInt (Int.ofNat c.natAbs * qS + offset) shift
+    out := out.push (if c < 0 then -mag else mag)
+  return out
+
+def dequantLevelsGen (levels : Array Int) (log2Size bitDepth : Nat) (qp : Int) : Array Int := Id.run do
+  let shift := bitDepth + log2Size - 5
+  let add := if shift == 0 then (0 : Int) else Int.ofNat (1 <<< (shift - 1))
   let scale := (hevcLevelScale.getD (qp.toNat % 6) 40) * Int.ofNat (1 <<< (qp.toNat / 6))
   let mut out : Array Int := Array.mkEmpty levels.size
   for lv in levels do
@@ -4552,6 +5095,447 @@ def intraPred8 (plane0 : ByteArray) (stride : Nat) (sps : HevcSps) (pps : HevcPp
           plane := plane.set! (rowOff + px) (clipU8Int v)
   return plane
 
+def intraPredGen (plane0 : Array UInt16) (stride : Nat) (sps : HevcSps) (pps : HevcPps)
+    (tabMvf : Array HevcMvf) (na : HevcNeighAvail) (x0 y0 log2Size cIdx mode : Nat) :
+    Array UInt16 := Id.run do
+  let bd := if cIdx == 0 then sps.bitDepth else sps.bitDepthChroma
+  let defVal : Int := Int.ofNat (1 <<< (bd - 1))
+  let defU16 : UInt16 := (1 <<< (bd - 1)).toUInt16
+  let hshift := if cIdx == 0 || sps.chromaFormatIdc == 3 then 0 else 1
+  let vshift := if cIdx == 0 || sps.chromaFormatIdc != 1 then 0 else 1
+  let size := 1 <<< log2Size
+  let sizeInLumaH := size <<< hshift
+  let sizeInLumaV := size <<< vshift
+  let log2MinTb := sps.log2MinTbSize
+  let tbMask := sps.tbMask
+  let sizeInTbsH := sizeInLumaH >>> log2MinTb
+  let sizeInTbsV := sizeInLumaV >>> log2MinTb
+  let x := x0 >>> hshift
+  let y := y0 >>> vshift
+  let xTb := x0 >>> log2MinTb
+  let yTb := y0 >>> log2MinTb
+  let spin :=
+    if cIdx != 0 && sizeInTbsV == 0 && ((2 * y0) &&& (1 <<< log2MinTb)) != 0 then 1
+    else 0
+  let curTbAddr := minTbAddrZs pps (Int.ofNat (xTb &&& tbMask)) (Int.ofNat (yTb &&& tbMask))
+  let mut candLeft := na.candLeft
+  let mut candUpLeft := na.candUpLeft
+  let mut candUp := na.candUp
+  let mut candBottomLeft := false
+  if na.candBottomLeft then
+    let ny := Int.ofNat ((yTb + sizeInTbsV + spin) &&& tbMask)
+    let nx := Int.ofNat (xTb &&& tbMask) - 1
+    if curTbAddr > minTbAddrZs pps nx ny then candBottomLeft := true
+  let mut candUpRight := false
+  if na.candUpRight && spin == 0 then
+    let nx := Int.ofNat ((xTb + sizeInTbsH) &&& tbMask)
+    let ny := Int.ofNat (yTb &&& tbMask) - 1
+    if curTbAddr > minTbAddrZs pps nx ny then candUpRight := true
+  let picW := sps.width
+  let picH := sps.height
+  let bottomLeftSize :=
+    if y0 + sizeInLumaV >= picH then 0
+    else (Nat.min (y0 + 2 * sizeInLumaV) picH - (y0 + sizeInLumaV)) >>> vshift
+  let topRightSize :=
+    if x0 + sizeInLumaH >= picW then 0
+    else (Nat.min (x0 + 2 * sizeInLumaH) picW - (x0 + sizeInLumaH)) >>> hshift
+  let log2MinPu := sps.log2MinPuSize
+  let minPuW := sps.minPuWidth
+  let minPuH := sps.minPuHeight
+  let isIntraRel (rx ry : Int) : Bool :=
+    let lx := Int.ofNat x0 + rx * Int.ofNat (1 <<< hshift)
+    let ly := Int.ofNat y0 + ry * Int.ofNat (1 <<< vshift)
+    if lx < 0 || ly < 0 then false
+    else
+      let px := lx.toNat >>> log2MinPu
+      let py := ly.toNat >>> log2MinPu
+      (tabMvf.getD (py * minPuW + px) mvfZero).predFlag == pfIntra
+  let mut leftArr : Array Int := Array.replicate (2 * size + 1) defVal
+  let mut topArr : Array Int := Array.replicate (2 * size + 1) defVal
+  if pps.constrainedIntraPredFlag then
+    let mut sizePuV := sizeInLumaV >>> log2MinPu
+    let mut sizePuH := sizeInLumaH >>> log2MinPu
+    if sizePuH == 0 then sizePuH := 1
+    if sizePuV == 0 then sizePuV := 1
+    let onPuEdgeX := (x0 &&& ((1 <<< log2MinPu) - 1)) == 0
+    let onPuEdgeY := (y0 &&& ((1 <<< log2MinPu) - 1)) == 0
+    if candBottomLeft && onPuEdgeX && x0 > 0 then
+      let xLeftPu := (x0 - 1) >>> log2MinPu
+      let yBotPu := (y0 + sizeInLumaV) >>> log2MinPu
+      let mx := Nat.min sizePuV (minPuH - yBotPu)
+      candBottomLeft := false
+      let mut i := 0
+      while i < mx do
+        if (tabMvf.getD ((yBotPu + i) * minPuW + xLeftPu) mvfZero).predFlag == pfIntra then
+          candBottomLeft := true
+        i := i + 2
+    if candLeft && onPuEdgeX && x0 > 0 then
+      let xLeftPu := (x0 - 1) >>> log2MinPu
+      let yLeftPu := y0 >>> log2MinPu
+      let mx := Nat.min sizePuV (minPuH - yLeftPu)
+      candLeft := false
+      let mut i := 0
+      while i < mx do
+        if (tabMvf.getD ((yLeftPu + i) * minPuW + xLeftPu) mvfZero).predFlag == pfIntra then
+          candLeft := true
+        i := i + 2
+    if candUpLeft && x0 > 0 && y0 > 0 then
+      let xLeftPu := (x0 - 1) >>> log2MinPu
+      let yTopPu := (y0 - 1) >>> log2MinPu
+      candUpLeft := (tabMvf.getD (yTopPu * minPuW + xLeftPu) mvfZero).predFlag == pfIntra
+    if candUp && onPuEdgeY && y0 > 0 then
+      let xTopPu := x0 >>> log2MinPu
+      let yTopPu := (y0 - 1) >>> log2MinPu
+      let mx := Nat.min sizePuH (minPuW - xTopPu)
+      candUp := false
+      let mut i := 0
+      while i < mx do
+        if (tabMvf.getD (yTopPu * minPuW + xTopPu + i) mvfZero).predFlag == pfIntra then
+          candUp := true
+        i := i + 2
+    if candUpRight && onPuEdgeY && y0 > 0 then
+      let yTopPu := (y0 - 1) >>> log2MinPu
+      let xRightPu := (x0 + sizeInLumaH) >>> log2MinPu
+      let mx := Nat.min sizePuH (minPuW - xRightPu)
+      candUpRight := false
+      let mut i := 0
+      while i < mx do
+        if (tabMvf.getD (yTopPu * minPuW + xRightPu + i) mvfZero).predFlag == pfIntra then
+          candUpRight := true
+        i := i + 2
+  if candUpLeft && x > 0 && y > 0 then
+    let v := Int.ofNat (plane0.getD ((y - 1) * stride + (x - 1)) defU16).toNat
+    leftArr := leftArr.set! 0 v
+    topArr := topArr.set! 0 v
+  if candUp && y > 0 then
+    let baseT := (y - 1) * stride + x
+    for i in [:size] do
+      topArr := topArr.set! (1 + i) (Int.ofNat (plane0.getD (baseT + i) defU16).toNat)
+  if candUpRight && y > 0 then
+    if topRightSize > 0 then
+      let baseT := (y - 1) * stride + x
+      for i in [:topRightSize] do
+        topArr := topArr.set! (1 + size + i) (Int.ofNat (plane0.getD (baseT + size + i) defU16).toNat)
+      let extV := Int.ofNat (plane0.getD (baseT + size + topRightSize - 1) defU16).toNat
+      for i in [topRightSize:size] do
+        topArr := topArr.set! (1 + size + i) extV
+    else if x + size > 0 then
+      let extV := Int.ofNat (plane0.getD ((y - 1) * stride + x + size - 1) defU16).toNat
+      for i in [:size] do
+        topArr := topArr.set! (1 + size + i) extV
+  if candLeft && x > 0 then
+    for i in [:size] do
+      leftArr := leftArr.set! (1 + i) (Int.ofNat (plane0.getD ((y + i) * stride + (x - 1)) defU16).toNat)
+  if candBottomLeft && x > 0 && bottomLeftSize > 0 then
+    for i in [:bottomLeftSize] do
+      leftArr := leftArr.set! (1 + size + i)
+        (Int.ofNat (plane0.getD ((y + size + i) * stride + (x - 1)) defU16).toNat)
+    let extV := Int.ofNat (plane0.getD ((y + size + bottomLeftSize - 1) * stride + (x - 1)) defU16).toNat
+    for i in [bottomLeftSize:size] do
+      leftArr := leftArr.set! (1 + size + i) extV
+  if pps.constrainedIntraPredFlag &&
+      (candBottomLeft || candLeft || candUpLeft || candUp || candUpRight) then
+    let mut sizeMaxX :=
+      if x0 + ((2 * size) <<< hshift) < picW then 2 * size else (picW - x0) >>> hshift
+    let mut sizeMaxY :=
+      if y0 + ((2 * size) <<< vshift) < picH then 2 * size else (picH - y0) >>> vshift
+    if !candUpRight then
+      sizeMaxX := if x0 + (size <<< hshift) < picW then size else (picW - x0) >>> hshift
+    if !candBottomLeft then
+      sizeMaxY := if y0 + (size <<< vshift) < picH then size else (picH - y0) >>> vshift
+    let stepX := if hshift == 0 then 4 else 2
+    let stepY := if vshift == 0 then 4 else 2
+    let mut j : Int := Int.ofNat (size + (if candBottomLeft then bottomLeftSize else 0)) - 1
+    if candBottomLeft || candLeft || candUpLeft then
+      let mut fuel := (2 * size + 2)
+      while j > -1 && !isIntraRel (-1) j && fuel > 0 do
+        fuel := fuel - 1
+        j := j - 1
+      if !isIntraRel (-1) j then
+        let mut jn := 0
+        while jn < sizeMaxX && !isIntraRel (Int.ofNat jn) (-1) do
+          jn := jn + 1
+        let mut ii := jn + 1
+        while ii > 0 do
+          ii := ii - 1
+          if !isIntraRel (Int.ofNat ii - 1) (-1) then
+            topArr := topArr.set! ii (topArr.getD (ii + 1) defVal)
+        leftArr := leftArr.set! 0 (topArr.getD 0 defVal)
+    else
+      let mut jn := 0
+      while jn < sizeMaxX && !isIntraRel (Int.ofNat jn) (-1) do
+        jn := jn + 1
+      if jn > 0 then
+        let mut ii := jn
+        while ii > 0 do
+          if !isIntraRel (Int.ofNat ii - 1) (-1) then
+            topArr := topArr.set! ii (topArr.getD (ii + 1) defVal)
+          ii := ii - 1
+        topArr := topArr.set! 0 (topArr.getD 1 defVal)
+      leftArr := leftArr.set! 0 (topArr.getD 0 defVal)
+    leftArr := leftArr.set! 0 (topArr.getD 0 defVal)
+    if candBottomLeft || candLeft then
+      let mut aVal := leftArr.getD 0 defVal
+      let mut i := 0
+      while i < sizeMaxY do
+        if !isIntraRel (-1) (Int.ofNat i) then
+          for k in [:stepY] do
+            if i + k < 2 * size then leftArr := leftArr.set! (1 + i + k) aVal
+        else
+          aVal := leftArr.getD (1 + Nat.min (i + stepY - 1) (2 * size - 1)) defVal
+        i := i + stepY
+    if !candLeft then
+      for i in [:size] do
+        leftArr := leftArr.set! (1 + i) (leftArr.getD 0 defVal)
+    if !candBottomLeft then
+      for i in [:size] do
+        leftArr := leftArr.set! (1 + size + i) (leftArr.getD size defVal)
+    let stepYI : Int := Int.ofNat stepY
+    if x0 != 0 && y0 != 0 then
+      if sizeMaxY > 0 then
+        let mut aVal := leftArr.getD sizeMaxY defVal
+        let mut ii : Int := Int.ofNat sizeMaxY - 1
+        let mut fuel := sizeMaxY + 2
+        while ii >= 0 && fuel > 0 do
+          fuel := fuel - 1
+          if !isIntraRel (-1) (ii - (stepYI - 1)) then
+            for k in [:stepY] do
+              let idxL := ii - (stepYI - 1) + Int.ofNat k
+              if idxL >= 0 then leftArr := leftArr.set! (1 + idxL.toNat) aVal
+          else
+            let idxM := if ii - (stepYI - 1) > 0 then (ii - (stepYI - 1)).toNat else 0
+            aVal := leftArr.getD (1 + idxM) defVal
+          ii := ii - stepYI
+      if !isIntraRel (-1) (-1) then leftArr := leftArr.set! 0 (leftArr.getD 1 defVal)
+    else if x0 == 0 then
+      for i in [:sizeMaxY] do
+        leftArr := leftArr.set! (1 + i) 0
+    else if sizeMaxY > 0 then
+      let mut aVal := leftArr.getD sizeMaxY defVal
+      let mut ii : Int := Int.ofNat sizeMaxY - 1
+      let mut fuel := sizeMaxY + 2
+      while ii >= 0 && fuel > 0 do
+        fuel := fuel - 1
+        if !isIntraRel (-1) (ii - (stepYI - 1)) then
+          for k in [:stepY] do
+            let idxL := ii - (stepYI - 1) + Int.ofNat k
+            if idxL >= 0 then leftArr := leftArr.set! (1 + idxL.toNat) aVal
+        else
+          let idxM := if ii - (stepYI - 1) > 0 then (ii - (stepYI - 1)).toNat else 0
+          aVal := leftArr.getD (1 + idxM) defVal
+        ii := ii - stepYI
+    topArr := topArr.set! 0 (leftArr.getD 0 defVal)
+    if y0 != 0 then
+      let mut aVal := leftArr.getD 0 defVal
+      let mut i := 0
+      while i < sizeMaxX do
+        if !isIntraRel (Int.ofNat i) (-1) then
+          for k in [:stepX] do
+            if i + k < 2 * size then topArr := topArr.set! (1 + i + k) aVal
+        else
+          aVal := topArr.getD (1 + Nat.min (i + stepX - 1) (2 * size - 1)) defVal
+        i := i + stepX
+  if !candBottomLeft then
+    if candLeft then
+      let v := leftArr.getD size defVal
+      for i in [:size] do
+        leftArr := leftArr.set! (1 + size + i) v
+    else if candUpLeft then
+      let v := leftArr.getD 0 defVal
+      for i in [:2 * size] do
+        leftArr := leftArr.set! (1 + i) v
+      candLeft := true
+    else if candUp then
+      let v := topArr.getD 1 defVal
+      leftArr := leftArr.set! 0 v
+      for i in [:2 * size] do
+        leftArr := leftArr.set! (1 + i) v
+      candUpLeft := true
+      candLeft := true
+    else if candUpRight then
+      let v := topArr.getD (1 + size) defVal
+      for i in [:size] do
+        topArr := topArr.set! (1 + i) v
+      leftArr := leftArr.set! 0 v
+      for i in [:2 * size] do
+        leftArr := leftArr.set! (1 + i) v
+      candUp := true
+      candUpLeft := true
+      candLeft := true
+    else
+      leftArr := leftArr.set! 0 defVal
+      for i in [:2 * size] do
+        topArr := topArr.set! (1 + i) defVal
+        leftArr := leftArr.set! (1 + i) defVal
+  if !candLeft then
+    let v := leftArr.getD (1 + size) defVal
+    for i in [:size] do
+      leftArr := leftArr.set! (1 + i) v
+  if !candUpLeft then
+    leftArr := leftArr.set! 0 (leftArr.getD 1 defVal)
+  if !candUp then
+    let v := leftArr.getD 0 defVal
+    for i in [:size] do
+      topArr := topArr.set! (1 + i) v
+  if !candUpRight then
+    let v := topArr.getD size defVal
+    for i in [:size] do
+      topArr := topArr.set! (1 + size + i) v
+  topArr := topArr.set! 0 (leftArr.getD 0 defVal)
+  let filterRef :=
+    !sps.intraSmoothingDisabledFlag && mode != 1 && size != 4 &&
+    (if cIdx == 0 || sps.chromaFormatIdc == 3 then
+      let d1 := (Int.ofNat mode - 26).natAbs
+      let d2 := (Int.ofNat mode - 10).natAbs
+      Nat.min d1 d2 > hevcIntraHorVerDistThresh.getD (log2Size - 3) 0
+     else false)
+  if filterRef then
+    let t0 := topArr.getD 0 defVal
+    let t32 := topArr.getD 32 defVal
+    let t64 := topArr.getD 64 defVal
+    let l0 := leftArr.getD 0 defVal
+    let l32 := leftArr.getD 32 defVal
+    let l64 := leftArr.getD 64 defVal
+    let strongThresh := 1 <<< (bd - 5)
+    if cIdx == 0 && sps.spsStrongIntraSmoothingEnableFlag && log2Size == 5 &&
+        (t0 + t64 - 2 * t32).natAbs < strongThresh && (l0 + l64 - 2 * l32).natAbs < strongThresh then
+      let mut fTop : Array Int := Array.replicate (2 * size + 1) 0
+      let mut fLeft : Array Int := Array.replicate (2 * size + 1) 0
+      fTop := fTop.set! 0 t0
+      fTop := fTop.set! 64 t64
+      fLeft := fLeft.set! 0 l0
+      fLeft := fLeft.set! 64 l64
+      for i in [:63] do
+        let k := Int.ofNat (i + 1)
+        fTop := fTop.set! (1 + i) (asrInt ((64 - k) * t0 + k * t64 + 32) 6)
+        fLeft := fLeft.set! (1 + i) (asrInt ((64 - k) * l0 + k * l64 + 32) 6)
+      topArr := fTop
+      leftArr := fLeft
+    else
+      let mut fTop : Array Int := Array.replicate (2 * size + 1) 0
+      let mut fLeft : Array Int := Array.replicate (2 * size + 1) 0
+      fLeft := fLeft.set! (2 * size) (leftArr.getD (2 * size) defVal)
+      fTop := fTop.set! (2 * size) (topArr.getD (2 * size) defVal)
+      for idx in [:2 * size - 1] do
+        let i := 2 * size - 2 - idx
+        fLeft := fLeft.set! (1 + i)
+          (asrInt (leftArr.getD (2 + i) defVal + 2 * leftArr.getD (1 + i) defVal + leftArr.getD i defVal + 2) 2)
+        fTop := fTop.set! (1 + i)
+          (asrInt (topArr.getD (2 + i) defVal + 2 * topArr.getD (1 + i) defVal + topArr.getD i defVal + 2) 2)
+      let corner := asrInt (leftArr.getD 1 defVal + 2 * leftArr.getD 0 defVal + topArr.getD 1 defVal + 2) 2
+      fTop := fTop.set! 0 corner
+      fLeft := fLeft.set! 0 corner
+      topArr := fTop
+      leftArr := fLeft
+  let mut plane := plane0
+  if mode == 0 then
+    let topSz := topArr.getD (1 + size) defVal
+    let leftSz := leftArr.getD (1 + size) defVal
+    let sh := log2Size + 1
+    let szI := Int.ofNat size
+    for py in [:size] do
+      let ly := leftArr.getD (1 + py) defVal
+      let rowOff := (y + py) * stride + x
+      let pyI := Int.ofNat py
+      for px in [:size] do
+        let pxI := Int.ofNat px
+        let v := asrInt ((szI - 1 - pxI) * ly + (pxI + 1) * topSz +
+          (szI - 1 - pyI) * topArr.getD (1 + px) defVal + (pyI + 1) * leftSz + szI) sh
+        plane := plane.set! (rowOff + px) (clipSampleU16 v bd)
+  else if mode == 1 then
+    let mut dc : Int := Int.ofNat size
+    for i in [:size] do
+      dc := dc + leftArr.getD (1 + i) defVal + topArr.getD (1 + i) defVal
+    dc := asrInt dc (log2Size + 1)
+    let dcS := clipSampleU16 dc bd
+    for py in [:size] do
+      let rowOff := (y + py) * stride + x
+      for px in [:size] do
+        plane := plane.set! (rowOff + px) dcS
+    if cIdx == 0 && size < 32 then
+      plane := plane.set! (y * stride + x)
+        (clipSampleU16 (asrInt (leftArr.getD 1 defVal + 2 * dc + topArr.getD 1 defVal + 2) 2) bd)
+      for px in [1:size] do
+        plane := plane.set! (y * stride + x + px)
+          (clipSampleU16 (asrInt (topArr.getD (1 + px) defVal + 3 * dc + 2) 2) bd)
+      for py in [1:size] do
+        plane := plane.set! ((y + py) * stride + x)
+          (clipSampleU16 (asrInt (leftArr.getD (1 + py) defVal + 3 * dc + 2) 2) bd)
+  else
+    let angle := hevcIntraPredAngle.getD (mode - 2) 0
+    let last := asrInt (Int.ofNat size * angle) 5
+    if mode >= 18 then
+      let mut refBuf : Array Int := Array.replicate (3 * size + 4) 0
+      if angle < 0 && last < -1 then
+        for k in [:size + 1] do
+          refBuf := refBuf.set! (size + k) (topArr.getD k defVal)
+        let inv := hevcInvAngle.getD (mode - 11) (-256)
+        let nNeg := (-last).toNat
+        for idx in [:nNeg] do
+          let k : Int := last + Int.ofNat idx
+          let lIdx := asrInt (k * inv + 128) 8
+          refBuf := refBuf.set! (Int.ofNat size + k).toNat (leftArr.getD lIdx.toNat defVal)
+      else
+        for k in [:2 * size + 1] do
+          refBuf := refBuf.set! (size + k) (topArr.getD k defVal)
+      for py in [:size] do
+        let prod := Int.ofNat (py + 1) * angle
+        let idx := asrInt prod 5
+        let fact := prod % 32
+        let rowOff := (y + py) * stride + x
+        if fact != 0 then
+          let w0 := 32 - fact
+          for px in [:size] do
+            let rI := (Int.ofNat (size + px + 1) + idx).toNat
+            let v := asrInt (w0 * refBuf.getD rI defVal + fact * refBuf.getD (rI + 1) defVal + 16) 5
+            plane := plane.set! (rowOff + px) (clipSampleU16 v bd)
+        else
+          for px in [:size] do
+            let rI := (Int.ofNat (size + px + 1) + idx).toNat
+            plane := plane.set! (rowOff + px) (clipSampleU16 (refBuf.getD rI defVal) bd)
+      if mode == 26 && cIdx == 0 && size < 32 then
+        let t0 := topArr.getD 1 defVal
+        let lm1 := leftArr.getD 0 defVal
+        for py in [:size] do
+          let v := t0 + asrInt (leftArr.getD (1 + py) defVal - lm1) 1
+          plane := plane.set! ((y + py) * stride + x) (clipSampleU16 v bd)
+    else
+      let mut refBuf : Array Int := Array.replicate (3 * size + 4) 0
+      if angle < 0 && last < -1 then
+        for k in [:size + 1] do
+          refBuf := refBuf.set! (size + k) (leftArr.getD k defVal)
+        let inv := hevcInvAngle.getD (mode - 11) (-256)
+        let nNeg := (-last).toNat
+        for idx in [:nNeg] do
+          let k : Int := last + Int.ofNat idx
+          let tIdx := asrInt (k * inv + 128) 8
+          refBuf := refBuf.set! (Int.ofNat size + k).toNat (topArr.getD tIdx.toNat defVal)
+      else
+        for k in [:2 * size + 1] do
+          refBuf := refBuf.set! (size + k) (leftArr.getD k defVal)
+      for px in [:size] do
+        let prod := Int.ofNat (px + 1) * angle
+        let idx := asrInt prod 5
+        let fact := prod % 32
+        if fact != 0 then
+          let w0 := 32 - fact
+          for py in [:size] do
+            let rI := (Int.ofNat (size + py + 1) + idx).toNat
+            let v := asrInt (w0 * refBuf.getD rI defVal + fact * refBuf.getD (rI + 1) defVal + 16) 5
+            plane := plane.set! ((y + py) * stride + x + px) (clipSampleU16 v bd)
+        else
+          for py in [:size] do
+            let rI := (Int.ofNat (size + py + 1) + idx).toNat
+            plane := plane.set! ((y + py) * stride + x + px) (clipSampleU16 (refBuf.getD rI defVal) bd)
+      if mode == 10 && cIdx == 0 && size < 32 then
+        let l0 := leftArr.getD 1 defVal
+        let tm1 := topArr.getD 0 defVal
+        let rowOff := y * stride + x
+        for px in [:size] do
+          let v := l0 + asrInt (topArr.getD (1 + px) defVal - tm1) 1
+          plane := plane.set! (rowOff + px) (clipSampleU16 v bd)
+  return plane
+
 def mcLuma14Bit (refY : ByteArray) (picW picH : Nat) (xOff yOff : Int)
     (mx my bw bh : Nat) : Array Int := Id.run do
   let mut out : Array Int := Array.replicate (bw * bh) 0
@@ -4716,6 +5700,7 @@ def mcBiWrite (dst0 : ByteArray) (stride dx dy bw bh : Nat) (s0 s1 : Array Int)
 
 structure HevcRefPlanes where
   planes     : Array ByteArray := #[]
+  planes16   : Array (Array UInt16) := #[]
   poc        : Int := 0
   tabMvf     : Array HevcMvf := #[]
   rplPoc     : Array (Array Int) := #[#[], #[]]
@@ -4762,14 +5747,16 @@ def mcPu8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps) (sh : Hevc
             (pwt.chromaWeightL1.getD ridx #[]).getD cI 1,
             (pwt.chromaOffsetL1.getD ridx #[]).getD cI 0)
   let mut planes := planes0
-  let emptyY := ByteArray.mk (Array.replicate (picW * picH) 128)
-  let emptyC := ByteArray.mk (Array.replicate (cw * ch) 128)
+  let mkEmptyY (_ : Unit) : ByteArray := ByteArray.mk (Array.replicate (picW * picH) 128)
+  let mkEmptyC (_ : Unit) : ByteArray := ByteArray.mk (Array.replicate (cw * ch) 128)
   if pf == pfL0 || pf == pfL1 then
     let lx := if pf == pfL0 then 0 else 1
     let ridx := (mvfRefIdx mvf lx).toNat
     let rplLx := rpl.getD lx {}
     let refOpt := rplLx.refs.getD ridx none
-    let refY := match refOpt with | some rf => rf.planes.getD 0 emptyY | none => emptyY
+    let refY := match refOpt with
+      | some rf => if rf.planes.size > 0 then rf.planes[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
     let (mvx, mvy) := mvfMv mvf lx
     let mx := (mvx % 4).toNat
     let my := (mvy % 4).toNat
@@ -4783,7 +5770,9 @@ def mcPu8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps) (sh : Hevc
     let cmx := (mvx % 8).toNat
     let cmy := (mvy % 8).toNat
     for cI in [:2] do
-      let refC := match refOpt with | some rf => rf.planes.getD (cI + 1) emptyC | none => emptyC
+      let refC := match refOpt with
+        | some rf => if cI + 1 < rf.planes.size then rf.planes[cI + 1]! else mkEmptyC ()
+        | none => mkEmptyC ()
       let sC := mcChroma14Bit refC cw ch (Int.ofNat cx0 + asrInt mvx 3) (Int.ofNat cy0 + asrInt mvy 3) cmx cmy cbw cbh
       let (wfC, denomC, wc, oc) := wChroma lx ridx cI
       planes := planes.set! (cI + 1)
@@ -4793,8 +5782,12 @@ def mcPu8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps) (sh : Hevc
     let r1 := mvf.refIdx1.toNat
     let ref0 := (rpl.getD 0 {}).refs.getD r0 none
     let ref1 := (rpl.getD 1 {}).refs.getD r1 none
-    let ref0Y := match ref0 with | some rf => rf.planes.getD 0 emptyY | none => emptyY
-    let ref1Y := match ref1 with | some rf => rf.planes.getD 0 emptyY | none => emptyY
+    let ref0Y := match ref0 with
+      | some rf => if rf.planes.size > 0 then rf.planes[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
+    let ref1Y := match ref1 with
+      | some rf => if rf.planes.size > 0 then rf.planes[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
     let (mv0x, mv0y) := mvf.mv0
     let (mv1x, mv1y) := mvf.mv1
     let s0Y := mcLuma14Bit ref0Y picW picH (Int.ofNat x0 + asrInt mv0x 2) (Int.ofNat y0 + asrInt mv0y 2)
@@ -4810,8 +5803,12 @@ def mcPu8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps) (sh : Hevc
     let cx0 := x0 >>> 1
     let cy0 := y0 >>> 1
     for cI in [:2] do
-      let ref0C := match ref0 with | some rf => rf.planes.getD (cI + 1) emptyC | none => emptyC
-      let ref1C := match ref1 with | some rf => rf.planes.getD (cI + 1) emptyC | none => emptyC
+      let ref0C := match ref0 with
+        | some rf => if cI + 1 < rf.planes.size then rf.planes[cI + 1]! else mkEmptyC ()
+        | none => mkEmptyC ()
+      let ref1C := match ref1 with
+        | some rf => if cI + 1 < rf.planes.size then rf.planes[cI + 1]! else mkEmptyC ()
+        | none => mkEmptyC ()
       let s0C := mcChroma14Bit ref0C cw ch (Int.ofNat cx0 + asrInt mv0x 3) (Int.ofNat cy0 + asrInt mv0y 3)
         (mv0x % 8).toNat (mv0y % 8).toNat cbw cbh
       let s1C := mcChroma14Bit ref1C cw ch (Int.ofNat cx0 + asrInt mv1x 3) (Int.ofNat cy0 + asrInt mv1y 3)
@@ -4820,6 +5817,295 @@ def mcPu8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps) (sh : Hevc
       let (_, _, wc1, oc1) := wChroma 1 r1 cI
       planes := planes.set! (cI + 1)
         (mcBiWrite (planes.getD (cI + 1) ByteArray.empty) cw cx0 cy0 cbw cbh s0C s1C wfC denomC wc0 wc1 oc0 oc1)
+  return planes
+
+def mcLumaGen (refY : Array UInt16) (picW picH bitDepth : Nat) (xOff yOff : Int)
+    (mx my bw bh : Nat) : Array Int := Id.run do
+  let mut out : Array Int := Array.replicate (bw * bh) 0
+  let maxX : Int := Int.ofNat picW - 1
+  let maxY : Int := Int.ofNat picH - 1
+  let shCopy := 14 - bitDepth
+  let sh1 := bitDepth - 8
+  if mx == 0 && my == 0 then
+    for py in [:bh] do
+      let ry := (clipInt (yOff + Int.ofNat py) 0 maxY).toNat * picW
+      let base := py * bw
+      for px in [:bw] do
+        let rx := (clipInt (xOff + Int.ofNat px) 0 maxX).toNat
+        out := out.set! (base + px) (Int.ofNat ((refY.getD (ry + rx) 0).toNat <<< shCopy))
+    return out
+  if my == 0 then
+    let flt := hevcQpelFilters.getD mx #[]
+    for py in [:bh] do
+      let ry := (clipInt (yOff + Int.ofNat py) 0 maxY).toNat * picW
+      let base := py * bw
+      for px in [:bw] do
+        let mut acc : Int := 0
+        for k in [:8] do
+          let rx := (clipInt (xOff + Int.ofNat px + Int.ofNat k - 3) 0 maxX).toNat
+          acc := acc + flt.getD k 0 * Int.ofNat (refY.getD (ry + rx) 0).toNat
+        out := out.set! (base + px) (asrInt acc sh1)
+    return out
+  if mx == 0 then
+    let flt := hevcQpelFilters.getD my #[]
+    for py in [:bh] do
+      let base := py * bw
+      let mut ys : Array Nat := Array.mkEmpty 8
+      for k in [:8] do
+        ys := ys.push ((clipInt (yOff + Int.ofNat py + Int.ofNat k - 3) 0 maxY).toNat * picW)
+      for px in [:bw] do
+        let rx := (clipInt (xOff + Int.ofNat px) 0 maxX).toNat
+        let mut acc : Int := 0
+        for k in [:8] do
+          acc := acc + flt.getD k 0 * Int.ofNat (refY.getD (ys.getD k 0 + rx) 0).toNat
+        out := out.set! (base + px) (asrInt acc sh1)
+    return out
+  let fh := hevcQpelFilters.getD mx #[]
+  let fv := hevcQpelFilters.getD my #[]
+  let tmpH := bh + 7
+  let mut tmp : Array Int := Array.replicate (tmpH * bw) 0
+  for ty in [:tmpH] do
+    let ry := (clipInt (yOff + Int.ofNat ty - 3) 0 maxY).toNat * picW
+    let tbase := ty * bw
+    for px in [:bw] do
+      let mut acc : Int := 0
+      for k in [:8] do
+        let rx := (clipInt (xOff + Int.ofNat px + Int.ofNat k - 3) 0 maxX).toNat
+        acc := acc + fh.getD k 0 * Int.ofNat (refY.getD (ry + rx) 0).toNat
+      tmp := tmp.set! (tbase + px) (asrInt acc sh1)
+  for py in [:bh] do
+    let base := py * bw
+    for px in [:bw] do
+      let mut acc : Int := 0
+      for k in [:8] do
+        acc := acc + fv.getD k 0 * tmp.getD ((py + k) * bw + px) 0
+      out := out.set! (base + px) (asrInt acc 6)
+  return out
+
+def mcChromaGen (refC : Array UInt16) (cw ch bitDepth : Nat) (xOff yOff : Int)
+    (mx my bw bh : Nat) : Array Int := Id.run do
+  let mut out : Array Int := Array.replicate (bw * bh) 0
+  let maxX : Int := Int.ofNat cw - 1
+  let maxY : Int := Int.ofNat ch - 1
+  let shCopy := 14 - bitDepth
+  let sh1 := bitDepth - 8
+  if mx == 0 && my == 0 then
+    for py in [:bh] do
+      let ry := (clipInt (yOff + Int.ofNat py) 0 maxY).toNat * cw
+      let base := py * bw
+      for px in [:bw] do
+        let rx := (clipInt (xOff + Int.ofNat px) 0 maxX).toNat
+        out := out.set! (base + px) (Int.ofNat ((refC.getD (ry + rx) 0).toNat <<< shCopy))
+    return out
+  if my == 0 then
+    let flt := hevcEpelFilters.getD mx #[]
+    for py in [:bh] do
+      let ry := (clipInt (yOff + Int.ofNat py) 0 maxY).toNat * cw
+      let base := py * bw
+      for px in [:bw] do
+        let mut acc : Int := 0
+        for k in [:4] do
+          let rx := (clipInt (xOff + Int.ofNat px + Int.ofNat k - 1) 0 maxX).toNat
+          acc := acc + flt.getD k 0 * Int.ofNat (refC.getD (ry + rx) 0).toNat
+        out := out.set! (base + px) (asrInt acc sh1)
+    return out
+  if mx == 0 then
+    let flt := hevcEpelFilters.getD my #[]
+    for py in [:bh] do
+      let base := py * bw
+      let mut ys : Array Nat := Array.mkEmpty 4
+      for k in [:4] do
+        ys := ys.push ((clipInt (yOff + Int.ofNat py + Int.ofNat k - 1) 0 maxY).toNat * cw)
+      for px in [:bw] do
+        let rx := (clipInt (xOff + Int.ofNat px) 0 maxX).toNat
+        let mut acc : Int := 0
+        for k in [:4] do
+          acc := acc + flt.getD k 0 * Int.ofNat (refC.getD (ys.getD k 0 + rx) 0).toNat
+        out := out.set! (base + px) (asrInt acc sh1)
+    return out
+  let fh := hevcEpelFilters.getD mx #[]
+  let fv := hevcEpelFilters.getD my #[]
+  let tmpH := bh + 3
+  let mut tmp : Array Int := Array.replicate (tmpH * bw) 0
+  for ty in [:tmpH] do
+    let ry := (clipInt (yOff + Int.ofNat ty - 1) 0 maxY).toNat * cw
+    let tbase := ty * bw
+    for px in [:bw] do
+      let mut acc : Int := 0
+      for k in [:4] do
+        let rx := (clipInt (xOff + Int.ofNat px + Int.ofNat k - 1) 0 maxX).toNat
+        acc := acc + fh.getD k 0 * Int.ofNat (refC.getD (ry + rx) 0).toNat
+      tmp := tmp.set! (tbase + px) (asrInt acc sh1)
+  for py in [:bh] do
+    let base := py * bw
+    for px in [:bw] do
+      let mut acc : Int := 0
+      for k in [:4] do
+        acc := acc + fv.getD k 0 * tmp.getD ((py + k) * bw + px) 0
+      out := out.set! (base + px) (asrInt acc 6)
+  return out
+
+def mcUniWriteGen (dst0 : Array UInt16) (stride dx dy bw bh bitDepth : Nat) (s0 : Array Int)
+    (weightFlag : Bool) (denom : Nat) (wx ox : Int) : Array UInt16 := Id.run do
+  let mut dst := dst0
+  let shiftNum := 14 - bitDepth
+  let offsetDef := Int.ofNat (1 <<< (shiftNum - 1))
+  if !weightFlag then
+    for py in [:bh] do
+      let roff := (dy + py) * stride + dx
+      let boff := py * bw
+      for px in [:bw] do
+        dst := dst.set! (roff + px) (clipSampleU16 (asrInt (s0.getD (boff + px) 0 + offsetDef) shiftNum) bitDepth)
+  else
+    let shift := denom + shiftNum
+    let offset := if shift == 0 then (0 : Int) else Int.ofNat (1 <<< (shift - 1))
+    for py in [:bh] do
+      let roff := (dy + py) * stride + dx
+      let boff := py * bw
+      for px in [:bw] do
+        dst := dst.set! (roff + px) (clipSampleU16 (asrInt (s0.getD (boff + px) 0 * wx + offset) shift + ox) bitDepth)
+  return dst
+
+def mcBiWriteGen (dst0 : Array UInt16) (stride dx dy bw bh bitDepth : Nat) (s0 s1 : Array Int)
+    (weightFlag : Bool) (denom : Nat) (wx0 wx1 ox0 ox1 : Int) : Array UInt16 := Id.run do
+  let mut dst := dst0
+  let shiftNum := 14 - bitDepth
+  if !weightFlag then
+    let shBi := shiftNum + 1
+    let offBi := Int.ofNat (1 <<< shiftNum)
+    for py in [:bh] do
+      let roff := (dy + py) * stride + dx
+      let boff := py * bw
+      for px in [:bw] do
+        dst := dst.set! (roff + px)
+          (clipSampleU16 (asrInt (s0.getD (boff + px) 0 + s1.getD (boff + px) 0 + offBi) shBi) bitDepth)
+  else
+    let log2Wd := denom + shiftNum
+    let offBi := (ox0 + ox1 + 1) * Int.ofNat (1 <<< log2Wd)
+    let shBi := log2Wd + 1
+    for py in [:bh] do
+      let roff := (dy + py) * stride + dx
+      let boff := py * bw
+      for px in [:bw] do
+        dst := dst.set! (roff + px)
+          (clipSampleU16 (asrInt (s0.getD (boff + px) 0 * wx0 + s1.getD (boff + px) 0 * wx1 + offBi) shBi) bitDepth)
+  return dst
+
+def mcPuGen (planes0 : Array (Array UInt16)) (sps : HevcSps) (pps : HevcPps) (sh : HevcSliceHeader)
+    (mvf : HevcMvf) (rpl : Array HevcRpl) (x0 y0 nPbW nPbH : Nat) : Array (Array UInt16) := Id.run do
+  let picW := sps.width
+  let picH := sps.height
+  let cf := sps.chromaFormatIdc
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let cw := picW >>> hshift
+  let ch := picH >>> vshift
+  let bdY := sps.bitDepth
+  let bdC := sps.bitDepthChroma
+  let pf := mvf.predFlag
+  let weightFlag := (pps.weightedPredFlag && sh.sliceType == sliceP) ||
+    (pps.weightedBipredFlag && sh.sliceType == sliceB)
+  let wLuma (lx ridx : Nat) : Bool × Nat × Int × Int :=
+    if !weightFlag then (false, 0, 1, 0)
+    else
+      match sh.pwt? with
+      | none => (false, 0, 1, 0)
+      | some pwt =>
+        if lx == 0 then (true, pwt.lumaLog2WeightDenom, pwt.lumaWeightL0.getD ridx 1, pwt.lumaOffsetL0.getD ridx 0)
+        else (true, pwt.lumaLog2WeightDenom, pwt.lumaWeightL1.getD ridx 1, pwt.lumaOffsetL1.getD ridx 0)
+  let wChroma (lx ridx cI : Nat) : Bool × Nat × Int × Int :=
+    if !weightFlag then (false, 0, 1, 0)
+    else
+      match sh.pwt? with
+      | none => (false, 0, 1, 0)
+      | some pwt =>
+        if lx == 0 then
+          (true, pwt.chromaLog2WeightDenom,
+            (pwt.chromaWeightL0.getD ridx #[]).getD cI 1,
+            (pwt.chromaOffsetL0.getD ridx #[]).getD cI 0)
+        else
+          (true, pwt.chromaLog2WeightDenom,
+            (pwt.chromaWeightL1.getD ridx #[]).getD cI 1,
+            (pwt.chromaOffsetL1.getD ridx #[]).getD cI 0)
+  let mut planes := planes0
+  let defY : UInt16 := (1 <<< (bdY - 1)).toUInt16
+  let defC : UInt16 := (1 <<< (bdC - 1)).toUInt16
+  let mkEmptyY (_ : Unit) : Array UInt16 := Array.replicate (picW * picH) defY
+  let mkEmptyC (_ : Unit) : Array UInt16 := Array.replicate (cw * ch) defC
+  let mvShX := 2 + hshift
+  let mvShY := 2 + vshift
+  let fracMulX : Int := if hshift == 0 then 2 else 1
+  let fracMulY : Int := if vshift == 0 then 2 else 1
+  if pf == pfL0 || pf == pfL1 then
+    let lx := if pf == pfL0 then 0 else 1
+    let ridx := (mvfRefIdx mvf lx).toNat
+    let rplLx := rpl.getD lx {}
+    let refOpt := rplLx.refs.getD ridx none
+    let refY := match refOpt with
+      | some rf => if rf.planes16.size > 0 then rf.planes16[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
+    let (mvx, mvy) := mvfMv mvf lx
+    let mx := (mvx % 4).toNat
+    let my := (mvy % 4).toNat
+    let sY := mcLumaGen refY picW picH bdY (Int.ofNat x0 + asrInt mvx 2) (Int.ofNat y0 + asrInt mvy 2) mx my nPbW nPbH
+    let (wfY, denomY, wy, oy) := wLuma lx ridx
+    planes := planes.set! 0 (mcUniWriteGen (planes.getD 0 #[]) picW x0 y0 nPbW nPbH bdY sY wfY denomY wy oy)
+    if cf != 0 then
+      let cbw := nPbW >>> hshift
+      let cbh := nPbH >>> vshift
+      let cx0 := x0 >>> hshift
+      let cy0 := y0 >>> vshift
+      let cmx := ((mvx * fracMulX) % 8).toNat
+      let cmy := ((mvy * fracMulY) % 8).toNat
+      for cI in [:2] do
+        let refC := match refOpt with
+          | some rf => if cI + 1 < rf.planes16.size then rf.planes16[cI + 1]! else mkEmptyC ()
+          | none => mkEmptyC ()
+        let sC := mcChromaGen refC cw ch bdC (Int.ofNat cx0 + asrInt mvx mvShX) (Int.ofNat cy0 + asrInt mvy mvShY) cmx cmy cbw cbh
+        let (wfC, denomC, wc, oc) := wChroma lx ridx cI
+        planes := planes.set! (cI + 1)
+          (mcUniWriteGen (planes.getD (cI + 1) #[]) cw cx0 cy0 cbw cbh bdC sC wfC denomC wc oc)
+  else if pf == pfBi then
+    let r0 := mvf.refIdx0.toNat
+    let r1 := mvf.refIdx1.toNat
+    let ref0 := (rpl.getD 0 {}).refs.getD r0 none
+    let ref1 := (rpl.getD 1 {}).refs.getD r1 none
+    let ref0Y := match ref0 with
+      | some rf => if rf.planes16.size > 0 then rf.planes16[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
+    let ref1Y := match ref1 with
+      | some rf => if rf.planes16.size > 0 then rf.planes16[0]! else mkEmptyY ()
+      | none => mkEmptyY ()
+    let (mv0x, mv0y) := mvf.mv0
+    let (mv1x, mv1y) := mvf.mv1
+    let s0Y := mcLumaGen ref0Y picW picH bdY (Int.ofNat x0 + asrInt mv0x 2) (Int.ofNat y0 + asrInt mv0y 2)
+      (mv0x % 4).toNat (mv0y % 4).toNat nPbW nPbH
+    let s1Y := mcLumaGen ref1Y picW picH bdY (Int.ofNat x0 + asrInt mv1x 2) (Int.ofNat y0 + asrInt mv1y 2)
+      (mv1x % 4).toNat (mv1y % 4).toNat nPbW nPbH
+    let (wfY, denomY, wy0, oy0) := wLuma 0 r0
+    let (_, _, wy1, oy1) := wLuma 1 r1
+    planes := planes.set! 0
+      (mcBiWriteGen (planes.getD 0 #[]) picW x0 y0 nPbW nPbH bdY s0Y s1Y wfY denomY wy0 wy1 oy0 oy1)
+    if cf != 0 then
+      let cbw := nPbW >>> hshift
+      let cbh := nPbH >>> vshift
+      let cx0 := x0 >>> hshift
+      let cy0 := y0 >>> vshift
+      for cI in [:2] do
+        let ref0C := match ref0 with
+          | some rf => if cI + 1 < rf.planes16.size then rf.planes16[cI + 1]! else mkEmptyC ()
+          | none => mkEmptyC ()
+        let ref1C := match ref1 with
+          | some rf => if cI + 1 < rf.planes16.size then rf.planes16[cI + 1]! else mkEmptyC ()
+          | none => mkEmptyC ()
+        let s0C := mcChromaGen ref0C cw ch bdC (Int.ofNat cx0 + asrInt mv0x mvShX) (Int.ofNat cy0 + asrInt mv0y mvShY)
+          ((mv0x * fracMulX) % 8).toNat ((mv0y * fracMulY) % 8).toNat cbw cbh
+        let s1C := mcChromaGen ref1C cw ch bdC (Int.ofNat cx0 + asrInt mv1x mvShX) (Int.ofNat cy0 + asrInt mv1y mvShY)
+          ((mv1x * fracMulX) % 8).toNat ((mv1y * fracMulY) % 8).toNat cbw cbh
+        let (wfC, denomC, wc0, oc0) := wChroma 0 r0 cI
+        let (_, _, wc1, oc1) := wChroma 1 r1 cI
+        planes := planes.set! (cI + 1)
+          (mcBiWriteGen (planes.getD (cI + 1) #[]) cw cx0 cy0 cbw cbh bdC s0C s1C wfC denomC wc0 wc1 oc0 oc1)
   return planes
 
 structure HevcDeblockCtb where
@@ -5244,6 +6530,441 @@ def saoFrame8 (planes0 : Array ByteArray) (sps : HevcSps) (pps : HevcPps)
           planes := planes.set! cIdx dst
   return planes
 
+@[inline]
+private def rdPx16I (plane : Array UInt16) (idx : Nat) : Int :=
+  Int.ofNat (plane.getD idx 0).toNat
+
+def loopFilterLumaGen (plane0 : Array UInt16) (baseIdx xstride ystride bitDepth : Nat) (beta : Int)
+    (tcPair : Int × Int) (noPPair noQPair : Nat × Nat) : Array UInt16 := Id.run do
+  let mut plane := plane0
+  let mut idx := baseIdx
+  for j in [:2] do
+    let p3_0 := rdPx16I plane (idx - 4 * xstride)
+    let p2_0 := rdPx16I plane (idx - 3 * xstride)
+    let p1_0 := rdPx16I plane (idx - 2 * xstride)
+    let p0_0 := rdPx16I plane (idx - 1 * xstride)
+    let q0_0 := rdPx16I plane idx
+    let q1_0 := rdPx16I plane (idx + 1 * xstride)
+    let q2_0 := rdPx16I plane (idx + 2 * xstride)
+    let q3_0 := rdPx16I plane (idx + 3 * xstride)
+    let idx3 := idx + 3 * ystride
+    let tp3 := rdPx16I plane (idx3 - 4 * xstride)
+    let tp2 := rdPx16I plane (idx3 - 3 * xstride)
+    let tp1 := rdPx16I plane (idx3 - 2 * xstride)
+    let tp0 := rdPx16I plane (idx3 - 1 * xstride)
+    let tq0 := rdPx16I plane idx3
+    let tq1 := rdPx16I plane (idx3 + 1 * xstride)
+    let tq2 := rdPx16I plane (idx3 + 2 * xstride)
+    let tq3 := rdPx16I plane (idx3 + 3 * xstride)
+    let dp0 := Int.ofNat (p2_0 - 2 * p1_0 + p0_0).natAbs
+    let dq0 := Int.ofNat (q2_0 - 2 * q1_0 + q0_0).natAbs
+    let dp3 := Int.ofNat (tp2 - 2 * tp1 + tp0).natAbs
+    let dq3 := Int.ofNat (tq2 - 2 * tq1 + tq0).natAbs
+    let d0 := dp0 + dq0
+    let d3 := dp3 + dq3
+    let tc := if j == 0 then tcPair.1 else tcPair.2
+    let noP := if j == 0 then noPPair.1 else noPPair.2
+    let noQ := if j == 0 then noQPair.1 else noQPair.2
+    if d0 + d3 >= beta || tc <= 0 then
+      idx := idx + 4 * ystride
+    else
+      let beta3 := asrInt beta 3
+      let beta2 := asrInt beta 2
+      let tc25 := asrInt (tc * 5 + 1) 1
+      let s1 := Int.ofNat (p3_0 - p0_0).natAbs + Int.ofNat (q3_0 - q0_0).natAbs < beta3
+      let s2 := Int.ofNat (p0_0 - q0_0).natAbs < tc25
+      let s3 := Int.ofNat (tp3 - tp0).natAbs + Int.ofNat (tq3 - tq0).natAbs < beta3
+      let s4 := Int.ofNat (tp0 - tq0).natAbs < tc25
+      if s1 && s2 && s3 && s4 && (2 * d0) < beta2 && (2 * d3) < beta2 then
+        let tc2 := 2 * tc
+        for _ in [:4] do
+          let p3 := rdPx16I plane (idx - 4 * xstride)
+          let p2 := rdPx16I plane (idx - 3 * xstride)
+          let p1 := rdPx16I plane (idx - 2 * xstride)
+          let p0 := rdPx16I plane (idx - 1 * xstride)
+          let q0 := rdPx16I plane idx
+          let q1 := rdPx16I plane (idx + 1 * xstride)
+          let q2 := rdPx16I plane (idx + 2 * xstride)
+          let q3 := rdPx16I plane (idx + 3 * xstride)
+          if noP == 0 then
+            let np0 := p0 + clipInt (asrInt (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) 3 - p0) (-tc2) tc2
+            let np1 := p1 + clipInt (asrInt (p2 + p1 + p0 + q0 + 2) 2 - p1) (-tc2) tc2
+            let np2 := p2 + clipInt (asrInt (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) 3 - p2) (-tc2) tc2
+            plane := plane.set! (idx - 1 * xstride) (clipSampleU16 np0 bitDepth)
+            plane := plane.set! (idx - 2 * xstride) (clipSampleU16 np1 bitDepth)
+            plane := plane.set! (idx - 3 * xstride) (clipSampleU16 np2 bitDepth)
+          if noQ == 0 then
+            let nq0 := q0 + clipInt (asrInt (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) 3 - q0) (-tc2) tc2
+            let nq1 := q1 + clipInt (asrInt (p0 + q0 + q1 + q2 + 2) 2 - q1) (-tc2) tc2
+            let nq2 := q2 + clipInt (asrInt (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) 3 - q2) (-tc2) tc2
+            plane := plane.set! idx (clipSampleU16 nq0 bitDepth)
+            plane := plane.set! (idx + 1 * xstride) (clipSampleU16 nq1 bitDepth)
+            plane := plane.set! (idx + 2 * xstride) (clipSampleU16 nq2 bitDepth)
+          idx := idx + ystride
+      else
+        let thr := asrInt (beta + asrInt beta 1) 3
+        let ndP := if dp0 + dp3 < thr then 2 else 1
+        let ndQ := if dq0 + dq3 < thr then 2 else 1
+        let tcHalf := asrInt tc 1
+        for _ in [:4] do
+          let p2 := rdPx16I plane (idx - 3 * xstride)
+          let p1 := rdPx16I plane (idx - 2 * xstride)
+          let p0 := rdPx16I plane (idx - 1 * xstride)
+          let q0 := rdPx16I plane idx
+          let q1 := rdPx16I plane (idx + 1 * xstride)
+          let q2 := rdPx16I plane (idx + 2 * xstride)
+          let delta0Raw := asrInt (9 * (q0 - p0) - 3 * (q1 - p1) + 8) 4
+          if Int.ofNat delta0Raw.natAbs < 10 * tc then
+            let delta0 := clipInt delta0Raw (-tc) tc
+            if noP == 0 then
+              plane := plane.set! (idx - 1 * xstride) (clipSampleU16 (p0 + delta0) bitDepth)
+            if noQ == 0 then
+              plane := plane.set! idx (clipSampleU16 (q0 - delta0) bitDepth)
+            if noP == 0 && ndP > 1 then
+              let dp1 := clipInt (asrInt (asrInt (p2 + p0 + 1) 1 - p1 + delta0) 1) (-tcHalf) tcHalf
+              plane := plane.set! (idx - 2 * xstride) (clipSampleU16 (p1 + dp1) bitDepth)
+            if noQ == 0 && ndQ > 1 then
+              let dq1 := clipInt (asrInt (asrInt (q2 + q0 + 1) 1 - q1 - delta0) 1) (-tcHalf) tcHalf
+              plane := plane.set! (idx + 1 * xstride) (clipSampleU16 (q1 + dq1) bitDepth)
+          idx := idx + ystride
+  return plane
+
+def loopFilterChromaGen (plane0 : Array UInt16) (baseIdx xstride ystride bitDepth : Nat)
+    (tcPair : Int × Int) (noPPair noQPair : Nat × Nat) : Array UInt16 := Id.run do
+  let mut plane := plane0
+  let mut idx := baseIdx
+  for j in [:2] do
+    let tc := if j == 0 then tcPair.1 else tcPair.2
+    if tc <= 0 then
+      idx := idx + 4 * ystride
+    else
+      let noP := if j == 0 then noPPair.1 else noPPair.2
+      let noQ := if j == 0 then noQPair.1 else noQPair.2
+      for _ in [:4] do
+        let p1 := rdPx16I plane (idx - 2 * xstride)
+        let p0 := rdPx16I plane (idx - 1 * xstride)
+        let q0 := rdPx16I plane idx
+        let q1 := rdPx16I plane (idx + 1 * xstride)
+        let delta0 := clipInt (asrInt (4 * (q0 - p0) + p1 - q1 + 4) 3) (-tc) tc
+        if noP == 0 then
+          plane := plane.set! (idx - 1 * xstride) (clipSampleU16 (p0 + delta0) bitDepth)
+        if noQ == 0 then
+          plane := plane.set! idx (clipSampleU16 (q0 - delta0) bitDepth)
+        idx := idx + ystride
+  return plane
+
+def deblockFrameGen (planes0 : Array (Array UInt16)) (sps : HevcSps) (pps : HevcPps)
+    (qpYTab : Array Int) (isPcm : Array Nat) (deblockCtb : Array HevcDeblockCtb)
+    (cbOffCtb crOffCtb : Array Int) (verticalBs horizontalBs : Array Nat) (bsWidth : Nat) :
+    Array (Array UInt16) := Id.run do
+  let picW := sps.width
+  let picH := sps.height
+  let cf := sps.chromaFormatIdc
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let cw := picW >>> hshift
+  let bdY := sps.bitDepth
+  let bdC := sps.bitDepthChroma
+  let scaleY : Int := Int.ofNat (1 <<< (bdY - 8))
+  let scaleC : Int := Int.ofNat (1 <<< (bdC - 8))
+  let log2Ctb := sps.log2CtbSize
+  let ctbW := sps.ctbWidth
+  let log2MinCb := sps.log2MinCbSize
+  let minCbW := sps.minCbWidth
+  let log2MinPu := sps.log2MinPuSize
+  let minPuW := sps.minPuWidth
+  let minPuH := sps.minPuHeight
+  let pcmLoopDis := match sps.pcm? with | some p => p.loopFilterDisableFlag | none => false
+  let pcmf := (sps.pcmEnabledFlag && pcmLoopDis) || pps.transquantBypassEnableFlag
+  let cbOffPps := pps.cbQpOffset
+  let crOffPps := pps.crQpOffset
+  let getQpY (px py : Nat) : Int :=
+    qpYTab.getD ((py >>> log2MinCb) * minCbW + (px >>> log2MinCb)) 26
+  let getPcmF (px py : Nat) : Nat :=
+    if !pcmf then 0
+    else
+      let xPu := px >>> log2MinPu
+      let yPu := py >>> log2MinPu
+      if xPu >= minPuW || yPu >= minPuH then 2
+      else isPcm.getD (yPu * minPuW + xPu) 0
+  let qpBdOffC : Int := Int.ofNat (6 * (bdC - 8))
+  let _ := (cbOffCtb, crOffCtb)
+  let chromaTc (qp : Int) (cIdx : Nat) (tcOff : Int) : Int :=
+    let off := if cIdx == 1 then cbOffPps else crOffPps
+    let qPi := clipInt (qp + off) (-qpBdOffC) 57
+    let qPc :=
+      if cf == 1 then
+        if qPi < 0 then qPi else mapQpC qPi
+      else
+        if qPi > 51 then 51 else qPi
+    let tcEven := evenFloorInt tcOff
+    let tcBase := hevcTcTable.getD (clipInt (qPc + 2 + tcEven) 0 53).toNat 0
+    tcBase * scaleC
+  let mut planes := planes0
+  let mut yPlane := planes.getD 0 #[]
+  let mut y := 0
+  while y < picH do
+    let mut x := 8
+    while x < picW do
+      let bs0 := verticalBs.getD ((x + y * bsWidth) >>> 2) 0
+      let bs1 := verticalBs.getD ((x + (y + 4) * bsWidth) >>> 2) 0
+      if bs0 != 0 || bs1 != 0 then
+        let ctbIdx := (y >>> log2Ctb) * ctbW + (x >>> log2Ctb)
+        let db := deblockCtb.getD ctbIdx {}
+        let qp := asrInt (getQpY (x - 1) y + getQpY x y + 1) 1
+        let beta := hevcBetaTable.getD (clipInt (qp + db.betaOffset) 0 51).toNat 0 * scaleY
+        let tcEven := evenFloorInt db.tcOffset
+        let tc0 := if bs0 != 0 then hevcTcTable.getD (clipInt (qp + 2 * (Int.ofNat bs0 - 1) + tcEven) 0 53).toNat 0 * scaleY else 0
+        let tc1 := if bs1 != 0 then hevcTcTable.getD (clipInt (qp + 2 * (Int.ofNat bs1 - 1) + tcEven) 0 53).toNat 0 * scaleY else 0
+        let np := (if bs0 != 0 then getPcmF (x - 1) y else 0, if bs1 != 0 then getPcmF (x - 1) (y + 4) else 0)
+        let nq := (if bs0 != 0 then getPcmF x y else 0, if bs1 != 0 then getPcmF x (y + 4) else 0)
+        yPlane := loopFilterLumaGen yPlane (y * picW + x) 1 picW bdY beta (tc0, tc1) np nq
+      x := x + 8
+    y := y + 8
+  y := 8
+  while y < picH do
+    let mut x := 0
+    while x < picW do
+      let bs0 := horizontalBs.getD ((x + y * bsWidth) >>> 2) 0
+      let bs1 := horizontalBs.getD (((x + 4) + y * bsWidth) >>> 2) 0
+      if bs0 != 0 || bs1 != 0 then
+        let ctbIdx := (y >>> log2Ctb) * ctbW + (x >>> log2Ctb)
+        let db := deblockCtb.getD ctbIdx {}
+        let qp := asrInt (getQpY x (y - 1) + getQpY x y + 1) 1
+        let beta := hevcBetaTable.getD (clipInt (qp + db.betaOffset) 0 51).toNat 0 * scaleY
+        let tcEven := evenFloorInt db.tcOffset
+        let tc0 := if bs0 != 0 then hevcTcTable.getD (clipInt (qp + 2 * (Int.ofNat bs0 - 1) + tcEven) 0 53).toNat 0 * scaleY else 0
+        let tc1 := if bs1 != 0 then hevcTcTable.getD (clipInt (qp + 2 * (Int.ofNat bs1 - 1) + tcEven) 0 53).toNat 0 * scaleY else 0
+        let np := (if bs0 != 0 then getPcmF x (y - 1) else 0, if bs1 != 0 then getPcmF (x + 4) (y - 1) else 0)
+        let nq := (if bs0 != 0 then getPcmF x y else 0, if bs1 != 0 then getPcmF (x + 4) y else 0)
+        yPlane := loopFilterLumaGen yPlane (y * picW + x) picW 1 bdY beta (tc0, tc1) np nq
+      x := x + 8
+    y := y + 8
+  planes := planes.set! 0 yPlane
+  if cf != 0 then
+    let ctbMask := (1 <<< log2Ctb) - 1
+    let stepX := 8 <<< hshift
+    let stepY := 8 <<< vshift
+    let halfX := 4 <<< hshift
+    let halfY := 4 <<< vshift
+    for cIdx in [1, 2] do
+      let mut cPlane := planes.getD cIdx #[]
+      let mut yc := 0
+      while yc < picH do
+        let mut xc := stepX
+        while xc < picW do
+          let bs0 := verticalBs.getD ((xc + yc * bsWidth) >>> 2) 0
+          let bs1 := verticalBs.getD ((xc + (yc + halfY) * bsWidth) >>> 2) 0
+          if bs0 == 2 || bs1 == 2 then
+            let ctb0 := (yc >>> log2Ctb) * ctbW + (xc >>> log2Ctb)
+            let ctb1 := (((yc + halfY) >>> log2Ctb) * ctbW) + (xc >>> log2Ctb)
+            let tcOff0 := (deblockCtb.getD ctb0 {}).tcOffset
+            let tcOff1 := (deblockCtb.getD ctb1 {}).tcOffset
+            let qp0 := if bs0 == 2 then asrInt (getQpY (xc - 1) yc + getQpY xc yc + 1) 1 else 0
+            let qp1 := if bs1 == 2 then asrInt (getQpY (xc - 1) (yc + halfY) + getQpY xc (yc + halfY) + 1) 1 else 0
+            let ctc0 := if bs0 == 2 then chromaTc qp0 cIdx tcOff0 else 0
+            let ctc1 := if bs1 == 2 then chromaTc qp1 cIdx tcOff1 else 0
+            let np := (if bs0 == 2 then getPcmF (xc - 1) yc else 0, if bs1 == 2 then getPcmF (xc - 1) (yc + halfY) else 0)
+            let nq := (if bs0 == 2 then getPcmF xc yc else 0, if bs1 == 2 then getPcmF xc (yc + halfY) else 0)
+            cPlane := loopFilterChromaGen cPlane ((yc >>> vshift) * cw + (xc >>> hshift)) 1 cw bdC (ctc0, ctc1) np nq
+          xc := xc + stepX
+        yc := yc + stepY
+      yc := stepY
+      while yc < picH do
+        let mut xc := 0
+        while xc < picW do
+          let bs0 := horizontalBs.getD ((xc + yc * bsWidth) >>> 2) 0
+          let bs1 := horizontalBs.getD (((xc + halfX) + yc * bsWidth) >>> 2) 0
+          if bs0 == 2 || bs1 == 2 then
+            let ctb0 := (yc >>> log2Ctb) * ctbW + (xc >>> log2Ctb)
+            let ctb1 := if ((xc + stepX) &&& ctbMask) == 0 && (xc + stepX) < picW then ctb0 + 1 else ctb0
+            let tcOff0 := (deblockCtb.getD ctb0 {}).tcOffset
+            let tcOff1 := (deblockCtb.getD ctb1 {}).tcOffset
+            let qp0 := if bs0 == 2 then asrInt (getQpY xc (yc - 1) + getQpY xc yc + 1) 1 else 0
+            let qp1 := if bs1 == 2 then asrInt (getQpY (xc + halfX) (yc - 1) + getQpY (xc + halfX) yc + 1) 1 else 0
+            let ctc0 := if bs0 == 2 then chromaTc qp0 cIdx tcOff0 else 0
+            let ctc1 := if bs1 == 2 then chromaTc qp1 cIdx tcOff1 else 0
+            let np := (if bs0 == 2 then getPcmF xc (yc - 1) else 0, if bs1 == 2 then getPcmF (xc + halfX) (yc - 1) else 0)
+            let nq := (if bs0 == 2 then getPcmF xc yc else 0, if bs1 == 2 then getPcmF (xc + halfX) yc else 0)
+            cPlane := loopFilterChromaGen cPlane ((yc >>> vshift) * cw + (xc >>> hshift)) cw 1 bdC (ctc0, ctc1) np nq
+          xc := xc + stepX
+        yc := yc + stepY
+      planes := planes.set! cIdx cPlane
+  return planes
+
+def saoFrameGen (planes0 : Array (Array UInt16)) (sps : HevcSps) (pps : HevcPps)
+    (saoCtb : Array HevcSaoCtb) (tabSliceAddr : Array Int) (filterSliceEdges : Array Bool)
+    (isPcm : Array Nat) : Array (Array UInt16) := Id.run do
+  let picW := sps.width
+  let picH := sps.height
+  let cf := sps.chromaFormatIdc
+  let log2Ctb := sps.log2CtbSize
+  let ctbSize := 1 <<< log2Ctb
+  let ctbW := sps.ctbWidth
+  let ctbH := sps.ctbHeight
+  let log2MinPu := sps.log2MinPuSize
+  let minPuSize := 1 <<< log2MinPu
+  let minPuW := sps.minPuWidth
+  let pcmLoopDis := match sps.pcm? with | some p => p.loopFilterDisableFlag | none => false
+  let restoreTqb := pps.transquantBypassEnableFlag || (sps.pcmEnabledFlag && pcmLoopDis)
+  let noTileFilter := pps.tilesEnabledFlag && !pps.loopFilterAcrossTilesEnabledFlag
+  let rsToTs := pps.ctbAddrRsToTs
+  let tileId := pps.tileId
+  let origPlanes := planes0
+  let mut planes := planes0
+  let numComp := if cf == 0 then 1 else 3
+  for yCtb in [:ctbH] do
+    for xCtb in [:ctbW] do
+      let ctbRs := yCtb * ctbW + xCtb
+      let ctbTs := rsToTs.getD ctbRs 0
+      let sao := saoCtb.getD ctbRs {}
+      let x := xCtb <<< log2Ctb
+      let y := yCtb <<< log2Ctb
+      let e0 := xCtb == 0
+      let e1 := yCtb == 0
+      let e2 := xCtb + 1 == ctbW
+      let e3 := yCtb + 1 == ctbH
+      let lfase := filterSliceEdges.getD ctbRs true
+      let restore := noTileFilter || !lfase
+      let mut vertEdge0 := false
+      let mut vertEdge1 := false
+      let mut horizEdge0 := false
+      let mut horizEdge1 := false
+      let mut diag0 := false
+      let mut diag1 := false
+      let mut diag2 := false
+      let mut diag3 := false
+      if restore then
+        let mut leftTe := false
+        let mut rightTe := false
+        let mut upTe := false
+        let mut botTe := false
+        let mySl := tabSliceAddr.getD ctbRs (-1)
+        let myTl := tileId.getD ctbTs 0
+        if !e0 then
+          leftTe := noTileFilter && myTl != tileId.getD (rsToTs.getD (ctbRs - 1) 0) 0
+          vertEdge0 := (!lfase && mySl != tabSliceAddr.getD (ctbRs - 1) (-1)) || leftTe
+        if !e2 then
+          rightTe := noTileFilter && myTl != tileId.getD (rsToTs.getD (ctbRs + 1) 0) 0
+          vertEdge1 := (!lfase && mySl != tabSliceAddr.getD (ctbRs + 1) (-1)) || rightTe
+        if !e1 then
+          upTe := noTileFilter && myTl != tileId.getD (rsToTs.getD (ctbRs - ctbW) 0) 0
+          horizEdge0 := (!lfase && mySl != tabSliceAddr.getD (ctbRs - ctbW) (-1)) || upTe
+        if !e3 then
+          botTe := noTileFilter && myTl != tileId.getD (rsToTs.getD (ctbRs + ctbW) 0) 0
+          horizEdge1 := (!lfase && mySl != tabSliceAddr.getD (ctbRs + ctbW) (-1)) || botTe
+        if !e0 && !e1 then
+          diag0 := (!lfase && mySl != tabSliceAddr.getD (ctbRs - ctbW - 1) (-1)) || leftTe || upTe
+        if !e1 && !e2 then
+          diag1 := (!lfase && mySl != tabSliceAddr.getD (ctbRs - ctbW + 1) (-1)) || rightTe || upTe
+        if !e2 && !e3 then
+          diag2 := (!lfase && mySl != tabSliceAddr.getD (ctbRs + ctbW + 1) (-1)) || rightTe || botTe
+        if !e0 && !e3 then
+          diag3 := (!lfase && mySl != tabSliceAddr.getD (ctbRs + ctbW - 1) (-1)) || leftTe || botTe
+      for cIdx in [:numComp] do
+        let tIdx := sao.typeIdx.getD cIdx saoNone
+        if tIdx != saoNone then
+          let hshift := if cIdx == 0 || cf == 3 then 0 else 1
+          let vshift := if cIdx == 0 || cf != 1 then 0 else 1
+          let bd := if cIdx == 0 then sps.bitDepth else sps.bitDepthChroma
+          let bandSh := bd - 5
+          let pw := picW >>> hshift
+          let ph := picH >>> vshift
+          let x0 := x >>> hshift
+          let y0 := y >>> vshift
+          let width := Nat.min (ctbSize >>> hshift) (pw - x0)
+          let height := Nat.min (ctbSize >>> vshift) (ph - y0)
+          let src := origPlanes.getD cIdx #[]
+          let mut dst := planes.getD cIdx #[]
+          let offVal := sao.offsetVal.getD cIdx #[0, 0, 0, 0, 0]
+          if tIdx == saoBand then
+            let mut bandTable : Array Int := Array.replicate 32 0
+            let bp := sao.bandPosition.getD cIdx 0
+            for k in [:4] do
+              bandTable := bandTable.set! ((bp + k) &&& 31) (offVal.getD (k + 1) 0)
+            for py in [:height] do
+              let roff := (y0 + py) * pw + x0
+              for px in [:width] do
+                let v := (src.getD (roff + px) 0).toNat
+                dst := dst.set! (roff + px) (clipSampleU16 (Int.ofNat v + bandTable.getD (v >>> bandSh) 0) bd)
+          else if tIdx == saoEdge then
+            let eo := sao.eoClass.getD cIdx 0
+            let eoPair := hevcSaoEoPos.getD eo ((-1, 0), (1, 0))
+            let ax := eoPair.1.1
+            let ay := eoPair.1.2
+            let bx := eoPair.2.1
+            let byPos := eoPair.2.2
+            let initX := if eo != 1 && e0 then 1 else 0
+            let endX := width - (if eo != 1 && e2 then 1 else 0)
+            let initY := if eo != 0 && e1 then 1 else 0
+            let endY := height - (if eo != 0 && e3 then 1 else 0)
+            let aOff : Int := ay * Int.ofNat pw + ax
+            let bOff : Int := byPos * Int.ofNat pw + bx
+            for py in [initY:endY] do
+              let roff := (y0 + py) * pw + x0
+              for px in [initX:endX] do
+                let idxP := roff + px
+                let cV := (src.getD idxP 0).toNat
+                let va := (src.getD (Int.ofNat idxP + aOff).toNat 0).toNat
+                let vb := (src.getD (Int.ofNat idxP + bOff).toNat 0).toNat
+                let d0 : Int := if cV > va then 1 else if cV < va then -1 else 0
+                let d1 : Int := if cV > vb then 1 else if cV < vb then -1 else 0
+                let eIdx := hevcSaoEdgeIdx.getD (2 + d0 + d1).toNat 0
+                dst := dst.set! idxP (clipSampleU16 (Int.ofNat cV + offVal.getD eIdx 0) bd)
+            if restore then
+              let wEff := endX
+              let hEff := endY
+              let saveUl := if !diag0 && eo == 2 && !e0 && !e1 then 1 else 0
+              let saveUr := if !diag1 && eo == 3 && !e1 && !e2 then 1 else 0
+              let saveLr := if !diag2 && eo == 2 && !e2 && !e3 then 1 else 0
+              let saveLl := if !diag3 && eo == 3 && !e0 && !e3 then 1 else 0
+              if vertEdge0 && eo != 1 then
+                for py in [initY + saveUl : hEff - saveLl] do
+                  let idxP := (y0 + py) * pw + x0
+                  dst := dst.set! idxP (src.getD idxP 0)
+              if vertEdge1 && eo != 1 && wEff > 0 then
+                for py in [initY + saveUr : hEff - saveLr] do
+                  let idxP := (y0 + py) * pw + x0 + wEff - 1
+                  dst := dst.set! idxP (src.getD idxP 0)
+              if horizEdge0 && eo != 0 then
+                for px in [initX + saveUl : wEff - saveUr] do
+                  let idxP := y0 * pw + x0 + px
+                  dst := dst.set! idxP (src.getD idxP 0)
+              if horizEdge1 && eo != 0 && hEff > 0 then
+                for px in [initX + saveLl : wEff - saveLr] do
+                  let idxP := (y0 + hEff - 1) * pw + x0 + px
+                  dst := dst.set! idxP (src.getD idxP 0)
+              if diag0 && eo == 2 then
+                let idxP := y0 * pw + x0
+                dst := dst.set! idxP (src.getD idxP 0)
+              if diag1 && eo == 3 && wEff > 0 then
+                let idxP := y0 * pw + x0 + wEff - 1
+                dst := dst.set! idxP (src.getD idxP 0)
+              if diag2 && eo == 2 && wEff > 0 && hEff > 0 then
+                let idxP := (y0 + hEff - 1) * pw + x0 + wEff - 1
+                dst := dst.set! idxP (src.getD idxP 0)
+              if diag3 && eo == 3 && hEff > 0 then
+                let idxP := (y0 + hEff - 1) * pw + x0
+                dst := dst.set! idxP (src.getD idxP 0)
+          if restoreTqb then
+            let xMin := x >>> log2MinPu
+            let yMin := y >>> log2MinPu
+            let xMax := (x + (width <<< hshift)) >>> log2MinPu
+            let yMax := (y + (height <<< vshift)) >>> log2MinPu
+            let blkW := Nat.max (minPuSize >>> hshift) 1
+            let blkH := Nat.max (minPuSize >>> vshift) 1
+            for yp in [yMin:yMax] do
+              for xp in [xMin:xMax] do
+                if isPcm.getD (yp * minPuW + xp) 0 != 0 then
+                  let bx0 := (xp <<< log2MinPu) >>> hshift
+                  let by0 := (yp <<< log2MinPu) >>> vshift
+                  for ny in [:blkH] do
+                    let roff := (by0 + ny) * pw + bx0
+                    for nx in [:blkW] do
+                      dst := dst.set! (roff + nx) (src.getD (roff + nx) 0)
+          planes := planes.set! cIdx dst
+  return planes
+
 def intraDc : Nat := 1
 
 def hevcIntraChromaModes : Array Nat := #[0, 26, 10, 1]
@@ -5283,6 +7004,9 @@ def sameMvRef (a b : HevcMvf) : Bool :=
 structure HevcDecodedFrame where
   poc        : Int := 0
   planes     : Array ByteArray := #[]
+  planes16   : Array (Array UInt16) := #[]
+  cbOffCtb   : Array Int := #[]
+  crOffCtb   : Array Int := #[]
   tabMvf     : Array HevcMvf := #[]
   rpl        : Array HevcRpl := #[{}, {}]
   rplTab     : Array (Option (Array HevcRpl)) := #[]
@@ -5319,6 +7043,7 @@ def frameToRefPlanes (f : HevcDecodedFrame) : HevcRefPlanes :=
     | none => none
     | some rs => some #[(rs.getD 0 {}).lt, (rs.getD 1 {}).lt]
   { planes := f.planes
+    planes16 := f.planes16
     poc := f.poc
     tabMvf := f.tabMvf
     rplPoc := #[r0.poc, r1.poc]
@@ -5329,16 +7054,27 @@ def frameToRefPlanes (f : HevcDecodedFrame) : HevcRefPlanes :=
 def newDecodedFrame (sps : HevcSps) (sh : HevcSliceHeader) : HevcDecodedFrame :=
   let w := sps.width
   let h := sps.height
-  let cw := w >>> 1
-  let ch := h >>> 1
+  let cf := sps.chromaFormatIdc
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let cw := if cf == 0 then 0 else w >>> hshift
+  let ch := if cf == 0 then 0 else h >>> vshift
   let puN := sps.minPuWidth * sps.minPuHeight
   let cbN := sps.minCbWidth * sps.minCbHeight
   let bsW := (w >>> 2) + 1
   let bsN := ((w + bsW * h) >>> 2) + 4
-  let yPlane := ByteArray.mk (Array.replicate (w * h) (128 : UInt8))
-  let cPlane := ByteArray.mk (Array.replicate (cw * ch) (128 : UInt8))
+  let is8 := isMain8Bit420Sps sps
+  let defY16 : UInt16 := (1 <<< (sps.bitDepth - 1)).toUInt16
+  let defC16 : UInt16 := (1 <<< (sps.bitDepthChroma - 1)).toUInt16
+  let yPlane := if is8 then ByteArray.mk (Array.replicate (w * h) (128 : UInt8)) else ByteArray.empty
+  let cPlane := if is8 then ByteArray.mk (Array.replicate (cw * ch) (128 : UInt8)) else ByteArray.empty
+  let yPlane16 := if is8 then #[] else Array.replicate (w * h) defY16
+  let cPlane16 := if is8 then #[] else Array.replicate (cw * ch) defC16
   { poc := sh.poc
     planes := #[yPlane, cPlane, cPlane]
+    planes16 := #[yPlane16, cPlane16, cPlane16]
+    cbOffCtb := Array.replicate sps.ctbSize sh.cbQpOffset
+    crOffCtb := Array.replicate sps.ctbSize sh.crQpOffset
     tabMvf := Array.replicate puN mvfZero
     rpl := #[{}, {}]
     rplTab := Array.replicate sps.ctbSize none
@@ -5383,8 +7119,13 @@ structure HevcCtbCtx where
   cuX                : Nat := 0
   cuY                : Nat := 0
   chromaPredMode     : Nat := 0
+  chromaModeRaw      : Nat := 0
+  intraChromaModesRaw : Array Nat := #[0]
   intraLumaModes     : Array Nat := #[1]
   tuLumaMode         : Nat := 1
+  statCoeff          : Nat := 0
+  cuChromaQpOffsetIdx : Nat := 0
+  cuChromaQpOffsetCoded : Bool := false
   deriving Inhabited
 
 def sortFramesByPoc (arr : Array HevcDecodedFrame) : Array HevcDecodedFrame := Id.run do
@@ -6128,10 +7869,10 @@ def decodeAmvp (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps 
     mvf := mvfSet mvf lx (Int.ofNat ridx) (mvp.1 + mvd.1, mvp.2 + mvd.2)
   some (mvf, c, st)
 
-def decodePredictionUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
-    (pps : HevcPps) (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
+def decodePredictionUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
+    (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
     (x0 y0 pw ph log2Cb predMode part partIdx : Nat) :
-    Option (HevcCtbCtx × HevcDecodedFrame × Array ByteArray × HevcCabacReader × Array Nat) := do
+    Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
   let (ctx, mvf, c, st) ←
     if predMode == modeSkip then
       let (idx, c1, st1) := decMergeIdx c0 st0 sh.maxNumMergeCand
@@ -6147,8 +7888,12 @@ def decodePredictionUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : He
         let (mvf, c2, st2) ← decodeAmvp ctx0 pic0 sps pps sh c1 st1 x0 y0 pw ph log2Cb
         some ({ ctx0 with mergeFlag := 0 }, mvf, c2, st2)
   let pic1 := storeMvfBlock pic0 sps x0 y0 pw ph mvf
-  let planes := mcPu8 pic1.planes sps pps sh mvf pic1.rpl x0 y0 pw ph
-  some (ctx, { pic1 with planes := planes }, planes, c, st)
+  let pic2 :=
+    if isMain8Bit420Sps sps then
+      { pic1 with planes := mcPu8 pic1.planes sps pps sh mvf pic1.rpl x0 y0 pw ph }
+    else
+      { pic1 with planes16 := mcPuGen pic1.planes16 sps pps sh mvf pic1.rpl x0 y0 pw ph }
+  some (ctx, pic2, c, st)
 
 def decodeInterPus (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
     (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
@@ -6172,7 +7917,7 @@ def decodeInterPus (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
   let mut st := st0
   for partIdx in [:parts.size] do
     let (ox, oy, pw, ph) := parts[partIdx]!
-    let (ctx', pic', _, c', st') ←
+    let (ctx', pic', c', st') ←
       decodePredictionUnit ctx pic sps pps sh c st (x0 + ox) (y0 + oy) pw ph log2Cb modeInter part partIdx
     ctx := ctx'
     pic := pic'
@@ -6185,7 +7930,13 @@ def decodePcmSamples (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps
     Option (HevcDecodedFrame × HevcCabacReader) := do
   let cb := 1 <<< log2Cb
   let pcmInfo ← sps.pcm?
-  let nbytes := (cb * cb * pcmInfo.bitDepth + 2 * ((cb >>> 1) * (cb >>> 1)) * pcmInfo.bitDepthChroma + 7) >>> 3
+  let cf := sps.chromaFormatIdc
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let cbw := if cf == 0 then 0 else cb >>> hshift
+  let cbh := if cf == 0 then 0 else cb >>> vshift
+  let nChroma := if cf == 0 then 0 else 2
+  let nbytes := (cb * cb * pcmInfo.bitDepth + nChroma * (cbw * cbh) * pcmInfo.bitDepthChroma + 7) >>> 3
   let (pcm, c1) ← c0.readPcmAndReinit nbytes
   let mut pic := fillIpmBlock pic0 sps x0 y0 cb cb intraDc true
   if !sh.disableDeblockingFilterFlag then
@@ -6195,24 +7946,33 @@ def decodePcmSamples (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps
   let mut gb := HevcBitReader.ofBytes pcm
   let bd := pcmInfo.bitDepth
   let bdc := pcmInfo.bitDepthChroma
+  let is8 := isMain8Bit420Sps sps
   let mut yPlane := pic.planes.getD 0 ByteArray.empty
+  let mut yPlane16 := pic.planes16.getD 0 #[]
   for yy in [:cb] do
     let row := (y0 + yy) * sps.width + x0
     for xx in [:cb] do
       let (v, gb') ← gb.getBits bd
       gb := gb'
-      yPlane := yPlane.set! (row + xx) (v <<< (8 - bd)).toUInt8
+      if is8 then yPlane := yPlane.set! (row + xx) (v <<< (8 - bd)).toUInt8
+      else yPlane16 := yPlane16.set! (row + xx) (v <<< (sps.bitDepth - bd)).toUInt16
   let mut planes := pic.planes.set! 0 yPlane
-  for cIdx in [1, 2] do
-    let mut p := planes.getD cIdx ByteArray.empty
-    for yy in [:(cb >>> 1)] do
-      let row := ((y0 >>> 1) + yy) * (sps.width >>> 1) + (x0 >>> 1)
-      for xx in [:(cb >>> 1)] do
-        let (v, gb') ← gb.getBits bdc
-        gb := gb'
-        p := p.set! (row + xx) (v <<< (8 - bdc)).toUInt8
-    planes := planes.set! cIdx p
-  some ({ pic with planes := planes }, c1)
+  let mut planes16 := pic.planes16.set! 0 yPlane16
+  if cf != 0 then
+    let cw := sps.width >>> hshift
+    for cIdx in [1, 2] do
+      let mut p := planes.getD cIdx ByteArray.empty
+      let mut p16 := planes16.getD cIdx #[]
+      for yy in [:cbh] do
+        let row := ((y0 >>> vshift) + yy) * cw + (x0 >>> hshift)
+        for xx in [:cbw] do
+          let (v, gb') ← gb.getBits bdc
+          gb := gb'
+          if is8 then p := p.set! (row + xx) (v <<< (8 - bdc)).toUInt8
+          else p16 := p16.set! (row + xx) (v <<< (sps.bitDepthChroma - bdc)).toUInt16
+      planes := planes.set! cIdx p
+      planes16 := planes16.set! cIdx p16
+  some ({ pic with planes := planes, planes16 := planes16 }, c1)
 
 def decodeIntraModes (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
     (c0 : HevcCabacReader) (st0 : Array Nat) (x0 y0 log2Cb part : Nat) :
@@ -6247,14 +8007,24 @@ def decodeIntraModes (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSp
       st := st'
       modes := modes.push m
       pic := fillIpmBlock pic sps px py pb pb m true
-  let (chromaMode, c2, st2) := decIntraChromaPredMode c st
+  let mut chromaRaws : Array Nat := #[]
+  if sps.chromaFormatIdc != 0 then
+    let nChroma := if split && sps.chromaFormatIdc == 3 then 4 else 1
+    for _ in [:nChroma] do
+      let (cm, c', st') := decIntraChromaPredMode c st
+      c := c'
+      st := st'
+      chromaRaws := chromaRaws.push cm
+  let chromaMode := chromaRaws.getD 0 0
   let luma0 := modes.getD 0 intraDc
   let chromaPred :=
-    if chromaMode == 4 then luma0
-    else
-      let mapped := hevcIntraChromaModes.getD chromaMode 0
-      if luma0 == mapped then 34 else mapped
-  return ({ ctx0 with chromaPredMode := chromaPred, intraLumaModes := modes }, pic, c2, st2)
+    if sps.chromaFormatIdc != 0 then mapChromaIntraMode chromaMode luma0 sps.chromaFormatIdc
+    else intraDc
+  return ({ ctx0 with
+    chromaPredMode := chromaPred
+    chromaModeRaw := chromaMode
+    intraChromaModesRaw := chromaRaws
+    intraLumaModes := modes }, pic, c, st)
 
 def qpyPredAt (ctx : HevcCtbCtx) (pic : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
     (sh : HevcSliceHeader) (x0 y0 : Nat) : Int × Bool :=
@@ -6290,32 +8060,62 @@ def setCbfLumaBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (x0 y0 log2Size : 
   return { pic0 with cbfLuma := tab }
 
 def applyResidualBlock (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
-    (c0 : HevcCabacReader) (st0 : Array Nat) (x0 y0 log2Size scanIdx cIdx predMode tqb : Nat)
-    (qpY qpCb qpCr : Int) (isIntra : Bool) :
-    Option (HevcDecodedFrame × HevcCabacReader × Array Nat) := do
-  let (res, c1, st1) ← decodeResidualCoding c0 st0 sps pps log2Size scanIdx cIdx predMode tqb qpY qpCb qpCr
+    (c0 : HevcCabacReader) (st0 : Array Nat) (stat0 : Nat)
+    (x0 y0 log2Size scanIdx cIdx predMode tqb : Nat)
+    (qpY qpCb qpCr : Int) (isIntra intraMode : Nat) :
+    Option (HevcDecodedFrame × HevcCabacReader × Array Nat × Nat) := do
+  let (res, c1, st1, stat1) ← decodeResidualCoding c0 st0 sps pps log2Size scanIdx cIdx predMode tqb qpY qpCb qpCr stat0
   let planeIdx := cIdx
-  let (stride, dstX, dstY, lg) :=
-    if cIdx == 0 then (sps.width, x0, y0, log2Size)
-    else (sps.width >>> 1, x0 >>> 1, y0 >>> 1, log2Size)
-  let plane := pic0.planes.getD planeIdx ByteArray.empty
-  let plane' := inverseTransformAndAdd plane stride dstX dstY res.coeffs lg cIdx isIntra
-    res.transformSkipFlag tqb (if res.dcOnly then 0 else res.colLimit)
-  some ({ pic0 with planes := pic0.planes.set! planeIdx plane' }, c1, st1)
+  let cf := sps.chromaFormatIdc
+  let hshift := if cIdx == 0 || cf == 3 then 0 else 1
+  let vshift := if cIdx == 0 || cf != 1 then 0 else 1
+  let stride := if cIdx == 0 then sps.width else sps.width >>> hshift
+  let dstX := x0 >>> hshift
+  let dstY := y0 >>> vshift
+  let lg := log2Size
+  let is8 := isMain8Bit420Sps sps
+  let pic1 :=
+    if is8 then
+      let plane := pic0.planes.getD planeIdx ByteArray.empty
+      let plane' :=
+        inverseTransformAndAdd plane stride dstX dstY res.coeffs lg cIdx (isIntra != 0)
+          res.transformSkipFlag tqb (if res.dcOnly then 0 else res.colLimit)
+      { pic0 with planes := pic0.planes.set! planeIdx plane' }
+    else
+      let plane16 := pic0.planes16.getD planeIdx #[]
+      let plane16' :=
+        inverseTransformAndAddGen plane16 stride dstX dstY sps res.coeffs lg cIdx intraMode
+          (isIntra != 0) res.transformSkipFlag res.explicitRdpcmFlag res.explicitRdpcmDir tqb
+          (if res.dcOnly then 0 else res.colLimit)
+      { pic0 with planes16 := pic0.planes16.set! planeIdx plane16' }
+  some (pic1, c1, st1, stat1)
 
 def decodeTransformUnit (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
     (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
-    (x0 y0 xBase yBase cbX cbY _log2Cb log2Size blkIdx cbfLuma0 : Nat)
-    (cbfCb cbfCr : Array Nat) (predMode tqb : Nat) :
+    (x0 y0 xBase yBase cbX cbY _log2Cb log2Size trafoDepth blkIdx cbfLuma0 : Nat)
+    (cbfCb cbfCr : Array Nat) (predMode part tqb : Nat) :
     Option (HevcCtbCtx × HevcDecodedFrame × HevcCabacReader × Array Nat) := do
   let mode := if predMode == modeIntra then ctx.tuLumaMode else intraDc
+  let cf := sps.chromaFormatIdc
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let chromaMode :=
+    if predMode == modeIntra && cf == 3 && part == partNxN && trafoDepth == 1 then
+      mapChromaIntraMode (ctx.intraChromaModesRaw.getD blkIdx ctx.chromaModeRaw) mode cf
+    else ctx.chromaPredMode
+  let is8 := isMain8Bit420Sps sps
   let mut pic := pic0
   if predMode == modeIntra then
     let na := computeNeighAvail ctx sps x0 y0 (1 <<< log2Size) (1 <<< log2Size)
-    let plane := intraPred8 (pic.planes.getD 0 ByteArray.empty) sps.width sps pps pic.tabMvf na
-      x0 y0 log2Size 0 mode
-    pic := { pic with planes := pic.planes.set! 0 plane }
-  let cbfChroma := cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0
+    if is8 then
+      let plane := intraPred8 (pic.planes.getD 0 ByteArray.empty) sps.width sps pps pic.tabMvf na x0 y0 log2Size 0 mode
+      pic := { pic with planes := pic.planes.set! 0 plane }
+    else
+      let plane16 := intraPredGen (pic.planes16.getD 0 #[]) sps.width sps pps pic.tabMvf na x0 y0 log2Size 0 mode
+      pic := { pic with planes16 := pic.planes16.set! 0 plane16 }
+  let cbfChroma :=
+    cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0 ||
+    (cf == 2 && (cbfCb.getD 1 0 != 0 || cbfCr.getD 1 0 != 0))
   let mut ctx := ctx
   let mut c := c0
   let mut st := st0
@@ -6326,52 +8126,90 @@ def decodeTransformUnit (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : Hevc
       st := st'
       let ctxCoded := { ctx with cuQpDelta := delta, cuQpDeltaCoded := true }
       let (qpPred, firstNext) := qpyPredAt ctxCoded pic sps pps sh cbX cbY
-      let qpY := if delta != 0 then (qpPred + delta + 52) % 52 else qpPred
+      let qpBdOffY : Int := Int.ofNat (6 * (sps.bitDepth - 8))
+      let qpMod : Int := 52 + qpBdOffY
+      let qpY :=
+        if delta != 0 then
+          ((qpPred + delta + 52 + 2 * qpBdOffY) % qpMod) - qpBdOffY
+        else qpPred
       ctx := { ctxCoded with qpY := qpY, firstQpGroup := firstNext }
-  let (scan, scanC) :=
+    if sh.cuChromaQpOffsetEnabledFlag && cbfChroma && tqb == 0 && !ctx.cuChromaQpOffsetCoded then
+      let (cIdxOff, c', st') := decCuChromaQpOffset c st pps.chromaQpOffsetListLenMinus1
+      c := c'
+      st := st'
+      ctx := { ctx with cuChromaQpOffsetIdx := cIdxOff, cuChromaQpOffsetCoded := true }
+  let scan :=
     if predMode == modeIntra && log2Size < 4 then
-      let s := if 6 <= mode && mode <= 14 then scanVert else if 22 <= mode && mode <= 30 then scanHoriz else scanDiag
-      let cm := ctx.chromaPredMode
-      let sc := if 6 <= cm && cm <= 14 then scanVert else if 22 <= cm && cm <= 30 then scanHoriz else scanDiag
-      (s, sc)
-    else (scanDiag, scanDiag)
-  let qpCb := mapQpC (clipInt (ctx.qpY + pps.cbQpOffset + sh.cbQpOffset) 0 57)
-  let qpCr := mapQpC (clipInt (ctx.qpY + pps.crQpOffset + sh.crQpOffset) 0 57)
+      if 6 <= mode && mode <= 14 then scanVert else if 22 <= mode && mode <= 30 then scanHoriz else scanDiag
+    else scanDiag
+  let log2SizeC := if cf == 3 then log2Size else if log2Size > 2 then log2Size - 1 else 2
+  let scanC :=
+    if predMode == modeIntra && (log2SizeC < 3 || (log2SizeC == 3 && cf == 3)) then
+      if 6 <= chromaMode && chromaMode <= 14 then scanVert
+      else if 22 <= chromaMode && chromaMode <= 30 then scanHoriz
+      else scanDiag
+    else scanDiag
+  let cuCbOff : Int :=
+    if ctx.cuChromaQpOffsetIdx == 0 then 0 else pps.cbQpOffsetList.getD (ctx.cuChromaQpOffsetIdx - 1) 0
+  let cuCrOff : Int :=
+    if ctx.cuChromaQpOffsetIdx == 0 then 0 else pps.crQpOffsetList.getD (ctx.cuChromaQpOffsetIdx - 1) 0
+  let qpCb := deriveChromaQp (ctx.qpY + pps.cbQpOffset + sh.cbQpOffset + cuCbOff) cf sps.bitDepthChroma
+  let qpCr := deriveChromaQp (ctx.qpY + pps.crQpOffset + sh.crQpOffset + cuCrOff) cf sps.bitDepthChroma
+  let isIntraNat := if predMode == modeIntra then 1 else 0
   if cbfLuma0 != 0 then
-    let (pic', c', st') ← applyResidualBlock pic sps pps c st x0 y0 log2Size scan 0 predMode tqb
-      ctx.qpY qpCb qpCr (predMode == modeIntra)
+    let (pic', c', st', stat') ← applyResidualBlock pic sps pps c st ctx.statCoeff
+      x0 y0 log2Size scan 0 predMode tqb ctx.qpY qpCb qpCr isIntraNat mode
     pic := pic'
     c := c'
     st := st'
-  if log2Size > 2 then
-    if predMode == modeIntra then
-      let na := computeNeighAvail ctx sps x0 y0 (1 <<< log2Size) (1 <<< log2Size)
-      for cIdx in [1, 2] do
-        let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) (sps.width >>> 1) sps pps pic.tabMvf na
-          x0 y0 (log2Size - 1) cIdx ctx.chromaPredMode
-        pic := { pic with planes := pic.planes.set! cIdx plane }
-    for (cIdx, cbf) in [1, 2].zip [cbfCb.getD 0 0, cbfCr.getD 0 0] do
-      if cbf != 0 then
-        let (pic', c', st') ← applyResidualBlock pic sps pps c st x0 y0 (log2Size - 1) scanC cIdx predMode tqb
-          ctx.qpY qpCb qpCr (predMode == modeIntra)
-        pic := pic'
-        c := c'
-        st := st'
-  else if blkIdx == 3 then
-    if predMode == modeIntra then
-      let na := computeNeighAvail ctx sps xBase yBase 8 8
-      for cIdx in [1, 2] do
-        let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) (sps.width >>> 1) sps pps pic.tabMvf na
-          xBase yBase 2 cIdx ctx.chromaPredMode
-        pic := { pic with planes := pic.planes.set! cIdx plane }
-    for (cIdx, cbf) in [1, 2].zip [cbfCb.getD 0 0, cbfCr.getD 0 0] do
-      if cbf != 0 then
-        let (pic', c', st') ← applyResidualBlock pic sps pps c st xBase yBase 2 scanC cIdx predMode tqb
-          ctx.qpY qpCb qpCr (predMode == modeIntra)
-        pic := pic'
-        c := c'
-        st := st'
-  some (ctx, pic, c, st)
+    ctx := { ctx with statCoeff := stat' }
+  if cf != 0 && (log2Size > 2 || cf == 3) then
+    let cw := sps.width >>> hshift
+    let numSub := if cf == 2 then 2 else 1
+    let subStepY := (1 <<< log2SizeC) <<< vshift
+    for cIdx in [1, 2] do
+      let cbfArr := if cIdx == 1 then cbfCb else cbfCr
+      for subIdx in [:numSub] do
+        let cyLuma := y0 + subIdx * subStepY
+        if predMode == modeIntra then
+          let na := computeNeighAvail ctx sps x0 cyLuma ((1 <<< log2SizeC) <<< hshift) ((1 <<< log2SizeC) <<< vshift)
+          if is8 then
+            let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) cw sps pps pic.tabMvf na x0 cyLuma log2SizeC cIdx chromaMode
+            pic := { pic with planes := pic.planes.set! cIdx plane }
+          else
+            let plane16 := intraPredGen (pic.planes16.getD cIdx #[]) cw sps pps pic.tabMvf na x0 cyLuma log2SizeC cIdx chromaMode
+            pic := { pic with planes16 := pic.planes16.set! cIdx plane16 }
+        if cbfArr.getD subIdx 0 != 0 then
+          let (pic', c', st', stat') ← applyResidualBlock pic sps pps c st ctx.statCoeff
+            x0 cyLuma log2SizeC scanC cIdx predMode tqb ctx.qpY qpCb qpCr isIntraNat chromaMode
+          pic := pic'
+          c := c'
+          st := st'
+          ctx := { ctx with statCoeff := stat' }
+  else if cf != 0 && blkIdx == 3 then
+    let cw := sps.width >>> hshift
+    let numSub := if cf == 2 then 2 else 1
+    let subStepY := 4 <<< vshift
+    for cIdx in [1, 2] do
+      let cbfArr := if cIdx == 1 then cbfCb else cbfCr
+      for subIdx in [:numSub] do
+        let cyLuma := yBase + subIdx * subStepY
+        if predMode == modeIntra then
+          let na := computeNeighAvail ctx sps xBase cyLuma 8 (4 <<< vshift)
+          if is8 then
+            let plane := intraPred8 (pic.planes.getD cIdx ByteArray.empty) cw sps pps pic.tabMvf na xBase cyLuma 2 cIdx chromaMode
+            pic := { pic with planes := pic.planes.set! cIdx plane }
+          else
+            let plane16 := intraPredGen (pic.planes16.getD cIdx #[]) cw sps pps pic.tabMvf na xBase cyLuma 2 cIdx chromaMode
+            pic := { pic with planes16 := pic.planes16.set! cIdx plane16 }
+        if cbfArr.getD subIdx 0 != 0 then
+          let (pic', c', st', stat') ← applyResidualBlock pic sps pps c st ctx.statCoeff
+            xBase cyLuma 2 scanC cIdx predMode tqb ctx.qpY qpCb qpCr isIntraNat chromaMode
+          pic := pic'
+          c := c'
+          st := st'
+          ctx := { ctx with statCoeff := stat' }
+  some ({ ctx with chromaPredMode := chromaMode }, pic, c, st)
 
 def decodeTransformTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
     (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat)
@@ -6386,7 +8224,12 @@ def decodeTransformTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : Hev
       else if trafoDepth == 0 && predMode == modeIntra then
         ctx0.intraLumaModes.getD 0 intraDc
       else ctx0.tuLumaMode
-    let ctx1 := { ctx0 with tuLumaMode := tuMode }
+    let (chRaw, chPred) :=
+      if predMode == modeIntra && sps.chromaFormatIdc == 3 && part == partNxN && trafoDepth == 1 then
+        let r := ctx0.intraChromaModesRaw.getD blkIdx ctx0.chromaModeRaw
+        (r, mapChromaIntraMode r tuMode sps.chromaFormatIdc)
+      else (ctx0.chromaModeRaw, ctx0.chromaPredMode)
+    let ctx1 := { ctx0 with tuLumaMode := tuMode, chromaModeRaw := chRaw, chromaPredMode := chPred }
     let intraSplit := predMode == modeIntra && part == partNxN
     let mut c := c0
     let mut st := st0
@@ -6403,17 +8246,30 @@ def decodeTransformTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : Hev
       split := log2Size > sps.log2MaxTrafoSize || (intraSplit && trafoDepth == 0) || interSplit
     let mut cbfCb := cbfCb0
     let mut cbfCr := cbfCr0
-    if log2Size > 2 then
+    let cf := sps.chromaFormatIdc
+    if cf != 0 && (log2Size > 2 || cf == 3) then
       if trafoDepth == 0 || cbfCb.getD 0 0 != 0 then
-        let (v, c', st') := decCbfCbCr c st trafoDepth
+        let (v0, c', st') := decCbfCbCr c st trafoDepth
         c := c'
         st := st'
-        cbfCb := #[v, 0]
+        if cf == 2 && (!split || log2Size == 3) then
+          let (v1, c'', st'') := decCbfCbCr c st trafoDepth
+          c := c''
+          st := st''
+          cbfCb := #[v0, v1]
+        else
+          cbfCb := #[v0, 0]
       if trafoDepth == 0 || cbfCr.getD 0 0 != 0 then
-        let (v, c', st') := decCbfCbCr c st trafoDepth
+        let (v0, c', st') := decCbfCbCr c st trafoDepth
         c := c'
         st := st'
-        cbfCr := #[v, 0]
+        if cf == 2 && (!split || log2Size == 3) then
+          let (v1, c'', st'') := decCbfCbCr c st trafoDepth
+          c := c''
+          st := st''
+          cbfCr := #[v0, v1]
+        else
+          cbfCr := #[v0, 0]
     if split then
       let off := 1 <<< (log2Size - 1)
       let offs : Array (Nat × Nat) := #[(0, 0), (off, 0), (0, off), (off, off)]
@@ -6431,13 +8287,16 @@ def decodeTransformTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : Hev
       some (ctx, pic, c, st)
     else
       let mut cbfLuma := 1
-      if predMode == modeIntra || trafoDepth != 0 || cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0 then
+      let anyChroma :=
+        cbfCb.getD 0 0 != 0 || cbfCr.getD 0 0 != 0 ||
+        (cf == 2 && (cbfCb.getD 1 0 != 0 || cbfCr.getD 1 0 != 0))
+      if predMode == modeIntra || trafoDepth != 0 || anyChroma then
         let (v, c', st') := decCbfLuma c st trafoDepth
         c := c'
         st := st'
         cbfLuma := v
       let (ctx2, pic1, c2, st2) ← decodeTransformUnit ctx1 pic0 sps pps sh c st
-        x0 y0 xBase yBase cbX cbY log2Cb log2Size blkIdx cbfLuma cbfCb cbfCr predMode tqb
+        x0 y0 xBase yBase cbX cbY log2Cb log2Size trafoDepth blkIdx cbfLuma cbfCb cbfCr predMode part tqb
       let mut pic2 := if cbfLuma != 0 then setCbfLumaBlock pic1 sps x0 y0 log2Size else pic1
       if !sh.disableDeblockingFilterFlag then
         pic2 := updateDeblockBs ctx2 pic2 sps pps sh x0 y0 log2Size
@@ -6480,7 +8339,7 @@ def decodeCodingUnit (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSp
     skip := sk
   pic := fillSkipBlock pic sps x0 y0 log2Cb skip
   if skip != 0 then
-    let (ctx1, pic1, _, c1, st1) ← decodePredictionUnit ctx pic sps pps sh c st
+    let (ctx1, pic1, c1, st1) ← decodePredictionUnit ctx pic sps pps sh c st
       x0 y0 cb cb log2Cb modeSkip part2Nx2N 0
     ctx := ctx1
     pic := fillIpmBlock pic1 sps x0 y0 cb cb intraDc false
@@ -6582,6 +8441,8 @@ def decodeCodingTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSp
       split := log2Cb > sps.log2MinCbSize
     if pps.cuQpDeltaEnabledFlag && log2Cb >= sps.log2CtbSize - pps.diffCuQpDeltaDepth then
       ctx := { ctx with cuQpDeltaCoded := false, cuQpDelta := 0 }
+    if sh.cuChromaQpOffsetEnabledFlag && log2Cb >= sps.log2CtbSize - pps.diffCuChromaQpOffsetDepth then
+      ctx := { ctx with cuChromaQpOffsetCoded := false, cuChromaQpOffsetIdx := 0 }
     if split then
       let half := log2Cb - 1
       let off := 1 <<< half
@@ -6609,7 +8470,7 @@ def decodeCodingTree (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSp
         some (term == 0, ctx1, pic1, c2, st1)
       else some (true, ctx1, pic1, c1, st1)
 
-def decodeSaoCtb (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
+def decodeSaoCtb (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps : HevcPps)
     (sh : HevcSliceHeader) (c0 : HevcCabacReader) (st0 : Array Nat) (rs : Nat) :
     HevcDecodedFrame × HevcCabacReader × Array Nat := Id.run do
   if !sps.saoEnabled || (!sh.saoLumaFlag && !sh.saoChromaFlag) then
@@ -6635,7 +8496,8 @@ def decodeSaoCtb (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
     let prev := pic0.sao.getD (rs - sps.ctbWidth) {}
     return ({ pic0 with sao := pic0.sao.set! rs prev }, c, st)
   let mut sao := pic0.sao.getD rs {}
-  for cIdx in [:3] do
+  let numComp := if sps.chromaFormatIdc == 0 then 1 else 3
+  for cIdx in [:numComp] do
     let active := if cIdx == 0 then sh.saoLumaFlag else sh.saoChromaFlag
     if active then
       if cIdx == 2 then
@@ -6649,11 +8511,14 @@ def decodeSaoCtb (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps)
         sao := { sao with typeIdx := sao.typeIdx.set! cIdx ti }
       let ti := sao.typeIdx.getD cIdx 0
       if ti != 0 then
+        let bd := if cIdx == 0 then sps.bitDepth else sps.bitDepthChroma
+        let scaleSh := if cIdx == 0 then pps.log2SaoOffsetScaleLuma else pps.log2SaoOffsetScaleChroma
+        let scaleMul : Int := Int.ofNat (1 <<< scaleSh)
         let mut offs : Array Int := Array.mkEmpty 4
         for _ in [:4] do
-          let (ov, c') := decSaoOffsetAbs c 8
+          let (ov, c') := decSaoOffsetAbs c bd
           c := c'
-          offs := offs.push (Int.ofNat ov)
+          offs := offs.push (Int.ofNat ov * scaleMul)
         let mut row := sao.offsetVal.getD cIdx #[0, 0, 0, 0, 0]
         if ti == saoBand then
           for i in [:4] do
@@ -6713,7 +8578,7 @@ def decodeCtb (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame) (sps : HevcSps) (pps
     boundaryUpperSlice := bndUpperSlice
     boundaryLeftTile := leftTile
     boundaryUpperTile := upTile }
-  let (pic1, c1, st1) := decodeSaoCtb ctx1 pic0 sps sh c0 st0 rs
+  let (pic1, c1, st1) := decodeSaoCtb ctx1 pic0 sps pps sh c0 st0 rs
   decodeCodingTree ctx1 pic1 sps pps sh c1 st1 x0 y0 sps.log2CtbSize 0 8
 
 def decodeSlices (dpb : Array HevcDecodedFrame) (pic0 : HevcDecodedFrame)
@@ -6723,12 +8588,15 @@ def decodeSlices (dpb : Array HevcDecodedFrame) (pic0 : HevcDecodedFrame)
   let mut ctx : HevcCtbCtx := {}
   let mut sliceRpl : Array HevcRpl := #[{}, {}]
   let mut wppSaved? : Option (Array Nat) := none
+  let mut wppStatSaved : Nat := 0
   for sh in headers do
     if !sh.dependentSliceSegmentFlag then
       let rpl := buildSliceRpl dpb sps sh
       pic := { pic with rpl := rpl }
       sliceRpl := rpl
-      ctx := { ctx with firstQpGroup := true, qpyPred := sh.sliceQp, qpY := sh.sliceQp }
+      ctx := { ctx with firstQpGroup := true, qpyPred := sh.sliceQp, qpY := sh.sliceQp, statCoeff := 0 }
+    else
+      ctx := { ctx with statCoeff := 0 }
     let cabacInit := if sh.cabacInitFlag then 1 else 0
     let mut cabacState := initCabacStates sh.sliceType cabacInit sh.sliceQp
     let mut subIdx := 0
@@ -6771,11 +8639,17 @@ def decodeSlices (dpb : Array HevcDecodedFrame) (pic0 : HevcDecodedFrame)
             match wppSaved? with
             | some saved => saved
             | none => initCabacStates sh.sliceType cabacInit sh.sliceQp
-        ctx := { ctx with qpyPred := sh.sliceQp, firstQpGroup := true }
+        let nextStat :=
+          if newTile || sps.ctbWidth == 1 then 0
+          else if sps.persistentRiceAdaptationEnabledFlag then wppStatSaved
+          else 0
+        ctx := { ctx with qpyPred := sh.sliceQp, firstQpGroup := true, statCoeff := nextStat }
       pic := { pic with
         sliceAddr := pic.sliceAddr.set! rs (Int.ofNat sh.sliceAddrRs)
         lfase := pic.lfase.set! rs sh.sliceLoopFilterAcrossSlicesEnabledFlag
         deblock := pic.deblock.set! rs { betaOffset := sh.betaOffset, tcOffset := sh.tcOffset }
+        cbOffCtb := pic.cbOffCtb.set! rs sh.cbQpOffset
+        crOffCtb := pic.crOffCtb.set! rs sh.crQpOffset
         rplTab := pic.rplTab.set! rs (some sliceRpl) }
       let (more, ctx', pic', cabac', st') ← decodeCtb ctx pic sps pps sh cabac cabacState rs xCtb yCtb
       ctx := ctx'
@@ -6787,6 +8661,7 @@ def decodeSlices (dpb : Array HevcDecodedFrame) (pic0 : HevcDecodedFrame)
       else
         if pps.entropyCodingSyncEnabledFlag && (xCtb == 1 || (sps.ctbWidth == 1 && xCtb == 0)) then
           wppSaved? := some cabacState
+          wppStatSaved := ctx.statCoeff
       ts := ts + 1
   some pic
 
@@ -6873,17 +8748,24 @@ def decodePictureSlices (st0 : HevcDecoderState) (slices : Array (Nat × Nat × 
     dpb := markDpbRps dpb sps sh0
     let pic0 := newDecodedFrame sps sh0
     let mut pic ← decodeSlices dpb pic0 sps pps headers
+    let is8 := isMain8Bit420Sps sps
     if !sh0.disableDeblockingFilterFlag then
-      let planes := deblockFrame8 pic.planes sps pps pic.qpY pic.isPcm pic.deblock
-        pic.vbs pic.hbs pic.bsW
-      pic := { pic with planes := planes }
+      if is8 then
+        pic := { pic with planes := deblockFrame8 pic.planes sps pps pic.qpY pic.isPcm pic.deblock pic.vbs pic.hbs pic.bsW }
+      else
+        let p16 := deblockFrameGen pic.planes16 sps pps pic.qpY pic.isPcm pic.deblock
+          pic.cbOffCtb pic.crOffCtb pic.vbs pic.hbs pic.bsW
+        pic := { pic with planes16 := p16 }
     if sps.saoEnabled then
-      let planes := saoFrame8 pic.planes sps pps pic.sao pic.sliceAddr pic.lfase pic.isPcm
-      pic := { pic with planes := planes }
+      if is8 then
+        pic := { pic with planes := saoFrame8 pic.planes sps pps pic.sao pic.sliceAddr pic.lfase pic.isPcm }
+      else
+        pic := { pic with planes16 := saoFrameGen pic.planes16 sps pps pic.sao pic.sliceAddr pic.lfase pic.isPcm }
     let (dpbNext, outNext, pocTid0Next) := bumpDpb dpb st0.output sps pic sh0 st0.pocTid0
     some { st0 with dpb := dpbNext, output := outNext, pocTid0 := pocTid0Next, prevIndepSh? := prevSh? }
 
-def decodeHevcStreamState (data : ByteArray) : Option (HevcDecoderState × String) := do
+def decodeHevcStreamStateWith (parseSpsFn : ByteArray → Option HevcSps)
+    (data : ByteArray) : Option (HevcDecoderState × String) := do
   let (nals, container) ← extractHevcNals data
   if nals.isEmpty then none
   let mut st : HevcDecoderState := {}
@@ -6899,7 +8781,7 @@ def decodeHevcStreamState (data : ByteArray) : Option (HevcDecoderState × Strin
       st := { st with vpsMap := st.vpsMap.set! v.vpsId (some v) }
     else if nalType == nalSps then
       let rm ← stripRbspWithMap payload
-      let s ← parseSps rm.rbsp
+      let s ← parseSpsFn rm.rbsp
       if s.spsId >= st.spsMap.size then none
       st := { st with spsMap := st.spsMap.set! s.spsId (some s) }
     else if nalType == nalPps then
@@ -6922,6 +8804,12 @@ def decodeHevcStreamState (data : ByteArray) : Option (HevcDecoderState × Strin
   if !picSlices.isEmpty then
     st ← decodePictureSlices st picSlices
   some (flushDpb st, container)
+
+def decodeHevcStreamState (data : ByteArray) : Option (HevcDecoderState × String) :=
+  decodeHevcStreamStateWith parseSps data
+
+def decodeHevcStreamStateExt (data : ByteArray) : Option (HevcDecoderState × String) :=
+  decodeHevcStreamStateWith parseSpsExt data
 
 def cropFrameYuv420p (f : HevcDecodedFrame) (sps : HevcSps) : ByteArray := Id.run do
   let cl := sps.confLeft
@@ -6952,6 +8840,111 @@ def decodeHevcToYuv420p (data : ByteArray) : Option (Nat × Nat × Nat × ByteAr
     out := out ++ cropFrameYuv420p f sps
   some (sps0.croppedWidth, sps0.croppedHeight, st.output.size, out)
 
+def pixFmtForBitDepthChroma (bitDepth chromaFormatIdc : Nat) : Option String :=
+  if bitDepth == 8 then
+    if chromaFormatIdc == 1 then some "yuv420p"
+    else if chromaFormatIdc == 2 then some "yuv422p"
+    else if chromaFormatIdc == 3 then some "yuv444p"
+    else none
+  else if bitDepth == 10 then
+    if chromaFormatIdc == 1 then some "yuv420p10le"
+    else if chromaFormatIdc == 2 then some "yuv422p10le"
+    else if chromaFormatIdc == 3 then some "yuv444p10le"
+    else none
+  else if bitDepth == 12 then
+    if chromaFormatIdc == 1 then some "yuv420p12le"
+    else if chromaFormatIdc == 2 then some "yuv422p12le"
+    else if chromaFormatIdc == 3 then some "yuv444p12le"
+    else none
+  else none
+
+def parseHevcPixFmt (pixFmt : String) : Option (Nat × Nat) :=
+  if pixFmt == "yuv420p" then some (8, 1)
+  else if pixFmt == "yuv422p" then some (8, 2)
+  else if pixFmt == "yuv444p" then some (8, 3)
+  else if pixFmt == "yuv420p10le" then some (10, 1)
+  else if pixFmt == "yuv422p10le" then some (10, 2)
+  else if pixFmt == "yuv444p10le" then some (10, 3)
+  else if pixFmt == "yuv420p12le" then some (12, 1)
+  else if pixFmt == "yuv422p12le" then some (12, 2)
+  else if pixFmt == "yuv444p12le" then some (12, 3)
+  else none
+
+def pixFmtForSps (sps : HevcSps) : Option String :=
+  if sps.separateColourPlaneFlag || sps.bitDepthChroma != sps.bitDepth then none
+  else pixFmtForBitDepthChroma sps.bitDepth sps.chromaFormatIdc
+
+def rawFrameByteSize (w h bitDepth chromaFormatIdc : Nat) : Nat :=
+  let bytesPerSample := if bitDepth <= 8 then 1 else 2
+  let cw := if chromaFormatIdc == 3 then w else (w + 1) / 2
+  let ch := if chromaFormatIdc == 1 then (h + 1) / 2 else h
+  bytesPerSample * (w * h + 2 * cw * ch)
+
+def cropFrameGen (f : HevcDecodedFrame) (sps : HevcSps) : ByteArray :=
+  if isMain8Bit420Sps sps then
+    cropFrameYuv420p f sps
+  else Id.run do
+    let cl := sps.confLeft
+    let cr := sps.confRight
+    let ct := sps.confTop
+    let cb := sps.confBottom
+    let w := sps.width
+    let h := sps.height
+    let cf := sps.chromaFormatIdc
+    let hshift := if cf == 3 then 0 else 1
+    let vshift := if cf == 1 then 1 else 0
+    let cw := w >>> hshift
+    let outW := sps.croppedWidth
+    let outH := sps.croppedHeight
+    let mut out := ByteArray.emptyWithCapacity (rawFrameByteSize outW outH sps.bitDepth cf)
+    let yPlane := f.planes16.getD 0 #[]
+    if sps.bitDepth <= 8 then
+      for row in [ct:(h - cb)] do
+        let base := row * w
+        for col in [cl:(w - cr)] do
+          out := out.push (yPlane.getD (base + col) 128).toUInt8
+      for cIdx in [1, 2] do
+        let p := f.planes16.getD cIdx #[]
+        for row in [(ct >>> vshift):((h - cb) >>> vshift)] do
+          let base := row * cw
+          for col in [(cl >>> hshift):((w - cr) >>> hshift)] do
+            out := out.push (p.getD (base + col) 128).toUInt8
+    else
+      let maxVal : Nat := (1 <<< sps.bitDepth) - 1
+      let defVal : UInt16 := (1 <<< (sps.bitDepth - 1)).toUInt16
+      for row in [ct:(h - cb)] do
+        let base := row * w
+        for col in [cl:(w - cr)] do
+          let v := Nat.min (yPlane.getD (base + col) defVal).toNat maxVal
+          out := (out.push (v &&& 0xFF).toUInt8).push ((v >>> 8) &&& 0xFF).toUInt8
+      for cIdx in [1, 2] do
+        let p := f.planes16.getD cIdx #[]
+        for row in [(ct >>> vshift):((h - cb) >>> vshift)] do
+          let base := row * cw
+          for col in [(cl >>> hshift):((w - cr) >>> hshift)] do
+            let v := Nat.min (p.getD (base + col) defVal).toNat maxVal
+            out := (out.push (v &&& 0xFF).toUInt8).push ((v >>> 8) &&& 0xFF).toUInt8
+    return out
+
+def decodeHevcGenWithColor (data : ByteArray) : Option (Nat × Nat × Nat × String × ByteArray × Nat × Nat × Nat) := do
+  let (st, _) ← decodeHevcStreamStateExt data
+  if st.output.isEmpty then none
+  let f0 := st.output[0]!
+  let sps0 ← st.spsMap.getD f0.spsId none
+  let pixFmt0 ← pixFmtForSps sps0
+  let mut out := ByteArray.empty
+  for f in st.output do
+    let sps ← st.spsMap.getD f.spsId none
+    let pf ← pixFmtForSps sps
+    if pf != pixFmt0 || sps.croppedWidth != sps0.croppedWidth || sps.croppedHeight != sps0.croppedHeight then
+      none
+    out := out ++ cropFrameGen f sps
+  some (sps0.croppedWidth, sps0.croppedHeight, st.output.size, pixFmt0, out, sps0.vuiPrimaries, sps0.vuiTransfer, sps0.vuiMatrix)
+
+def decodeHevcGen (data : ByteArray) : Option (Nat × Nat × Nat × String × ByteArray) := do
+  let (w, h, cnt, pf, out, _, _, _) ← decodeHevcGenWithColor data
+  some (w, h, cnt, pf, out)
+
 def probeHevcStreamJson (data : ByteArray) : Option String := do
   let (nals, container) ← extractHevcNals data
   if nals.isEmpty then none
@@ -6974,7 +8967,7 @@ def probeHevcStreamJson (data : ByteArray) : Option String := do
       vpsMap := vpsMap.set! v.vpsId (some v)
     else if nalType == nalSps then
       let rm ← stripRbspWithMap payload
-      let s ← parseSps rm.rbsp
+      let s ← parseSpsExt rm.rbsp
       if s.spsId >= spsMap.size then none
       spsMap := spsMap.set! s.spsId (some s)
       if firstSps?.isNone then firstSps? := some s
@@ -6997,10 +8990,11 @@ def probeHevcStreamJson (data : ByteArray) : Option String := do
           s!"\{\"nal_type\":{sh.nalType},\"slice_type\":\"{stName}\",\"poc\":{sh.poc},\"qp\":{sh.sliceQp}}"
   let sps ← firstSps?
   let pps ← firstPps?
+  let pixFmt ← pixFmtForSps sps
   if frameCount == 0 then none
   let slicesStr := String.intercalate "," sliceJsons.toList
   let p0 := s!"\{\"ok\":true,\"codec\":\"hevc\",\"container\":\"{container}\","
-  let p1 := s!"\"profile_idc\":{sps.ptl.profileIdc},\"level_idc\":{sps.ptl.levelIdc},"
+  let p1 := s!"\"profile_idc\":{sps.ptl.profileIdc},\"level_idc\":{sps.ptl.levelIdc},\"pix_fmt\":\"{pixFmt}\","
   let p2 := s!"\"width\":{sps.croppedWidth},\"height\":{sps.croppedHeight},"
   let p3 := s!"\"coded_width\":{sps.width},\"coded_height\":{sps.height},"
   let p4 := s!"\"bit_depth_luma\":{sps.bitDepth},\"bit_depth_chroma\":{sps.bitDepthChroma},"
@@ -7273,6 +9267,12 @@ def encodeIntraTu (cfg : HevcEncoderCfg) (ctx : HevcCtbCtx) (pic0 : HevcDecodedF
   w := wL
   st := stL
   let scan := encScanForIntra log2Size mode
+  let scanC :=
+    if log2Size < 4 then
+      if 6 <= mode && mode <= 14 then scanVert
+      else if 22 <= mode && mode <= 30 then scanHoriz
+      else scanDiag
+    else scanDiag
   if cbfY != 0 then
     let (w', st') := encResidual w st lvY log2Size scan 0
     w := w'
@@ -7284,7 +9284,7 @@ def encodeIntraTu (cfg : HevcEncoderCfg) (ctx : HevcCtbCtx) (pic0 : HevcDecodedF
   if log2Size > 2 then
     let cs := side >>> 1
     if cbfCb != 0 then
-      let (w', st') := encResidual w st lvCb (log2Size - 1) scan 1
+      let (w', st') := encResidual w st lvCb (log2Size - 1) scanC 1
       w := w'
       st := st'
       let dqU := dequantLevels lvCb (log2Size - 1) cfg.qpC
@@ -7292,7 +9292,7 @@ def encodeIntraTu (cfg : HevcEncoderCfg) (ctx : HevcCtbCtx) (pic0 : HevcDecodedF
       let recU := inverseTransformAndAdd (pic.planes.getD 1 ByteArray.empty) cfg.cw (x0 >>> 1) (y0 >>> 1) dqU (log2Size - 1) 1 true 0 0 maxU
       pic := { pic with planes := pic.planes.set! 1 recU }
     if cbfCr != 0 then
-      let (w', st') := encResidual w st lvCr (log2Size - 1) scan 2
+      let (w', st') := encResidual w st lvCr (log2Size - 1) scanC 2
       w := w'
       st := st'
       let dqV := dequantLevels lvCr (log2Size - 1) cfg.qpC
@@ -7758,5 +9758,898 @@ def encodeHevcFromYuv420p (width height : Nat) (yuv : ByteArray) (qp : Int := 28
     let hvcc := buildHvccRecord vpsNal spsNal ppsNal
     let samples := sliceNals.map packLenPrefixed4
     some (buildHevcMp4 samples width height hvcc)
+
+structure HevcEncoderCfgGen where
+  width      : Nat
+  height     : Nat
+  bitDepth   : Nat
+  chromaFmt  : Nat
+  lossless   : Bool := false
+  qp         : Int := 28
+  qpDequantY : Int := 28
+  qpDequantC : Int := 28
+  log2Ctb    : Nat := 6
+  tilesCol   : Nat := 1
+  tilesRow   : Nat := 1
+  conf       : Nat × Nat × Nat × Nat := (0, 0, 0, 0)
+  ew         : Nat
+  eh         : Nat
+  cw         : Nat
+  ch         : Nat
+  ctb        : Nat
+  ctbW       : Nat
+  ctbH       : Nat
+  sps        : HevcSps
+  pps        : HevcPps
+  deriving Inhabited
+
+def padPlaneGen (src : ByteArray) (baseOff sw sh dw dh bitDepth : Nat) : Array UInt16 := Id.run do
+  let defVal : UInt16 := (1 <<< (bitDepth - 1)).toUInt16
+  let maxVal : Nat := (1 <<< bitDepth) - 1
+  let mut out : Array UInt16 := Array.mkEmpty (dw * dh)
+  if bitDepth <= 8 then
+    for y in [:dh] do
+      let sy := if sh == 0 then 0 else Nat.min y (sh - 1)
+      let rOff := baseOff + sy * sw
+      for x in [:sw] do
+        out := out.push (baGetD src (rOff + x) 128).toUInt16
+      let lastPix : UInt16 :=
+        if sw == 0 then defVal else (baGetD src (rOff + sw - 1) 128).toUInt16
+      for _ in [sw:dw] do
+        out := out.push lastPix
+  else
+    for y in [:dh] do
+      let sy := if sh == 0 then 0 else Nat.min y (sh - 1)
+      let rOff := baseOff + 2 * sy * sw
+      for x in [:sw] do
+        let lo := (baGetD src (rOff + 2 * x) 0).toNat
+        let hi := (baGetD src (rOff + 2 * x + 1) 0).toNat
+        let v := Nat.min (lo ||| (hi <<< 8)) maxVal
+        out := out.push v.toUInt16
+      let lastPix : UInt16 :=
+        if sw == 0 then defVal
+        else
+          let lo := (baGetD src (rOff + 2 * (sw - 1)) 0).toNat
+          let hi := (baGetD src (rOff + 2 * (sw - 1) + 1) 0).toNat
+          (Nat.min (lo ||| (hi <<< 8)) maxVal).toUInt16
+      for _ in [sw:dw] do
+        out := out.push lastPix
+  return out
+
+def extractPaddedPlanesGen (cfg : HevcEncoderCfgGen) (raw : ByteArray) (frameIdx : Nat) :
+    Array (Array UInt16) :=
+  let sw := cfg.width
+  let sh := cfg.height
+  let scw := if cfg.chromaFmt == 3 then sw else (sw + 1) / 2
+  let sch := if cfg.chromaFmt == 1 then (sh + 1) / 2 else sh
+  let bps := if cfg.bitDepth <= 8 then 1 else 2
+  let lumaBytes := bps * sw * sh
+  let chromaBytes := bps * scw * sch
+  let frameSize := lumaBytes + 2 * chromaBytes
+  let base := frameIdx * frameSize
+  #[padPlaneGen raw base sw sh cfg.ew cfg.eh cfg.bitDepth,
+    padPlaneGen raw (base + lumaBytes) scw sch cfg.cw cfg.ch cfg.bitDepth,
+    padPlaneGen raw (base + lumaBytes + chromaBytes) scw sch cfg.cw cfg.ch cfg.bitDepth]
+
+def encBlockVarGen (cfg : HevcEncoderCfgGen) (srcY : Array UInt16) (x0 y0 cb : Nat) : Nat := Id.run do
+  let shBd := cfg.bitDepth - 8
+  let mut acc : Int := 0
+  let mut n : Nat := 0
+  let mut y := y0
+  while y < y0 + cb do
+    let row := y * cfg.ew
+    let mut x := x0
+    while x < x0 + cb do
+      acc := acc + Int.ofNat ((srcY.getD (row + x) 0).toNat >>> shBd)
+      n := n + 1
+      x := x + 2
+    y := y + 2
+  let denom := Int.ofNat (Nat.max n 1)
+  let mean := acc / denom
+  let mut vAcc : Nat := 0
+  let mut y2 := y0
+  while y2 < y0 + cb do
+    let row := y2 * cfg.ew
+    let mut x2 := x0
+    while x2 < x0 + cb do
+      let d := Int.ofNat ((srcY.getD (row + x2) 0).toNat >>> shBd) - mean
+      vAcc := vAcc + (d * d).toNat
+      x2 := x2 + 2
+    y2 := y2 + 2
+  return vAcc / Nat.max n 1
+
+def encSadMvGen (cfg : HevcEncoderCfgGen) (srcY refY : Array UInt16) (x0 y0 cb : Nat)
+    (mv : Int × Int) : Nat := Id.run do
+  let shBd := cfg.bitDepth - 8
+  let dx := asrInt mv.1 2
+  let dy := asrInt mv.2 2
+  let maxX := Int.ofNat cfg.ew - 1
+  let maxY := Int.ofNat cfg.eh - 1
+  let mut acc : Nat := 0
+  let mut y := 0
+  while y < cb do
+    let sy := (clipInt (Int.ofNat (y0 + y) + dy) 0 maxY).toNat
+    let srow := (y0 + y) * cfg.ew + x0
+    let rrow := sy * cfg.ew
+    let mut x := 0
+    while x < cb do
+      let sx := (clipInt (Int.ofNat (x0 + x) + dx) 0 maxX).toNat
+      let sv := Int.ofNat ((srcY.getD (srow + x) 0).toNat >>> shBd)
+      let rv := Int.ofNat ((refY.getD (rrow + sx) 0).toNat >>> shBd)
+      acc := acc + (sv - rv).natAbs
+      x := x + 2
+    y := y + 2
+  return acc * 4
+
+def encSadQpelGen (cfg : HevcEncoderCfgGen) (srcY refY : Array UInt16) (x0 y0 cb : Nat)
+    (mv : Int × Int) : Nat := Id.run do
+  let shBd := cfg.bitDepth - 8
+  let shiftNum := 14 - cfg.bitDepth
+  let offsetDef := Int.ofNat (1 <<< (shiftNum - 1))
+  let maxVal := Int.ofNat ((1 <<< cfg.bitDepth) - 1)
+  let pred14 := mcLumaGen refY cfg.ew cfg.eh cfg.bitDepth
+    (Int.ofNat x0 + asrInt mv.1 2) (Int.ofNat y0 + asrInt mv.2 2)
+    (mv.1 % 4).toNat (mv.2 % 4).toNat cb cb
+  let mut acc : Nat := 0
+  for y in [:cb] do
+    let row := (y0 + y) * cfg.ew + x0
+    let prow := y * cb
+    for x in [:cb] do
+      let p := (clipInt (asrInt (pred14.getD (prow + x) 0 + offsetDef) shiftNum) 0 maxVal).toNat >>> shBd
+      let s := (srcY.getD (row + x) 0).toNat >>> shBd
+      acc := acc + (Int.ofNat s - Int.ofNat p).natAbs
+  return acc
+
+def encShouldSplitGen (cfg : HevcEncoderCfgGen) (srcY : Array UInt16)
+    (refY? : Option (Array UInt16)) (x0 y0 cb : Nat) (forceIntra : Bool) : Bool :=
+  if cb > 32 then true
+  else if cb <= 8 then false
+  else if forceIntra then
+    encBlockVarGen cfg srcY x0 y0 cb > (if cb == 32 then 500 else 900)
+  else
+    match refY? with
+    | none => encBlockVarGen cfg srcY x0 y0 cb > (if cb == 32 then 500 else 900)
+    | some refY =>
+      let sad0 := encSadMvGen cfg srcY refY x0 y0 cb (0, 0)
+      if sad0 <= cb * cb * 2 then false
+      else sad0 > cb * cb * (if cb == 32 then 10 else 18)
+
+def encMotionSearchGen (cfg : HevcEncoderCfgGen) (srcY refY : Array UInt16) (x0 y0 cb : Nat)
+    (seedMv : Int × Int) : (Int × Int) × Nat := Id.run do
+  let mut best : Int × Int := (asrInt seedMv.1 2 * 4, asrInt seedMv.2 2 * 4)
+  let mut bestSad := encSadMvGen cfg srcY refY x0 y0 cb best
+  let zSad := encSadMvGen cfg srcY refY x0 y0 cb (0, 0)
+  if zSad < bestSad then
+    best := (0, 0)
+    bestSad := zSad
+  for step in #[ (8 : Int), 4, 2, 1 ] do
+    let (cx, cy) := best
+    for dy in #[-step, 0, step] do
+      for dx in #[-step, 0, step] do
+        if !(dx == 0 && dy == 0) then
+          let cand := (clipInt (cx + dx * 4) (-256) 256, clipInt (cy + dy * 4) (-256) 256)
+          let s := encSadMvGen cfg srcY refY x0 y0 cb cand
+          if s < bestSad then
+            bestSad := s
+            best := cand
+  for stepQ in #[ (2 : Int), 1 ] do
+    let (cx, cy) := best
+    for dy in #[-stepQ, 0, stepQ] do
+      for dx in #[-stepQ, 0, stepQ] do
+        if !(dx == 0 && dy == 0) then
+          let cand := (clipInt (cx + dx) (-256) 256, clipInt (cy + dy) (-256) 256)
+          let s := encSadQpelGen cfg srcY refY x0 y0 cb cand
+          if s < bestSad then
+            bestSad := s
+            best := cand
+  return (best, bestSad)
+
+def encPickIntraModeGen (cfg : HevcEncoderCfgGen) (ctx : HevcCtbCtx) (pic : HevcDecodedFrame)
+    (srcY : Array UInt16) (x0 y0 log2Cb : Nat) : Nat := Id.run do
+  let cb := 1 <<< log2Cb
+  let na := computeNeighAvail ctx cfg.sps x0 y0 cb cb
+  let mut bestMode := intraDc
+  let mut bestSad : Nat := 1 <<< 40
+  let basePlane := pic.planes16.getD 0 #[]
+  for m in #[intraPlanar, intraDc, intraHoriz, intraVert] do
+    let predPlane := intraPredGen basePlane cfg.ew cfg.sps cfg.pps pic.tabMvf na x0 y0 log2Cb 0 m
+    let mut sad : Nat := 0
+    for yy in [:cb] do
+      let row := (y0 + yy) * cfg.ew + x0
+      for xx in [:cb] do
+        let s := (srcY.getD (row + xx) 0).toNat
+        let p := (predPlane.getD (row + xx) 0).toNat
+        sad := sad + (Int.ofNat s - Int.ofNat p).natAbs
+    if sad < bestSad then
+      bestSad := sad
+      bestMode := m
+  return bestMode
+
+def encExtractResGen (src pred : Array UInt16) (stride x0 y0 side : Nat) : Array Int := Id.run do
+  let mut res : Array Int := Array.mkEmpty (side * side)
+  for yy in [:side] do
+    let row := (y0 + yy) * stride + x0
+    for xx in [:side] do
+      let s := Int.ofNat (src.getD (row + xx) 0).toNat
+      let p := Int.ofNat (pred.getD (row + xx) 0).toNat
+      res := res.push (s - p)
+  return res
+
+def encodeIntraTuGen (cfg : HevcEncoderCfgGen) (ctx : HevcCtbCtx) (pic0 : HevcDecodedFrame)
+    (srcPlanes : Array (Array UInt16)) (w0 : HevcCabacWriter) (st0 : Array Nat)
+    (x0 y0 log2Size mode : Nat) : HevcDecodedFrame × HevcCabacWriter × Array Nat := Id.run do
+  let sps := cfg.sps
+  let pps := cfg.pps
+  let cf := cfg.chromaFmt
+  let bd := cfg.bitDepth
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let side := 1 <<< log2Size
+  let tqb := if cfg.lossless then 1 else 0
+  let mut w := w0
+  let mut st := st0
+  let mut pic := pic0
+  if log2Size > 2 then
+    let splitCtx := hevcCabacElemOffset.getD elemSplitTransformFlag 0 + 5 - log2Size
+    let (w', st') := w.encodeDecision st splitCtx 0
+    w := w'
+    st := st'
+  let na := computeNeighAvail ctx sps x0 y0 side side
+  let predY := intraPredGen (pic.planes16.getD 0 #[]) cfg.ew sps pps pic.tabMvf na x0 y0 log2Size 0 mode
+  pic := { pic with planes16 := pic.planes16.set! 0 predY }
+  let resY := encExtractResGen (srcPlanes.getD 0 #[]) predY cfg.ew x0 y0 side
+  let isDst := log2Size == 2
+  let lvY :=
+    if cfg.lossless then resY
+    else quantizeCoeffsGen (forwardTransformGen resY log2Size bd isDst) log2Size bd cfg.qpDequantY true
+  let cbfY := if lvY.any (· != 0) then 1 else 0
+  let log2SizeC := if cf == 3 then log2Size else if log2Size > 2 then log2Size - 1 else 2
+  let cs := 1 <<< log2SizeC
+  let numSub := if cf == 2 then 2 else 1
+  let subStepY := cs <<< vshift
+  let chromaMode := mapChromaIntraMode 4 mode cf
+  let mut lvCbArr : Array (Array Int) := #[]
+  let mut lvCrArr : Array (Array Int) := #[]
+  let mut cbfCbArr : Array Nat := #[]
+  let mut cbfCrArr : Array Nat := #[]
+  if cf != 0 && (log2Size > 2 || cf == 3) then
+    for cIdx in [1, 2] do
+      for subIdx in [:numSub] do
+        let cyLuma := y0 + subIdx * subStepY
+        let naC := computeNeighAvail ctx sps x0 cyLuma (cs <<< hshift) (cs <<< vshift)
+        let predC := intraPredGen (pic.planes16.getD cIdx #[]) cfg.cw sps pps pic.tabMvf naC x0 cyLuma log2SizeC cIdx chromaMode
+        pic := { pic with planes16 := pic.planes16.set! cIdx predC }
+        let resC := encExtractResGen (srcPlanes.getD cIdx #[]) predC cfg.cw (x0 >>> hshift) (cyLuma >>> vshift) cs
+        let lvC :=
+          if cfg.lossless then resC
+          else quantizeCoeffsGen (forwardTransformGen resC log2SizeC bd false) log2SizeC bd cfg.qpDequantC true
+        let cbfC := if lvC.any (· != 0) then 1 else 0
+        if cbfC != 0 then
+          let dqC := if cfg.lossless then lvC else dequantLevelsGen lvC log2SizeC bd cfg.qpDequantC
+          let maxC := encColLimitAndDcOnly lvC cs
+          let recC := inverseTransformAndAddGen (pic.planes16.getD cIdx #[]) cfg.cw
+            (x0 >>> hshift) (cyLuma >>> vshift) sps dqC log2SizeC cIdx chromaMode true 0 0 0 tqb maxC
+          pic := { pic with planes16 := pic.planes16.set! cIdx recC }
+        if cIdx == 1 then
+          lvCbArr := lvCbArr.push lvC
+          cbfCbArr := cbfCbArr.push cbfC
+        else
+          lvCrArr := lvCrArr.push lvC
+          cbfCrArr := cbfCrArr.push cbfC
+    let cbfCtx := hevcCabacElemOffset.getD elemCbfCbCr 0
+    for v in cbfCbArr do
+      let (w', st') := w.encodeDecision st cbfCtx v
+      w := w'
+      st := st'
+    for v in cbfCrArr do
+      let (w', st') := w.encodeDecision st cbfCtx v
+      w := w'
+      st := st'
+  let (wL, stL) := w.encodeDecision st (hevcCabacElemOffset.getD elemCbfLuma 0 + 1) cbfY
+  w := wL
+  st := stL
+  let scan := encScanForIntra log2Size mode
+  let scanC :=
+    if log2SizeC < 3 || (log2SizeC == 3 && cf == 3) then encScanForIntra log2SizeC chromaMode
+    else scanDiag
+  if cbfY != 0 then
+    let (w', st') := encResidual w st lvY log2Size scan 0
+    w := w'
+    st := st'
+    let dq := if cfg.lossless then lvY else dequantLevelsGen lvY log2Size bd cfg.qpDequantY
+    let maxXY := encColLimitAndDcOnly lvY side
+    let recY := inverseTransformAndAddGen (pic.planes16.getD 0 #[]) cfg.ew x0 y0 sps dq log2Size 0 mode true 0 0 0 tqb maxXY
+    pic := { pic with planes16 := pic.planes16.set! 0 recY }
+  if cf != 0 && (log2Size > 2 || cf == 3) then
+    for subIdx in [:numSub] do
+      if cbfCbArr.getD subIdx 0 != 0 then
+        let lvU := lvCbArr.getD subIdx #[]
+        let (w', st') := encResidual w st lvU log2SizeC scanC 1
+        w := w'
+        st := st'
+    for subIdx in [:numSub] do
+      if cbfCrArr.getD subIdx 0 != 0 then
+        let lvV := lvCrArr.getD subIdx #[]
+        let (w', st') := encResidual w st lvV log2SizeC scanC 2
+        w := w'
+        st := st'
+  return (pic, w, st)
+
+def encodeInterTuGen (cfg : HevcEncoderCfgGen) (pic0 : HevcDecodedFrame)
+    (srcPlanes : Array (Array UInt16)) (w0 : HevcCabacWriter) (st0 : Array Nat)
+    (x0 y0 log2Size : Nat) (isMerge2Nx2N : Bool) :
+    HevcDecodedFrame × HevcCabacWriter × Array Nat := Id.run do
+  let sps := cfg.sps
+  let cf := cfg.chromaFmt
+  let bd := cfg.bitDepth
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let side := 1 <<< log2Size
+  let log2SizeC := if cf == 3 then log2Size else if log2Size > 2 then log2Size - 1 else 2
+  let cs := 1 <<< log2SizeC
+  let numSub := if cf == 2 then 2 else 1
+  let subStepY := cs <<< vshift
+  let tqb := if cfg.lossless then 1 else 0
+  let mut w := w0
+  let mut st := st0
+  let mut pic := pic0
+  let resY := encExtractResGen (srcPlanes.getD 0 #[]) (pic.planes16.getD 0 #[]) cfg.ew x0 y0 side
+  let mut lvY :=
+    if cfg.lossless then resY
+    else quantizeCoeffsGen (forwardTransformGen resY log2Size bd false) log2Size bd cfg.qpDequantY false
+  let mut cbfY := if lvY.any (· != 0) then 1 else 0
+  let mut lvCbArr : Array (Array Int) := #[]
+  let mut lvCrArr : Array (Array Int) := #[]
+  let mut cbfCbArr : Array Nat := #[]
+  let mut cbfCrArr : Array Nat := #[]
+  for subIdx in [:numSub] do
+    let cyLuma := y0 + subIdx * subStepY
+    let resU := encExtractResGen (srcPlanes.getD 1 #[]) (pic.planes16.getD 1 #[]) cfg.cw (x0 >>> hshift) (cyLuma >>> vshift) cs
+    let resV := encExtractResGen (srcPlanes.getD 2 #[]) (pic.planes16.getD 2 #[]) cfg.cw (x0 >>> hshift) (cyLuma >>> vshift) cs
+    let lvU :=
+      if cfg.lossless then resU
+      else quantizeCoeffsGen (forwardTransformGen resU log2SizeC bd false) log2SizeC bd cfg.qpDequantC false
+    let lvV :=
+      if cfg.lossless then resV
+      else quantizeCoeffsGen (forwardTransformGen resV log2SizeC bd false) log2SizeC bd cfg.qpDequantC false
+    lvCbArr := lvCbArr.push lvU
+    lvCrArr := lvCrArr.push lvV
+    cbfCbArr := cbfCbArr.push (if lvU.any (· != 0) then 1 else 0)
+    cbfCrArr := cbfCrArr.push (if lvV.any (· != 0) then 1 else 0)
+  let anyChroma := cbfCbArr.any (· != 0) || cbfCrArr.any (· != 0)
+  let hasAny := cbfY != 0 || anyChroma
+  if !isMerge2Nx2N then
+    let rqtCtx := hevcCabacElemOffset.getD elemNoResidualDataFlag 0
+    let (w', st') := w.encodeDecision st rqtCtx (if hasAny then 1 else 0)
+    w := w'
+    st := st'
+    if !hasAny then return (pic, w, st)
+  else if !hasAny then
+    let dcSign : Int := if resY.getD 0 0 >= 0 then 1 else -1
+    lvY := lvY.set! 0 dcSign
+    cbfY := 1
+  let splitCtx := hevcCabacElemOffset.getD elemSplitTransformFlag 0 + 5 - log2Size
+  let cbfCtx := hevcCabacElemOffset.getD elemCbfCbCr 0
+  let (w1, st1) := w.encodeDecision st splitCtx 0
+  w := w1
+  st := st1
+  for v in cbfCbArr do
+    let (w', st') := w.encodeDecision st cbfCtx v
+    w := w'
+    st := st'
+  for v in cbfCrArr do
+    let (w', st') := w.encodeDecision st cbfCtx v
+    w := w'
+    st := st'
+  if anyChroma then
+    let (wL, stL) := w.encodeDecision st (hevcCabacElemOffset.getD elemCbfLuma 0 + 1) cbfY
+    w := wL
+    st := stL
+  if cbfY != 0 then
+    let (w', st') := encResidual w st lvY log2Size scanDiag 0
+    w := w'
+    st := st'
+    let dq := if cfg.lossless then lvY else dequantLevelsGen lvY log2Size bd cfg.qpDequantY
+    let maxXY := encColLimitAndDcOnly lvY side
+    let recY := inverseTransformAndAddGen (pic.planes16.getD 0 #[]) cfg.ew x0 y0 sps dq log2Size 0 0 false 0 0 0 tqb maxXY
+    pic := { pic with planes16 := pic.planes16.set! 0 recY }
+  for subIdx in [:numSub] do
+    let cyLuma := y0 + subIdx * subStepY
+    if cbfCbArr.getD subIdx 0 != 0 then
+      let lvU := lvCbArr.getD subIdx #[]
+      let (w', st') := encResidual w st lvU log2SizeC scanDiag 1
+      w := w'
+      st := st'
+      let dqU := if cfg.lossless then lvU else dequantLevelsGen lvU log2SizeC bd cfg.qpDequantC
+      let maxU := encColLimitAndDcOnly lvU cs
+      let recU := inverseTransformAndAddGen (pic.planes16.getD 1 #[]) cfg.cw
+        (x0 >>> hshift) (cyLuma >>> vshift) sps dqU log2SizeC 1 0 false 0 0 0 tqb maxU
+      pic := { pic with planes16 := pic.planes16.set! 1 recU }
+  for subIdx in [:numSub] do
+    let cyLuma := y0 + subIdx * subStepY
+    if cbfCrArr.getD subIdx 0 != 0 then
+      let lvV := lvCrArr.getD subIdx #[]
+      let (w', st') := encResidual w st lvV log2SizeC scanDiag 2
+      w := w'
+      st := st'
+      let dqV := if cfg.lossless then lvV else dequantLevelsGen lvV log2SizeC bd cfg.qpDequantC
+      let maxV := encColLimitAndDcOnly lvV cs
+      let recV := inverseTransformAndAddGen (pic.planes16.getD 2 #[]) cfg.cw
+        (x0 >>> hshift) (cyLuma >>> vshift) sps dqV log2SizeC 2 0 false 0 0 0 tqb maxV
+      pic := { pic with planes16 := pic.planes16.set! 2 recV }
+  return (pic, w, st)
+
+def encodeCuGen (cfg : HevcEncoderCfgGen) (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame)
+    (sh : HevcSliceHeader) (srcPlanes : Array (Array UInt16)) (refPic? : Option HevcRefPlanes)
+    (w0 : HevcCabacWriter) (st0 : Array Nat) (x0 y0 log2Cb depth : Nat) (forceIntra : Bool) :
+    HevcCtbCtx × HevcDecodedFrame × HevcCabacWriter × Array Nat := Id.run do
+  let sps := cfg.sps
+  let pps := cfg.pps
+  let cf := cfg.chromaFmt
+  let hshift := if cf == 3 then 0 else 1
+  let vshift := if cf == 1 then 1 else 0
+  let cb := 1 <<< log2Cb
+  let ctbMask := (1 <<< sps.log2CtbSize) - 1
+  let ctx := { ctx0 with cuX := x0, cuY := y0 }
+  let mut pic := setCtDepthBlock pic0 sps x0 y0 log2Cb depth
+  let mut w := w0
+  let mut st := st0
+  if pps.transquantBypassEnableFlag then
+    let tqbFlag := if cfg.lossless then 1 else 0
+    let (wT, stT) := w.encodeDecision st (hevcCabacElemOffset.getD elemCuTransquantBypass 0) tqbFlag
+    w := wT
+    st := stT
+    if tqbFlag != 0 then
+      pic := fillPcmFlagBlock pic sps x0 y0 log2Cb 2
+  let srcY := srcPlanes.getD 0 #[]
+  if !forceIntra then
+    if let some refPic := refPic? then
+      let refY := refPic.planes16.getD 0 #[]
+      let sl := if ctx.ctbLeft || (x0 &&& ctbMask) != 0 then skipAt pic sps (Int.ofNat x0 - 1) (Int.ofNat y0) else 0
+      let su := if ctx.ctbUp || (y0 &&& ctbMask) != 0 then skipAt pic sps (Int.ofNat x0) (Int.ofNat y0 - 1) else 0
+      let skipInc := (if sl != 0 then 1 else 0) + (if su != 0 then 1 else 0)
+      let skipCtx := hevcCabacElemOffset.getD elemSkipFlag 0 + skipInc
+      let mergeCands := mergeCandidates ctx pic sps pps sh x0 y0 cb cb log2Cb part2Nx2N 0
+      let mut bestMIdx := 0
+      let mut bestMSad : Nat := 1 <<< 40
+      for idx in [:mergeCands.size] do
+        let mc := mergeCands[idx]!
+        let s := encSadQpelGen cfg srcY refY x0 y0 cb mc.mv0
+        if s < bestMSad then
+          bestMSad := s
+          bestMIdx := idx
+      let allowSkip :=
+        if cfg.lossless then bestMSad == 0 else bestMSad <= cb * cb
+      if allowSkip then
+        let bestMvf := mergeCands.getD bestMIdx mvfZero
+        let tmpPlanes := mcPuGen pic.planes16 sps pps sh bestMvf pic.rpl x0 y0 cb cb
+        let mut maxErr : Nat := 0
+        if cfg.lossless then
+          let pY := tmpPlanes.getD 0 #[]
+          for yy in [:cb] do
+            let rOff := (y0 + yy) * cfg.ew + x0
+            for xx in [:cb] do
+              let e := (Int.ofNat (srcY.getD (rOff + xx) 0).toNat - Int.ofNat (pY.getD (rOff + xx) 0).toNat).natAbs
+              if e > maxErr then maxErr := e
+        for cIdx in [1, 2] do
+          let sPlane := srcPlanes.getD cIdx #[]
+          let pPlane := tmpPlanes.getD cIdx #[]
+          for yy in [:cb >>> vshift] do
+            let rOff := ((y0 >>> vshift) + yy) * cfg.cw + (x0 >>> hshift)
+            for xx in [:cb >>> hshift] do
+              let e := (Int.ofNat (sPlane.getD (rOff + xx) 0).toNat - Int.ofNat (pPlane.getD (rOff + xx) 0).toNat).natAbs
+              if e > maxErr then maxErr := e
+        let skipOk :=
+          if cfg.lossless then maxErr == 0
+          else (maxErr >>> (cfg.bitDepth - 8)) <= 2 && bestMSad <= (cb * cb * 3) / 4
+        if skipOk then
+          let (w1, st1) := w.encodeDecision st skipCtx 1
+          let (w2, st2) := encMergeIdx w1 st1 bestMIdx sh.maxNumMergeCand
+          pic := fillSkipBlock pic sps x0 y0 log2Cb 1
+          pic := storeMvfBlock pic sps x0 y0 cb cb bestMvf
+          pic := { pic with planes16 := tmpPlanes }
+          pic := fillIpmBlock pic sps x0 y0 cb cb intraDc false
+          return (ctx, pic, w2, st2)
+      let mvp0 := mvpList ctx pic sps pps sh x0 y0 cb cb 0 0 0
+      let mvp1 := mvpList ctx pic sps pps sh x0 y0 cb cb 0 0 1
+      let (bestMv, bestInterSad) := encMotionSearchGen cfg srcY refY x0 y0 cb mvp0
+      let d0 := (bestMv.1 - mvp0.1).natAbs + (bestMv.2 - mvp0.2).natAbs
+      let d1 := (bestMv.1 - mvp1.1).natAbs + (bestMv.2 - mvp1.2).natAbs
+      let mvpFlag := if d1 < d0 then 1 else 0
+      let mvp := if mvpFlag != 0 then mvp1 else mvp0
+      let intraCost := encBlockVarGen cfg srcY x0 y0 cb * 8 + 120
+      if bestInterSad <= intraCost then
+        let (w1, st1) := w.encodeDecision st skipCtx 0
+        let (w2, st2) := w1.encodeDecision st1 (hevcCabacElemOffset.getD elemPredModeFlag 0) 0
+        let (w3, st3) := w2.encodeDecision st2 (hevcCabacElemOffset.getD elemPartMode 0) 1
+        w := w3
+        st := st3
+        pic := fillSkipBlock pic sps x0 y0 log2Cb 0
+        pic := fillIpmBlock pic sps x0 y0 cb cb intraDc false
+        let useMerge := !cfg.lossless && bestMSad <= bestInterSad + cb
+        let mut chosenMvf := mvfZero
+        if useMerge then
+          let (w4, st4) := w.encodeDecision st (hevcCabacElemOffset.getD elemMergeFlag 0) 1
+          let (w5, st5) := encMergeIdx w4 st4 bestMIdx sh.maxNumMergeCand
+          w := w5
+          st := st5
+          chosenMvf := mergeCands.getD bestMIdx mvfZero
+        else
+          let (w4, st4) := w.encodeDecision st (hevcCabacElemOffset.getD elemMergeFlag 0) 0
+          let (w5, st5) := encMvd w4 st4 (bestMv.1 - mvp.1) (bestMv.2 - mvp.2)
+          let (w6, st6) := w5.encodeDecision st5 (hevcCabacElemOffset.getD elemMvpLxFlag 0) mvpFlag
+          w := w6
+          st := st6
+          chosenMvf := { predFlag := pfL0, refIdx0 := 0, refIdx1 := -1, mv0 := bestMv, mv1 := (0, 0) }
+        pic := storeMvfBlock pic sps x0 y0 cb cb chosenMvf
+        pic := { pic with planes16 := mcPuGen pic.planes16 sps pps sh chosenMvf pic.rpl x0 y0 cb cb }
+        let (pic', w', st') := encodeInterTuGen cfg pic srcPlanes w st x0 y0 log2Cb useMerge
+        return (ctx, pic', w', st')
+      let (w1, st1) := w.encodeDecision st skipCtx 0
+      let (w2, st2) := w1.encodeDecision st1 (hevcCabacElemOffset.getD elemPredModeFlag 0) 1
+      w := w2
+      st := st2
+      pic := fillSkipBlock pic sps x0 y0 log2Cb 0
+  if log2Cb == sps.log2MinCbSize then
+    let (w', st') := w.encodeDecision st (hevcCabacElemOffset.getD elemPartMode 0) 1
+    w := w'
+    st := st'
+  pic := storeMvfBlock pic sps x0 y0 cb cb mvfIntra
+  let mode := encPickIntraModeGen cfg ctx pic srcY x0 y0 log2Cb
+  let mpm := encMpmList ctx pic sps x0 y0
+  let mIdx? := mpm.findIdx? (· == mode)
+  match mIdx? with
+  | some mIdx =>
+    let (w1, st1) := w.encodeDecision st (hevcCabacElemOffset.getD elemPrevIntraLumaPredFlag 0) 1
+    w := w1
+    st := st1
+    for _ in [:mIdx] do
+      w := w.encodeBypass 1
+    if mIdx < 2 then
+      w := w.encodeBypass 0
+  | none =>
+    let (w1, st1) := w.encodeDecision st (hevcCabacElemOffset.getD elemPrevIntraLumaPredFlag 0) 0
+    w := w1
+    st := st1
+    let mut rem := mode
+    for m in mpm do
+      if m < mode then rem := rem - 1
+    w := w.encodeBypassBits rem 5
+  pic := fillIpmBlock pic sps x0 y0 cb cb mode true
+  let (wC, stC) := w.encodeDecision st (hevcCabacElemOffset.getD elemIntraChromaPredMode 0) 0
+  let (pic', w', st') := encodeIntraTuGen cfg ctx pic srcPlanes wC stC x0 y0 log2Cb mode
+  return (ctx, pic', w', st')
+
+def encodeCodingTreeGen (cfg : HevcEncoderCfgGen) (ctx0 : HevcCtbCtx) (pic0 : HevcDecodedFrame)
+    (sh : HevcSliceHeader) (srcPlanes : Array (Array UInt16)) (refPic? : Option HevcRefPlanes)
+    (w0 : HevcCabacWriter) (st0 : Array Nat) (x0 y0 log2Cb depth : Nat)
+    (forceIntra : Bool) : Nat → HevcCtbCtx × HevcDecodedFrame × HevcCabacWriter × Array Nat
+  | 0 => (ctx0, pic0, w0, st0)
+  | fuel + 1 => Id.run do
+    let sps := cfg.sps
+    let cb := 1 <<< log2Cb
+    let ctbMask := (1 <<< sps.log2CtbSize) - 1
+    let srcY := srcPlanes.getD 0 #[]
+    let refY? := refPic?.map (fun rp => rp.planes16.getD 0 #[])
+    let mut w := w0
+    let mut st := st0
+    let mut split := 0
+    if x0 + cb <= sps.width && y0 + cb <= sps.height && log2Cb > sps.log2MinCbSize then
+      let dl := if ctx0.ctbLeft || (x0 &&& ctbMask) != 0 then ctDepthAt pic0 sps (Int.ofNat x0 - 1) (Int.ofNat y0) else 0
+      let dt := if ctx0.ctbUp || (y0 &&& ctbMask) != 0 then ctDepthAt pic0 sps (Int.ofNat x0) (Int.ofNat y0 - 1) else 0
+      let inc := (if dl > depth then 1 else 0) + (if dt > depth then 1 else 0)
+      split := if encShouldSplitGen cfg srcY refY? x0 y0 cb forceIntra then 1 else 0
+      let (w', st') := w.encodeDecision st (hevcCabacElemOffset.getD elemSplitCuFlag 0 + inc) split
+      w := w'
+      st := st'
+    else
+      split := if log2Cb > sps.log2MinCbSize then 1 else 0
+    if split != 0 then
+      let half := log2Cb - 1
+      let off := 1 <<< half
+      let mut ctx := ctx0
+      let mut pic := pic0
+      for (ox, oy) in #[(0, 0), (off, 0), (0, off), (off, off)] do
+        if x0 + ox < sps.width && y0 + oy < sps.height then
+          let (ctx', pic', w', st') := encodeCodingTreeGen cfg ctx pic sh srcPlanes refPic? w st
+            (x0 + ox) (y0 + oy) half (depth + 1) forceIntra fuel
+          ctx := ctx'
+          pic := pic'
+          w := w'
+          st := st'
+      return (ctx, pic, w, st)
+    return encodeCuGen cfg ctx0 pic0 sh srcPlanes refPic? w st x0 y0 log2Cb depth forceIntra
+
+def newEncPicAndHeaderGen (cfg : HevcEncoderCfgGen) (poc : Int) (sliceType : Nat)
+    (refPic? : Option HevcRefPlanes) : HevcDecodedFrame × HevcSliceHeader :=
+  let sps := cfg.sps
+  let rpl0 : HevcRpl :=
+    match refPic? with
+    | some rp => { refs := #[some rp], poc := #[rp.poc], lt := #[false] }
+    | none => {}
+  let rpl1 : HevcRpl := {}
+  let sh : HevcSliceHeader := {
+    nalType := if sliceType == sliceI then nalIdrWRadl else nalTrailR
+    sliceType := sliceType
+    sliceAddrRs := 0
+    poc := poc
+    sliceTemporalMvpEnabledFlag := sliceType != sliceI
+    collocatedList := 0
+    collocatedRefIdx := 0
+    nbRefs := #[if sliceType == sliceP then 1 else 0, 0]
+    maxNumMergeCand := 5
+    pwt? := none
+    sliceQp := cfg.qp
+    cbQpOffset := 0
+    crQpOffset := 0
+    betaOffset := 0
+    tcOffset := 0
+    disableDeblockingFilterFlag := false
+    sliceLoopFilterAcrossSlicesEnabledFlag := true
+    saoLumaFlag := true
+    saoChromaFlag := false
+  }
+  let basePic := newDecodedFrame sps sh
+  let defY16 : UInt16 := (1 <<< (sps.bitDepth - 1)).toUInt16
+  let defC16 : UInt16 := (1 <<< (sps.bitDepthChroma - 1)).toUInt16
+  let p16 :=
+    if (basePic.planes16.getD 0 #[]).isEmpty then
+      #[Array.replicate (cfg.ew * cfg.eh) defY16,
+        Array.replicate (cfg.cw * cfg.ch) defC16,
+        Array.replicate (cfg.cw * cfg.ch) defC16]
+    else basePic.planes16
+  let rplPair : Array HevcRpl := #[rpl0, rpl1]
+  let pic := { basePic with
+    planes16 := p16
+    rpl := rplPair
+    rplTab := Array.replicate sps.ctbSize (some rplPair)
+    sliceAddr := Array.replicate sps.ctbSize 0
+  }
+  (pic, sh)
+
+def encodeHevcFrameGen (cfg : HevcEncoderCfgGen) (srcPlanes : Array (Array UInt16))
+    (refPic? : Option HevcRefPlanes) (frameIdx : Nat) : Option ByteArray := do
+  let intra := refPic?.isNone
+  let sliceType := if intra then sliceI else sliceP
+  let nalType := if intra then nalIdrWRadl else nalTrailR
+  let (pic0, sh) := newEncPicAndHeaderGen cfg (Int.ofNat frameIdx) sliceType refPic?
+  let sps := cfg.sps
+  let pps := cfg.pps
+  let mut pic := pic0
+  let mut groups : Array ByteArray := #[]
+  let mut subW? : Option HevcCabacWriter := none
+  let mut subSt : Array Nat := #[]
+  let mut firstInTile := true
+  let mut endOfTilesX := sps.width
+  for ts in [:sps.ctbSize] do
+    let rs := pps.ctbAddrTsToRs.getD ts 0
+    let xCtb := rs % sps.ctbWidth
+    let yCtb := rs / sps.ctbWidth
+    let newTile := ts == 0 ||
+      (pps.tilesEnabledFlag && pps.tileId.getD ts 0 != pps.tileId.getD (ts - 1) 0)
+    if newTile then
+      if let some prevW := subW? then
+        let finW := (prevW.encodeTerminate 0).encodeTerminate 1
+        let grpBytes ← finW.toBytes
+        groups := groups.push grpBytes
+      subW? := some HevcCabacWriter.fresh
+      subSt := initCabacStates sliceType 0 cfg.qp
+      firstInTile := true
+      if pps.tilesEnabledFlag then
+        let idxX := pps.colIdxX.getD xCtb 0
+        endOfTilesX := (xCtb + pps.columnWidth.getD idxX 1) <<< sps.log2CtbSize
+      else
+        endOfTilesX := sps.width
+    let mut subW := subW?.getD HevcCabacWriter.fresh
+    if !firstInTile then
+      subW := subW.encodeTerminate 0
+    firstInTile := false
+    let leftTile := xCtb > 0 && pps.tilesEnabledFlag &&
+      pps.tileId.getD ts 0 != pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - 1) 0) 0
+    let upTile := yCtb > 0 && pps.tilesEnabledFlag &&
+      pps.tileId.getD ts 0 != pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - sps.ctbWidth) 0) 0
+    let ctbLeft := xCtb > 0 && rs > 0 && !leftTile
+    let ctbUp := yCtb > 0 && rs >= sps.ctbWidth && !upTile
+    let ctbUpRight := yCtb > 0 && rs + 1 >= sps.ctbWidth && xCtb + 1 < sps.ctbWidth &&
+      (!pps.tilesEnabledFlag ||
+        pps.tileId.getD ts 0 == pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs + 1 - sps.ctbWidth) 0) 0)
+    let ctbUpLeft := xCtb > 0 && yCtb > 0 && rs - 1 >= sps.ctbWidth &&
+      (!pps.tilesEnabledFlag ||
+        pps.tileId.getD ts 0 == pps.tileId.getD (pps.ctbAddrRsToTs.getD (rs - 1 - sps.ctbWidth) 0) 0)
+    let ctbSize := 1 <<< sps.log2CtbSize
+    let ctx : HevcCtbCtx := {
+      endOfTilesX := endOfTilesX
+      endOfTilesY := Nat.min (yCtb * ctbSize + ctbSize) sps.height
+      ctbLeft := ctbLeft
+      ctbUp := ctbUp
+      ctbUpRight := ctbUpRight
+      ctbUpLeft := ctbUpLeft
+      boundaryLeftSlice := false
+      boundaryUpperSlice := false
+      boundaryLeftTile := leftTile
+      boundaryUpperTile := upTile
+    }
+    if ctbLeft then
+      let (w', st') := subW.encodeDecision subSt (hevcCabacElemOffset.getD elemSaoMergeFlag 0) 0
+      subW := w'
+      subSt := st'
+    if ctbUp then
+      let (w', st') := subW.encodeDecision subSt (hevcCabacElemOffset.getD elemSaoMergeFlag 0) 0
+      subW := w'
+      subSt := st'
+    let (wSao, stSao) := subW.encodeDecision subSt (hevcCabacElemOffset.getD elemSaoTypeIdx 0) 0
+    let (_, pic', wTree, stTree) := encodeCodingTreeGen cfg ctx pic sh srcPlanes refPic? wSao stSao
+      (xCtb <<< sps.log2CtbSize) (yCtb <<< sps.log2CtbSize) sps.log2CtbSize 0 intra 8
+    pic := pic'
+    subW? := some wTree
+    subSt := stTree
+  let lastW ← subW?
+  let lastBytes ← (lastW.encodeTerminate 1).toBytes
+  groups := groups.push lastBytes
+  let mut entryLens : Array Nat := #[]
+  if groups.size > 1 then
+    for i in [:groups.size - 1] do
+      entryLens := entryLens.push (insertRbspEpb groups[i]!).size
+  let hdr ← sliceHeaderBits nalType sliceType (frameIdx &&& 0xFF) true false entryLens cfg.qp
+  let mut body := hdr
+  for g in groups do
+    body := ByteArray.append body g
+  some (packHevcNal nalType 0 1 body)
+
+def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
+    (lossless : Bool := false) (log2Ctb : Nat := 6)
+    (tilesCol : Nat := 1) (tilesRow : Nat := 1)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) :
+    Option (HevcEncoderCfgGen × ByteArray × ByteArray × ByteArray × HevcDecoderState) := do
+  let _ ← ptlParamsForFormat bitDepth chromaFmt
+  if width == 0 || height == 0 then none
+  if chromaFmt != 3 && (width &&& 1) != 0 then none
+  if chromaFmt == 1 && (height &&& 1) != 0 then none
+  if log2Ctb < 4 || log2Ctb > 6 || tilesCol == 0 || tilesRow == 0 then none
+  let qpBdOff : Int := Int.ofNat (6 * (bitDepth - 8))
+  let qpClamped := if lossless then (0 : Int) else clipInt qp (-qpBdOff) 51
+  let qpDequantY := qpClamped + qpBdOff
+  let qpDequantC := deriveChromaQp qpClamped chromaFmt bitDepth
+  let padW := (8 - (width &&& 7)) &&& 7
+  let padH := (8 - (height &&& 7)) &&& 7
+  let conf := (0, padW, 0, padH)
+  let ew := width + padW
+  let eh := height + padH
+  let hshift := if chromaFmt == 3 then 0 else 1
+  let vshift := if chromaFmt == 1 then 1 else 0
+  let ctb := 1 <<< log2Ctb
+  let ctbW := (ew + ctb - 1) >>> log2Ctb
+  let ctbH := (eh + ctb - 1) >>> log2Ctb
+  if tilesCol > ctbW || tilesRow > ctbH then none
+  let vpsNal ← writeVpsGen bitDepth chromaFmt
+  let spsNal ← writeSpsGen ew eh log2Ctb bitDepth chromaFmt conf vuiColour?
+  let ppsNal ← writePpsGen tilesCol tilesRow ctbW ctbH lossless
+  let vpsRm ← stripRbspWithMap (vpsNal.extract 2 vpsNal.size)
+  let spsRm ← stripRbspWithMap (spsNal.extract 2 spsNal.size)
+  let ppsRm ← stripRbspWithMap (ppsNal.extract 2 ppsNal.size)
+  let vps ← parseVps vpsRm.rbsp
+  let sps ← parseSpsExt spsRm.rbsp
+  let mut decSt : HevcDecoderState := {}
+  decSt := { decSt with
+    vpsMap := decSt.vpsMap.set! vps.vpsId (some vps)
+    spsMap := decSt.spsMap.set! sps.spsId (some sps) }
+  let pps ← parsePps ppsRm.rbsp decSt.spsMap
+  decSt := { decSt with ppsMap := decSt.ppsMap.set! pps.ppsId (some pps) }
+  let cfg : HevcEncoderCfgGen := {
+    width := width
+    height := height
+    bitDepth := bitDepth
+    chromaFmt := chromaFmt
+    lossless := lossless
+    qp := qpClamped
+    qpDequantY := qpDequantY
+    qpDequantC := qpDequantC
+    log2Ctb := log2Ctb
+    tilesCol := tilesCol
+    tilesRow := tilesRow
+    conf := conf
+    ew := ew
+    eh := eh
+    cw := ew >>> hshift
+    ch := eh >>> vshift
+    ctb := ctb
+    ctbW := ctbW
+    ctbH := ctbH
+    sps := sps
+    pps := pps
+  }
+  some (cfg, vpsNal, spsNal, ppsNal, decSt)
+
+def encodeHevcNalsGen (width height : Nat) (pixFmt : String) (raw : ByteArray)
+    (qp : Int := 28) (lossless : Bool := false) (log2Ctb : Nat := 6)
+    (tilesCol : Nat := 1) (tilesRow : Nat := 1)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) :
+    Option (Nat × Nat × ByteArray × ByteArray × ByteArray × Array ByteArray) := do
+  let (bitDepth, chromaFmt) ← parseHevcPixFmt pixFmt
+  if bitDepth == 8 && chromaFmt == 1 && !lossless && vuiColour?.isNone then
+    let (vpsNal, spsNal, ppsNal, sliceNals) ←
+      encodeHevcNals width height raw qp log2Ctb tilesCol tilesRow
+    some (8, 1, vpsNal, spsNal, ppsNal, sliceNals)
+  else
+    let frameBytes := rawFrameByteSize width height bitDepth chromaFmt
+    if frameBytes == 0 || raw.size == 0 || raw.size % frameBytes != 0 then none
+    let nFrames := raw.size / frameBytes
+    let (cfg, vpsNal, spsNal, ppsNal, decSt0) ←
+      initHevcEncoderGen width height bitDepth chromaFmt qp lossless log2Ctb tilesCol tilesRow vuiColour?
+    let mut decSt := decSt0
+    let mut sliceNals : Array ByteArray := Array.mkEmpty nFrames
+    let mut refPic? : Option HevcRefPlanes := none
+    for f in [:nFrames] do
+      let srcPlanes := extractPaddedPlanesGen cfg raw f
+      let nal ← encodeHevcFrameGen cfg srcPlanes refPic? f
+      sliceNals := sliceNals.push nal
+      let nalType := if f == 0 then nalIdrWRadl else nalTrailR
+      decSt ← decodePictureSlices decSt #[(nalType, 0, nal.extract 2 nal.size)]
+      let mut chosen? : Option HevcDecodedFrame := decSt.dpb.back?
+      for pf in decSt.dpb do
+        if pf.poc == Int.ofNat f then
+          chosen? := some pf
+      let chosen ← chosen?
+      let chosen16 :=
+        if (chosen.planes16.getD 0 #[]).isEmpty then
+          let conv (b : ByteArray) : Array UInt16 := Id.run do
+            let mut arr : Array UInt16 := Array.mkEmpty b.size
+            for i in [:b.size] do
+              arr := arr.push (b.get! i).toUInt16
+            return arr
+          { chosen with planes16 := chosen.planes.map conv }
+        else chosen
+      refPic? := some (frameToRefPlanes chosen16)
+    some (bitDepth, chromaFmt, vpsNal, spsNal, ppsNal, sliceNals)
+
+def encodeHevcFromRaw (width height : Nat) (pixFmt : String) (raw : ByteArray)
+    (qp : Int := 28) (mp4 : Bool := false) (log2Ctb : Nat := 6)
+    (tilesCol : Nat := 1) (tilesRow : Nat := 1) (lossless : Bool := false) :
+    Option ByteArray := do
+  let (bitDepth, chromaFmt, vpsNal, spsNal, ppsNal, sliceNals) ←
+    encodeHevcNalsGen width height pixFmt raw qp lossless log2Ctb tilesCol tilesRow
+  if !mp4 then
+    let mut all : Array ByteArray := #[vpsNal, spsNal, ppsNal]
+    for s in sliceNals do
+      all := all.push s
+    some (muxAnnexB all)
+  else
+    let hvcc ← buildHvccRecordGen vpsNal spsNal ppsNal bitDepth chromaFmt
+    let samples := sliceNals.map packLenPrefixed4
+    some (buildHevcMp4 samples width height hvcc)
+
+@[export leanav_lean_hevc_ext_roundtrip]
+def hevcExtRoundtrip (op width height qp flags : UInt32) (pixFmt : String) (raw : ByteArray) :
+    ByteArray :=
+  let log2Ctb := ((flags >>> 2) &&& 0xF).toNat
+  let tilesCol := ((flags >>> 6) &&& 0xF).toNat
+  let tilesRow := ((flags >>> 10) &&& 0xF).toNat
+  let mp4 := (flags &&& 1) != 0
+  let lossless := ((flags >>> 1) &&& 1) != 0
+  let pack (w h nf : Nat) (pf : String) (payload : ByteArray) : ByteArray := Id.run do
+    let mut out := ByteArray.emptyWithCapacity (12 + pf.utf8ByteSize + 1 + payload.size)
+    for n in [w, h, nf] do
+      out := out.push (n &&& 0xFF).toUInt8
+      out := out.push ((n >>> 8) &&& 0xFF).toUInt8
+      out := out.push ((n >>> 16) &&& 0xFF).toUInt8
+      out := out.push ((n >>> 24) &&& 0xFF).toUInt8
+    out := out ++ pf.toUTF8
+    out := out.push 0
+    return out ++ payload
+  if op == 0 then
+    match decodeHevcGen raw with
+    | some (w, h, nf, pf, decoded) => pack w h nf pf decoded
+    | none => ByteArray.empty
+  else if op == 1 then
+    match encodeHevcFromRaw width.toNat height.toNat pixFmt raw (Int.ofNat qp.toNat) mp4 log2Ctb
+        tilesCol tilesRow lossless with
+    | some bs => pack width.toNat height.toNat 0 pixFmt bs
+    | none => ByteArray.empty
+  else if op == 2 then
+    match probeHevcStreamJson raw with
+    | some js => pack 0 0 0 "" js.toUTF8
+    | none => ByteArray.empty
+  else
+    ByteArray.empty
 
 end LeanAV.HevcMain

@@ -234,6 +234,16 @@ def build_lean_modules_direct(packages, prefix, jobs, env):
             manifest.unlink()
         all_nodes.update(discover_package_modules(pkg_root, pkg_name, top_file, src_dir))
     deps = {mod: {imp for imp in info["imports"] if imp in all_nodes} for mod, info in all_nodes.items()}
+    trans_deps = {}
+    for mod in all_nodes:
+        seen = set()
+        stack = list(deps[mod])
+        while stack:
+            cur = stack.pop()
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(deps[cur] - seen)
+        trans_deps[mod] = seen
     done = set()
     failed = set()
     active = []
@@ -265,7 +275,7 @@ def build_lean_modules_direct(packages, prefix, jobs, env):
                 c_out.parent.mkdir(parents=True, exist_ok=True)
                 dep_sig = hashlib.sha256()
                 dep_sig.update(file_sha256(info["src"]).encode())
-                for d in sorted(deps[mod]):
+                for d in sorted(trans_deps[mod]):
                     d_olean = all_nodes[d]["pkg_root"] / ".lake" / "build" / "lib" / "lean" / all_nodes[d]["rel"].with_suffix(".olean")
                     dep_sig.update(file_sha256(d_olean).encode())
                 digest = dep_sig.hexdigest()

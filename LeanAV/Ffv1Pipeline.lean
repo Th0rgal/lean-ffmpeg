@@ -384,6 +384,7 @@ private def decodeStreamToFrames (s : Stream) (outPix : Option Ffv1PixelFormat)
 
 private def loadEncodeSource (job : Ffv1CliJob) (inBytes : ByteArray) :
     Except String RawFrameSeq := do
+  let preMax := if job.outRate.isSome then none else job.maxFrames
   let inFmt := job.inFmt.getD "unknown"
   if inFmt == "rawvideo" then
     let some (w, h) := job.inSize | throw "rawvideo input requires -video_size"
@@ -392,7 +393,7 @@ private def loadEncodeSource (job : Ffv1CliJob) (inBytes : ByteArray) :
     if fsz == 0 || inBytes.size % fsz != 0 then
       throw "rawvideo byte length is not an exact multiple of frame size"
     let nFrames := inBytes.size / fsz
-    let count := match job.maxFrames with | some m => min m nFrames | none => nFrames
+    let count := match preMax with | some m => min m nFrames | none => nFrames
     let mut frames : Array ByteArray := Array.emptyWithCapacity count
     for i in [:count] do
       frames := frames.push (inBytes.extract (i * fsz) ((i + 1) * fsz))
@@ -404,11 +405,11 @@ private def loadEncodeSource (job : Ffv1CliJob) (inBytes : ByteArray) :
     return {
       width := y4m.width, height := y4m.height, timeNum := tn, timeDen := td,
       sarNum := y4m.sarNum, sarDen := y4m.sarDen, pixFmt := y4m.pixelFormat,
-      frames := takeMaxFrames y4m.frames job.maxFrames
+      frames := takeMaxFrames y4m.frames preMax
     }
   else
     let s ← demux inBytes
-    decodeStreamToFrames s none job.maxFrames
+    decodeStreamToFrames s none preMax
 
 private def convertLosslessPixFmt (srcFmt dstFmt : Ffv1PixelFormat) (frm : ByteArray) :
     Except String ByteArray :=
@@ -420,9 +421,20 @@ private def convertLosslessPixFmt (srcFmt dstFmt : Ffv1PixelFormat) (frm : ByteA
 private def runEncodePure (job : Ffv1CliJob) (inBytes : ByteArray) :
     Except String (ByteArray × Nat) := do
   let src ← loadEncodeSource job inBytes
+  let (tn, td) := job.outRate.getD (src.timeNum, src.timeDen)
+  let resampledSrcFrames : Array ByteArray :=
+    if src.frames.isEmpty || tn == 0 || td == 0 || src.timeNum == 0 || src.timeDen == 0 ||
+       (tn == src.timeNum && td == src.timeDen) then
+      src.frames
+    else
+      let outCount := Nat.max 1 ((src.frames.size * src.timeNum * td) / (src.timeDen * tn))
+      (Array.range outCount).map fun i =>
+        let srcIdx := Nat.min (src.frames.size - 1) ((i * tn * src.timeDen) / (td * src.timeNum))
+        src.frames.getD srcIdx ByteArray.empty
+  let srcFrames := takeMaxFrames resampledSrcFrames job.maxFrames
   let targetPix := job.outPixFmt.getD src.pixFmt
-  let mut convFrames : Array ByteArray := Array.emptyWithCapacity src.frames.size
-  for frm in src.frames do
+  let mut convFrames : Array ByteArray := Array.emptyWithCapacity srcFrames.size
+  for frm in srcFrames do
     let cf ← convertLosslessPixFmt src.pixFmt targetPix frm
     convFrames := convFrames.push cf
   let encCfg ← makeEncoderConfiguration targetPix job.coder job.slices job.sliceCrc job.gopSize
@@ -439,7 +451,6 @@ private def runEncodePure (job : Ffv1CliJob) (inBytes : ByteArray) :
     gop := nextGop
   if job.outFmt == "null" then
     return (ByteArray.empty, convFrames.size)
-  let (tn, td) := job.outRate.getD (src.timeNum, src.timeDen)
   let outStream : Stream := {
     width := src.width, height := src.height,
     timeNum := tn, timeDen := td,
@@ -452,8 +463,19 @@ private def runEncodePure (job : Ffv1CliJob) (inBytes : ByteArray) :
 private def runDecodePure (job : Ffv1CliJob) (inBytes : ByteArray) :
     Except String (ByteArray × Nat) := do
   let s ← demux inBytes
-  let decoded ← decodeStreamToFrames s job.outPixFmt job.maxFrames
-  let (tn, td) := job.outRate.getD (decoded.timeNum, decoded.timeDen)
+  let preMax := if job.outRate.isSome then none else job.maxFrames
+  let decoded0 ← decodeStreamToFrames s job.outPixFmt preMax
+  let (tn, td) := job.outRate.getD (decoded0.timeNum, decoded0.timeDen)
+  let resampledFrames : Array ByteArray :=
+    if decoded0.frames.isEmpty || tn == 0 || td == 0 || decoded0.timeNum == 0 || decoded0.timeDen == 0 ||
+       (tn == decoded0.timeNum && td == decoded0.timeDen) then
+      decoded0.frames
+    else
+      let outCount := Nat.max 1 ((decoded0.frames.size * decoded0.timeNum * td) / (decoded0.timeDen * tn))
+      (Array.range outCount).map fun i =>
+        let srcIdx := Nat.min (decoded0.frames.size - 1) ((i * tn * decoded0.timeDen) / (td * decoded0.timeNum))
+        decoded0.frames.getD srcIdx ByteArray.empty
+  let decoded := { decoded0 with frames := takeMaxFrames resampledFrames job.maxFrames }
   if job.outFmt == "null" then
     return (ByteArray.empty, decoded.frames.size)
   else if job.outFmt == "rawvideo" then

@@ -469,4 +469,34 @@ theorem lawfulStageCleanContainerRemux_nonzero_mask
     intro hZero
     exact hNe (beq_iff_eq.mpr hZero)
 
+/-- A high-bit-depth frame is admitted only at its declared code range and plane count. -/
+def HighBitFrameAdmitted (f : HighBitFrame) : Prop :=
+  f.planes.size = 3 ∧ f.maxCode = match f.pixFmt.bitDepth with
+    | 10 => 1023
+    | 12 => 4095
+    | _ => 65535
+
+def highBitFrameGate (f : HighBitFrame) : Bool :=
+  decide (f.planes.size = 3) &&
+    (f.maxCode == match f.pixFmt.bitDepth with | 10 => 1023 | 12 => 4095 | _ => 65535)
+
+def highBitFrameGateSpec : AVGateSpec HighBitFrame HighBitFrameAdmitted where
+  gate := highBitFrameGate
+  sound := by
+    intro f h
+    simp only [highBitFrameGate, Bool.and_eq_true, beq_iff_eq, decide_eq_true_iff] at h
+    exact h
+  complete := by
+    intro f h
+    simp only [highBitFrameGate, Bool.and_eq_true, beq_iff_eq, decide_eq_true_iff]
+    exact h
+  posWitness := HighBitFrame.alloc .yuv420p10le 2 2
+  negWitness := { (HighBitFrame.alloc .yuv420p10le 2 2) with maxCode := 0 }
+  nonVacuous := by decide
+  tight := by decide
+
+theorem highBitFrameGateSpec_iff (f : HighBitFrame) :
+    highBitFrameGateSpec.gate f = true ↔ HighBitFrameAdmitted f :=
+  highBitFrameGateSpec.iff_safe f
+
 end LeanAV.Domain

@@ -65,7 +65,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 812 or total_tight != 812:
+          if total_audited != 892 or total_tight != 892:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -79,14 +79,20 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 25053 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           ! command -v ffmpeg
           ! command -v ffprobe
           python3 -m unittest discover -s tests -p "test_*.py"
-      - name: Install reference ffmpeg oracle
-        run: sudo apt-get install -y ffmpeg
+      - name: Install reference ffmpeg oracle (FFmpeg 8.1+ ships AV1 ITU-T T.35 Dolby Vision EMDF decode)
+        run: |
+          mkdir -p "$HOME/.local/ffmpeg"
+          curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz \
+            -o /tmp/ffmpeg-oracle.tar.xz
+          tar -xJf /tmp/ffmpeg-oracle.tar.xz -C "$HOME/.local/ffmpeg" --strip-components=1
+          echo "$HOME/.local/ffmpeg/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/ffmpeg/bin/ffmpeg" -version | head -n 2
       - name: Differential oracle suite
         run: |
           python3 - <<'PY'
@@ -174,7 +180,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 812 or total_tight != 812:
+          if total_audited != 892 or total_tight != 892:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -186,7 +192,7 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 25053 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           python3 - <<'PY'

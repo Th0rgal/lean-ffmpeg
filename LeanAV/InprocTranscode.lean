@@ -48,34 +48,30 @@ structure InprocTranscodeScope where
   deriving Repr, DecidableEq, Inhabited
 
 def InprocTranscodeScopeSafe (s : InprocTranscodeScope) : Prop :=
-  0 < s.srcW ∧ s.srcW % 2 = 0 ∧
-  0 < s.srcH ∧ s.srcH % 2 = 0 ∧
-  0 < s.dstW ∧ s.dstW % 2 = 0 ∧
-  0 < s.dstH ∧ s.dstH % 2 = 0 ∧
-  s.chromaFormatIdc = 1 ∧
-  s.bitDepthLuma8 = 0 ∧
-  s.bitDepthChroma8 = 0 ∧
+  0 < s.srcW ∧ 0 < s.srcH ∧ 0 < s.dstW ∧ 0 < s.dstH ∧
+  s.dstW % 2 = 0 ∧ s.dstH % 2 = 0 ∧
+  (s.chromaFormatIdc = 0 ∨ s.chromaFormatIdc = 1 ∨ s.chromaFormatIdc = 2 ∨ s.chromaFormatIdc = 3) ∧
+  (s.chromaFormatIdc ≠ 1 ∨ (s.srcW % 2 = 0 ∧ s.srcH % 2 = 0)) ∧
+  (s.chromaFormatIdc ≠ 2 ∨ s.srcW % 2 = 0) ∧
+  (s.bitDepthLuma8 = 0 ∨ s.bitDepthLuma8 = 2 ∨ s.bitDepthLuma8 = 4) ∧
+  (s.bitDepthChroma8 = 0 ∨ s.bitDepthChroma8 = 2 ∨ s.bitDepthChroma8 = 4) ∧
   s.frameMbsOnly = true ∧
   s.hasFmo = false ∧
-  s.hasScalingLists = false ∧
-  s.qpprimeBypass = false ∧
   s.profileIdc ≠ 135 ∧
   (s.audioChannels = 0 ∨ s.audioChannels = 1 ∨ s.audioChannels = 2) ∧
   0 < s.ringCap
 
 instance (s : InprocTranscodeScope) : Decidable (InprocTranscodeScopeSafe s) :=
   inferInstanceAs (Decidable
-    (0 < s.srcW ∧ s.srcW % 2 = 0 ∧
-     0 < s.srcH ∧ s.srcH % 2 = 0 ∧
-     0 < s.dstW ∧ s.dstW % 2 = 0 ∧
-     0 < s.dstH ∧ s.dstH % 2 = 0 ∧
-     s.chromaFormatIdc = 1 ∧
-     s.bitDepthLuma8 = 0 ∧
-     s.bitDepthChroma8 = 0 ∧
+    (0 < s.srcW ∧ 0 < s.srcH ∧ 0 < s.dstW ∧ 0 < s.dstH ∧
+     s.dstW % 2 = 0 ∧ s.dstH % 2 = 0 ∧
+     (s.chromaFormatIdc = 0 ∨ s.chromaFormatIdc = 1 ∨ s.chromaFormatIdc = 2 ∨ s.chromaFormatIdc = 3) ∧
+     (s.chromaFormatIdc ≠ 1 ∨ (s.srcW % 2 = 0 ∧ s.srcH % 2 = 0)) ∧
+     (s.chromaFormatIdc ≠ 2 ∨ s.srcW % 2 = 0) ∧
+     (s.bitDepthLuma8 = 0 ∨ s.bitDepthLuma8 = 2 ∨ s.bitDepthLuma8 = 4) ∧
+     (s.bitDepthChroma8 = 0 ∨ s.bitDepthChroma8 = 2 ∨ s.bitDepthChroma8 = 4) ∧
      s.frameMbsOnly = true ∧
      s.hasFmo = false ∧
-     s.hasScalingLists = false ∧
-     s.qpprimeBypass = false ∧
      s.profileIdc ≠ 135 ∧
      (s.audioChannels = 0 ∨ s.audioChannels = 1 ∨ s.audioChannels = 2) ∧
      0 < s.ringCap))
@@ -112,62 +108,6 @@ theorem inprocTranscodeGateSpec_iff (s : InprocTranscodeScope) :
     inprocTranscodeGateSpec.gate s = true ↔ InprocTranscodeScopeSafe s :=
   inprocTranscodeGateSpec.iff_safe s
 
-structure InprocDecodedBlk4 where
-  sliceId      : Nat := 0
-  isIntra      : Bool := false
-  hasCoeff     : Bool := false
-  refIdxL0     : Int := -1
-  mvL0         : LeanAV.H264InterDeblockDpb.MotionVec := ⟨0, 0⟩
-  refPicUidL0  : Option Nat := none
-  refIdxL1     : Int := -1
-  mvL1         : LeanAV.H264InterDeblockDpb.MotionVec := ⟨0, 0⟩
-  refPicUidL1  : Option Nat := none
-  deriving Repr, DecidableEq, Inhabited
-
-structure InprocStoredPic where
-  uid          : Nat
-  poc          : Int
-  isLongTerm   : Bool
-  yPlane       : Plane2D
-  uPlane       : Plane2D
-  vPlane       : Plane2D
-  cropLeft     : Nat
-  cropTop      : Nat
-  cropWidth    : Nat
-  cropHeight   : Nat
-  gridW4       : Nat
-  gridH4       : Nat
-  colGrid      : Array InprocDecodedBlk4
-  deriving Inhabited
-
-structure InprocPocState where
-  prevPocMsb         : Int := 0
-  prevPocLsb         : Int := 0
-  prevFrameNum       : Nat := 0
-  prevFrameNumOffset : Nat := 0
-  prevHasMmco5       : Bool := false
-  deriving Repr, DecidableEq, Inhabited
-
-structure InprocSpsPair where
-  syn : LeanAV.H264Syntax.H264SpsFull
-  ent : LeanAV.H264Entropy.SpsFull
-  deriving Inhabited
-
-structure InprocPpsPair where
-  syn : LeanAV.H264Syntax.H264PpsFull
-  ent : LeanAV.H264Entropy.PpsFull
-  deriving Inhabited
-
-structure InprocDecoderState where
-  spsTable    : Array (Option InprocSpsPair) := Array.replicate 32 none
-  ppsTable    : Array (Option InprocPpsPair) := Array.replicate 256 none
-  dpb         : LeanAV.H264InterDeblockDpb.H264Dpb := {}
-  dpbInit     : Bool := false
-  storedPics  : Array InprocStoredPic := #[]
-  emittedUids : Array Nat := #[]
-  pocState    : InprocPocState := {}
-  deriving Inhabited
-
 structure InprocMp4Probe where
   videoTrack   : NativeMp4Track
   avcc         : LeanAV.H264Syntax.AvcDecoderConfigRecord
@@ -191,7 +131,7 @@ private def buildScopeForSpsPps
   let hasScaling :=
     sps.seqScalingMatrixPresentFlag || pps.picScalingMatrixPresentFlag
   let hasFmo :=
-    pps.numSliceGroupsMinus1 != 0 || sps.separateColourPlaneFlag
+    pps.numSliceGroupsMinus1 != 0
   {
     srcW := sps.widthPx.toNat
     srcH := sps.heightPx.toNat
@@ -208,80 +148,6 @@ private def buildScopeForSpsPps
     audioChannels := audioCh
     ringCap := ringCap
   }
-
-private def registerSpsNalu (st : InprocDecoderState) (nal : ByteArray) : Option InprocDecoderState := do
-  let syn ← LeanAV.H264Syntax.parseH264SpsFull (ByteSlice.ofByteArray nal)
-  let ent ← LeanAV.H264Entropy.parseSpsFull nal
-  let idx := syn.spsId.toNat
-  if idx ≥ 32 || ent.spsId != idx then none
-  else
-    some { st with spsTable := st.spsTable.set! idx (some { syn := syn, ent := ent }) }
-
-private def registerPpsNalu (st : InprocDecoderState) (nal : ByteArray) : Option InprocDecoderState := do
-  let rbsp := LeanAV.H264Entropy.stripNalEmulationBytes nal
-  if rbsp.data.size < 2 then none
-  else do
-    let r0 : BitReader := { slice := ByteSlice.ofByteArray rbsp, bitOffset := 8 }
-    let (ppsId64, r1) ← r0.readUE
-    let (spsId64, _) ← r1.readUE
-    let ppsIdx := ppsId64.toNat
-    let spsIdx := spsId64.toNat
-    if ppsIdx ≥ 256 || spsIdx ≥ 32 then none
-    else do
-      let spsPair ← (st.spsTable.getD spsIdx none)
-      let syn ← LeanAV.H264Syntax.parseH264PpsFull (ByteSlice.ofByteArray nal) (some spsPair.syn)
-      let entSpsArr := st.spsTable.map (fun o => o.map (·.ent))
-      let ent ← LeanAV.H264Entropy.parsePpsFull nal entSpsArr
-      if syn.ppsId.toNat != ppsIdx || ent.ppsId != ppsIdx then none
-      else
-        some { st with ppsTable := st.ppsTable.set! ppsIdx (some { syn := syn, ent := ent }) }
-
-private def findStoredPic (pics : Array InprocStoredPic) (uid : Nat) : Option InprocStoredPic :=
-  pics.find? (fun p => p.uid == uid)
-
-private def cropPlane2D (src : Plane2D) (x0 y0 w h : Nat) : Option Plane2D := do
-  if w == 0 || h == 0 || x0 + w > src.width || y0 + h > src.height then none
-  else Id.run do
-    let mut out := ByteArray.emptyWithCapacity (w * h)
-    for r in [:h] do
-      for c in [:w] do
-        out := out.push (src.getPixel (y0 + r) (x0 + c))
-    return some { data := out, width := w, height := h, stride := w }
-
-private def storedPicToVideoFrame (pic : InprocStoredPic) : Option VideoFrame := do
-  if pic.cropWidth % 2 != 0 || pic.cropHeight % 2 != 0 then none
-  else
-    let yCropped ←
-      if pic.cropLeft == 0 && pic.cropTop == 0 &&
-         pic.cropWidth == pic.yPlane.width && pic.cropHeight == pic.yPlane.height &&
-         pic.yPlane.stride == pic.yPlane.width then
-        some pic.yPlane
-      else
-        cropPlane2D pic.yPlane pic.cropLeft pic.cropTop pic.cropWidth pic.cropHeight
-    let uCropped ←
-      if pic.cropLeft == 0 && pic.cropTop == 0 &&
-         pic.cropWidth / 2 == pic.uPlane.width && pic.cropHeight / 2 == pic.uPlane.height &&
-         pic.uPlane.stride == pic.uPlane.width then
-        some pic.uPlane
-      else
-        cropPlane2D pic.uPlane (pic.cropLeft / 2) (pic.cropTop / 2) (pic.cropWidth / 2) (pic.cropHeight / 2)
-    let vCropped ←
-      if pic.cropLeft == 0 && pic.cropTop == 0 &&
-         pic.cropWidth / 2 == pic.vPlane.width && pic.cropHeight / 2 == pic.vPlane.height &&
-         pic.vPlane.stride == pic.vPlane.width then
-        some pic.vPlane
-      else
-        cropPlane2D pic.vPlane (pic.cropLeft / 2) (pic.cropTop / 2) (pic.cropWidth / 2) (pic.cropHeight / 2)
-    some {
-      width := pic.cropWidth
-      height := pic.cropHeight
-      pixFmt := .yuv420p
-      colorMatrix := .bt709
-      pts := 0
-      duration := 1
-      timeBase := AVRational.tb90kHz
-      planes := #[yCropped, uCropped, vCropped]
-    }
 
 /-! ## Plane, Scan, and Intra Mode Helpers -/
 
@@ -510,277 +376,6 @@ private def reconstructDecodedIntraMb
     let recV := LeanAV.H264IntraTransform.reconstructChroma8x8Lossy predV vDc4 vAc4 qpcCr
     some ({ y := canvasY, u := recU, v := recV }, modes, hasCoeff)
 
-/-! ## Inter Neighbor MV Lookup, Direct Mode & Motion Compensation -/
-
-private def lookupNeighborMv
-    (colGrid : Array InprocDecodedBlk4) (blkSliceIds : Array Int)
-    (gridW4 gridH4 : Nat) (curSliceId : Int) (listIdx : Nat)
-    (gx gy : Int) : LeanAV.H264InterDeblockDpb.NeighborMv :=
-  if gx < 0 || gy < 0 || gx.toNat ≥ gridW4 || gy.toNat ≥ gridH4 then
-    { avail := false, refIdx := -1, mv := ⟨0, 0⟩ }
-  else
-    let idx := gy.toNat * gridW4 + gx.toNat
-    if blkSliceIds.getD idx (-1) != curSliceId then
-      { avail := false, refIdx := -1, mv := ⟨0, 0⟩ }
-    else
-      let b := colGrid.getD idx {}
-      if b.isIntra then
-        { avail := true, refIdx := -1, mv := ⟨0, 0⟩ }
-      else if listIdx == 0 then
-        { avail := true, refIdx := b.refIdxL0, mv := b.mvL0 }
-      else
-        { avail := true, refIdx := b.refIdxL1, mv := b.mvL1 }
-
-private def partNeighborsABC
-    (colGrid : Array InprocDecodedBlk4) (blkSliceIds : Array Int)
-    (gridW4 gridH4 : Nat) (curSliceId : Int) (listIdx : Nat)
-    (gx0 gy0 pw4 : Nat)
-    : LeanAV.H264InterDeblockDpb.NeighborMv ×
-      LeanAV.H264InterDeblockDpb.NeighborMv ×
-      LeanAV.H264InterDeblockDpb.NeighborMv :=
-  let igx := Int.ofNat gx0
-  let igy := Int.ofNat gy0
-  let nbA := lookupNeighborMv colGrid blkSliceIds gridW4 gridH4 curSliceId listIdx (igx - 1) igy
-  let nbB := lookupNeighborMv colGrid blkSliceIds gridW4 gridH4 curSliceId listIdx igx (igy - 1)
-  let rx := gx0 % 4
-  let ry := gy0 % 4
-  let trBlockedInMb : Bool :=
-    (rx + pw4 == 4 && (ry == 1 || ry == 2 || ry == 3)) ||
-    (rx + pw4 == 2 && (ry == 1 || ry == 3))
-  let nbCRaw :=
-    if trBlockedInMb then { avail := false, refIdx := -1, mv := ⟨0, 0⟩ }
-    else lookupNeighborMv colGrid blkSliceIds gridW4 gridH4 curSliceId listIdx (igx + Int.ofNat pw4) (igy - 1)
-  let nbC :=
-    if nbCRaw.avail then nbCRaw
-    else lookupNeighborMv colGrid blkSliceIds gridW4 gridH4 curSliceId listIdx (igx - 1) (igy - 1)
-  (nbA, nbB, nbC)
-
-private def setRectMvInGrid
-    (colGrid : Array InprocDecodedBlk4) (gridW4 gx0 gy0 pw4 ph4 : Nat)
-    (listIdx : Nat) (refIdx : Int) (mv : LeanAV.H264InterDeblockDpb.MotionVec)
-    (refUid? : Option Nat) : Array InprocDecodedBlk4 := Id.run do
-  let mut g := colGrid
-  for dy in [:ph4] do
-    for dx in [:pw4] do
-      let idx := (gy0 + dy) * gridW4 + (gx0 + dx)
-      let cur := g.getD idx {}
-      let upd :=
-        if listIdx == 0 then { cur with refIdxL0 := refIdx, mvL0 := mv, refPicUidL0 := refUid? }
-        else { cur with refIdxL1 := refIdx, mvL1 := mv, refPicUidL1 := refUid? }
-      g := g.set! idx upd
-  return g
-
-private def resolveCollocatedMotion
-    (l0Pics l1Pics : Array InprocStoredPic)
-    (direct8x8Inference : Bool) (gx gy : Nat)
-    : Bool × Int × LeanAV.H264InterDeblockDpb.MotionVec × Int × Int :=
-  if l1Pics.size == 0 then
-    (false, 0, ⟨0, 0⟩, 0, 0)
-  else
-    let colPic := l1Pics[0]!
-    let rx := gx % 4
-    let ry := gy % 4
-    let cgx :=
-      if direct8x8Inference then (gx - rx) + (if rx ≥ 2 then 3 else 0) else gx
-    let cgy :=
-      if direct8x8Inference then (gy - ry) + (if ry ≥ 2 then 3 else 0) else gy
-    let colBlk :=
-      if cgx < colPic.gridW4 && cgy < colPic.gridH4 then
-        colPic.colGrid.getD (cgy * colPic.gridW4 + cgx) {}
-      else {}
-    if colBlk.isIntra then
-      (false, 0, ⟨0, 0⟩, (l0Pics.getD 0 colPic).poc, colPic.poc)
-    else
-      let useColL0 := colBlk.refIdxL0 ≥ 0
-      let mvCol := if useColL0 then colBlk.mvL0 else colBlk.mvL1
-      let refCol := if useColL0 then colBlk.refIdxL0 else colBlk.refIdxL1
-      let uidCol? := if useColL0 then colBlk.refPicUidL0 else colBlk.refPicUidL1
-      let mappedL0 : Int :=
-        match uidCol? with
-        | some u =>
-          match l0Pics.findIdx? (fun p => p.uid == u) with
-          | some i => Int.ofNat i
-          | none => 0
-        | none => 0
-      let colZero : Bool :=
-        !colPic.isLongTerm && refCol == 0 && mvCol.x.natAbs ≤ 1 && mvCol.y.natAbs ≤ 1
-      let poc0 :=
-        if mappedL0 ≥ 0 && mappedL0.toNat < l0Pics.size then (l0Pics.getD mappedL0.toNat colPic).poc
-        else colPic.poc
-      (colZero, mappedL0, mvCol, poc0, colPic.poc)
-
-private def deriveDirectSubMb8x8
-    (colGrid0 : Array InprocDecodedBlk4) (blkSliceIds : Array Int)
-    (gridW4 gridH4 : Nat) (curSliceId : Int) (currPoc : Int)
-    (directSpatialFlag direct8x8Inference : Bool)
-    (l0Pics l1Pics : Array InprocStoredPic)
-    (mbGx mbGy subIdx : Nat)
-    (spatialBase? : Option (LeanAV.H264InterDeblockDpb.NeighborMv ×
-                            LeanAV.H264InterDeblockDpb.NeighborMv ×
-                            LeanAV.H264InterDeblockDpb.NeighborMv ×
-                            LeanAV.H264InterDeblockDpb.NeighborMv ×
-                            LeanAV.H264InterDeblockDpb.NeighborMv ×
-                            LeanAV.H264InterDeblockDpb.NeighborMv))
-    : Array InprocDecodedBlk4 := Id.run do
-  let mut g := colGrid0
-  let sx0 := (subIdx % 2) * 2
-  let sy0 := (subIdx / 2) * 2
-  let (nb0A, nb0B, nb0C, nb1A, nb1B, nb1C) :=
-    match spatialBase? with
-    | some base => base
-    | none =>
-      let (a0, b0, c0) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 0 mbGx mbGy 4
-      let (a1, b1, c1) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 1 mbGx mbGy 4
-      (a0, b0, c0, a1, b1, c1)
-  for dy in [:2] do
-    for dx in [:2] do
-      let gx := mbGx + sx0 + dx
-      let gy := mbGy + sy0 + dy
-      let (colZero, mappedL0, mvCol, poc0, poc1) :=
-        resolveCollocatedMotion l0Pics l1Pics direct8x8Inference gx gy
-      let dp :=
-        if directSpatialFlag then
-          LeanAV.H264InterDeblockDpb.bDirectSpatial nb0A nb0B nb0C nb1A nb1B nb1C colZero
-        else
-          LeanAV.H264InterDeblockDpb.bDirectTemporal mvCol mappedL0 currPoc poc0 poc1
-      let r0 := if dp.predFlagL0 then dp.refIdxL0 else -1
-      let r1 := if dp.predFlagL1 then dp.refIdxL1 else -1
-      let uid0? := if r0 ≥ 0 && r0.toNat < l0Pics.size then some (l0Pics[r0.toNat]!.uid) else none
-      let uid1? := if r1 ≥ 0 && r1.toNat < l1Pics.size then some (l1Pics[r1.toNat]!.uid) else none
-      let cur := g.getD (gy * gridW4 + gx) {}
-      g := g.set! (gy * gridW4 + gx) {
-        cur with
-        refIdxL0 := r0
-        mvL0 := if dp.predFlagL0 then dp.mvL0 else ⟨0, 0⟩
-        refPicUidL0 := uid0?
-        refIdxL1 := r1
-        mvL1 := if dp.predFlagL1 then dp.mvL1 else ⟨0, 0⟩
-        refPicUidL1 := uid1?
-      }
-  return g
-
-private def deriveInterMbMotionGrid
-    (mb : LeanAV.H264Entropy.MbSyntax)
-    (sliceKind : LeanAV.H264Syntax.H264SliceKind)
-    (colGrid0 : Array InprocDecodedBlk4) (blkSliceIds : Array Int)
-    (gridW4 gridH4 mbX mbY : Nat) (curSliceId : Int) (currPoc : Int)
-    (directSpatialFlag direct8x8Inference : Bool)
-    (l0Pics l1Pics : Array InprocStoredPic)
-    : Option (Array InprocDecodedBlk4) := Id.run do
-  let mbGx := mbX * 4
-  let mbGy := mbY * 4
-  let mut g := colGrid0
-  if mb.isSkip then
-    if sliceKind == .P then
-      if l0Pics.size == 0 then return none
-      let (nbA, nbB, nbC) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 0 mbGx mbGy 4
-      let atLeftOrTop := !nbA.avail || !nbB.avail
-      let mv := LeanAV.H264InterDeblockDpb.pSkipMv atLeftOrTop nbA nbB nbC
-      let uid0? := some (l0Pics[0]!.uid)
-      g := setRectMvInGrid g gridW4 mbGx mbGy 4 4 0 0 mv uid0?
-      return some g
-    else if sliceKind == .B then
-      let (a0, b0, c0) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 0 mbGx mbGy 4
-      let (a1, b1, c1) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 1 mbGx mbGy 4
-      let spBase := some (a0, b0, c0, a1, b1, c1)
-      for i8 in [:4] do
-        g := deriveDirectSubMb8x8 g blkSliceIds gridW4 gridH4 curSliceId currPoc
-               directSpatialFlag direct8x8Inference l0Pics l1Pics mbGx mbGy i8 spBase
-      return some g
-    else
-      return none
-  let (info, numLists) :=
-    if mb.kind == .pInter then (LeanAV.H264Entropy.pMbInfoTable.getD mb.interIdx {}, 1)
-    else if mb.kind == .bInter then (LeanAV.H264Entropy.bMbInfoTable.getD mb.interIdx {}, 2)
-    else ({}, 0)
-  if numLists == 0 then return none
-  if info.shape == .direct then
-    let (a0, b0, c0) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 0 mbGx mbGy 4
-    let (a1, b1, c1) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 1 mbGx mbGy 4
-    let spBase := some (a0, b0, c0, a1, b1, c1)
-    for i8 in [:4] do
-      g := deriveDirectSubMb8x8 g blkSliceIds gridW4 gridH4 curSliceId currPoc
-             directSpatialFlag direct8x8Inference l0Pics l1Pics mbGx mbGy i8 spBase
-    return some g
-  let refsSrc := #[mb.refL0, mb.refL1]
-  let mvdsSrc := #[mb.mvdL0, mb.mvdL1]
-  let useLists := #[info.useL0, info.useL1]
-  let picsLists := #[l0Pics, l1Pics]
-  if info.shape == .p8x8 then
-    let (a0, b0, c0) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 0 mbGx mbGy 4
-    let (a1, b1, c1) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId 1 mbGx mbGy 4
-    let spBase := some (a0, b0, c0, a1, b1, c1)
-    let mut rc0 := 0
-    let mut rc1 := 0
-    let mut mc0 := 0
-    let mut mc1 := 0
-    for i8 in [:4] do
-      let st := mb.subMbTypes.getD i8 0
-      let sub :=
-        if mb.kind == .pInter then LeanAV.H264Entropy.pSubInfoTable.getD st {}
-        else LeanAV.H264Entropy.bSubInfoTable.getD st {}
-      if sub.shape == .direct then
-        g := deriveDirectSubMb8x8 g blkSliceIds gridW4 gridH4 curSliceId currPoc
-               directSpatialFlag direct8x8Inference l0Pics l1Pics mbGx mbGy i8 spBase
-      else
-        for lst in [:numLists] do
-          let sUse := if lst == 0 then sub.useL0 else sub.useL1
-          if sUse then
-            let rc := if lst == 0 then rc0 else rc1
-            let rvNat : Nat :=
-              if mb.kind == .pInter && mb.interIdx == 4 then 0
-              else (refsSrc.getD lst #[]).getD rc 0
-            if !(mb.kind == .pInter && mb.interIdx == 4) then
-              if lst == 0 then rc0 := rc0 + 1 else rc1 := rc1 + 1
-            let refPics := picsLists.getD lst #[]
-            if rvNat ≥ refPics.size then return none
-            let rv := Int.ofNat rvNat
-            let uid? := some (refPics[rvNat]!.uid)
-            for j in [:sub.subCnt] do
-              let (off, bw, bh) := LeanAV.H264Entropy.subPartGeom sub.shape j
-              let blkIdx := 4 * i8 + off
-              let (xO, yO) := LeanAV.H264IntraTransform.zScan4BlkCoord blkIdx
-              let gx0 := mbGx + xO / 4
-              let gy0 := mbGy + yO / 4
-              let (nbA, nbB, nbC) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId lst gx0 gy0 bw
-              let mvp := LeanAV.H264InterDeblockDpb.mvpMedian rv nbA nbB nbC .p8x8 j
-              let mc := if lst == 0 then mc0 else mc1
-              let (dx, dy) := (mvdsSrc.getD lst #[]).getD mc (0, 0)
-              if lst == 0 then mc0 := mc0 + 1 else mc1 := mc1 + 1
-              let mv : LeanAV.H264InterDeblockDpb.MotionVec := ⟨mvp.x + dx, mvp.y + dy⟩
-              g := setRectMvInGrid g gridW4 gx0 gy0 bw bh lst rv mv uid?
-    return some g
-  else
-    let dpbShape : LeanAV.H264InterDeblockDpb.H264PartShape :=
-      match info.shape with
-      | .p16x16 => .p16x16
-      | .p16x8  => .p16x8
-      | .p8x16  => .p8x16
-      | _       => .p16x16
-    let nPart := info.useL0.size
-    for lst in [:numLists] do
-      let mut rc := 0
-      let mut mc := 0
-      for pi in [:nPart] do
-        if (useLists.getD lst #[]).getD pi false then
-          let (gx0, gy0, bw, bh) :=
-            if info.shape == .p16x16 then (mbGx, mbGy, 4, 4)
-            else if info.shape == .p16x8 then (mbGx, mbGy + 2 * pi, 4, 2)
-            else (mbGx + 2 * pi, mbGy, 2, 4)
-          let rvNat := (refsSrc.getD lst #[]).getD rc 0
-          let refPics := picsLists.getD lst #[]
-          if rvNat ≥ refPics.size then return none
-          let rv := Int.ofNat rvNat
-          let uid? := some (refPics[rvNat]!.uid)
-          let (nbA, nbB, nbC) := partNeighborsABC g blkSliceIds gridW4 gridH4 curSliceId lst gx0 gy0 bw
-          let mvp := LeanAV.H264InterDeblockDpb.mvpMedian rv nbA nbB nbC dpbShape pi
-          let (dx, dy) := (mvdsSrc.getD lst #[]).getD mc (0, 0)
-          rc := rc + 1
-          mc := mc + 1
-          let mv : LeanAV.H264InterDeblockDpb.MotionVec := ⟨mvp.x + dx, mvp.y + dy⟩
-          g := setRectMvInGrid g gridW4 gx0 gy0 bw bh lst rv mv uid?
-    return some g
-
 def clipWeightedU8 (v : Int) : UInt8 :=
   if v ≤ 0 then 0 else if v ≥ 255 then 255 else v.toNat.toUInt8
 
@@ -912,714 +507,32 @@ theorem evalExplicitBiWeight_default_eq_biPredSample (s0 s1 : UInt8) (logWD : Na
     simp [UInt16.toNat_toUInt8, h2, Nat.mod_eq_of_lt hAvgLt]
   exact hU16.symm
 
-private def lookupLumaWeightOffset
-    (arr : Array LeanAV.H264Syntax.PredWeightEntry) (refIdx : Nat) (logWD : Nat) : Int × Int :=
-  let defW : Int := (2 ^ logWD : Int)
-  match arr[refIdx]? with
-  | some e => if e.lumaWeightFlag then (e.lumaWeight.toInt, e.lumaOffset.toInt) else (defW, 0)
-  | none => (defW, 0)
+/-! ## Access-Unit HBD Picture Decoder Bridge -/
 
-private def lookupChromaWeightOffset
-    (arr : Array LeanAV.H264Syntax.PredWeightEntry) (refIdx : Nat) (logWD : Nat) : (Int × Int) × (Int × Int) :=
-  let defW : Int := (2 ^ logWD : Int)
-  match arr[refIdx]? with
-  | some e =>
-    if e.chromaWeightFlag then
-      ((e.cbWeight.toInt, e.cbOffset.toInt), (e.crWeight.toInt, e.crOffset.toInt))
-    else
-      ((defW, 0), (defW, 0))
-  | none => ((defW, 0), (defW, 0))
-
-private def reconstructDecodedInterMb
-    (mb : LeanAV.H264Entropy.MbSyntax)
-    (colGrid : Array InprocDecodedBlk4)
-    (gridW4 mbX mbY : Nat)
-    (l0Pics l1Pics : Array InprocStoredPic)
-    (currPoc : Int) (weightedBipredIdc : UInt8)
-    (hasPredWeightTable : Bool) (pwt : LeanAV.H264Syntax.PredWeightTable)
-    (qpY : Nat) (cqpOff secCqpOff : Int)
-    : Option (LeanAV.H264IntraTransform.H264Yuv420pMb × Array Bool) := do
-  let mbGx := mbX * 4
-  let mbGy := mbY * 4
-  let mut predY := Array.replicate 256 (0 : UInt8)
-  let mut predU := Array.replicate 64 (0 : UInt8)
-  let mut predV := Array.replicate 64 (0 : UInt8)
-  let mut predOk : Bool := true
-  let lLogWD := pwt.lumaLog2WeightDenom.toNat
-  let cLogWD := pwt.chromaLog2WeightDenom.toNat
-  for ry in [:4] do
-    for rx in [:4] do
-      let b := colGrid.getD ((mbGy + ry) * gridW4 + (mbGx + rx)) {}
-      let use0 := b.refIdxL0 ≥ 0 && b.refIdxL0.toNat < l0Pics.size
-      let use1 := b.refIdxL1 ≥ 0 && b.refIdxL1.toNat < l1Pics.size
-      if !use0 && !use1 then
-        predOk := false
-      else do
-        let x0L := mbX * 16 + rx * 4
-        let y0L := mbY * 16 + ry * 4
-        let x0C := mbX * 8 + rx * 2
-        let y0C := mbY * 8 + ry * 2
-        let useImpBi := !hasPredWeightTable && use0 && use1 && weightedBipredIdc == 2 &&
-          !(l0Pics[b.refIdxL0.toNat]!.isLongTerm || l1Pics[b.refIdxL1.toNat]!.isLongTerm)
-        for dy in [:4] do
-          for dx in [:4] do
-            let vL : UInt8 :=
-              if use0 && use1 then
-                let r0 := b.refIdxL0.toNat
-                let r1 := b.refIdxL1.toNat
-                let p0Pic := l0Pics[r0]!
-                let p1Pic := l1Pics[r1]!
-                let s0 := LeanAV.H264InterDeblockDpb.h264LumaQpel p0Pic.yPlane
-                  (4 * Int.ofNat (x0L + dx) + b.mvL0.x) (4 * Int.ofNat (y0L + dy) + b.mvL0.y)
-                let s1 := LeanAV.H264InterDeblockDpb.h264LumaQpel p1Pic.yPlane
-                  (4 * Int.ofNat (x0L + dx) + b.mvL1.x) (4 * Int.ofNat (y0L + dy) + b.mvL1.y)
-                if hasPredWeightTable then
-                  let (w0, o0) := lookupLumaWeightOffset pwt.l0Weights r0 lLogWD
-                  let (w1, o1) := lookupLumaWeightOffset pwt.l1Weights r1 lLogWD
-                  evalExplicitBiWeight s0 s1 lLogWD w0 o0 w1 o1
-                else if useImpBi then
-                  LeanAV.H264InterDeblockDpb.implicitWeightedBiPredPixel s0 s1 currPoc p0Pic.poc p1Pic.poc
-                else
-                  LeanAV.H264InterDeblockDpb.biPredSample s0 s1
-              else if use0 then
-                let r0 := b.refIdxL0.toNat
-                let p0Pic := l0Pics[r0]!
-                let s0 := LeanAV.H264InterDeblockDpb.h264LumaQpel p0Pic.yPlane
-                  (4 * Int.ofNat (x0L + dx) + b.mvL0.x) (4 * Int.ofNat (y0L + dy) + b.mvL0.y)
-                if hasPredWeightTable then
-                  let (w0, o0) := lookupLumaWeightOffset pwt.l0Weights r0 lLogWD
-                  evalExplicitUniWeight s0 lLogWD w0 o0
-                else s0
-              else
-                let r1 := b.refIdxL1.toNat
-                let p1Pic := l1Pics[r1]!
-                let s1 := LeanAV.H264InterDeblockDpb.h264LumaQpel p1Pic.yPlane
-                  (4 * Int.ofNat (x0L + dx) + b.mvL1.x) (4 * Int.ofNat (y0L + dy) + b.mvL1.y)
-                if hasPredWeightTable then
-                  let (w1, o1) := lookupLumaWeightOffset pwt.l1Weights r1 lLogWD
-                  evalExplicitUniWeight s1 lLogWD w1 o1
-                else s1
-            predY := predY.set! ((ry * 4 + dy) * 16 + (rx * 4 + dx)) vL
-        for dy in [:2] do
-          for dx in [:2] do
-            let cx := Int.ofNat (x0C + dx)
-            let cy := Int.ofNat (y0C + dy)
-            let (vU, vV) : UInt8 × UInt8 :=
-              if use0 && use1 then
-                let r0 := b.refIdxL0.toNat
-                let r1 := b.refIdxL1.toNat
-                let p0Pic := l0Pics[r0]!
-                let p1Pic := l1Pics[r1]!
-                let u0 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p0Pic.uPlane cx cy b.mvL0.x b.mvL0.y
-                let u1 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p1Pic.uPlane cx cy b.mvL1.x b.mvL1.y
-                let v0 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p0Pic.vPlane cx cy b.mvL0.x b.mvL0.y
-                let v1 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p1Pic.vPlane cx cy b.mvL1.x b.mvL1.y
-                if hasPredWeightTable then
-                  let ((wu0, ou0), (wv0, ov0)) := lookupChromaWeightOffset pwt.l0Weights r0 cLogWD
-                  let ((wu1, ou1), (wv1, ov1)) := lookupChromaWeightOffset pwt.l1Weights r1 cLogWD
-                  (evalExplicitBiWeight u0 u1 cLogWD wu0 ou0 wu1 ou1,
-                   evalExplicitBiWeight v0 v1 cLogWD wv0 ov0 wv1 ov1)
-                else if useImpBi then
-                  (LeanAV.H264InterDeblockDpb.implicitWeightedBiPredPixel u0 u1 currPoc p0Pic.poc p1Pic.poc,
-                   LeanAV.H264InterDeblockDpb.implicitWeightedBiPredPixel v0 v1 currPoc p0Pic.poc p1Pic.poc)
-                else
-                  (LeanAV.H264InterDeblockDpb.biPredSample u0 u1,
-                   LeanAV.H264InterDeblockDpb.biPredSample v0 v1)
-              else if use0 then
-                let r0 := b.refIdxL0.toNat
-                let p0Pic := l0Pics[r0]!
-                let u0 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p0Pic.uPlane cx cy b.mvL0.x b.mvL0.y
-                let v0 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p0Pic.vPlane cx cy b.mvL0.x b.mvL0.y
-                if hasPredWeightTable then
-                  let ((wu0, ou0), (wv0, ov0)) := lookupChromaWeightOffset pwt.l0Weights r0 cLogWD
-                  (evalExplicitUniWeight u0 cLogWD wu0 ou0, evalExplicitUniWeight v0 cLogWD wv0 ov0)
-                else (u0, v0)
-              else
-                let r1 := b.refIdxL1.toNat
-                let p1Pic := l1Pics[r1]!
-                let u1 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p1Pic.uPlane cx cy b.mvL1.x b.mvL1.y
-                let v1 := LeanAV.H264InterDeblockDpb.h264ChromaOpel420 p1Pic.vPlane cx cy b.mvL1.x b.mvL1.y
-                if hasPredWeightTable then
-                  let ((wu1, ou1), (wv1, ov1)) := lookupChromaWeightOffset pwt.l1Weights r1 cLogWD
-                  (evalExplicitUniWeight u1 cLogWD wu1 ou1, evalExplicitUniWeight v1 cLogWD wv1 ov1)
-                else (u1, v1)
-            let cOff := (ry * 2 + dy) * 8 + (rx * 2 + dx)
-            predU := predU.set! cOff vU
-            predV := predV.set! cOff vV
-  guard predOk
-  if mb.isSkip || mb.cbp == 0 then
-    some ({ y := predY, u := predU, v := predV }, Array.replicate 16 false)
-  else
-    let qp := LeanAV.H264IntraTransform.clampQp qpY
-    let qpcCb := LeanAV.H264IntraTransform.qpcFromQpy qp cqpOff
-    let qpcCr := LeanAV.H264IntraTransform.qpcFromQpy qp secCqpOff
-    let mut recY := predY
-    let mut hasCoeff := Array.replicate 16 false
-    if mb.transform8x8 != 0 then
-      for i8 in [:4] do
-        let xO := (i8 % 2) * 8
-        let yO := (i8 / 2) * 8
-        let scan64 :=
-          if (mb.cbp &&& (1 <<< i8)) != 0 then mb.luma8x8.getD i8 (Array.replicate 64 0)
-          else Array.replicate 64 0
-        let nz := (mb.cbp &&& (1 <<< i8)) != 0 && anyNonZeroInt scan64 64
-        for dy in [:2] do
-          for dx in [:2] do
-            hasCoeff := hasCoeff.set! ((yO / 4 + dy) * 4 + (xO / 4 + dx)) nz
-        if nz then
-          let p64 := LeanAV.H264IntraTransform.extractMbBlock8 recY xO yO
-          let r64 := LeanAV.H264IntraTransform.reconstructSubblock8Idct p64
-            (LeanAV.H264Entropy.zigzagToRaster8x8 scan64) qp
-          recY := LeanAV.H264IntraTransform.writeMbBlock8 recY xO yO r64
-    else
-      for b in [:16] do
-        let (xO, yO) := LeanAV.H264IntraTransform.zScan4BlkCoord b
-        let i8 := b / 4
-        let scan16 :=
-          if (mb.cbp &&& (1 <<< i8)) != 0 then mb.lumaAcOr4x4.getD b (Array.replicate 16 0)
-          else Array.replicate 16 0
-        let nz := (mb.cbp &&& (1 <<< i8)) != 0 && anyNonZeroInt scan16 16
-        hasCoeff := hasCoeff.set! ((yO / 4) * 4 + (xO / 4)) nz
-        if nz then
-          let p16 := LeanAV.H264IntraTransform.extractMbBlock4 recY xO yO
-          let r16 := LeanAV.H264IntraTransform.reconstructSubblock4Idct p16
-            (LeanAV.H264Entropy.zigzagToRaster4x4 scan16) qp
-          recY := LeanAV.H264IntraTransform.writeMbBlock4 recY xO yO r16
-    let hasCdc := (mb.cbp &&& 0x30) != 0
-    let hasCac := (mb.cbp &&& 0x20) != 0
-    let uDc4 := if hasCdc then mb.chromaDc.getD 0 (Array.replicate 4 0) else Array.replicate 4 0
-    let vDc4 := if hasCdc then mb.chromaDc.getD 1 (Array.replicate 4 0) else Array.replicate 4 0
-    let uAc4 := Array.ofFn fun i : Fin 4 =>
-      if hasCac then ac15ScanToRaster16 (mb.chromaAc.getD i.val #[]) else Array.replicate 16 0
-    let vAc4 := Array.ofFn fun i : Fin 4 =>
-      if hasCac then ac15ScanToRaster16 (mb.chromaAc.getD (4 + i.val) #[]) else Array.replicate 16 0
-    let recU :=
-      if hasCdc || hasCac then LeanAV.H264IntraTransform.reconstructChroma8x8Lossy predU uDc4 uAc4 qpcCb
-      else predU
-    let recV :=
-      if hasCdc || hasCac then LeanAV.H264IntraTransform.reconstructChroma8x8Lossy predV vDc4 vAc4 qpcCr
-      else predV
-    some ({ y := recY, u := recU, v := recV }, hasCoeff)
-
-/-! ## Normative Macroblock Deblocking Filter (Luma + Chroma 4:2:0) -/
-
-private def blkRefMvDiffGe4 (pBlk qBlk : InprocDecodedBlk4) : Bool :=
-  let u0P := pBlk.refPicUidL0
-  let u1P := pBlk.refPicUidL1
-  let u0Q := qBlk.refPicUidL0
-  let u1Q := qBlk.refPicUidL1
-  let mvDiff (a b : LeanAV.H264InterDeblockDpb.MotionVec) : Bool :=
-    (a.x - b.x).natAbs ≥ 4 || (a.y - b.y).natAbs ≥ 4
-  if u0P == u0Q && u1P == u1Q then
-    if u0P.isSome && u0P == u1P then
-      (mvDiff pBlk.mvL0 qBlk.mvL0 || mvDiff pBlk.mvL1 qBlk.mvL1) &&
-      (mvDiff pBlk.mvL0 qBlk.mvL1 || mvDiff pBlk.mvL1 qBlk.mvL0)
-    else
-      (u0P.isSome && mvDiff pBlk.mvL0 qBlk.mvL0) ||
-      (u1P.isSome && mvDiff pBlk.mvL1 qBlk.mvL1)
-  else if u0P == u1Q && u1P == u0Q then
-    (u0P.isSome && mvDiff pBlk.mvL0 qBlk.mvL1) ||
-    (u1P.isSome && mvDiff pBlk.mvL1 qBlk.mvL0)
-  else
-    true
-
-private def computeBlkEdgeBs (isMbEdge : Bool) (pBlk qBlk : InprocDecodedBlk4) : Nat :=
-  LeanAV.H264InterDeblockDpb.bSFromFlags
-    isMbEdge pBlk.isIntra qBlk.isIntra pBlk.hasCoeff qBlk.hasCoeff
-    (blkRefMvDiffGe4 pBlk qBlk)
-
-private def deblockChromaVertEdge2
-    (p : Plane2D) (edgeXC yStartC count bS : Nat) (qPavC aOff bOff : Int) : Plane2D := Id.run do
-  if edgeXC < 2 || edgeXC + 2 > p.width then return p
-  let mut dst := p
-  for i in [:count] do
-    let y := yStartC + i
-    if y < dst.height then
-      let p1 := dst.getPixel y (edgeXC - 2)
-      let p0 := dst.getPixel y (edgeXC - 1)
-      let q0 := dst.getPixel y edgeXC
-      let q1 := dst.getPixel y (edgeXC + 1)
-      let (np0, nq0) := LeanAV.H264InterDeblockDpb.filterChromaSamples4 p1 p0 q0 q1 bS qPavC aOff bOff
-      dst := dst.setPixel y (edgeXC - 1) np0
-      dst := dst.setPixel y edgeXC nq0
-  return dst
-
-private def deblockChromaHorizEdge2
-    (p : Plane2D) (xStartC edgeYC count bS : Nat) (qPavC aOff bOff : Int) : Plane2D := Id.run do
-  if edgeYC < 2 || edgeYC + 2 > p.height then return p
-  let mut dst := p
-  for i in [:count] do
-    let x := xStartC + i
-    if x < dst.width then
-      let p1 := dst.getPixel (edgeYC - 2) x
-      let p0 := dst.getPixel (edgeYC - 1) x
-      let q0 := dst.getPixel edgeYC x
-      let q1 := dst.getPixel (edgeYC + 1) x
-      let (np0, nq0) := LeanAV.H264InterDeblockDpb.filterChromaSamples4 p1 p0 q0 q1 bS qPavC aOff bOff
-      dst := dst.setPixel (edgeYC - 1) x np0
-      dst := dst.setPixel edgeYC x nq0
-  return dst
-
-structure InprocMbDeblockMeta where
-  sliceId      : Int := -1
-  qpY          : Nat := 26
-  is8x8        : Bool := false
-  disableIdc   : Nat := 1
-  alphaOffDiv2 : Int := 0
-  betaOffDiv2  : Int := 0
-  cqpOff       : Int := 0
-  secCqpOff    : Int := 0
-  deriving Repr, DecidableEq, Inhabited
-
-private def deblockDecodedPicture
-    (pY0 pU0 pV0 : Plane2D)
-    (colGrid : Array InprocDecodedBlk4)
-    (mbMeta : Array InprocMbDeblockMeta)
-    (mbsW mbsH : Nat) : Plane2D × Plane2D × Plane2D := Id.run do
-  let gridW4 := mbsW * 4
-  let mut pY := pY0
-  let mut pU := pU0
-  let mut pV := pV0
-  for mbY in [:mbsH] do
-    for mbX in [:mbsW] do
-      let curIdx := mbY * mbsW + mbX
-      let mQ := mbMeta.getD curIdx {}
-      if mQ.sliceId ≥ 0 && mQ.disableIdc != 1 && mQ.disableIdc < 3 then
-        let aOff := mQ.alphaOffDiv2
-        let bOff := mQ.betaOffDiv2
-        for kx in ([0, 4, 8, 12] : List Nat) do
-          let edgeX := mbX * 16 + kx
-          let isMb := kx == 0
-          let mP := if isMb && mbX > 0 then mbMeta.getD (mbY * mbsW + (mbX - 1)) mQ else mQ
-          let isSlice := isMb && (mbX == 0 || mP.sliceId != mQ.sliceId)
-          if edgeX > 0 && !(mQ.disableIdc == 2 && isSlice) &&
-             !(LeanAV.H264InterDeblockDpb.skipInternalEdge8x8 mQ.is8x8 kx) then
-            let qPavL : Int := Int.ofNat ((mP.qpY + mQ.qpY + 1) / 2)
-            let qpCbP := LeanAV.H264IntraTransform.qpcFromQpy mP.qpY mP.cqpOff
-            let qpCbQ := LeanAV.H264IntraTransform.qpcFromQpy mQ.qpY mQ.cqpOff
-            let qpCrP := LeanAV.H264IntraTransform.qpcFromQpy mP.qpY mP.secCqpOff
-            let qpCrQ := LeanAV.H264IntraTransform.qpcFromQpy mQ.qpY mQ.secCqpOff
-            let qPavCb : Int := Int.ofNat ((qpCbP + qpCbQ + 1) / 2)
-            let qPavCr : Int := Int.ofNat ((qpCrP + qpCrQ + 1) / 2)
-            let gxQ := mbX * 4 + kx / 4
-            for blkRow in [:4] do
-              let gy := mbY * 4 + blkRow
-              let pBlk := colGrid.getD (gy * gridW4 + (gxQ - 1)) {}
-              let qBlk := colGrid.getD (gy * gridW4 + gxQ) {}
-              let bS := computeBlkEdgeBs isMb pBlk qBlk
-              if bS > 0 then
-                pY := LeanAV.H264InterDeblockDpb.deblockVertEdge4
-                        pY edgeX (mbY * 16 + blkRow * 4) 4 bS qPavL aOff bOff
-                if kx == 0 || kx == 8 then
-                  let edgeXC := mbX * 8 + kx / 2
-                  pU := deblockChromaVertEdge2 pU edgeXC (mbY * 8 + blkRow * 2) 2 bS qPavCb aOff bOff
-                  pV := deblockChromaVertEdge2 pV edgeXC (mbY * 8 + blkRow * 2) 2 bS qPavCr aOff bOff
-        for ky in ([0, 4, 8, 12] : List Nat) do
-          let edgeY := mbY * 16 + ky
-          let isMb := ky == 0
-          let mP := if isMb && mbY > 0 then mbMeta.getD ((mbY - 1) * mbsW + mbX) mQ else mQ
-          let isSlice := isMb && (mbY == 0 || mP.sliceId != mQ.sliceId)
-          if edgeY > 0 && !(mQ.disableIdc == 2 && isSlice) &&
-             !(LeanAV.H264InterDeblockDpb.skipInternalEdge8x8 mQ.is8x8 ky) then
-            let qPavL : Int := Int.ofNat ((mP.qpY + mQ.qpY + 1) / 2)
-            let qpCbP := LeanAV.H264IntraTransform.qpcFromQpy mP.qpY mP.cqpOff
-            let qpCbQ := LeanAV.H264IntraTransform.qpcFromQpy mQ.qpY mQ.cqpOff
-            let qpCrP := LeanAV.H264IntraTransform.qpcFromQpy mP.qpY mP.secCqpOff
-            let qpCrQ := LeanAV.H264IntraTransform.qpcFromQpy mQ.qpY mQ.secCqpOff
-            let qPavCb : Int := Int.ofNat ((qpCbP + qpCbQ + 1) / 2)
-            let qPavCr : Int := Int.ofNat ((qpCrP + qpCrQ + 1) / 2)
-            let gyQ := mbY * 4 + ky / 4
-            for blkCol in [:4] do
-              let gx := mbX * 4 + blkCol
-              let pBlk := colGrid.getD ((gyQ - 1) * gridW4 + gx) {}
-              let qBlk := colGrid.getD (gyQ * gridW4 + gx) {}
-              let bS := computeBlkEdgeBs isMb pBlk qBlk
-              if bS > 0 then
-                pY := LeanAV.H264InterDeblockDpb.deblockHorizEdge4
-                        pY (mbX * 16 + blkCol * 4) edgeY 4 bS qPavL aOff bOff
-                if ky == 0 || ky == 8 then
-                  let edgeYC := mbY * 8 + ky / 2
-                  pU := deblockChromaHorizEdge2 pU (mbX * 8 + blkCol * 2) edgeYC 2 bS qPavCb aOff bOff
-                  pV := deblockChromaHorizEdge2 pV (mbX * 8 + blkCol * 2) edgeYC 2 bS qPavCr aOff bOff
-  return (pY, pU, pV)
-
-/-! ## POC, Reference List Modification, MMCO & Access-Unit Picture Decoder -/
-
-private def syntaxModOpsToDpb
-    (ops : Array LeanAV.H264Syntax.RefPicListModOp)
-    : List LeanAV.H264InterDeblockDpb.RefListModOp :=
-  (ops.toList.map fun op =>
-    match op.modificationOfPicNumsIdc.toNat with
-    | 0 => LeanAV.H264InterDeblockDpb.RefListModOp.subPicNum op.param.toNat
-    | 1 => LeanAV.H264InterDeblockDpb.RefListModOp.addPicNum op.param.toNat
-    | 2 => LeanAV.H264InterDeblockDpb.RefListModOp.longTermPic op.param.toNat
-    | _ => LeanAV.H264InterDeblockDpb.RefListModOp.endLoop) ++
-  [LeanAV.H264InterDeblockDpb.RefListModOp.endLoop]
-
-private def syntaxMmcoOpsToDpb
-    (ops : Array LeanAV.H264Syntax.MmcoOp)
-    : Option (List LeanAV.H264InterDeblockDpb.MmcoOp) := do
-  let mut out : List LeanAV.H264InterDeblockDpb.MmcoOp := []
-  for op in ops do
-    match op.opcode.toNat with
-    | 1 => out := out ++ [.markShortUnused op.arg0.toNat]
-    | 2 => out := out ++ [.markLongUnused op.arg0.toNat]
-    | 3 => out := out ++ [.assignLongTermIdx op.arg0.toNat op.arg1.toNat]
-    | 4 => out := out ++ [.setMaxLongTermIdxPlus1 op.arg0.toNat]
-    | 5 => out := out ++ [.markAllUnused]
-    | 6 => out := out ++ [.markCurrLongTerm op.arg0.toNat]
-    | _ => none
+private def picsHbdToVideoFrames
+    (pics : Array LeanAV.H264InterDeblockDpb.H264PictureHbd) : Option (Array VideoFrame) := do
+  let mut out : Array VideoFrame := Array.mkEmpty pics.size
+  for p in pics do
+    let vf ← LeanAV.H264IntraTransform.pictureHbdToYuv420pVideoFrame p
+    out := out.push vf
   some out
 
-private def computePicturePoc
-    (sps : LeanAV.H264Syntax.H264SpsFull)
-    (sh : LeanAV.H264Syntax.H264SliceHeaderFull)
-    (ps : InprocPocState) : Int × InprocPocState :=
-  let isIdr := sh.nalUnitType == 5
-  let isRef := sh.nalRefIdc != 0
-  let hasMmco5 :=
-    isRef && !isIdr && sh.adaptiveRefPicMarkingModeFlag &&
-    sh.mmcoOps.any (fun op => op.opcode == 5)
-  let log2MaxFn := sps.log2MaxFrameNumMinus4.toNat + 4
-  let fn := sh.frameNum.toNat
-  if sps.picOrderCntType == 0 then
-    let log2MaxLsb := sps.log2MaxPicOrderCntLsbMinus4.toNat + 4
-    let lsb := sh.picOrderCntLsb.toNat
-    let (poc, msb, _) :=
-      LeanAV.H264InterDeblockDpb.derivePocType0
-        isIdr ps.prevHasMmco5 false false false
-        lsb log2MaxLsb sh.deltaPicOrderCntBottom.toInt
-        ps.prevPocMsb ps.prevPocLsb
-    let nextPs : InprocPocState :=
-      if isRef then
-        { prevPocMsb := if hasMmco5 then 0 else msb
-          prevPocLsb := if hasMmco5 then 0 else Int.ofNat lsb
-          prevFrameNum := if hasMmco5 then 0 else fn
-          prevFrameNumOffset := 0
-          prevHasMmco5 := hasMmco5 }
-      else
-        { ps with prevFrameNum := fn, prevHasMmco5 := false }
-    (poc, nextPs)
-  else if sps.picOrderCntType == 1 then
-    let offArr := sps.offsetForRefFrame.map (fun v => v.toInt)
-    let (poc, fnOff) :=
-      LeanAV.H264InterDeblockDpb.derivePocType1
-        isIdr isRef ps.prevHasMmco5 false false
-        fn log2MaxFn ps.prevFrameNumOffset ps.prevFrameNum
-        sps.offsetForNonRefPic.toInt sps.offsetForTopToBottomField.toInt
-        offArr sh.deltaPicOrderCnt0.toInt sh.deltaPicOrderCnt1.toInt
-    let nextPs : InprocPocState :=
-      { ps with
-        prevFrameNum := if hasMmco5 then 0 else fn
-        prevFrameNumOffset := if hasMmco5 then 0 else fnOff
-        prevHasMmco5 := hasMmco5 }
-    (poc, nextPs)
-  else
-    let (poc, fnOff) :=
-      LeanAV.H264InterDeblockDpb.derivePocType2
-        isIdr isRef ps.prevHasMmco5 fn log2MaxFn
-        ps.prevFrameNumOffset ps.prevFrameNum
-    let nextPs : InprocPocState :=
-      { ps with
-        prevFrameNum := if hasMmco5 then 0 else fn
-        prevFrameNumOffset := if hasMmco5 then 0 else fnOff
-        prevHasMmco5 := hasMmco5 }
-    (poc, nextPs)
+private def decodeAccessUnitNalusHbd
+    (st0 : LeanAV.H264IntraTransform.HbdDecoderState) (nalus : Array ByteArray) (dstW dstH audioCh : Nat)
+    : Option (LeanAV.H264IntraTransform.HbdDecoderState × Array VideoFrame) := do
+  let chk := fun sps pps =>
+    let scope := buildScopeForSpsPps sps pps dstW dstH audioCh LeanAV.Encoder.inprocRingDefaultCap
+    inprocTranscodeGateSpec.gate scope
+  let (stNext, emittedPics) ← LeanAV.H264IntraTransform.decodeHbdAccessUnitNalusChecked st0 nalus (some chk)
+  let emittedFrames ← picsHbdToVideoFrames emittedPics
+  some (stNext, emittedFrames)
 
-private def collectEmittedAndPrune
-    (dpbBefore dpbAfter : LeanAV.H264InterDeblockDpb.H264Dpb)
-    (storedPics : Array InprocStoredPic)
-    (emittedUids0 : Array Nat)
-    : Option (Array VideoFrame × Array InprocStoredPic × Array Nat) := do
-  let newLogCount := dpbAfter.outputPocLog.length - dpbBefore.outputPocLog.length
-  let mut frames : Array VideoFrame := #[]
-  let mut emitted := emittedUids0
-  if newLogCount > 0 then
-    let mut cands : List InprocStoredPic := []
-    for sp in storedPics do
-      if !emitted.contains sp.uid then
-        let stillNeedsOut := dpbAfter.entries.any (fun e => e.uid == sp.uid && e.neededForOut)
-        if !stillNeedsOut then
-          cands := cands ++ [sp]
-    let sortedCands :=
-      (cands.toArray.qsort (fun a b =>
-        if a.poc != b.poc then a.poc < b.poc else a.uid < b.uid)).toList
-    for sp in sortedCands.take newLogCount do
-      let vf ← storedPicToVideoFrame sp
-      frames := frames.push vf
-      emitted := emitted.push sp.uid
-  let liveStored := storedPics.filter fun sp =>
-    dpbAfter.entries.any (fun e => e.uid == sp.uid &&
-      (LeanAV.H264InterDeblockDpb.isUsedForRef e || e.neededForOut))
-  some (frames, liveStored, emitted)
-
-private def resolveDpbRefsToStored
-    (refEntries : List LeanAV.H264InterDeblockDpb.DpbPicture)
-    (storedPics : Array InprocStoredPic) : Option (Array InprocStoredPic) := do
-  let mut out : Array InprocStoredPic := Array.mkEmpty refEntries.length
-  for e in refEntries do
-    let sp ← findStoredPic storedPics e.uid
-    let isLt := LeanAV.H264InterDeblockDpb.isLongTermRef e
-    out := out.push { sp with poc := e.poc, isLongTerm := isLt }
-  some out
-
-private def decodeAccessUnitNalus
-    (st0 : InprocDecoderState) (nalus : Array ByteArray) (dstW dstH audioCh : Nat)
-    : Option (InprocDecoderState × Array VideoFrame) := do
-  let mut st := st0
-  let mut vclNals : Array ByteArray := #[]
-  for nal in nalus do
-    guard (nal.data.size > 0)
-    let hdr := nal.data.getD 0 0
-    guard ((hdr &&& 0x80) == 0)
-    let nalType := (hdr &&& 0x1F).toNat
-    if nalType == 7 then
-      let stNext ← registerSpsNalu st nal
-      st := stNext
-    else if nalType == 8 then
-      let stNext ← registerPpsNalu st nal
-      st := stNext
-    else if nalType == 1 || nalType == 5 then
-      vclNals := vclNals.push nal
-    else
-      guard (nalType != 2 && nalType != 3 && nalType != 4 && nalType != 19)
-  if vclNals.isEmpty then
-    some (st, #[])
-  else
-    let firstNal := vclNals[0]!
-    let rbsp0 := LeanAV.H264Entropy.stripNalEmulationBytes firstNal
-    let entSpsArr := st.spsTable.map (fun o => o.map (·.ent))
-    let entPpsArr := st.ppsTable.map (fun o => o.map (·.ent))
-    let (shEnt0, _) ← LeanAV.H264Entropy.parseSliceHeaderFull rbsp0 entSpsArr entPpsArr
-    let ppsPair0 ← st.ppsTable.getD shEnt0.ppsId none
-    let spsPair0 ← st.spsTable.getD ppsPair0.syn.spsId.toNat none
-    let sps := spsPair0.syn
-    let scope := buildScopeForSpsPps sps ppsPair0.syn dstW dstH audioCh LeanAV.Encoder.inprocRingDefaultCap
-    if !inprocTranscodeGateSpec.gate scope then
-      none
-    else
-      let shSyn0 ← LeanAV.H264Syntax.parseH264SliceHeaderFull (ByteSlice.ofByteArray firstNal) sps ppsPair0.syn
-      if shSyn0.redundantPicCnt != 0 then
-        none
-      else
-        let mbsW := sps.picWidthInMbsMinus1.toNat + 1
-        let mbsH := sps.picHeightInMapUnitsMinus1.toNat + 1
-        let totalMbs := mbsW * mbsH
-        let gridW4 := mbsW * 4
-        let gridH4 := mbsH * 4
-        let maxFn := 1 <<< (sps.log2MaxFrameNumMinus4.toNat + 4)
-        let maxRefs := Nat.max 1 sps.maxNumRefFrames.toNat
-        if !st.dpbInit then
-          st := {
-            st with
-            dpb := {
-              maxRefFrames := sps.maxNumRefFrames.toNat
-              maxDpbCapacity := Nat.max 16 (maxRefs + 2)
-              maxFrameNum := maxFn
-            }
-            dpbInit := true
-          }
-        let (currPoc, nextPocState) := computePicturePoc sps shSyn0 st.pocState
-        let mut pY := Plane2D.alloc (mbsW * 16) (mbsH * 16) (mbsW * 16) 128
-        let mut pU := Plane2D.alloc (mbsW * 8) (mbsH * 8) (mbsW * 8) 128
-        let mut pV := Plane2D.alloc (mbsW * 8) (mbsH * 8) (mbsW * 8) 128
-        let mut colGrid : Array InprocDecodedBlk4 := Array.replicate (gridW4 * gridH4) {}
-        let mut intraModeGrid : Array Nat := Array.replicate (gridW4 * gridH4) 2
-        let mut blkSliceIds : Array Int := Array.replicate (gridW4 * gridH4) (-1)
-        let mut blkIsIntra : Array Bool := Array.replicate (gridW4 * gridH4) false
-        let mut mbSliceIds : Array Int := Array.replicate totalMbs (-1)
-        let mut mbIsIntra : Array Bool := Array.replicate totalMbs false
-        let mut mbMeta : Array InprocMbDeblockMeta := Array.replicate totalMbs {}
-        let mut coveredMbs : Nat := 0
-        for sIdx in [:vclNals.size] do
-          let sNal := vclNals[sIdx]!
-          let sRbsp := LeanAV.H264Entropy.stripNalEmulationBytes sNal
-          let (shEnt, bitStart) ← LeanAV.H264Entropy.parseSliceHeaderFull sRbsp entSpsArr entPpsArr
-          let ppsPair ← st.ppsTable.getD shEnt.ppsId none
-          guard (ppsPair.syn.spsId == sps.spsId)
-          let pps := ppsPair.syn
-          let sliceScope := buildScopeForSpsPps sps pps dstW dstH audioCh LeanAV.Encoder.inprocRingDefaultCap
-          guard (inprocTranscodeGateSpec.gate sliceScope)
-          let shSyn ← LeanAV.H264Syntax.parseH264SliceHeaderFull (ByteSlice.ofByteArray sNal) sps pps
-          if shSyn.redundantPicCnt != 0 then
-            pure ()
-          else
-            guard ((shSyn.nalUnitType == 5) == (shSyn0.nalUnitType == 5) &&
-                   shSyn.frameNum == shSyn0.frameNum)
-            let mbs ←
-              if pps.entropyCodingModeFlag then
-                LeanAV.H264Entropy.decodeSliceCabac sRbsp shEnt bitStart spsPair0.ent ppsPair.ent
-              else
-                LeanAV.H264Entropy.decodeSliceCavlc sRbsp shEnt bitStart spsPair0.ent ppsPair.ent
-            let firstMb := shEnt.firstMbInSlice
-            guard (firstMb + mbs.size ≤ totalMbs)
-            let numL0 := shSyn.numRefIdxL0ActiveMinus1.toNat + 1
-            let numL1 := shSyn.numRefIdxL1ActiveMinus1.toNat + 1
-            let currFn := shSyn.frameNum.toNat
-            let (l0Dpb, l1Dpb) :=
-              if shSyn.sliceKind == .P then
-                let init0 := LeanAV.H264InterDeblockDpb.buildRefPicListP0 st.dpb currFn
-                  (Nat.max numL0 (st.dpb.entries.length + 1))
-                let mod0 :=
-                  if shSyn.refPicListModFlagL0 then
-                    LeanAV.H264InterDeblockDpb.applyRefPicListMod st.dpb init0 currFn numL0
-                      (syntaxModOpsToDpb shSyn.refPicListModL0)
-                  else init0.take numL0
-                (mod0, [])
-              else if shSyn.sliceKind == .B then
-                let maxPool := Nat.max (Nat.max numL0 numL1) (st.dpb.entries.length + 1)
-                let (init0, init1) :=
-                  LeanAV.H264InterDeblockDpb.buildRefPicListsB st.dpb currFn currPoc maxPool maxPool
-                let mod0 :=
-                  if shSyn.refPicListModFlagL0 then
-                    LeanAV.H264InterDeblockDpb.applyRefPicListMod st.dpb init0 currFn numL0
-                      (syntaxModOpsToDpb shSyn.refPicListModL0)
-                  else init0.take numL0
-                let mod1 :=
-                  if shSyn.refPicListModFlagL1 then
-                    LeanAV.H264InterDeblockDpb.applyRefPicListMod st.dpb init1 currFn numL1
-                      (syntaxModOpsToDpb shSyn.refPicListModL1)
-                  else init1.take numL1
-                (mod0, mod1)
-              else
-                ([], [])
-            let l0Pics ← resolveDpbRefsToStored l0Dpb st.storedPics
-            let l1Pics ← resolveDpbRefsToStored l1Dpb st.storedPics
-            let curSliceId := Int.ofNat sIdx
-            let mut curQpY : Int := shSyn.sliceQpY.toInt
-            for i in [:mbs.size] do
-              let mbIdx := firstMb + i
-              guard (mbSliceIds.getD mbIdx (-1) == -1)
-              let mb := mbs[i]!
-              let mbX := mbIdx % mbsW
-              let mbY := mbIdx / mbsW
-              let isIntraMb := mb.kind.isIntra
-              if mb.kind == .iPcm then
-                curQpY := 0
-              else if !mb.isSkip && (mb.kind == .i16x16 || mb.cbp != 0) then
-                curQpY := (curQpY + mb.mbQpDelta + 52).emod 52
-              let qpNat := curQpY.toNat
-              mbSliceIds := mbSliceIds.set! mbIdx curSliceId
-              mbIsIntra := mbIsIntra.set! mbIdx isIntraMb
-              for ry in [:4] do
-                for rx in [:4] do
-                  let gIdx := (mbY * 4 + ry) * gridW4 + (mbX * 4 + rx)
-                  blkSliceIds := blkSliceIds.set! gIdx curSliceId
-                  blkIsIntra := blkIsIntra.set! gIdx isIntraMb
-              let cqpOff := pps.chromaQpIndexOffset.toInt
-              let secCqpOff := pps.secondChromaQpIndexOffset.toInt
-              let (recMb, hasCoeff16) ←
-                if isIntraMb then do
-                  let nbrs := buildIntraMbNeighbors pY pU pV mbSliceIds mbIsIntra
-                    mbsW mbX mbY curSliceId pps.constrainedIntraPredFlag
-                  let (rm, modes', hc) ← reconstructDecodedIntraMb mb nbrs intraModeGrid
-                    blkSliceIds blkIsIntra gridW4 mbX mbY curSliceId
-                    pps.constrainedIntraPredFlag qpNat cqpOff secCqpOff
-                  intraModeGrid := modes'
-                  some (rm, hc)
-                else do
-                  for ry in [:4] do
-                    for rx in [:4] do
-                      intraModeGrid := intraModeGrid.set! ((mbY * 4 + ry) * gridW4 + (mbX * 4 + rx)) 2
-                  let cg' ← deriveInterMbMotionGrid mb shSyn.sliceKind colGrid blkSliceIds
-                    gridW4 gridH4 mbX mbY curSliceId currPoc
-                    shSyn.directSpatialMvPredFlag sps.direct8x8InferenceFlag l0Pics l1Pics
-                  colGrid := cg'
-                  reconstructDecodedInterMb mb colGrid gridW4 mbX mbY l0Pics l1Pics
-                    currPoc pps.weightedBipredIdc shSyn.hasPredWeightTable shSyn.predWeightTable
-                    qpNat cqpOff secCqpOff
-              pY := writeMbYToPlane pY mbX mbY recMb.y
-              pU := writeMbCToPlane pU mbX mbY recMb.u
-              pV := writeMbCToPlane pV mbX mbY recMb.v
-              for ry in [:4] do
-                for rx in [:4] do
-                  let gIdx := (mbY * 4 + ry) * gridW4 + (mbX * 4 + rx)
-                  let prevB := colGrid.getD gIdx {}
-                  colGrid := colGrid.set! gIdx {
-                    prevB with
-                    sliceId := sIdx
-                    isIntra := isIntraMb
-                    hasCoeff := hasCoeff16.getD (ry * 4 + rx) false
-                    refIdxL0 := if isIntraMb then -1 else prevB.refIdxL0
-                    mvL0 := if isIntraMb then ⟨0, 0⟩ else prevB.mvL0
-                    refPicUidL0 := if isIntraMb then none else prevB.refPicUidL0
-                    refIdxL1 := if isIntraMb then -1 else prevB.refIdxL1
-                    mvL1 := if isIntraMb then ⟨0, 0⟩ else prevB.mvL1
-                    refPicUidL1 := if isIntraMb then none else prevB.refPicUidL1
-                  }
-              mbMeta := mbMeta.set! mbIdx {
-                sliceId := curSliceId
-                qpY := qpNat
-                is8x8 := mb.transform8x8 != 0
-                disableIdc := shSyn.disableDeblockingFilterIdc.toNat
-                alphaOffDiv2 := shSyn.sliceAlphaC0OffsetDiv2.toInt
-                betaOffDiv2 := shSyn.sliceBetaOffsetDiv2.toInt
-                cqpOff := cqpOff
-                secCqpOff := secCqpOff
-              }
-              coveredMbs := coveredMbs + 1
-        guard (coveredMbs == totalMbs)
-        let (dY, dU, dV) := deblockDecodedPicture pY pU pV colGrid mbMeta mbsW mbsH
-        let (cropUnitX, cropUnitY) :=
-          LeanAV.H264Syntax.h264CropUnits sps.chromaFormatIdc sps.separateColourPlaneFlag sps.frameMbsOnlyFlag
-        let cropL := if sps.frameCroppingFlag then sps.frameCropLeftOffset.toNat * cropUnitX else 0
-        let cropT := if sps.frameCroppingFlag then sps.frameCropTopOffset.toNat * cropUnitY else 0
-        let picUid := st.dpb.nextUid
-        let hasMmco5 :=
-          shSyn0.nalRefIdc != 0 && shSyn0.nalUnitType != 5 &&
-          shSyn0.adaptiveRefPicMarkingModeFlag &&
-          shSyn0.mmcoOps.any (fun op => op.opcode == 5)
-        let effPoc := if hasMmco5 then 0 else currPoc
-        let mmcoList ← syntaxMmcoOpsToDpb shSyn0.mmcoOps
-        let storedPic : InprocStoredPic := {
-          uid := picUid
-          poc := effPoc
-          isLongTerm := shSyn0.nalUnitType == 5 && shSyn0.longTermReferenceFlag
-          yPlane := dY
-          uPlane := dU
-          vPlane := dV
-          cropLeft := cropL
-          cropTop := cropT
-          cropWidth := sps.widthPx.toNat
-          cropHeight := sps.heightPx.toNat
-          gridW4 := gridW4
-          gridH4 := gridH4
-          colGrid := colGrid
-        }
-        let storedWithCurr := st.storedPics.push storedPic
-        let dpbBefore := st.dpb
-        let dpbAfter :=
-          LeanAV.H264InterDeblockDpb.insertDecodedPicture
-            dpbBefore
-            (shSyn0.nalUnitType == 5)
-            shSyn0.noOutputOfPriorPicsFlag
-            shSyn0.longTermReferenceFlag
-            (shSyn0.nalRefIdc != 0)
-            shSyn0.frameNum.toNat
-            currPoc
-            shSyn0.adaptiveRefPicMarkingModeFlag
-            mmcoList
-            0
-        let (emittedFrames, liveStored, emittedUids') ←
-          collectEmittedAndPrune dpbBefore dpbAfter storedWithCurr st.emittedUids
-        let stNext : InprocDecoderState := {
-          st with
-          dpb := dpbAfter
-          storedPics := liveStored
-          emittedUids := emittedUids'
-          pocState := nextPocState
-        }
-        some (stNext, emittedFrames)
-
-private def flushDecoderFrames (st : InprocDecoderState) : Option (InprocDecoderState × Array VideoFrame) := do
-  if !st.dpbInit then
-    some (st, #[])
-  else
-    let dpbBefore := st.dpb
-    let dpbAfter := LeanAV.H264InterDeblockDpb.flushDpb dpbBefore
-    let (frames, liveStored, emittedUids') ←
-      collectEmittedAndPrune dpbBefore dpbAfter st.storedPics st.emittedUids
-    some ({ st with dpb := dpbAfter, storedPics := liveStored, emittedUids := emittedUids' }, frames)
+private def flushDecoderFramesHbd
+    (st : LeanAV.H264IntraTransform.HbdDecoderState)
+    : Option (LeanAV.H264IntraTransform.HbdDecoderState × Array VideoFrame) := do
+  let (stNext, flushedPics) ← LeanAV.H264IntraTransform.flushHbdDecoderPictures st
+  let flushedFrames ← picsHbdToVideoFrames flushedPics
+  some (stNext, flushedFrames)
 
 /-! ## CAVLC All-Intra H.264 Frame Re-Encoder -/
 
@@ -2054,13 +967,13 @@ def runInprocTranscodeWithProbeStatsIO
     return .error "inproc_scope_gate_rejected"
   let cap := probe.scope.ringCap
   let audioCh := probe.scope.audioChannels
-  let mut decInit : InprocDecoderState := {}
+  let mut decInit : LeanAV.H264IntraTransform.HbdDecoderState := {}
   for spsNal in probe.avcc.spsNalus do
-    match registerSpsNalu decInit spsNal with
+    match LeanAV.H264IntraTransform.registerHbdSps decInit spsNal with
     | none => return .error "inproc_avcc_sps_parse_failed"
     | some st' => decInit := st'
   for ppsNal in probe.avcc.ppsNalus do
-    match registerPpsNalu decInit ppsNal with
+    match LeanAV.H264IntraTransform.registerHbdPps decInit ppsNal with
     | none => return .error "inproc_avcc_pps_parse_failed"
     | some st' => decInit := st'
   let some (_, _, encSpsEnt, encPpsEnt, _, _, encAvccBody) :=
@@ -2083,7 +996,7 @@ def runInprocTranscodeWithProbeStatsIO
   let needScale := probe.dstW != probe.srcW || probe.dstH != probe.srcH
   let decChunksRes ← LeanAV.Encoder.runBoundedRingStageIO auList cap fun nalus => do
     let stCur ← decStateRef.get
-    match decodeAccessUnitNalus stCur nalus probe.dstW probe.dstH audioCh with
+    match decodeAccessUnitNalusHbd stCur nalus probe.dstW probe.dstH audioCh with
     | none => return .error "inproc_h264_decode_failed"
     | some (stNext, emitted) =>
       decStateRef.set stNext
@@ -2097,7 +1010,7 @@ def runInprocTranscodeWithProbeStatsIO
     | .error e => return .error e
     | .ok v => pure v
   let stAfterLoop ← decStateRef.get
-  let some (_, flushedFrames) := flushDecoderFrames stAfterLoop
+  let some (_, flushedFrames) := flushDecoderFramesHbd stAfterLoop
     | return .error "inproc_h264_dpb_flush_failed"
   let flushedScaled :=
     if needScale then
@@ -2197,43 +1110,45 @@ def decodeMp4AvcTrackToFrames
     let pps ← LeanAV.H264Syntax.parseH264PpsFull (ByteSlice.ofByteArray ppsNal) (some sps)
     let srcW := sps.widthPx.toNat
     let srcH := sps.heightPx.toNat
-    let scope := buildScopeForSpsPps sps pps srcW srcH 0 LeanAV.Encoder.inprocRingDefaultCap
-    if !inprocTranscodeGateSpec.gate scope then
+    if srcW % 2 != 0 || srcH % 2 != 0 then
       none
     else
-      let mut decSt : InprocDecoderState := {}
-      for sN in avcc.spsNalus do
-        let st' ← registerSpsNalu decSt sN
-        decSt := st'
-      for pN in avcc.ppsNalus do
-        let st' ← registerPpsNalu decSt pN
-        decSt := st'
-      let mut allFrames : Array VideoFrame := #[]
-      for s in video.samples do
-        let pkt := raw.extract s.fileOff (s.fileOff + s.byteLen)
-        let nalus ← LeanAV.H264Syntax.splitAvccPacket pkt nalLenSize
-        if nalus.isEmpty then none
-        let (stNext, emitted) ← decodeAccessUnitNalus decSt nalus srcW srcH 0
-        decSt := stNext
-        for vf in emitted do
-          allFrames := allFrames.push vf
-      let (_, flushed) ← flushDecoderFrames decSt
-      for vf in flushed do
-        allFrames := allFrames.push vf
-      if allFrames.isEmpty then none
+      let scope := buildScopeForSpsPps sps pps srcW srcH 0 LeanAV.Encoder.inprocRingDefaultCap
+      if !inprocTranscodeGateSpec.gate scope then
+        none
       else
-        let durs := deriveOutputVideoDurations video.samples allFrames.size
-        some (allFrames, durs, sps.levelIdc)
+        let mut decSt : LeanAV.H264IntraTransform.HbdDecoderState := {}
+        for sN in avcc.spsNalus do
+          let st' ← LeanAV.H264IntraTransform.registerHbdSps decSt sN
+          decSt := st'
+        for pN in avcc.ppsNalus do
+          let st' ← LeanAV.H264IntraTransform.registerHbdPps decSt pN
+          decSt := st'
+        let mut allFrames : Array VideoFrame := #[]
+        for s in video.samples do
+          let pkt := raw.extract s.fileOff (s.fileOff + s.byteLen)
+          let nalus ← LeanAV.H264Syntax.splitAvccPacket pkt nalLenSize
+          if nalus.isEmpty then none
+          let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt nalus srcW srcH 0
+          decSt := stNext
+          for vf in emitted do
+            allFrames := allFrames.push vf
+        let (_, flushed) ← flushDecoderFramesHbd decSt
+        for vf in flushed do
+          allFrames := allFrames.push vf
+        if allFrames.isEmpty then none
+        else
+          let durs := deriveOutputVideoDurations video.samples allFrames.size
+          some (allFrames, durs, sps.levelIdc)
 
 /-- Decode an Annex-B H.264 byte stream (`.h264`/`.264` or MPEG-TS PES payloads) into `yuv420p` `VideoFrame`s. -/
 def decodeAnnexBH264StreamToFrames (annexB : ByteArray) : Option (Array VideoFrame) := do
   let nals := LeanAV.H264Entropy.splitAnnexB annexB
   if nals.isEmpty then none
   else
-    let mut decSt : InprocDecoderState := {}
+    let mut decSt : LeanAV.H264IntraTransform.HbdDecoderState := {}
     let mut allFrames : Array VideoFrame := #[]
     let mut curVcl : Array ByteArray := #[]
-    let mut prevFirstMb? : Option Nat := none
     for nal in nals do
       if nal.size > 0 then
         let hdr := nal.data.getD 0 0
@@ -2244,35 +1159,32 @@ def decodeAnnexBH264StreamToFrames (annexB : ByteArray) : Option (Array VideoFra
             let sps0 ← (decSt.spsTable.findSome? id)
             let w := sps0.syn.widthPx.toNat
             let h := sps0.syn.heightPx.toNat
-            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt curVcl w h 0
             decSt := stNext
             for vf in emitted do allFrames := allFrames.push vf
             curVcl := #[]
-            prevFirstMb? := none
-          let st' ← registerSpsNalu decSt nal
+          let st' ← LeanAV.H264IntraTransform.registerHbdSps decSt nal
           decSt := st'
         else if nalType == 8 then
           if !curVcl.isEmpty then
             let sps0 ← (decSt.spsTable.findSome? id)
             let w := sps0.syn.widthPx.toNat
             let h := sps0.syn.heightPx.toNat
-            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt curVcl w h 0
             decSt := stNext
             for vf in emitted do allFrames := allFrames.push vf
             curVcl := #[]
-            prevFirstMb? := none
-          let st' ← registerPpsNalu decSt nal
+          let st' ← LeanAV.H264IntraTransform.registerHbdPps decSt nal
           decSt := st'
         else if nalType == 9 then
           if !curVcl.isEmpty then
             let sps0 ← (decSt.spsTable.findSome? id)
             let w := sps0.syn.widthPx.toNat
             let h := sps0.syn.heightPx.toNat
-            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt curVcl w h 0
             decSt := stNext
             for vf in emitted do allFrames := allFrames.push vf
             curVcl := #[]
-            prevFirstMb? := none
         else if nalType == 1 || nalType == 5 then
           let rbsp := LeanAV.H264Entropy.stripNalEmulationBytes nal
           let entSpsArr := decSt.spsTable.map (fun o => o.map (·.ent))
@@ -2282,23 +1194,22 @@ def decodeAnnexBH264StreamToFrames (annexB : ByteArray) : Option (Array VideoFra
             let sps0 ← (decSt.spsTable.findSome? id)
             let w := sps0.syn.widthPx.toNat
             let h := sps0.syn.heightPx.toNat
-            let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+            let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt curVcl w h 0
             decSt := stNext
             for vf in emitted do allFrames := allFrames.push vf
             curVcl := #[nal]
           else
             curVcl := curVcl.push nal
-          prevFirstMb? := some shEnt.firstMbInSlice
         else if nalType == 2 || nalType == 3 || nalType == 4 || nalType == 19 then
           none
     if !curVcl.isEmpty then
       let sps0 ← (decSt.spsTable.findSome? id)
       let w := sps0.syn.widthPx.toNat
       let h := sps0.syn.heightPx.toNat
-      let (stNext, emitted) ← decodeAccessUnitNalus decSt curVcl w h 0
+      let (stNext, emitted) ← decodeAccessUnitNalusHbd decSt curVcl w h 0
       decSt := stNext
       for vf in emitted do allFrames := allFrames.push vf
-    let (_, flushed) ← flushDecoderFrames decSt
+    let (_, flushed) ← flushDecoderFramesHbd decSt
     for vf in flushed do allFrames := allFrames.push vf
     if allFrames.isEmpty then none else some allFrames
 

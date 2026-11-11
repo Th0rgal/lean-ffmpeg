@@ -1,0 +1,143 @@
+{
+  "schema_version": "1.0",
+  "contract": "p1_1_hdr_highbitdepth_422_444_filmgrain",
+  "base_commit": "3f9055cfab9ef1ed2730cd34026c949a91e8af8a",
+  "campaign_branch": "campaign/p1-1-hdr-highbitdepth-20261106",
+  "global_invariants": {
+    "zero_lake": "Never invoke lake (lake build/env/exe/test/clean/update). Build exclusively via python3 scripts/build_turbo.py --direct-lean or python3 scripts/build_turbo.py with LEAN_PATH=.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean and TURBO_LEAN_EMIT_C=1.",
+    "zero_sorry_axioms": "0 sorryAx and 0 custom axioms across all LeanAV.* declarations ({propext, Classical.choice, Quot.sound} only).",
+    "tight_specs": "Every AVGateSpec in edited modules must pass turbo-lean --json audit-spec with 0 vacuous, 0 trivial, 0 shadowed.",
+    "zero_subprocess": "0 child process spawns (no ffmpeg/ffprobe execve in Lean or C).",
+    "signed_commits": "GPG-sign commits (git commit -S), never amend, never force-push, never use [skip ci]."
+  },
+  "canonical_raw_frame_layouts": {
+    "planar_8bit": {
+      "yuv420p": "Y (w*h) ++ U (((w+1)/2)*((h+1)/2)) ++ V (((w+1)/2)*((h+1)/2))",
+      "yuv422p": "Y (w*h) ++ U (((w+1)/2)*h) ++ V (((w+1)/2)*h)",
+      "yuv444p": "Y (w*h) ++ U (w*h) ++ V (w*h)"
+    },
+    "planar_u16le": {
+      "yuv420p10le": "LE u16 in [0,1023]: Y (2*w*h) ++ U (2*((w+1)/2)*((h+1)/2)) ++ V (2*((w+1)/2)*((h+1)/2))",
+      "yuv422p10le": "LE u16 in [0,1023]: Y (2*w*h) ++ U (2*((w+1)/2)*h) ++ V (2*((w+1)/2)*h)",
+      "yuv444p10le": "LE u16 in [0,1023]: Y (2*w*h) ++ U (2*w*h) ++ V (2*w*h)",
+      "yuv420p12le": "LE u16 in [0,4095]: Y (2*w*h) ++ U (2*((w+1)/2)*((h+1)/2)) ++ V (2*((w+1)/2)*((h+1)/2))",
+      "yuv422p12le": "LE u16 in [0,4095]: Y (2*w*h) ++ U (2*((w+1)/2)*h) ++ V (2*((w+1)/2)*h)",
+      "yuv444p12le": "LE u16 in [0,4095]: Y (2*w*h) ++ U (2*w*h) ++ V (2*w*h)",
+      "gbrp10le": "Planar G, B, R order (FFmpeg GBRP10LE), each plane 2*w*h LE u16 in [0,1023]"
+    },
+    "semi_planar_and_packed_u16le": {
+      "p010le": "Y plane 2*w*h LE u16 (sample10 <<< 6, low 6 bits 0) ++ interleaved UV plane 4*((w+1)/2)*((h+1)/2) LE u16 (U10 <<< 6, V10 <<< 6)",
+      "rgba64le": "Packed R, G, B, A 8*w*h bytes (four LE u16 in [0,65535] per pixel)"
+    }
+  },
+  "tracks": {
+    "track_a_pixfmt_hdr": {
+      "branch": "campaign/p1-1-track-a-pixfmt-hdr",
+      "owned_files": [
+        "LeanAV/Core.lean",
+        "LeanAV/Domain.lean",
+        "LeanAV/Scale.lean",
+        "LeanAV/Filter.lean",
+        "LeanAV/LavfiGraph.lean",
+        "LeanAV/LavfiGraphProofs.lean",
+        "tests/differential/test_p1_1_pixfmt_hdr.py"
+      ],
+      "deliverables": [
+        "Extend PixelFormat in Core.lean with p010le, yuv422p10le, yuv444p10le, yuv420p12le, yuv422p12le, yuv444p12le, gbrp10le, rgba64le plus parse/toString/bitDepth/chromaSubsampling/frameByteSize and Plane16 / HighBitFrame helpers without breaking existing Core.lean APIs.",
+        "Exact lossless/clamped conversions in Scale.lean among yuv420p10le <-> p010le (<<6 / >>6), yuv420p10le <-> yuv422p10le <-> yuv444p10le, 10-bit <-> 12-bit, BT.709/BT.2020 YUV444P10LE <-> gbrp10le <-> rgba64le, and 10/12-bit bilinear scaling for 4:2:0/4:2:2/4:4:4.",
+        "Ordered 4x4 Bayer dithering and Floyd-Steinberg [7,3,5,1]/16 error-diffusion dithering (10/12-bit -> 8-bit and 12-bit -> 10-bit) in Scale.lean with tight AVGateSpec bounds/determinism proofs.",
+        "SMPTE ST 2084 PQ EOTF/OETF and ARIB STD-B67 HLG OETF/OOTF/EOTF + BT.2020 <-> BT.709 gamut conversion in Scale.lean, wired into real LavfiGraph vfColorspace and vfTonemap execution (replacing the placeholder execVideoEq fallback in vfTonemap).",
+        "Differential tests against ffmpeg swscale/zscale/tonemap in tests/differential/test_p1_1_pixfmt_hdr.py."
+      ]
+    },
+    "track_b_av1": {
+      "branch": "campaign/p1-1-track-b-av1",
+      "owned_files": [
+        "LeanAV/Av1Main.lean",
+        "LeanAV/Av1MainProofs.lean",
+        "tests/differential/test_av1_main.py"
+      ],
+      "deliverables": [
+        "Expand AV1 sequence/frame admission and sample pipelines from 8-bit 4:2:0 to Main 10-bit (profile 0, hbd=1, 4:2:0), High 8/10-bit 4:4:4 (profile 1, subsampling 0/0), and Professional 8/10/12-bit 4:2:2 & 4:4:4 & 4:2:0 (profile 2, twelve_bit=0/1), preserving existing 8-bit Main entrypoints while adding high-bit-depth/chroma-generalized decode & encode entrypoints returning/accepting canonical raw ByteArray layouts and valid av1C config.",
+        "Bit-depth-generalize intra prediction, inter prediction/OBMC/warped/subpel, inverse & forward DCT/ADST/IDTX row/col bd clamp, deblock, CDEF (coeff_shift = bitDepth - 8), and Wiener/SGR loop restoration.",
+        "Implement full AV1 Spec §7.18.3 Film-Grain Synthesis (apply_grain): pseudo-random Gaussian sequence from grain_seed, autoregressive 64x64 luma & chroma grain block generation (ar_coeffs_y/cb/cr, ar_coeff_lag, ar_coeff_shift, grain_scale_shift), piecewise linear luma/chroma scaling LUT (num_y_points, num_cb_points, num_cr_points, cb_mult, cb_luma_mult, cb_offset, clip_to_restricted_range, chroma_scaling_from_luma), 32x32 block synthesis with overlap_flag blending, applied to output frames while keeping reference frame slots ungrained; support encoding film_grain_params OBU headers too.",
+        "Tight AVGateSpec theorems in Av1MainProofs.lean and zero-skip ffmpeg/libaom-av1 differential parity tests (Main10, High 4:4:4 10-bit, Prof 4:2:2 10/12-bit, and film-grain synthesis bit-exact/PSNR) in tests/differential/test_av1_main.py."
+      ]
+    },
+    "track_c_hevc": {
+      "branch": "campaign/p1-1-track-c-hevc",
+      "owned_files": [
+        "LeanAV/HevcMain.lean",
+        "LeanAV/HevcMainProofs.lean",
+        "tests/differential/test_hevc_main.py"
+      ],
+      "deliverables": [
+        "Expand HEVC SPS/PPS/hvcC/slice support from Main 8-bit 4:2:0 to Main 10 (profile 2, 10-bit 4:2:0) and Format Range Extensions / RExt (profile 4: Main 4:2:2 10, Main 4:4:4, Main 4:4:4 10, Main 12 / 12-bit 4:2:0/4:2:2/4:4:4), parsing sps_range_extension() and pps_range_extension() flags accurately.",
+        "Parameterize sample buffers (UInt16/Int32 planes), intra planar/DC/angular prediction (including 4:2:2 chroma angle mapping Table 8-4 and 4:4:4), 4x4..32x32 inverse/forward transforms & transform_skip with bitDepth shifts, inter luma/chroma fractional MC, deblocking (beta/tc << (bitDepth - 8)), SAO (band shift bitDepth - 5 and EO offsets), and conformance window cropping for 8/10/12-bit 4:2:0, 4:2:2, and 4:4:4; preserve all existing 8-bit Main function names/signatures while adding generalized decode/encode entrypoints and valid hvcC PTL generation.",
+        "Tight AVGateSpec theorems in HevcMainProofs.lean and fast (compact dimensions <= 64x48) zero-skip differential ffmpeg/libx265 decode & encode parity tests in tests/differential/test_hevc_main.py."
+      ]
+    },
+    "track_d_h264": {
+      "branch": "campaign/p1-1-track-d-h264",
+      "owned_files": [
+        "LeanAV/H264Syntax.lean",
+        "LeanAV/H264SyntaxProofs.lean",
+        "LeanAV/H264Entropy.lean",
+        "LeanAV/H264EntropyProofs.lean",
+        "LeanAV/H264IntraTransform.lean",
+        "LeanAV/H264IntraTransformProofs.lean",
+        "LeanAV/H264InterDeblockDpb.lean",
+        "LeanAV/H264InterDeblockDpbProofs.lean",
+        "LeanAV/InprocTranscode.lean",
+        "tests/differential/test_h264_syntax.py",
+        "tests/differential/test_h264_entropy.py",
+        "tests/differential/test_h264_reconstruct.py",
+        "tests/differential/test_inproc_transcode.py"
+      ],
+      "deliverables": [
+        "Preserve all existing public declarations in H264Entropy.lean and H264Syntax.lean imported by HevcMain.lean and LavfiGraph.lean.",
+        "Support H.264 High (100), High 10 (110), High 4:2:2 (122), and High 4:4:4 Predictive (244) in CAVLC & CABAC entropy (chroma_format_idc in {0,1,2,3}, 4:2:2 2x4 chroma DC + 8 chroma AC blocks, 4:4:4 16x16 chroma / separate_colour_plane_flag, bit_depth_luma_minus8 <= 4, bit_depth_chroma_minus8 <= 4, qpBdOffset = 6 * bit_depth_minus8, qpprime_y_zero_transform_bypass_flag, high-bit-depth I_PCM).",
+        "Parse and apply custom 4x4 & 8x8 SPS/PPS scaling matrices (seq_scaling_matrix_present_flag, pic_scaling_matrix_present_flag) with ITU-T H.264 Table 7-2 fallback rules in both inverse and forward quantization.",
+        "Bit-depth and chroma-format generalize 4x4/8x8 intra prediction, transforms (including transform_8x8_mode_flag and lossless bypass), inter MC, deblocking, DPB, and in-process decode/encode (including High10 / High422 / High444 avcC extension bytes).",
+        "Tight AVGateSpec theorems across *Proofs.lean and pixel-exact ffmpeg/libx264 differential tests (High custom scaling matrices, High 10, High 4:2:2 10-bit, High 4:4:4 Predictive 10-bit & lossless qp=0)."
+      ]
+    },
+    "track_e_containers_dovi": {
+      "branch": "campaign/p1-1-track-e-containers-dovi",
+      "owned_files": [
+        "LeanAV/Format.lean",
+        "LeanAV/Cli.lean",
+        "LeanAV/PlanIR.lean",
+        "tests/differential/test_p1_1_hdr_dovi_containers.py"
+      ],
+      "deliverables": [
+        "Preserve all existing public function signatures in Format.lean, Cli.lean, and PlanIR.lean.",
+        "Extend Cli.lean / PlanIR.lean pixel-format and HDR colorimetry flags (-pix_fmt yuv420p10le/p010le/yuv422p10le/yuv444p10le/yuv420p12le/yuv422p12le/yuv444p12le/gbrp10le/rgba64le, -color_primaries, -color_trc, -colorspace) without breaking existing standalone routing tests.",
+        "Implement HDR10 static metadata (SMPTE ST 2086 mdcv, CTA-861.3 clli, colr nclx BT.2020 PQ/HLG) demux + mux passthrough for both ISOBMFF (MP4/MOV) and Matroska/WebM (Colour, MasteringMetadata), plus high-bit-depth visual sample entry builders (avc1, hvc1/hev1, av01).",
+        "Implement Dolby Vision configuration & RPU metadata parsing, validation, and lossless passthrough in Format.lean: ISOBMFF dvcC / dvvC boxes (dv_version_major/minor, dv_profile, dv_level, rpu_present_flag, el_present_flag, bl_present_flag, dv_bl_signal_compatibility_id), Matroska BlockAdditionMapping (dvcC/dvvC), HEVC UNSPEC62 (nal_unit_type = 62) RPU NAL extraction/injection with RBSP unescaping & CRC32 validation, and AV1 METADATA_TYPE_ITUT_T35 (country_code 0xB5, provider_code 0x003B, provider_oriented_code 0x00000800) Dolby Vision RPU OBU extraction/injection.",
+        "Tight AVGateSpec theorems in Format.lean and PlanIR.lean plus differential ffprobe/ffmpeg tests in tests/differential/test_p1_1_hdr_dovi_containers.py."
+      ]
+    }
+  },
+  "wave_2_integration": {
+    "owned_files": [
+      "LeanAV/UnifiedPipeline.lean",
+      "LeanAV/Main.lean",
+      "LeanAV/H264IntraTransform.lean",
+      "LeanAV/HevcMain.lean",
+      "LeanAV/HevcMainProofs.lean",
+      "tests/differential/test_p1_1_e2e_pipeline.py",
+      "tests/differential/test_hevc_main.py",
+      "AGENTS.md",
+      "docs/VERIFICATION_APPENDIX.md",
+      "docs/CAMPAIGN_CLOSURE_DOSSIER.md",
+      ".github/workflows/ci.yml"
+    ],
+    "deliverables": [
+      "Merge Tracks A-E cleanly onto campaign/p1-1-hdr-highbitdepth-20261106.",
+      "Wire end-to-end multi-stream 10/12-bit, 4:2:2, 4:4:4, p010le, gbrp10le, rgba64le, dithering, BT.2020 PQ/HLG, HDR10 mdcv/clli, Dolby Vision RPU passthrough, and AV1 film-grain synthesis across UnifiedPipeline.lean and Main.lean.",
+      "Register new proof theorems in Main.lean #print axioms and sync declaration + tight-spec counters across docs and CI.",
+      "Pass all mechanical & zero-skip differential gates, obtain independent writer=false ACCEPT on exact signed HEAD + green Linux/macOS CI, and merge PR into origin/main."
+    ]
+  }
+}
