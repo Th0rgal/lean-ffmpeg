@@ -784,8 +784,9 @@ class TestAv1Main(unittest.TestCase):
                 if s.endswith((".o.export", ".a", "leanav_zero_exec_stub.o"))
                 and not s.endswith("/LeanAV/Main.c.o.export")
             ]
+            link_args = [] if sys.platform == "darwin" else ["-lpthread"]
             subprocess.run(
-                [str(leanc_bin), "-O2", "-o", str(driver_bin), str(c_file), *objects, "-lpthread"],
+                [str(leanc_bin), "-O2", "-o", str(driver_bin), str(c_file), *objects, *link_args],
                 cwd=ROOT, env=lean_env, check=True, capture_output=True, timeout=180,
             )
         except Exception:

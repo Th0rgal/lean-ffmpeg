@@ -2678,7 +2678,8 @@ def writeVpsGen (bitDepth chromaFormatIdc : Nat) : Option ByteArray := do
   some (packHevcNal nalVps 0 1 body)
 
 def writeSpsGen (width height log2Ctb bitDepth chromaFormatIdc : Nat)
-    (conf : Nat × Nat × Nat × Nat) : Option ByteArray := do
+    (conf : Nat × Nat × Nat × Nat)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) : Option ByteArray := do
   let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
   let subW := hevcSubWidthC.getD chromaFormatIdc 1
   let subH := hevcSubHeightC.getD chromaFormatIdc 1
@@ -2714,13 +2715,26 @@ def writeSpsGen (width height log2Ctb bitDepth chromaFormatIdc : Nat)
   w := (w.putUe 0).putBit 1
   w := w.putBit 0
   w := (w.putBit 1).putBit 1
+  match vuiColour? with
+  | some (cp, tc, mc) =>
+    w := w.putBit 1
+    w := (w.putBit 0).putBit 0
+    w := w.putBit 1
+    w := (w.putBits 5 3).putBit 0
+    w := w.putBit 1
+    w := ((w.putBits (cp &&& 0xFF) 8).putBits (tc &&& 0xFF) 8).putBits (mc &&& 0xFF) 8
+    w := w.putBit 0
+    w := w.putBits 0 3
+    w := ((w.putBit 0).putBit 0).putBit 0
+  | none =>
+    w := w.putBit 0
   if prof == 4 then
-    w := (w.putBit 0).putBit 1
+    w := w.putBit 1
     w := (((w.putBit 1).putBit 0).putBit 0).putBit 0
     w := w.putBits 0 4
     w := w.putBits 0 9
   else
-    w := (w.putBit 0).putBit 0
+    w := w.putBit 0
   let body ← w.rbspTrailingBits.toBytes
   some (packHevcNal nalSps 0 1 body)
 
@@ -10457,7 +10471,8 @@ def encodeHevcFrameGen (cfg : HevcEncoderCfgGen) (srcPlanes : Array (Array UInt1
 
 def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
     (lossless : Bool := false) (log2Ctb : Nat := 6)
-    (tilesCol : Nat := 1) (tilesRow : Nat := 1) :
+    (tilesCol : Nat := 1) (tilesRow : Nat := 1)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) :
     Option (HevcEncoderCfgGen × ByteArray × ByteArray × ByteArray × HevcDecoderState) := do
   let _ ← ptlParamsForFormat bitDepth chromaFmt
   if width == 0 || height == 0 then none
@@ -10480,7 +10495,7 @@ def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
   let ctbH := (eh + ctb - 1) >>> log2Ctb
   if tilesCol > ctbW || tilesRow > ctbH then none
   let vpsNal ← writeVpsGen bitDepth chromaFmt
-  let spsNal ← writeSpsGen ew eh log2Ctb bitDepth chromaFmt conf
+  let spsNal ← writeSpsGen ew eh log2Ctb bitDepth chromaFmt conf vuiColour?
   let ppsNal ← writePpsGen tilesCol tilesRow ctbW ctbH lossless
   let vpsRm ← stripRbspWithMap (vpsNal.extract 2 vpsNal.size)
   let spsRm ← stripRbspWithMap (spsNal.extract 2 spsNal.size)
@@ -10520,10 +10535,11 @@ def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
 
 def encodeHevcNalsGen (width height : Nat) (pixFmt : String) (raw : ByteArray)
     (qp : Int := 28) (lossless : Bool := false) (log2Ctb : Nat := 6)
-    (tilesCol : Nat := 1) (tilesRow : Nat := 1) :
+    (tilesCol : Nat := 1) (tilesRow : Nat := 1)
+    (vuiColour? : Option (Nat × Nat × Nat) := none) :
     Option (Nat × Nat × ByteArray × ByteArray × ByteArray × Array ByteArray) := do
   let (bitDepth, chromaFmt) ← parseHevcPixFmt pixFmt
-  if bitDepth == 8 && chromaFmt == 1 && !lossless then
+  if bitDepth == 8 && chromaFmt == 1 && !lossless && vuiColour?.isNone then
     let (vpsNal, spsNal, ppsNal, sliceNals) ←
       encodeHevcNals width height raw qp log2Ctb tilesCol tilesRow
     some (8, 1, vpsNal, spsNal, ppsNal, sliceNals)
@@ -10532,7 +10548,7 @@ def encodeHevcNalsGen (width height : Nat) (pixFmt : String) (raw : ByteArray)
     if frameBytes == 0 || raw.size == 0 || raw.size % frameBytes != 0 then none
     let nFrames := raw.size / frameBytes
     let (cfg, vpsNal, spsNal, ppsNal, decSt0) ←
-      initHevcEncoderGen width height bitDepth chromaFmt qp lossless log2Ctb tilesCol tilesRow
+      initHevcEncoderGen width height bitDepth chromaFmt qp lossless log2Ctb tilesCol tilesRow vuiColour?
     let mut decSt := decSt0
     let mut sliceNals : Array ByteArray := Array.mkEmpty nFrames
     let mut refPic? : Option HevcRefPlanes := none

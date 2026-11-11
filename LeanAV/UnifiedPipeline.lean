@@ -925,7 +925,17 @@ def encodeHevcStreamForMedia (media : Media) (options : Options) : Option (ByteA
   if w == 0 || h == 0 then none
   let pf := media.videoPixFmt
   let raw := if media.rawVideo.size > 0 then media.rawVideo else packVideoFramesYuv420pRaw media.video
-  if pf == "yuv420p" && !media.hasDovi then
+  let c := media.colour
+  let vuiColour? : Option (Nat × Nat × Nat) :=
+    if (c.primaries != 0 && c.primaries != 2) ||
+       (c.transferCharacteristics != 0 && c.transferCharacteristics != 2) ||
+       (c.matrixCoefficients != 0 && c.matrixCoefficients != 2) then
+      some (
+        if c.primaries == 0 then 2 else c.primaries,
+        if c.transferCharacteristics == 0 then 2 else c.transferCharacteristics,
+        if c.matrixCoefficients == 0 then 2 else c.matrixCoefficients)
+    else none
+  if pf == "yuv420p" && !media.hasDovi && vuiColour?.isNone then
     let (vps, sps, pps, encoded) ← LeanAV.HevcMain.encodeHevcNals w h raw options.qp options.log2Ctb options.tileColumns options.tileRows
     let hvcc := LeanAV.HevcMain.buildHvccRecord vps sps pps
     let mp4Pkts := encoded.mapIdx (fun i p => (LeanAV.HevcMain.packLenPrefixed4 p, i == 0))
@@ -933,7 +943,7 @@ def encodeHevcStreamForMedia (media : Media) (options : Options) : Option (ByteA
     some (hvcc, mp4Pkts, annexB)
   else
     let (bitDepth, chromaFmt, vps, sps, pps, slices) ←
-      LeanAV.HevcMain.encodeHevcNalsGen w h pf raw options.qp (options.qp == 0) options.log2Ctb options.tileColumns options.tileRows
+      LeanAV.HevcMain.encodeHevcNalsGen w h pf raw options.qp (options.qp == 0) options.log2Ctb options.tileColumns options.tileRows vuiColour?
     let hvcc ← LeanAV.HevcMain.buildHvccRecordGen vps sps pps bitDepth chromaFmt
     let mp4Pkts := slices.mapIdx fun i sl => Id.run do
       let mut sample := LeanAV.HevcMain.packLenPrefixed4 sl
