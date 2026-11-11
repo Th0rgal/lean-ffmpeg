@@ -123,6 +123,11 @@
     "owned_files": [
       "LeanAV/UnifiedPipeline.lean",
       "LeanAV/Main.lean",
+      "LeanAV/H264IntraTransform.lean",
+      "LeanAV/HevcMain.lean",
+      "LeanAV/HevcMainProofs.lean",
+      "tests/differential/test_p1_1_e2e_pipeline.py",
+      "tests/differential/test_hevc_main.py",
       "AGENTS.md",
       "docs/VERIFICATION_APPENDIX.md",
       "docs/CAMPAIGN_CLOSURE_DOSSIER.md",

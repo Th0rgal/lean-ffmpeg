@@ -892,8 +892,8 @@ def checkHevcExtPixFmtHvccAndSpsRoundtrip : Bool :=
     rawFrameByteSize 16 16 10 2 == 1024 &&
     rawFrameByteSize 16 16 12 3 == 1536
   let spsHvccOk :=
-    match writeVpsGen 10 1 false, writeSpsGen 64 48 6 10 1 (0, 2, 0, 2) false,
-          writeSpsGen 64 48 6 10 2 (0, 2, 0, 2) false, writeSpsGen 64 48 6 12 3 (0, 2, 0, 2) false with
+    match writeVpsGen 10 1, writeSpsGen 64 48 6 10 1 (0, 2, 0, 2),
+          writeSpsGen 64 48 6 10 2 (0, 2, 0, 2), writeSpsGen 64 48 6 12 3 (0, 2, 0, 2) with
     | some vpsNal, some spsMain10, some sps422_10, some sps444_12 =>
       parseNalHeader vpsNal == some (nalVps, 0, 0) &&
       parseNalHeader spsMain10 == some (nalSps, 0, 0) &&
@@ -905,7 +905,7 @@ def checkHevcExtPixFmtHvccAndSpsRoundtrip : Bool :=
       (stripRbspWithMap (ByteArray.mk (sps444_12.data.extract 2 sps444_12.data.size))).isSome
     | _, _, _, _ => false
   let ptlOk := pairs.all fun (bd, cf, _, prof) =>
-    match ptlParamsForFormat bd cf false with
+    match ptlParamsForFormat bd cf with
     | some (p, _, _, _) =>
       p == prof &&
       hvccHeaderFieldsGate {

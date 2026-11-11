@@ -3882,7 +3882,7 @@ private def pred4x4DcEnc (recP : HbdPlane) (x0 y0 : Nat) (bitDepth : Nat) : Int 
     return (mid : Int)
 
 private def encodeChromaPlane420Or422
-    (srcP recP : HbdPlane) (mbX mbY chType qpC bitC : Nat)
+    (srcP recP : HbdPlane) (mbX mbY chType qpC bitC : Nat) (bypass : Bool := false)
     : Array Int × Array (Array Int) × HbdPlane := Id.run do
   let midC := h264MidSample bitC
   let cW := 8
@@ -3907,29 +3907,36 @@ private def encodeChromaPlane420Or422
     let res16 := Array.ofFn fun k : Fin 16 =>
       let idx := (by_ + k.val / 4) * 8 + (bx + k.val % 4)
       (src.getD idx midC : Int) - (pred.getD idx midC : Int)
-    let coeff16 := forwardDct4x4 res16
-    rawDc := rawDc.set! blk (coeff16.getD 0 0)
-    let q16 := Array.ofFn fun k : Fin 16 =>
-      if k.val == 0 then 0 else quantCoeff4x4 (coeff16.getD k.val 0) qpC (k.val / 4) (k.val % 4) true 16
-    acRasters := acRasters.set! blk q16
+    if bypass then
+      rawDc := rawDc.set! blk (res16.getD 0 0)
+      acRasters := acRasters.set! blk (res16.set! 0 0)
+    else
+      let coeff16 := forwardDct4x4 res16
+      rawDc := rawDc.set! blk (coeff16.getD 0 0)
+      let q16 := Array.ofFn fun k : Fin 16 =>
+        if k.val == 0 then 0 else quantCoeff4x4 (coeff16.getD k.val 0) qpC (k.val / 4) (k.val % 4) true 16
+      acRasters := acRasters.set! blk q16
   let dcScan :=
-    if chType == 1 then chromaDcQuant420Hbd rawDc qpC true 16
+    if bypass then
+      if chType == 1 then rawDc else chromaDcRasterToScan2x4 rawDc
+    else if chType == 1 then chromaDcQuant420Hbd rawDc qpC true 16
     else chromaDcRasterToScan2x4 (chromaDcQuant422 rawDc qpC true 16)
   let acScans := Array.ofFn fun b : Fin nBlks => raster16ToAc15Scan (acRasters.getD b.val #[])
   let recSamples :=
-    if chType == 1 then
+    if bypass then src
+    else if chType == 1 then
       reconstructChroma420Hbd pred dcScan acRasters qpC bitC
     else
       reconstructChroma422Hbd pred (chromaDcScan2x4ToRaster dcScan) acRasters qpC bitC
   return (dcScan, acScans, writeMbRect recP cX cY cW recSamples)
 
-def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) : Option ByteArray := do
+def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) (lossless : Bool := false) : Option ByteArray := do
   if w == 0 || h == 0 then none else
   let pics ← unpackCanonicalRawPicturesHbd raw pixFmt w h
   if pics.isEmpty then none
   else
     let pic0 := pics[0]!
-    let profile ← highTierProfileFor pic0.chromaFormatIdc pic0.bitDepthY false
+    let profile ← highTierProfileFor pic0.chromaFormatIdc pic0.bitDepthY lossless
     let mbsW := (w + 15) / 16
     let mbsH := (h + 15) / 16
     let chType := pic0.chromaFormatIdc
@@ -3942,7 +3949,7 @@ def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) :
       chromaFormatIdc := chType.toUInt8
       bitDepthLumaMinus8 := (bitY - 8).toUInt8
       bitDepthChromaMinus8 := (bitC - 8).toUInt8
-      qpprimeYZeroTransformBypass := false
+      qpprimeYZeroTransformBypass := lossless
       picWidthInMbsMinus1 := (mbsW - 1).toUInt16
       picHeightInMapUnitsMinus1 := (mbsH - 1).toUInt16
       frameMbsOnlyFlag := true
@@ -3964,10 +3971,10 @@ def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) :
     let spsEnt ← LeanAV.H264Entropy.parseSpsFull spsNal
     let spsArr := (Array.replicate 32 none).set! 0 (some spsEnt)
     let ppsEnt ← LeanAV.H264Entropy.parsePpsFull ppsNal spsArr
-    let sliceQpY : Int := 16
+    let sliceQpY : Int := if lossless then -(6 * (bitY - 8 : Int)) else 16
     let qpDelta : Int := sliceQpY - 26
-    let qpPrimeY : Nat := (sliceQpY + 6 * (bitY - 8 : Int)).toNat
-    let qpC : Nat := qpcFromQpyHbd qpPrimeY 0 bitC
+    let qpPrimeY : Nat := if lossless then 0 else (sliceQpY + 6 * (bitY - 8 : Int)).toNat
+    let qpC : Nat := if lossless then 0 else qpcFromQpyHbd qpPrimeY 0 bitC
     let midY := h264MidSample bitY
     let midC := h264MidSample bitC
     let (cw, chh) :=
@@ -4011,29 +4018,29 @@ def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) :
             let predY16 := Array.replicate 16 dcPredY.toNat
             let src4Y := extractMbRect pic.y x0 y0 4 4 midY
             let res4Y := Array.ofFn fun k : Fin 16 => (src4Y.getD k.val midY : Int) - dcPredY
-            let levels4Y := quantBlock4x4Hbd res4Y qpPrimeY true
+            let levels4Y := if lossless then res4Y else quantBlock4x4Hbd res4Y qpPrimeY true
             let scan4Y := LeanAV.H264Entropy.rasterToZigzag4x4 levels4Y
             lumaScans := lumaScans.set! zIdx scan4Y
             let mut subNz := anyNz scan4Y 16
-            let rec4Y := reconstructBlock4x4Hbd predY16 levels4Y qpPrimeY bitY
+            let rec4Y := if lossless then src4Y else reconstructBlock4x4Hbd predY16 levels4Y qpPrimeY bitY
             recY := writeMbRect recY x0 y0 4 rec4Y
             if chType == 3 then
               let dcPredU := pred4x4DcEnc recU x0 y0 bitC
               let src4U := extractMbRect pic.u x0 y0 4 4 midC
               let res4U := Array.ofFn fun k : Fin 16 => (src4U.getD k.val midC : Int) - dcPredU
-              let levels4U := quantBlock4x4Hbd res4U qpC true
+              let levels4U := if lossless then res4U else quantBlock4x4Hbd res4U qpC true
               let scan4U := LeanAV.H264Entropy.rasterToZigzag4x4 levels4U
               c444Scans := c444Scans.set! zIdx scan4U
               if anyNz scan4U 16 then subNz := true
-              recU := writeMbRect recU x0 y0 4 (reconstructBlock4x4Hbd (Array.replicate 16 dcPredU.toNat) levels4U qpC bitC)
+              recU := writeMbRect recU x0 y0 4 (if lossless then src4U else reconstructBlock4x4Hbd (Array.replicate 16 dcPredU.toNat) levels4U qpC bitC)
               let dcPredV := pred4x4DcEnc recV x0 y0 bitC
               let src4V := extractMbRect pic.v x0 y0 4 4 midC
               let res4V := Array.ofFn fun k : Fin 16 => (src4V.getD k.val midC : Int) - dcPredV
-              let levels4V := quantBlock4x4Hbd res4V qpC true
+              let levels4V := if lossless then res4V else quantBlock4x4Hbd res4V qpC true
               let scan4V := LeanAV.H264Entropy.rasterToZigzag4x4 levels4V
               c444Scans := c444Scans.set! (16 + zIdx) scan4V
               if anyNz scan4V 16 then subNz := true
-              recV := writeMbRect recV x0 y0 4 (reconstructBlock4x4Hbd (Array.replicate 16 dcPredV.toNat) levels4V qpC bitC)
+              recV := writeMbRect recV x0 y0 4 (if lossless then src4V else reconstructBlock4x4Hbd (Array.replicate 16 dcPredV.toNat) levels4V qpC bitC)
             if subNz then
               cbpLuma := cbpLuma ||| (1 <<< (zIdx / 4))
           let mut cbpChroma : Nat := 0
@@ -4041,8 +4048,8 @@ def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) :
           let mut finalChromaAc : Array (Array Int) := Array.replicate 16 (Array.replicate 15 0)
           if chType == 1 || chType == 2 then
             let nBlks := if chType == 1 then 4 else 8
-            let (uDc, uAc, recU') := encodeChromaPlane420Or422 pic.u recU mbX mbY chType qpC bitC
-            let (vDc, vAc, recV') := encodeChromaPlane420Or422 pic.v recV mbX mbY chType qpC bitC
+            let (uDc, uAc, recU') := encodeChromaPlane420Or422 pic.u recU mbX mbY chType qpC bitC lossless
+            let (vDc, vAc, recV') := encodeChromaPlane420Or422 pic.v recV mbX mbY chType qpC bitC lossless
             recU := recU'
             recV := recV'
             let mut hasAc := false
@@ -4070,7 +4077,7 @@ def encodeCanonicalRawToAnnexB (raw : ByteArray) (pixFmt : String) (w h : Nat) :
       let wPre :=
         let w0 := LeanAV.H264Entropy.writeUNat BitWriter.empty 0 4
         let w1 := LeanAV.H264Entropy.writeUENat w0 idrPicId
-        let w2 := LeanAV.H264Entropy.writeUNat w1 ((frameIdx * 2) % 256) 8
+        let w2 := LeanAV.H264Entropy.writeUNat w1 ((frameIdx * 2) % 16) 4
         let w3 := LeanAV.H264Entropy.writeU1Nat w2 0
         LeanAV.H264Entropy.writeU1Nat w3 0
       let wSuf := LeanAV.H264Entropy.writeUENat BitWriter.empty 1

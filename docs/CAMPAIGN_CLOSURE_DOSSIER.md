@@ -1,5 +1,29 @@
 # Campaign Closure Dossier: FFmpeg Parity & Maxwell Qualification (`lean-ffmpeg`)
 
+The 2026-11-11 P1.1 HDR, Dolby Vision, 10/12-Bit, 4:2:2/4:4:4 & Film-Grain
+Codec Tiers qualification (`campaign/p1-1-hdr-highbitdepth-20261106` over
+`3f9055cf`) under Lean v4.35.0 and `turbo-lean`
+(`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) extends the
+standalone pipeline with HEVC Main 10 & RExt 8/10/12-bit 4:2:0/4:2:2/4:4:4
+(plus HDR10 `mdcv`/`clli` SEI & Dolby Vision `UNSPEC62` RPU passthrough), AV1
+Main/High/Professional 8/10/12-bit 4:2:0/4:2:2/4:4:4 with film-grain synthesis
+and ITU-T T.35 Dolby Vision EMDF RPU passthrough, H.264 High / High 10 / High
+4:2:2 / High 4:4:4 Predictive 8/10/12-bit with custom 4x4 & 8x8 scaling
+matrices and `qp=0` lossless bypass, ISOBMFF (`dvcC`/`dvvC`/`mdcv`/`clli`) &
+Matroska/WebM HDR10/Dolby Vision container demux/mux, and 10/12/16-bit scaling,
+BT.2020 PQ/HLG tonemapping, and Bayer/Floyd-Steinberg dithering across
+`yuv420p10le`, `p010le`, `yuv422p10le`, `yuv444p10le`, `yuv420p12le`,
+`yuv422p12le`, `yuv444p12le`, `gbrp10le`, and `rgba64le`, auditing **24,909
+declarations with zero sorryAx/custom axioms** (`99,253` LOC across 38 formal
+`LeanAV/*.lean` modules) and **890/890 `non_vacuous_and_tight` specifications**
+(`AacLcProofs`: 84, `H264IntraTransformProofs`: 82, `H264InterDeblockDpbProofs`:
+79, `Format`: 70, `Ffv1Proofs`: 60, `NativeKernels`: 59, `Video`: 47,
+`LavfiGraphProofs`: 40, `Encoder`: 37, `Audio`: 35, `H264EntropyProofs`: 35,
+`Scale`: 34, `Av1MainProofs`: 33, `H264SyntaxProofs`: 32, `HevcMainProofs`: 31,
+`Bitstream`: 27, `Spec`: 23, `PlanIR`: 22, `Core`: 14, `Domain`: 9,
+`InprocTranscode`: 8, `Cli`: 7, `Filter`: 7, `Md5`: 7, `LavfiGraph`: 6,
+`UnifiedPipeline`: 2; `0` vacuous, `0` trivial, `0` shadowed).
+
 The 2026-11-06 P1.0 unified multi-stream pipeline qualification
 (`campaign/p1-0-unified-pipeline-20261106` over `627b45e1`) under Lean v4.35.0 and
 `turbo-lean` (`dc1656dc948f1d7bfc25d165575ae3819a2e8b97`, `audit-spec` v2.1) replaces

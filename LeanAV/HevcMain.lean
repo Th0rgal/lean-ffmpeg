@@ -2636,7 +2636,7 @@ def buildHvccRecord (vps sps pps : ByteArray) : ByteArray :=
   let body := ByteArray.append (arrayBody 32 vps) (ByteArray.append (arrayBody 33 sps) (arrayBody 34 pps))
   ByteArray.append header body
 
-def ptlParamsForFormat (bitDepth chromaFormatIdc : Nat) (_lossless : Bool := false) :
+def ptlParamsForFormat (bitDepth chromaFormatIdc : Nat) :
     Option (Nat × Nat × Nat × Nat) :=
   if bitDepth == 8 && chromaFormatIdc == 1 then
     some (1, 0x60000000, 0x9000, 0x00)
@@ -2663,8 +2663,8 @@ def writePtlGen (w : HevcBitWriter) (profileIdc compatHi32 cstrHi16 cstrMid8 : N
   let cur1 := ((cur0.putBits cstrHi16 16).putBits cstrMid8 8).putBits 0 24
   cur1.putBits levelIdc 8
 
-def writeVpsGen (bitDepth chromaFormatIdc : Nat) (lossless : Bool := false) : Option ByteArray := do
-  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc lossless
+def writeVpsGen (bitDepth chromaFormatIdc : Nat) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
   let mut w := HevcBitWriter.empty
   w := (w.putBits 0 4).putBits 3 2
   w := (w.putBits 0 6).putBits 0 3
@@ -2678,8 +2678,8 @@ def writeVpsGen (bitDepth chromaFormatIdc : Nat) (lossless : Bool := false) : Op
   some (packHevcNal nalVps 0 1 body)
 
 def writeSpsGen (width height log2Ctb bitDepth chromaFormatIdc : Nat)
-    (conf : Nat × Nat × Nat × Nat) (lossless : Bool := false) : Option ByteArray := do
-  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc lossless
+    (conf : Nat × Nat × Nat × Nat) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
   let subW := hevcSubWidthC.getD chromaFormatIdc 1
   let subH := hevcSubHeightC.getD chromaFormatIdc 1
   let mut w := HevcBitWriter.empty
@@ -2758,9 +2758,8 @@ def writePpsGen (numTileColumns numTileRows ctbW ctbH : Nat)
   let some body := w.rbspTrailingBits.toBytes | return none
   return some (packHevcNal nalPps 0 1 body)
 
-def buildHvccRecordGen (vps sps pps : ByteArray) (bitDepth chromaFormatIdc : Nat)
-    (lossless : Bool := false) : Option ByteArray := do
-  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc lossless
+def buildHvccRecordGen (vps sps pps : ByteArray) (bitDepth chromaFormatIdc : Nat) : Option ByteArray := do
+  let (prof, compat, cHi, cMid) ← ptlParamsForFormat bitDepth chromaFormatIdc
   let arrayBody (nalType : Nat) (nal : ByteArray) : ByteArray :=
     let b0 : UInt8 := (0x80 ||| nalType).toUInt8
     let body := (((ByteArray.empty.push b0).push 0).push 1).push ((nal.size >>> 8).toUInt8)
@@ -10460,7 +10459,7 @@ def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
     (lossless : Bool := false) (log2Ctb : Nat := 6)
     (tilesCol : Nat := 1) (tilesRow : Nat := 1) :
     Option (HevcEncoderCfgGen × ByteArray × ByteArray × ByteArray × HevcDecoderState) := do
-  let _ ← ptlParamsForFormat bitDepth chromaFmt lossless
+  let _ ← ptlParamsForFormat bitDepth chromaFmt
   if width == 0 || height == 0 then none
   if chromaFmt != 3 && (width &&& 1) != 0 then none
   if chromaFmt == 1 && (height &&& 1) != 0 then none
@@ -10480,8 +10479,8 @@ def initHevcEncoderGen (width height bitDepth chromaFmt : Nat) (qp : Int := 28)
   let ctbW := (ew + ctb - 1) >>> log2Ctb
   let ctbH := (eh + ctb - 1) >>> log2Ctb
   if tilesCol > ctbW || tilesRow > ctbH then none
-  let vpsNal ← writeVpsGen bitDepth chromaFmt lossless
-  let spsNal ← writeSpsGen ew eh log2Ctb bitDepth chromaFmt conf lossless
+  let vpsNal ← writeVpsGen bitDepth chromaFmt
+  let spsNal ← writeSpsGen ew eh log2Ctb bitDepth chromaFmt conf
   let ppsNal ← writePpsGen tilesCol tilesRow ctbW ctbH lossless
   let vpsRm ← stripRbspWithMap (vpsNal.extract 2 vpsNal.size)
   let spsRm ← stripRbspWithMap (spsNal.extract 2 spsNal.size)
@@ -10572,7 +10571,7 @@ def encodeHevcFromRaw (width height : Nat) (pixFmt : String) (raw : ByteArray)
       all := all.push s
     some (muxAnnexB all)
   else
-    let hvcc ← buildHvccRecordGen vpsNal spsNal ppsNal bitDepth chromaFmt lossless
+    let hvcc ← buildHvccRecordGen vpsNal spsNal ppsNal bitDepth chromaFmt
     let samples := sliceNals.map packLenPrefixed4
     some (buildHevcMp4 samples width height hvcc)
 

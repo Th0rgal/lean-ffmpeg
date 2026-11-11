@@ -65,7 +65,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 812 or total_tight != 812:
+          if total_audited != 890 or total_tight != 890:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -79,7 +79,7 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 24909 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           ! command -v ffmpeg
@@ -174,7 +174,7 @@ jobs:
               if not data.get("ok") or vacuous != 0 or trivial != 0 or shadowed != 0 or tight != audited:
                   sys.exit(1)
           print(f"Total: {total_tight}/{total_audited} non_vacuous_and_tight")
-          if total_audited != 812 or total_tight != 812:
+          if total_audited != 890 or total_tight != 890:
               sys.exit(1)
           PY
       - name: LNIR wire & outer-shell zero-drift check
@@ -186,7 +186,7 @@ jobs:
         run: |
           out="$(LEAN_PATH='.lake/build/lib/lean:../lean-sys/.lake/build/lib/lean' lean scripts/check_axioms.lean 2>&1)"
           echo "$out"
-          echo "$out" | grep -Fq "Verified 23201 LeanAV declarations (0 sorryAx, 0 custom axioms)."
+          echo "$out" | grep -Fq "Verified 24909 LeanAV declarations (0 sorryAx, 0 custom axioms)."
       - name: Zero-FFmpeg Standalone Suite
         run: |
           python3 - <<'PY'

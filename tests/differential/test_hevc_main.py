@@ -49,6 +49,15 @@ static uint8_t* slurp(const char* path, size_t* out_len) {
     return buf;
 }
 
+static uint32_t parse_u32(const char* s) {
+    uint32_t v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10u + (uint32_t)(*s - '0');
+        s++;
+    }
+    return v;
+}
+
 int main(int argc, char** argv) {
     if (argc != 9) return 2;
     lean_initialize_runtime_module();
@@ -60,11 +69,11 @@ int main(int argc, char** argv) {
     lean_dec_ref(init_res);
     lean_io_mark_end_initialization();
 
-    uint32_t op = (uint32_t)strtoul(argv[1], NULL, 10);
-    uint32_t width = (uint32_t)strtoul(argv[2], NULL, 10);
-    uint32_t height = (uint32_t)strtoul(argv[3], NULL, 10);
-    uint32_t qp = (uint32_t)strtoul(argv[4], NULL, 10);
-    uint32_t flags = (uint32_t)strtoul(argv[5], NULL, 10);
+    uint32_t op = parse_u32(argv[1]);
+    uint32_t width = parse_u32(argv[2]);
+    uint32_t height = parse_u32(argv[3]);
+    uint32_t qp = parse_u32(argv[4]);
+    uint32_t flags = parse_u32(argv[5]);
     const char* pix_fmt = argv[6];
     const char* in_path = argv[7];
     const char* out_path = argv[8];
