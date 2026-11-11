@@ -6,7 +6,7 @@ these blocks only.
 
 ```text
 wave: W0
-sha: 3949bf86918c04d89ff551d4253b8801c8812a06
+sha: 2ff58dcf0346735fa16517553a227627ca0d734c
 base: 4624a5e46b1d51d13dd4e7264a8bbd2b4f2f9cc1 (campaign/ef-e2e-20261111)
 merged: origin/campaign/p1-1-hdr-highbitdepth-20261106 @ 61aa07be8ea5622a77ecde0b8c3858b199a5e0d1 (clean merge, conflicts: none)
 docs: README.md updated to P1.1 capability set (10/12-bit 4:2:0/4:2:2/4:4:4,
@@ -123,3 +123,5 @@ W0 worker notes (not part of the §4 template):
   exactly one `execve` (the `lffmpeg` invocation itself); zero child spawns.
 - P1.1 branch pin `61aa07be` merged exactly as frozen in the plan; the later
   `3632c2f` tip pushed after freeze is out of W0 scope.
+
+ACCEPT W0 2ff58dcf0346735fa16517553a227627ca0d734c
